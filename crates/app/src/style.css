@@ -1,0 +1,768 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1d212b;
+  --col: #14171e;
+  --card: #1e232e;
+  --card-hover: #252b38;
+  --border: #2a2f3a;
+  --text: #e6e8ec;
+  --muted: #8b93a3;
+  --accent: #6c8cff;
+  --accent-2: #4a6bff;
+  --green: #3fb950;
+  --amber: #d29922;
+  --red: #f85149;
+  --radius: 10px;
+
+  /* Interaction states */
+  --border-hover: #3a4150;
+  --surface-hover: #2a3140;
+  --scrollbar: #313847;
+  --scrollbar-hover: #3f4858;
+
+  /* Translucent washes (alpha-tinted accents) */
+  --red-wash: rgba(248, 81, 73, 0.14);
+  --red-border: rgba(248, 81, 73, 0.12);
+  --green-wash: rgba(63, 185, 80, 0.14);
+  --amber-wash: rgba(210, 153, 34, 0.12);
+  --amber-border: rgba(210, 153, 34, 0.3);
+
+  /* Status accents */
+  --danger-border: #5a2b2b;
+  --success-fg: #04210a;
+
+  /* Code / transcript surfaces */
+  --code-bg: #0c0e12;
+  --code-fg: #c8d0dc;
+
+  /* Badge palette */
+  --badge-claude-bg: #3a2620;
+  --badge-claude-fg: #eba985;
+  --badge-codex-bg: #16332c;
+  --badge-codex-fg: #7fd7c0;
+  --badge-cost-bg: #332;
+  --badge-cost-fg: #e6d49f;
+  --intervention-fg: #1a1500;
+
+  /* Overlays & shadows */
+  --overlay: rgba(0, 0, 0, 0.55);
+  --shadow: rgba(0, 0, 0, 0.5);
+  --shadow-soft: rgba(0, 0, 0, 0.4);
+}
+
+html, body, #main {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+.app {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Dark, custom scrollbars (the webview defaults to a light overlay bar). */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 6px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ----- Sidebar ----- */
+.sidebar {
+  width: 200px;
+  min-width: 200px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 12px 8px;
+  gap: 6px;
+}
+.sidebar-brand { display: flex; align-items: center; gap: 8px; padding: 2px 4px 12px; }
+/* Logo art is black on transparent; invert to white for the dark sidebar. */
+.brand-logo { width: 24px; height: 24px; filter: invert(1); flex: none; }
+.brand-name { font-weight: 700; font-size: 16px; letter-spacing: 0.01em; }
+
+.sidebar-top { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.sidebar-projects { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.sidebar-bottom { margin-top: 6px; }
+.cog {
+  flex: none; background: transparent; border: 1px solid transparent; color: var(--muted);
+  cursor: pointer; padding: 7px; border-radius: 8px; display: flex; align-items: center;
+}
+.cog:hover { background: var(--panel-2); color: var(--text); }
+
+.nav-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; text-align: left;
+  background: transparent; color: var(--text);
+  border: 1px solid transparent; border-radius: 8px;
+  padding: 8px 10px; cursor: pointer; font-size: 13px;
+}
+.nav-item:hover { background: var(--panel-2); }
+.nav-item.active { background: var(--accent-2); color: white; }
+.nav-item.home { font-weight: 600; flex: 1; }
+.proj-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+.proj-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-trash {
+  flex: none; background: transparent; border: none; color: inherit; cursor: pointer;
+  padding: 2px; border-radius: 4px; display: flex; align-items: center; opacity: 0;
+}
+.nav-item:hover .proj-trash { opacity: 0.55; }
+.proj-trash:hover { opacity: 1; color: var(--red); background: var(--red-wash); }
+
+.demo-badge {
+  font-size: 11px; color: var(--amber); text-align: center;
+  background: var(--amber-wash); border: 1px solid var(--amber-border);
+  border-radius: 6px; padding: 4px 8px; margin-bottom: 8px;
+}
+.add-project {
+  width: 100%; background: var(--panel-2); color: var(--text);
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 8px; cursor: pointer; font-size: 13px; margin-top: 8px; flex: none;
+}
+.add-project:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ----- Board ----- */
+.board {
+  flex: 1; display: flex; gap: 12px;
+  padding: 16px; overflow-x: auto; overflow-y: hidden;
+}
+.column {
+  width: 280px; min-width: 280px;
+  background: var(--col); border: 1px solid var(--border);
+  border-radius: var(--radius); display: flex; flex-direction: column;
+  max-height: 100%;
+}
+.column-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--border);
+  font-weight: 600; font-size: 13px;
+}
+.column-count { color: var(--muted); font-weight: 500; background: var(--panel-2); border-radius: 10px; padding: 1px 8px; font-size: 12px; }
+.column-body { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+
+/* ----- New card form ----- */
+.new-card { display: flex; flex-direction: column; gap: 6px; padding: 4px; }
+.new-card input, .new-card textarea, .new-card select {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit; width: 100%;
+}
+.new-card textarea { resize: vertical; min-height: 48px; }
+.hint { color: var(--muted); font-size: 12px; padding: 8px; text-align: center; }
+.hint.warn { color: var(--amber); }
+.wt-path {
+  color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace;
+  word-break: break-all; margin-bottom: 6px;
+}
+
+.add-card {
+  width: 100%; background: transparent; color: var(--muted);
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px; cursor: pointer; font-size: 13px; font-family: inherit; margin-top: 2px;
+}
+.add-card:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Replace the native (glassy) select control with one matching the dark theme. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: var(--panel-2);
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="%238b93a3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>');
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 30px;
+  cursor: pointer;
+}
+select option { background: var(--panel-2); color: var(--text); }
+
+/* ----- Card ----- */
+.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; cursor: pointer; display: flex; flex-direction: column; gap: 8px;
+}
+.card:hover { background: var(--card-hover); border-color: var(--border-hover); }
+.card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.card.failed { border-color: var(--red); }
+.card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.card-title { font-weight: 600; font-size: 13px; line-height: 1.3; flex: 1; min-width: 0; }
+/* Per-card actions: a chevron button opening a floating dropdown (rendered at
+   the app root by CardMenuHost so a column's scroll can't clip it). */
+.card-menu-wrap { position: relative; flex: none; }
+.card-menu-btn {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  padding: 3px; border-radius: 5px; display: flex; align-items: center; opacity: 0.5;
+}
+.card-menu-btn:hover { color: var(--text); opacity: 1; background: var(--surface-hover); }
+.menu-backdrop { position: fixed; inset: 0; z-index: 1500; }
+.card-menu {
+  position: fixed; transform: translate(-100%, 6px); min-width: 184px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px; display: flex; flex-direction: column;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.menu-item {
+  background: transparent; border: none; color: var(--text); cursor: pointer;
+  text-align: left; padding: 7px 10px; border-radius: 5px; font-size: 13px; font-family: inherit;
+}
+.menu-item:hover { background: var(--surface-hover); }
+.menu-item.danger { color: var(--red); }
+.menu-item.danger:hover { background: var(--red-border); }
+.card-meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.badge { font-size: 11px; padding: 2px 7px; border-radius: 6px; background: var(--panel-2); color: var(--muted); }
+.badge.provider.claude { background: var(--badge-claude-bg); color: var(--badge-claude-fg); }
+.badge.provider.codex { background: var(--badge-codex-bg); color: var(--badge-codex-fg); }
+.badge.cost { background: var(--badge-cost-bg); color: var(--badge-cost-fg); }
+.badge.intervention { background: var(--amber); color: var(--intervention-fg); font-weight: 600; }
+.badge.status { background: var(--panel-2); color: var(--muted); }
+.spinner { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.card-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+/* Preview controls, pushed to the card's bottom-right corner so they read as
+   tools rather than as the state's primary action. */
+.card-tools { display: flex; gap: 2px; margin-left: auto; flex: none; }
+.card-icon-btn {
+  display: flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+  background: transparent; border: none; border-radius: 6px; padding: 0;
+  color: var(--muted); cursor: pointer; opacity: 0.65;
+}
+.card-icon-btn:hover { color: var(--text); opacity: 1; background: var(--surface-hover); }
+/* The starting spinner is a status, not a target. */
+.card-icon-btn.is-busy { cursor: default; opacity: 1; }
+.card-icon-btn.is-busy:hover { background: transparent; }
+.btn {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; font-family: inherit;
+}
+.btn:hover { background: var(--surface-hover); }
+.btn.primary { background: var(--accent-2); border-color: var(--accent-2); color: white; }
+.btn.primary:hover { background: var(--accent); }
+.btn.danger { color: var(--red); border-color: var(--danger-border); }
+.btn.success { background: var(--green); border-color: var(--green); color: var(--success-fg); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+/* A lifecycle command is in flight for this card (`CardBusy`). Such a command
+   does its git/forge work *before* transitioning, so the card's own state shows
+   nothing happening — freeze its actions and let the spinner carry the wait.
+   The executor drops a duplicate anyway (`CardCommand::is_exclusive`), so this
+   only makes that visible rather than letting a second click look ignored.
+   Icon tools (preview, diff) are excluded: they don't advance the lifecycle. */
+.is-busy .btn { pointer-events: none; opacity: 0.5; }
+/* Compact square button (e.g. the reviewer-list refresh) that shouldn't stretch
+   to fill a flex `.row`. */
+.btn.icon { flex: 0 0 auto; width: 36px; padding: 6px 0; font-size: 14px; line-height: 1; }
+/* Inline, link-styled button for use inside a hint sentence. */
+.btn.link {
+  background: transparent; border: none; padding: 0; color: var(--accent);
+  font-size: inherit; text-decoration: underline; cursor: pointer;
+}
+.btn.link:hover { background: transparent; color: var(--text); }
+
+/* ----- Attachment chips ----- */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 6px 3px 8px; font-size: 12px;
+}
+.chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.chip-remove {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 2px;
+}
+.chip-remove:hover { color: var(--red); }
+
+/* ----- Detail panel ----- */
+.detail {
+  width: 380px; min-width: 380px; background: var(--panel);
+  border-left: 1px solid var(--border); display: flex; flex-direction: column;
+}
+.detail-header { padding: 16px; border-bottom: 1px solid var(--border); }
+/* Title, then its diff button; the close button is pinned to the far right. */
+.detail-title-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.detail-header h2 {
+  font-size: 16px; flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.detail-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+.detail-close {
+  margin-left: auto; flex: none; background: transparent; border: none;
+  color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1;
+}
+
+.section { display: flex; flex-direction: column; gap: 8px; }
+.section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.checkbox-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text); cursor: pointer; margin: 2px 0;
+}
+.checkbox-row input { width: auto; margin: 0; flex: 0 0 auto; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { font-size: 12px; color: var(--muted); }
+.field input, .field textarea, .field select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+}
+.field textarea { resize: vertical; min-height: 60px; }
+
+/* Auto-growing textarea: a hidden mirror (::after, fed by data-replicated-value)
+   sizes the grid cell to the content; the textarea overlays it at the same size. */
+.grow-wrap { display: grid; width: 100%; }
+.grow-wrap::after {
+  content: attr(data-replicated-value) " ";
+  visibility: hidden;
+}
+.grow-wrap > textarea { resize: none; overflow: hidden; }
+.grow-wrap > textarea,
+.grow-wrap::after {
+  grid-area: 1 / 1 / 2 / 2;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  min-height: 60px;
+  box-sizing: border-box;
+  width: 100%;
+}
+.row { display: flex; gap: 8px; }
+.row > * { flex: 1; }
+
+.transcript {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+  max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; white-space: pre-wrap;
+}
+.transcript .line { color: var(--code-fg); }
+.transcript .ts { color: var(--muted); opacity: 0.65; }
+
+.plan-box { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; max-height: 240px; overflow-y: auto; }
+
+/* The validation gate's captured failing output. */
+.validation-output { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; white-space: pre-wrap; word-break: break-word; font-family: var(--mono, monospace); font-size: 12px; max-height: 280px; overflow-y: auto; margin: 8px 0; }
+
+/* The implement run's hand-off: open questions + what to test. */
+.handoff-list { margin: 0; padding-left: 18px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.handoff-list li { line-height: 1.45; }
+
+/* --- Diff viewer -------------------------------------------------------- */
+.diff-header { display: flex; align-items: center; justify-content: space-between; }
+.diff-header h3 { margin: 0; }
+.diff {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; line-height: 1.5;
+  max-height: 480px; overflow: auto;
+}
+.diff-file + .diff-file { border-top: 1px solid var(--border); }
+.diff-file-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer;
+  position: sticky; top: 0; background: var(--panel-2); border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+.diff-file-head:hover { background: var(--surface-hover); }
+.diff-status { font-weight: 700; width: 1em; text-align: center; flex: 0 0 auto; }
+.diff-status.add { color: var(--green); }
+.diff-status.del { color: var(--red); }
+.diff-status.mod { color: var(--amber); }
+.diff-file-path { color: var(--text); word-break: break-all; flex: 1 1 auto; }
+.diff-file-stat { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.diff-file-stat.add { color: var(--green); }
+.diff-file-stat.del { color: var(--red); }
+.diff-file-note { flex: 0 0 auto; color: var(--muted); font-size: 11px; font-style: italic; }
+.diff-collapse { flex: 0 0 auto; color: var(--muted); }
+/* Each hunk skips layout/paint while off-screen (WebKit tiled-scroll paint is
+   the main source of the blank-while-scrolling jank). `contain-intrinsic-height`
+   is set inline per hunk from its line count so the scrollbar stays stable. */
+.diff-hunk { content-visibility: auto; }
+.diff-hunk-head { padding: 2px 10px; color: var(--accent); background: rgba(108, 140, 255, 0.06); white-space: pre; }
+.diff-binary { padding: 8px 10px; color: var(--muted); }
+/* Lines wrap rather than scroll horizontally — required so the hunk's paint
+   containment (implied by content-visibility) doesn't clip long lines. */
+.diff-line { display: flex; align-items: flex-start; }
+.diff-line.add { background: var(--green-wash); }
+.diff-line.del { background: var(--red-wash); }
+.diff-gutter {
+  flex: 0 0 auto; width: 3.5em; padding: 0 6px; text-align: right;
+  color: var(--muted); opacity: 0.6; user-select: none; -webkit-user-select: none;
+}
+.diff-sign { flex: 0 0 auto; width: 1.2em; text-align: center; color: var(--muted); }
+.diff-line.add .diff-sign { color: var(--green); }
+.diff-line.del .diff-sign { color: var(--red); }
+.diff-code { flex: 1 1 auto; min-width: 0; color: var(--code-fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.question { background: var(--panel-2); border: 1px solid var(--amber); border-radius: 8px; padding: 12px; }
+.option-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+.question .qtext { font-weight: 600; margin-bottom: 4px; }
+.question input {
+  width: 100%; margin-top: 4px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+}
+
+.comment { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; display: flex; gap: 8px; }
+.comment-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+.comment-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.comment .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
+/* Lead with the analysis: rationale is the prominent line. */
+.comment .rationale { color: var(--text); font-size: 13px; line-height: 1.45; }
+/* Original comment is tucked into a collapsible, muted by default. */
+.comment .orig > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; }
+.comment .orig > summary::before { content: "▸ "; }
+.comment .orig[open] > summary::before { content: "▾ "; }
+.comment .orig > summary:hover { color: var(--text); }
+.comment .orig-body { margin-top: 4px; padding-left: 12px; color: var(--muted); font-size: 12px; white-space: pre-wrap; border-left: 2px solid var(--border); }
+
+/* Severity + verdict pills */
+.sev, .verdict-tag { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); white-space: nowrap; }
+.sev { color: var(--muted); background: var(--panel); }
+.sev-critical { color: var(--red); background: var(--red-wash); border-color: var(--red-border); }
+.sev-high { color: var(--amber); background: var(--amber-wash); border-color: var(--amber-border); }
+.sev-medium { color: var(--accent); background: rgba(108, 140, 255, 0.12); border-color: rgba(108, 140, 255, 0.3); }
+.sev-low { color: var(--muted); }
+.verdict-tag.verdict-yes { color: var(--green); border-color: rgba(63, 185, 80, 0.35); }
+.verdict-tag.verdict-no { color: var(--muted); }
+
+/* ----- Confirm modal ----- */
+.modal-overlay {
+  position: fixed; inset: 0; background: var(--overlay);
+  display: flex; align-items: center; justify-content: center; z-index: 2000;
+  backdrop-filter: blur(1px);
+}
+/* The confirm prompt is always raised *from* another modal (diff viewer,
+   settings), so it has to outrank every other overlay — they all share the base
+   z-index and the confirm host renders first, which would otherwise bury it. */
+.modal-overlay.confirm-overlay { z-index: 2400; }
+.modal {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  width: 380px; max-width: calc(100vw - 40px); padding: 20px;
+  box-shadow: 0 20px 60px var(--shadow);
+}
+.modal-title { font-size: 15px; margin-bottom: 10px; }
+
+/* The large framed modal (header + fill body) used by the diff dialog. */
+.modal.modal-large {
+  padding: 0;
+  width: min(1180px, calc(100vw - 48px));
+  height: min(86vh, 940px);
+  display: flex; flex-direction: column;
+}
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); flex: 0 0 auto;
+}
+.modal-header .modal-title { margin: 0; }
+/* Whole-diff line counts, pinned next to the title (the header is space-between). */
+.diff-total-stat {
+  display: flex; gap: 6px; flex: 0 0 auto; margin-right: auto;
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.diff-total-stat .add { color: var(--green); }
+.diff-total-stat .del { color: var(--red); }
+.modal-header-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.modal-body-fill { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.modal-body-fill > .hint { padding: 28px; }
+
+/* Two-pane diff: a fixed file list on the left, the scrolling diff on the right. */
+.diff-layout { flex: 1 1 auto; min-height: 0; display: flex; }
+/* The list scrolls; the filter box above it stays put. */
+.diff-filelist {
+  flex: 0 0 auto; width: 260px; min-height: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--border); background: var(--panel-2);
+}
+.diff-filelist-search { flex: 0 0 auto; padding: 8px; border-bottom: 1px solid var(--border); }
+.diff-filelist-search input {
+  width: 100%; box-sizing: border-box; padding: 5px 8px; font-size: 12px;
+  color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+}
+.diff-filelist-search input:focus { outline: none; border-color: var(--accent); }
+.diff-filelist-items { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px; }
+.diff-filelist-empty { padding: 10px 8px; color: var(--muted); font-size: 12px; }
+.diff-fileitem {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: transparent; border: none; color: var(--text); cursor: pointer;
+  padding: 5px 8px; border-radius: 6px; font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.diff-fileitem:hover { background: var(--surface-hover); }
+.diff-fileitem-path { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diff-fileitem-stat { flex: 0 0 auto; display: flex; gap: 6px; font-variant-numeric: tabular-nums; }
+.diff-fileitem-stat .add { color: var(--green); }
+.diff-fileitem-stat .del { color: var(--red); }
+.diff-main { flex: 1 1 auto; min-width: 0; overflow-y: auto; overflow-x: hidden; }
+.diff-main .diff { max-height: none; border: none; border-radius: 0; }
+/* How many drafted comments landed in a file, so the list doubles as a map of
+   where the review has notes. */
+.diff-fileitem-comments {
+  flex: 0 0 auto; min-width: 16px; padding: 0 5px; border-radius: 8px;
+  background: var(--accent-2); color: white; font-size: 10px; font-weight: 700;
+  text-align: center; line-height: 16px;
+}
+
+/* --- Inline review comments (validating a PR inside the diff) ------------ */
+/* A drafted comment, threaded under the line it annotates. It breaks out of the
+   diff's monospace grid on purpose: it is prose about the code, not code. */
+.inline-comment {
+  margin: 6px 10px 10px 10px; padding: 8px 10px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: 6px;
+  font-family: system-ui, -apple-system, sans-serif; font-size: 12px;
+  display: flex; flex-direction: column; gap: 6px; cursor: auto;
+}
+/* Unchecked: it stays legible and editable, but reads as excluded. */
+.inline-comment.is-skipped { border-left-color: var(--border); opacity: 0.6; }
+.inline-comment-head { display: flex; align-items: center; gap: 8px; }
+.inline-comment-loc {
+  color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.inline-comment-skip { margin-left: auto; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
+/* Comments the agent anchored off the diff — GitHub would reject these inline,
+   so they're called out at the top rather than quietly dropped. */
+.diff-unplaced { padding: 10px 10px 2px 10px; border-bottom: 1px solid var(--border); background: var(--amber-wash); }
+.diff-unplaced-head { color: var(--amber); font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+
+/* The publish bar pinned under the diff while validating a review. */
+.review-validate-bar {
+  flex: 0 0 auto; display: flex; align-items: flex-end; gap: 12px;
+  padding: 10px 16px; border-top: 1px solid var(--border); background: var(--panel-2);
+}
+.review-validate-summary { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.review-validate-label { font-size: 11px; color: var(--muted); }
+/* Inside the bar the summary box is fixed-height and scrolls — the autogrow
+   script isn't driving it, and a long summary must not eat the diff. */
+.review-validate-bar .review-summary-edit { overflow-y: auto; resize: vertical; }
+.review-validate-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.review-validate-actions select {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
+}
+
+.settings-modal { width: 420px; }
+.settings-modal .section { gap: 10px; }
+.settings-modal .section + .section { margin-top: 18px; }
+/* `pre-line` so a message can break into paragraphs; spaces still collapse. */
+.modal-body { color: var(--muted); font-size: 13px; line-height: 1.5; margin-bottom: 18px; white-space: pre-line; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ----- Settings tabs ----- */
+.settings-tabs {
+  display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 0 0 16px;
+}
+.settings-tab {
+  background: transparent; border: none; color: var(--muted);
+  padding: 8px 12px; font-size: 13px; font-family: inherit; cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.settings-tab:hover { color: var(--text); }
+.settings-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* ----- Structured preview-port rows ----- */
+.port-list { display: flex; flex-direction: column; gap: 6px; }
+.port-row { display: flex; align-items: center; gap: 6px; }
+.port-row .port-label { flex: 1 1 auto; min-width: 0; }
+.port-row .port-num { flex: 0 0 84px; appearance: textfield; -moz-appearance: textfield; }
+.port-num::-webkit-outer-spin-button,
+.port-num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.port-colon { color: var(--muted); }
+.add-port { align-self: flex-start; }
+
+/* ----- Toasts ----- */
+.toast-host {
+  position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 1000;
+  max-width: 360px;
+}
+.toast {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--panel-2); border: 1px solid var(--border); border-left-width: 4px;
+  border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 20px var(--shadow-soft);
+}
+.toast .toast-msg { flex: 1; font-size: 13px; }
+.toast .toast-close { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 16px; }
+.toast.info { border-left-color: var(--accent); }
+.toast.success { border-left-color: var(--green); }
+.toast.warning { border-left-color: var(--amber); }
+.toast.error { border-left-color: var(--red); }
+.toast.error .toast-icon { color: var(--red); }
+.toast.success .toast-icon { color: var(--green); }
+.toast.warning .toast-icon { color: var(--amber); }
+.toast.info .toast-icon { color: var(--accent); }
+
+/* ----- PR review workflow ----- */
+.proj-action {
+  flex: none; background: transparent; border: none; color: inherit; cursor: pointer;
+  padding: 2px; border-radius: 4px; display: flex; align-items: center; opacity: 0;
+}
+.nav-item:hover .proj-action { opacity: 0.55; }
+.proj-action:hover { opacity: 1; color: var(--accent); background: var(--panel-2); }
+/* The review-mode entry stays visible even when the row isn't hovered, so
+   completed reviews remain reachable with nothing pending. The dimming lives on
+   the glyph rather than the button, so the pending-review badge it carries never
+   fades with it. */
+.proj-review, .nav-item:hover .proj-review { opacity: 1; position: relative; }
+.proj-review > svg { opacity: 0.5; }
+.nav-item:hover .proj-review > svg, .proj-review:hover > svg { opacity: 1; }
+/* The pending-review count, pinned to the eye's top-right corner. The ring blends
+   it into whatever the row's background is; clicks fall through to the button. */
+.proj-badge {
+  position: absolute; top: -4px; right: -4px; pointer-events: none;
+  min-width: 14px; height: 14px; padding: 0 3px; box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--red); color: white; border-radius: 7px;
+  font-size: 9px; font-weight: 700; line-height: 1;
+  box-shadow: 0 0 0 1.5px var(--panel);
+}
+.nav-item.active .proj-badge { box-shadow: 0 0 0 1.5px var(--accent-2); }
+
+.review-area { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.review-topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); gap: 12px;
+}
+.review-topbar-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.review-title { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-board { flex: 1; }
+.column-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 6px; }
+
+/* A review card is a board card: it inherits `.card`, `.card-top`, `.card-title`,
+   `.card-meta` and `.card-actions` wholesale so the two boards look like one
+   product. Only the PR number — which has no equivalent on a card — is styled
+   here, as a monospace prefix inside the title. */
+.review-pr-num { color: var(--muted); font-family: ui-monospace, monospace; font-weight: 500; margin-right: 6px; }
+.review-author { color: var(--muted); font-size: 12px; }
+.reviewed-tag { color: var(--green); font-size: 12px; font-weight: 600; }
+
+/* CI rollup + mergeability, on both the review card and its detail header. */
+.badge.check-pass { color: var(--green); background: var(--green-wash); }
+.badge.check-fail { color: var(--red); background: var(--red-wash); }
+.badge.check-pending { color: var(--amber); background: var(--amber-wash); }
+.badge.conflict { color: var(--red); background: var(--red-wash); font-weight: 600; }
+
+/* The PR description, as the author wrote it. Pre-wrapped (it's markdown source,
+   not rendered) and capped so a long one can't push the review controls off. */
+.pr-body {
+  white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.55;
+  color: var(--text); background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; max-height: 260px; overflow-y: auto;
+}
+
+/* "Jump to this comment in the diff", on each row of the panel's draft index. */
+.draft-jump {
+  margin-left: auto; flex: none; background: transparent; border: none;
+  color: var(--muted); cursor: pointer; font-size: 11px; font-family: inherit;
+  padding: 2px 5px; border-radius: 4px;
+}
+.draft-jump:hover { color: var(--accent); background: var(--surface-hover); }
+
+.btn.subtle { color: var(--muted); }
+.btn.subtle:hover { color: var(--text); }
+
+/* The drafted-comment editor in the review detail panel. Both boxes are grown to
+   fit their text by the autogrow script, so neither scrolls nor is hand-resized. */
+.review-comment-edit, .review-summary-edit {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
+  width: 100%; resize: none; overflow-y: hidden; line-height: 1.5;
+}
+/* A drafted comment is collapsible and starts open: the body is the thing being
+   reviewed. Collapsed, its severity and location stay visible. */
+.comment .draft > summary {
+  display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
+  list-style: none; margin-bottom: 6px;
+}
+.comment .draft > summary::-webkit-details-marker { display: none; }
+.comment .draft > summary::before { content: "▾"; color: var(--muted); font-size: 10px; }
+.comment .draft:not([open]) > summary::before { content: "▸"; }
+.comment .draft:not([open]) > summary { margin-bottom: 0; }
+
+.check-list { display: flex; flex-direction: column; gap: 4px; }
+.check-row { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.field-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.field-title { display: flex; align-items: center; gap: 6px; }
+.info-icon {
+  position: relative; display: inline-flex; align-items: center;
+  color: var(--muted); font-size: 12px; cursor: help; user-select: none;
+}
+.info-icon:hover { color: var(--text); }
+/* Custom hover tooltip: macOS WKWebView ignores the native `title` attribute. */
+.info-tip {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 2100;
+  width: max-content; max-width: 240px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; font-size: 12px; line-height: 1.4;
+  font-weight: 400; text-transform: none; letter-spacing: normal;
+  box-shadow: 0 6px 20px var(--shadow);
+  white-space: normal; pointer-events: none;
+  visibility: hidden; opacity: 0; transition: opacity 0.1s ease;
+}
+.info-icon:hover .info-tip { visibility: visible; opacity: 1; }
+
+/* Multi-select: selected values as removable chips + an add dropdown. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.chips-empty { color: var(--muted); font-size: 12px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+  padding: 3px 6px 3px 10px; font-size: 12px;
+}
+.chip-remove {
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  font-size: 15px; line-height: 1; padding: 0 2px;
+}
+.chip-remove:hover { color: var(--red); }
+.add-select {
+  width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+}
+
+/* Bottom usage bar: per-provider session (5h) / weekly (7d) rate-limit gauges.
+   Only mounted when some window is non-zero, so it costs no space until then. */
+.usage-bar {
+  display: flex; align-items: center; gap: 14px; flex: none;
+  padding: 5px 14px; background: var(--panel); border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--muted);
+}
+.usage-group { display: flex; align-items: center; gap: 10px; }
+.usage-group + .usage-group { border-left: 1px solid var(--border); padding-left: 14px; }
+.usage-gauge { display: flex; align-items: center; gap: 6px; }
+.usage-label { font-weight: 600; }
+.usage-meter { width: 54px; height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+.usage-fill { height: 100%; border-radius: 3px; }
+.usage-fill.ok { background: var(--green); }
+.usage-fill.warn { background: var(--amber); }
+.usage-fill.high { background: var(--red); }
+.usage-pct { font-weight: 600; font-variant-numeric: tabular-nums; }
+.usage-pct.ok { color: var(--green); }
+.usage-pct.warn { color: var(--amber); }
+.usage-pct.high { color: var(--red); }
+.usage-reset { color: var(--muted); }
+.usage-refresh {
+  margin-left: auto; background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 5px; border-radius: 4px;
+}
+.usage-refresh:hover { color: var(--text); background: var(--surface-hover); }

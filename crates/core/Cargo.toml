@@ -1,0 +1,36 @@
+[package]
+name = "usine-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "usine_core"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1.89"
+directories.workspace = true
+futures.workspace = true
+git2 = "0.21.0"
+native_db = "0.8.2"
+native_model = "0.4.20"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# Splits a user-configured open-in-terminal/editor command into argv (respecting
+# quotes) so we spawn it directly — no shell, so paths with spaces stay intact.
+shlex = "2.0.1"
+# Syntax highlighting for the in-app diff viewer. `default-fancy` selects the
+# pure-Rust fancy-regex backend so we never pull the `onig` C dependency.
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+thiserror = "2.0.18"
+# bat's extended syntax/theme bundle: adds TypeScript + TSX (absent from syntect's
+# defaults) as a prebuilt dump compatible with the fancy-regex backend.
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "process", "io-util", "sync", "macros", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

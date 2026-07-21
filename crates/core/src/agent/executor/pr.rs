@@ -1,0 +1,700 @@
+//! Opening the card's own pull request and driving its review: creating the
+//! PR, fetching + applying reviewer comments, marking ready, and merging.
+
+use super::*;
+
+impl Executor {
+    pub(super) async fn create_pr(
+        &self,
+        card_id: Uuid,
+        branch: String,
+        title: String,
+        body: String,
+        reviewer: Option<String>,
+        draft: bool,
+    ) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let current = card
+            .branch
+            .clone()
+            .ok_or_else(|| CoreError::other("card has no branch to open a PR from"))?;
+        // The branch was checked out in the main repo (its worktree torn down at
+        // checkout-for-review), so git ops run in the project root; fall back to
+        // the worktree if one somehow remains.
+        let dir = card
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| project.path.clone());
+
+        // Rename to the user's chosen branch name before the first push, so the
+        // PR opens from a meaningfully-named branch and no stale remote branch is
+        // left behind (nothing has been pushed yet).
+        //
+        // The name is sanitised here rather than trusted from the UI: this is the
+        // last point before it becomes a real ref, and a name git rejects (or
+        // silently stores under a different one) strands the card mid-flow.
+        let requested = sanitize_branch_name(&branch);
+        if requested.is_empty() && !branch.trim().is_empty() {
+            return Err(CoreError::other(format!(
+                "`{}` has no usable branch name in it",
+                branch.trim()
+            )));
+        }
+        // On a case-insensitive filesystem git will fold `Fix/x` into an existing
+        // `fix/` directory, so ask for the name it would actually create — see
+        // `canonicalize_branch_case`. An empty listing means the backend doesn't
+        // report branches (the simulator), and canonicalising is then a no-op.
+        let existing = self.git.local_branches(&dir).await.unwrap_or_default();
+        let target = canonicalize_branch_case(&requested, &existing);
+
+        let head = if target.is_empty() || target == current {
+            current.clone()
+        } else {
+            self.git.rename_branch(&dir, &current, &target).await?;
+            // `git branch -m` exits 0 even when the filesystem stored the ref
+            // under a name other than the one asked for, so confirm the branch
+            // exists as named before recording it — otherwise the card would
+            // point at a branch that can't be pushed, and the wrong name would
+            // block every retry. (Canonicalising above handles the ASCII case;
+            // this also covers Unicode folding, which it doesn't.)
+            let after = self.git.local_branches(&dir).await.unwrap_or_default();
+            if !after.is_empty() && !after.iter().any(|b| b == &target) {
+                // Best-effort: name it back, which restores HEAD and leaves the
+                // card exactly where it was so the user can pick another name.
+                let _ = self.git.rename_branch(&dir, &target, &current).await;
+                return Err(CoreError::other(format!(
+                    "the repository stored `{target}` under a different name — its \
+                     filesystem ignores capitalisation. Pick a branch name that \
+                     doesn't differ only in case from an existing one; the card is \
+                     still on `{current}`."
+                )));
+            }
+            let updated = self.store.mutate_card(card_id, |c| {
+                c.branch = Some(target.clone());
+                c.updated_at = now_millis();
+                Ok(())
+            })?;
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+            // The name that lands can differ from what was typed (sanitising,
+            // or adopting an existing directory's case). Say so rather than
+            // letting the PR quietly open from an unexpected branch.
+            if target != branch.trim() {
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Info,
+                    format!("Branch named `{target}`"),
+                ));
+            }
+            target.clone()
+        };
+
+        // First push: the pre-PR branch is kept local until now.
+        self.git.push(&dir, &head).await?;
+
+        // Draft PRs let the user add screenshots on GitHub (no API embeds images
+        // in a PR body) then mark it ready; a non-draft opens straight for review.
+        let pr = self
+            .forge
+            .create_pr(
+                &project.path,
+                &title,
+                &body,
+                project.config.effective_base_branch(),
+                &head,
+                reviewer.as_deref(),
+                draft,
+            )
+            .await?;
+
+        let number = pr.number;
+        self.store.mutate_card(card_id, |c| {
+            c.pr = Some(pr.clone());
+            c.updated_at = now_millis();
+            Ok(())
+        })?;
+
+        self.apply(card_id, Transition::CreatePr)?;
+        let msg = if draft {
+            format!("Draft PR #{number} created — add screenshots on GitHub, then mark it ready.")
+        } else {
+            format!("PR #{number} created")
+        };
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::toast(card_id, Severity::Success, msg));
+        Ok(())
+    }
+
+    /// Fetch the PR's *unanswered* review threads and launch an agent to triage
+    /// them (decide worth-fixing + draft a reply for the ones left unfixed).
+    /// Threads an earlier pass fixed or replied to are excluded (see
+    /// [`thread_triage_items`]), which is what makes this safe to re-enter from
+    /// `ReadyToMerge` when comments land after a pass. The items are stashed so
+    /// the triage run's completion can join verdicts back to them by id (see
+    /// `finalize_triage`). With nothing to triage, park with an empty picker.
+    pub(super) async fn fetch_comments(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let pr_number = card
+            .pr
+            .as_ref()
+            .map(|p| p.number)
+            .ok_or_else(|| CoreError::other("card has no PR to read comments from"))?;
+
+        // Talk to the forge BEFORE the running-state transition, so a failed
+        // fetch leaves the card where it was (the PR gate, the fix picker, or
+        // the merge gate — all recoverable) instead of stranded mid-fetch.
+        let comments = self.forge.fetch_comments(&project.path, pr_number).await?;
+        let items = match self.forge.list_threads(&project.path, pr_number).await {
+            Ok(threads) => {
+                // Keep the freshly-learned unanswered count on the card, so the
+                // merge gate's "reevaluate" offer tracks what this fetch saw.
+                let unanswered = threads.iter().filter(|t| t.is_unanswered()).count();
+                if unanswered != card.unanswered_count {
+                    let updated = self.store.mutate_card(card_id, |c| {
+                        c.unanswered_count = unanswered;
+                        Ok(())
+                    })?;
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                }
+                thread_triage_items(&comments, &threads)
+            }
+            // No thread info (a GraphQL hiccup, or a forge that can't answer):
+            // fall back to triaging the raw comment list — the pre-thread
+            // behavior — rather than blocking triage entirely. Say so, since
+            // this path can re-surface already-answered comments.
+            Err(e) => {
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Warning,
+                    format!("couldn't read review threads — triaging every comment: {e}"),
+                ));
+                comments.clone()
+            }
+        };
+
+        self.apply(card_id, Transition::FetchComments)?;
+        if items.is_empty() {
+            self.apply(card_id, Transition::CommentsFetched { verdicts: vec![] })?;
+            return Ok(());
+        }
+
+        self.store.set_pending_comments(card_id, &items)?;
+        // Like the self-review, triage is a fresh conversation that would otherwise
+        // judge the comments against the card's original description alone.
+        let background = card_background(&self.store, &card);
+        let extra = join_sections(&[&background, &triage_prompt(&items)]);
+        let card = self.store.get_card(card_id)?;
+        self.launch(card, RunMode::Triage, Some(extra), None).await
+    }
+
+    /// Apply the selected PR-comment fixes and reply to the ignored ones. The
+    /// checked comments — plus the user's free-form `note`, if any — go to an
+    /// agent run (which commits + pushes and captures a fixes recap); each
+    /// unchecked comment with a drafted reply gets that reply posted on GitHub.
+    /// With neither a checked comment nor a note, records a recap and advances.
+    pub(super) async fn apply_fixes(
+        &self,
+        card_id: Uuid,
+        selected_ids: Vec<u64>,
+        note: String,
+    ) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let pr_number = card.pr.as_ref().map(|p| p.number);
+        let verdicts: Vec<FixVerdict> = match &card.state {
+            CardState::PrReview(PrReviewSub::SelectingFixes { verdicts }) => verdicts.clone(),
+            _ => {
+                return Err(CoreError::IllegalTransition(
+                    "can only apply fixes while selecting fixes".into(),
+                ))
+            }
+        };
+        let (checked, ignored): (Vec<FixVerdict>, Vec<FixVerdict>) = verdicts
+            .into_iter()
+            .partition(|v| selected_ids.contains(&v.comment.id));
+
+        // Reply to the ignored comments with the agent's short explanation
+        // (best-effort — a failed reply shouldn't block applying the fixes).
+        if let Some(pr) = pr_number {
+            for v in &ignored {
+                if v.reply.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = self
+                    .forge
+                    .reply_to_comment(&project.path, pr, v.comment.id, &v.reply)
+                    .await
+                {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                        card_id,
+                        Severity::Warning,
+                        format!("couldn't reply to a comment: {e}"),
+                    ));
+                }
+            }
+        }
+
+        let note = note.trim().to_string();
+        if checked.is_empty() && note.is_empty() {
+            // Nothing to fix — record a recap and advance straight to merge.
+            self.apply(card_id, Transition::SelectFixes)?;
+            let replied = ignored
+                .iter()
+                .filter(|v| !v.reply.trim().is_empty())
+                .count();
+            let recap = format!("No fixes applied; replied to {replied} comment(s).");
+            self.store.set_review_recap(card_id, &recap)?;
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::recap_updated(card_id, recap));
+            self.apply(card_id, Transition::AgentFixesDone)?;
+            // No fix run means no `ResolveFixedComments` follow-up, so refresh
+            // here: the replies above just answered threads, and the merge
+            // gate's "reevaluate comments" offer must not still count them.
+            if let Err(e) = self.list_reviews(card_id).await {
+                tracing::warn!("post-reply review refresh failed: {e}");
+            }
+            return Ok(());
+        }
+        // Keep the note so a later "back to start" folds it into the prompt,
+        // just like a post-PR change request.
+        if !note.is_empty() {
+            self.record_qa(card_id, format!("Requested change: {note}"));
+        }
+        // Remember which comments this run addresses so their GitHub review
+        // threads can be marked resolved once the fix lands (see `finalize_run`,
+        // which emits `ResolveFixedComments` on completion). A note-only run has
+        // no comments to resolve.
+        let fixed_ids: Vec<u64> = checked.iter().map(|v| v.comment.id).collect();
+        self.store.set_pending_resolve(card_id, &fixed_ids)?;
+
+        // Run the fix in an ISOLATED worktree on the card's branch — never in the
+        // user's main working copy (the pre-PR checkout leaves the branch there).
+        // Done before the running-state transition so a failure (e.g. a dirty main
+        // repo) leaves the card in the recoverable fix picker.
+        self.ensure_branch_worktree(card_id).await?;
+        let card = self.apply(card_id, Transition::SelectFixes)?;
+        let extra = fix_prompt(&checked, &note);
+        self.launch(card, RunMode::ApplyFixes, Some(extra), None)
+            .await
+    }
+
+    /// After a PR-comment fix run lands, mark the fixed comments' review threads
+    /// resolved on GitHub, then refresh the card's review status. Best-effort: a
+    /// failure just warns (the fix itself is already committed + pushed), and the
+    /// stashed ids are consumed either way so a resolve is attempted only once
+    /// per fix run.
+    pub(super) async fn resolve_fixed_comments(&self, card_id: Uuid) -> Result<()> {
+        let ids = self.store.take_pending_resolve(card_id)?;
+        let card = self.store.get_card(card_id)?;
+        let Some(pr) = card.pr.as_ref().map(|p| p.number) else {
+            return Ok(());
+        };
+        if !ids.is_empty() {
+            let project = self.store.get_project(card.project_id)?;
+            match self.forge.resolve_threads(&project.path, pr, &ids).await {
+                Ok(0) => {}
+                Ok(n) => self.progress(card_id, &format!("✔ resolved {n} review thread(s)")),
+                Err(e) => {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                        card_id,
+                        Severity::Warning,
+                        format!("couldn't resolve review threads: {e}"),
+                    ));
+                }
+            }
+        }
+        // The run just resolved threads and/or posted replies (`apply_fixes`
+        // replies to the unchecked comments before launching it), so the counts
+        // the card last saw — from before the pass — are stale. Refresh now,
+        // rather than waiting out the poll: the card typically just landed on
+        // the merge gate, whose "reevaluate comments" offer reads
+        // `unanswered_count` and must not reflect the pre-fix world.
+        if let Err(e) = self.list_reviews(card_id).await {
+            tracing::warn!("post-fix review refresh failed: {e}");
+        }
+        Ok(())
+    }
+
+    /// Guarantee the card has its isolated worktree, so any agent that *writes*
+    /// (self-review fixes, PR-comment fixes, follow-up changes) runs — and
+    /// commits/pushes — only there, never in the user's main working copy.
+    ///
+    /// The worktree normally persists for the card's whole life (implement →
+    /// merge), so this is a no-op. It only rebuilds one that went missing (e.g. a
+    /// crash or manual cleanup left the card without its worktree dir). The branch
+    /// is never checked out in the main repo, so there is nothing to free there.
+    pub(super) async fn ensure_branch_worktree(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        if let Some(wt) = &card.worktree_path {
+            if wt.exists() {
+                return Ok(());
+            }
+        }
+        let project = self.store.get_project(card.project_id)?;
+        let branch = card
+            .branch
+            .clone()
+            .ok_or_else(|| CoreError::other("card has no branch to check out for the fix"))?;
+
+        let wt = worktree_path(&project.path, card_id);
+        // Clear any stale worktree/dir from a previous attempt.
+        if wt.exists() {
+            let _ = self.git.remove_worktree(&project.path, &wt).await;
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+        self.progress(card_id, "Setting up an isolated worktree for the fix…");
+        self.git
+            .worktree_add_existing(&project.path, &branch, &wt)
+            .await?;
+        let updated = self.store.mutate_card(card_id, |c| {
+            c.worktree_path = Some(wt.clone());
+            c.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        Ok(())
+    }
+
+    /// From "awaiting review", re-run the implement phase in the existing
+    /// worktree to apply the reviewer's requested changes. The run is
+    /// self-contained (plan + worktree note + the change request) so it stands on
+    /// its own without relying on session resume — the worktree already holds the
+    /// prior implementation for the agent to build on.
+    pub(super) async fn revise(&self, card_id: Uuid, feedback: String) -> Result<()> {
+        self.record_qa(card_id, format!("Requested change: {}", feedback.trim()));
+        let plan = self.store.get_plan(card_id).unwrap_or(None);
+        let extra = revise_extra(plan.as_deref(), &feedback);
+        let card = self.apply(card_id, Transition::RequestChanges)?;
+        self.launch(card, RunMode::Implement, Some(extra), None)
+            .await
+    }
+
+    /// Look up the project's reviewer candidates and hand them back to the UI.
+    /// Project-scoped, so it emits a `Reviewers` event rather than a card update.
+    pub(super) async fn list_reviewers(&self, project_id: Uuid) -> Result<()> {
+        let project = self.store.get_project(project_id)?;
+        let logins = self.forge.list_reviewers(&project.path).await?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::reviewers(project_id, logins));
+        Ok(())
+    }
+
+    /// Read a PR's current review comments, submitted reviews, and unanswered-
+    /// thread count together — the shared fetch behind both the background poll
+    /// ([`Self::poll_pr_comments`]) and the panel's manual refresh
+    /// ([`Self::list_reviews`]). Callers derive the two comment counts with
+    /// [`comment_counts`]. The unanswered count is `None` when the thread
+    /// listing failed — it rides on GraphQL, unlike the other two — so callers
+    /// keep the card's previous value rather than guessing.
+    pub(super) async fn fetch_review_status(
+        &self,
+        repo: &Path,
+        pr_number: u64,
+    ) -> Result<(Vec<ReviewComment>, Vec<ReviewSummary>, Option<usize>)> {
+        let comments = self.forge.fetch_comments(repo, pr_number).await?;
+        let reviews = self.forge.list_submitted_reviews(repo, pr_number).await?;
+        let unanswered = match self.forge.list_threads(repo, pr_number).await {
+            Ok(threads) => Some(threads.iter().filter(|t| t.is_unanswered()).count()),
+            Err(e) => {
+                tracing::warn!(
+                    "review-status refresh: couldn't list threads for #{pr_number}: {e}"
+                );
+                None
+            }
+        };
+        Ok((comments, reviews, unanswered))
+    }
+
+    /// Refresh the submitted reviews *and* the comment counts on the card's PR.
+    /// The user-triggered twin of what the background poll does on every tick —
+    /// both land on the card, so the panel has one source of truth and the ↻
+    /// button both skips the wait for the next tick and surfaces the triage button
+    /// the instant a comment from any reviewer lands (without necessarily badging
+    /// the card — that stays the assigned reviewer's job, see [`comment_counts`]).
+    pub(super) async fn list_reviews(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let pr = card
+            .pr
+            .as_ref()
+            .ok_or_else(|| CoreError::other("card has no PR to read reviews from"))?;
+        let reviewer = pr
+            .reviewer
+            .as_deref()
+            .or(project.config.reviewer.as_deref());
+        let (comments, reviews, unanswered) =
+            self.fetch_review_status(&project.path, pr.number).await?;
+        let (by_reviewer, total) = comment_counts(&comments, reviewer);
+        // A failed thread listing keeps the previous count (see fetch_review_status).
+        let unanswered = unanswered.unwrap_or(card.unanswered_count);
+        let card = if reviews != card.reviews
+            || by_reviewer != card.reviewer_comment_count
+            || total != card.comment_count
+            || unanswered != card.unanswered_count
+        {
+            let updated = self.store.mutate_card(card_id, |c| {
+                c.reviews = reviews;
+                c.reviewer_comment_count = by_reviewer;
+                c.comment_count = total;
+                c.unanswered_count = unanswered;
+                Ok(())
+            })?;
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::updated(updated.clone()));
+            updated
+        } else {
+            card
+        };
+        // Same auto-advance the poll does, so ↻ carries an approved-and-clear
+        // card to the merge gate now instead of on the next tick.
+        if card.approval_clears_merge() {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ approved with no comments — ready to merge");
+        }
+        Ok(())
+    }
+
+    /// Flip the card's draft PR to ready-for-review (after the user has added any
+    /// screenshots and finished the description on GitHub).
+    pub(super) async fn mark_pr_ready(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let pr = card
+            .pr
+            .as_ref()
+            .map(|p| p.number)
+            .ok_or_else(|| CoreError::other("card has no PR to mark ready"))?;
+        self.forge.mark_ready(&project.path, pr).await?;
+        let updated = self.store.mutate_card(card_id, |c| {
+            if let Some(pr) = &mut c.pr {
+                pr.state = "open".into();
+            }
+            c.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            card_id,
+            Severity::Success,
+            "PR marked ready for review",
+        ));
+        Ok(())
+    }
+
+    /// Reprompt a card whose PR is already open with a free-form change, run in an
+    /// isolated worktree on the card's branch (never the main working copy), then
+    /// commit + push to update the PR. Legal from both `ReadyToMerge` (loops back
+    /// to merge) and `PrReview(Idle)` (the freshly-opened PR, before any comment
+    /// triage — loops back to the PR gate); the state machine routes each.
+    pub(super) async fn request_post_pr_change(
+        &self,
+        card_id: Uuid,
+        feedback: String,
+    ) -> Result<()> {
+        // Keep the request so a later "back to start" folds it into the prompt,
+        // matching the pre-PR `revise`/`apply_fixes` paths.
+        self.record_qa(card_id, format!("Requested change: {}", feedback.trim()));
+        let extra = format!(
+            "A follow-up change was requested on this pull request. Update the changes in \
+             this branch accordingly:\n\n{}",
+            feedback.trim()
+        );
+        // Isolate the fix before entering the running state (a failure here leaves
+        // the card recoverable in its current state — ReadyToMerge or the PR gate).
+        self.ensure_branch_worktree(card_id).await?;
+        let card = self.apply(card_id, Transition::RequestPostPrChange)?;
+        self.launch(card, RunMode::ApplyFixes, Some(extra), None)
+            .await
+    }
+
+    /// Squash-merge the card's PR and tear down what it leaves behind.
+    ///
+    /// The merge is the only step allowed to fail the card. Everything after it
+    /// is cleanup of local state, and once GitHub has merged the PR no local
+    /// failure can un-merge it — so a failed cleanup must never keep the card
+    /// out of `Done`, or it strands a card whose work is already on the base
+    /// branch. (It used to: `gh pr merge --delete-branch` deletes the *local*
+    /// branch itself, which git refuses while the card's worktree has it checked
+    /// out, and gh's non-zero exit aborted both the transition and the worktree
+    /// removal that would have unblocked the next attempt.)
+    ///
+    /// So: merge bare, transition, then remove the worktree to free the branch,
+    /// and only then delete it locally and on the remote.
+    pub(super) async fn merge(&self, card_id: Uuid, delete_branch: bool) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let pr_number = card
+            .pr
+            .as_ref()
+            .map(|p| p.number)
+            .ok_or_else(|| CoreError::other("card has no PR to merge"))?;
+
+        // A PR merged by an earlier attempt (or on GitHub directly) can't be
+        // merged again — but the card still needs to reach `Done` and shed its
+        // worktree. Ask the forge rather than matching on gh's error text.
+        if let Err(e) = self.forge.merge(&project.path, pr_number).await {
+            if !self
+                .forge
+                .is_merged(&project.path, pr_number)
+                .await
+                .unwrap_or(false)
+            {
+                // A conflict with the base branch isn't a failure the user should
+                // read as an error: it's a fixable state, and the agent that wrote
+                // the branch can resolve it. Offer that instead, leaving the card
+                // in `ReadyToMerge` to merge again once the branch is updated.
+                if self.pr_conflicts(&project.path, pr_number).await {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::merge_conflict(
+                        card_id,
+                        pr_number,
+                        project.config.effective_base_branch().to_string(),
+                    ));
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        }
+        self.apply(card_id, Transition::Merge)?;
+
+        // Past this point the PR is merged: report cleanup problems, never raise
+        // them. A preview left running in this worktree keeps writing into it
+        // (vite's dep cache, the backend's `dist`), which races `git worktree
+        // remove` and leaves it behind as "Directory not empty" — so reap the
+        // preview (and tear down its isolated infra) before touching the worktree.
+        // The worktree must go next: it holds the branch.
+        let _ = self.stop_preview(card_id).await;
+        let mut left_behind = Vec::new();
+        let mut worktree_gone = true;
+        if let Some(worktree) = &card.worktree_path {
+            if let Err(e) = self.remove_worktree_retrying(&project.path, worktree).await {
+                worktree_gone = false;
+                left_behind.push(format!("worktree ({e})"));
+            }
+        }
+        // Drop the path only once the worktree is actually gone, so a card that
+        // still has one on disk keeps pointing at it.
+        if worktree_gone && card.worktree_path.is_some() {
+            if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+                c.worktree_path = None;
+                c.updated_at = now_millis();
+                Ok(())
+            }) {
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+            }
+        }
+        if delete_branch {
+            if let Some(branch) = &card.branch {
+                // Deleting the local branch can only work once nothing has it
+                // checked out; don't even try if its worktree is still there.
+                if worktree_gone {
+                    if let Err(e) = self.git.delete_branch(&project.path, branch).await {
+                        left_behind.push(format!("local branch ({e})"));
+                    }
+                } else {
+                    left_behind.push("local branch (worktree still holds it)".to_string());
+                }
+                if let Err(e) = self.forge.delete_remote_branch(&project.path, branch).await {
+                    left_behind.push(format!("remote branch ({e})"));
+                }
+            }
+        }
+
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            card_id,
+            Severity::Success,
+            "Merged 🎉".to_string(),
+        ));
+        if !left_behind.is_empty() {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                format!("Merged, but couldn't clean up: {}", left_behind.join("; ")),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the PR was refused because it conflicts with its base.
+    ///
+    /// GitHub recomputes mergeability asynchronously, so a PR pushed moments ago
+    /// answers `UNKNOWN` for a beat; poll briefly rather than mistaking "not
+    /// computed yet" for "no conflict". Only a definite `CONFLICTING` claims the
+    /// conflict — every other answer (and any error reaching the forge) leaves
+    /// the original merge error to surface as itself.
+    async fn pr_conflicts(&self, repo: &Path, pr_number: u64) -> bool {
+        for attempt in 0..MERGEABILITY_ATTEMPTS {
+            match self.forge.merge_status(repo, pr_number).await {
+                Ok(MergeStatus::Conflicting) => return true,
+                Ok(MergeStatus::Unknown) => {}
+                Ok(MergeStatus::Mergeable) | Err(_) => return false,
+            }
+            if attempt + 1 < MERGEABILITY_ATTEMPTS {
+                tokio::time::sleep(MERGEABILITY_POLL).await;
+            }
+        }
+        false
+    }
+
+    /// Resolve the PR's conflicts with its base branch, with an agent.
+    ///
+    /// The base is merged into the card's branch inside the card's ISOLATED
+    /// worktree — never the user's working copy — which leaves that worktree
+    /// mid-merge with the conflict markers in place. The agent then resolves them
+    /// exactly as a human would, and `finalize_run` commits (completing the merge)
+    /// and pushes. The card loops back to `ReadyToMerge` for the user to merge
+    /// again.
+    pub(super) async fn resolve_conflicts(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let base = project.config.effective_base_branch().to_string();
+        let branch = card
+            .branch
+            .clone()
+            .ok_or_else(|| CoreError::other("card has no branch to resolve conflicts on"))?;
+
+        // Everything up to the transition is recoverable: a failure here leaves the
+        // card sitting in `ReadyToMerge`, where the user can try again.
+        self.ensure_branch_worktree(card_id).await?;
+        let dir = self
+            .store
+            .get_card(card_id)?
+            .worktree_path
+            .ok_or_else(|| CoreError::other("card has no worktree to resolve conflicts in"))?;
+
+        self.progress(card_id, &format!("Fetching origin and merging {base}…"));
+        self.git.fetch(&dir, "origin").await?;
+        let files = match self.git.merge_ref(&dir, &format!("origin/{base}")).await? {
+            // The conflict resolved itself (the base moved again, or someone
+            // updated the branch). Publish the merge and let the user retry.
+            MergeOutcome::Clean => {
+                self.git.push(&dir, &branch).await?;
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Success,
+                    format!(
+                        "No conflicts left — merged {base} into the branch. Try merging again."
+                    ),
+                ));
+                return Ok(());
+            }
+            MergeOutcome::Conflicted(files) => files,
+        };
+
+        self.progress(
+            card_id,
+            &format!(
+                "{} conflicted file(s) — asking the agent to resolve them…",
+                files.len()
+            ),
+        );
+        let extra = conflict_prompt(&base, &files);
+        let card = self.apply(card_id, Transition::RequestPostPrChange)?;
+        self.launch(card, RunMode::ApplyFixes, Some(extra), None)
+            .await
+    }
+}

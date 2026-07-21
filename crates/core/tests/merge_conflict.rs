@@ -1,0 +1,543 @@
+//! A merge refused because the PR conflicts with its base is an offer, not an
+//! error: the card stays in `ReadyToMerge` and the UI is told to ask whether an
+//! agent should resolve the conflicts.
+//!
+//! Two things have to hold for that to be safe. A conflict must be recognized by
+//! *asking the forge* (`mergeable`), never by matching gh's error prose — so
+//! every other reason a merge fails (auth, protected branch, failing checks)
+//! still reaches the user as the error it is. And `merge_ref` must tell a
+//! conflicted merge apart from a broken one, since only the former leaves a
+//! worktree an agent can resolve.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::StreamExt;
+use usine_core::{
+    spawn_executor, Card, CardConfig, CardState, CoreError, DraftComment, ExecutorCommand,
+    ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome, MergeStatus,
+    PrInfo, PrSummary, Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewSummary,
+    Severity, SimFactory, SimForge, SimGit, Store,
+};
+
+/// A forge whose merge always fails, reporting `status` when asked why.
+struct RefusingForge {
+    status: MergeStatus,
+}
+
+#[async_trait]
+impl Forge for RefusingForge {
+    async fn merge(&self, _: &Path, _: u64) -> usine_core::Result<()> {
+        Err(CoreError::forge(
+            "gh pr merge 7 --squash failed: not mergeable",
+        ))
+    }
+    async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
+        Ok(false)
+    }
+    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<MergeStatus> {
+        Ok(self.status)
+    }
+    async fn delete_remote_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    // Unreached by a merge; defer to the simulator.
+    async fn create_pr(
+        &self,
+        r: &Path,
+        t: &str,
+        b: &str,
+        base: &str,
+        h: &str,
+        rev: Option<&str>,
+        d: bool,
+    ) -> usine_core::Result<PrInfo> {
+        SimForge.create_pr(r, t, b, base, h, rev, d).await
+    }
+    async fn fetch_comments(&self, r: &Path, n: u64) -> usine_core::Result<Vec<ReviewComment>> {
+        SimForge.fetch_comments(r, n).await
+    }
+    async fn list_review_prs(&self, r: &Path, a: &[String]) -> usine_core::Result<Vec<PrSummary>> {
+        SimForge.list_review_prs(r, a).await
+    }
+    async fn submit_review(
+        &self,
+        r: &Path,
+        n: u64,
+        e: ReviewEvent,
+        b: &str,
+        c: &[DraftComment],
+    ) -> usine_core::Result<()> {
+        SimForge.submit_review(r, n, e, b, c).await
+    }
+    async fn list_reviewers(&self, r: &Path) -> usine_core::Result<Vec<String>> {
+        SimForge.list_reviewers(r).await
+    }
+    async fn list_submitted_reviews(
+        &self,
+        r: &Path,
+        n: u64,
+    ) -> usine_core::Result<Vec<ReviewSummary>> {
+        SimForge.list_submitted_reviews(r, n).await
+    }
+    async fn reply_to_comment(&self, r: &Path, n: u64, c: u64, b: &str) -> usine_core::Result<()> {
+        SimForge.reply_to_comment(r, n, c, b).await
+    }
+    async fn mark_ready(&self, r: &Path, n: u64) -> usine_core::Result<()> {
+        SimForge.mark_ready(r, n).await
+    }
+    async fn resolve_threads(&self, r: &Path, n: u64, c: &[u64]) -> usine_core::Result<usize> {
+        SimForge.resolve_threads(r, n, c).await
+    }
+    async fn list_threads(
+        &self,
+        r: &Path,
+        n: u64,
+    ) -> usine_core::Result<Vec<usine_core::ReviewThread>> {
+        SimForge.list_threads(r, n).await
+    }
+}
+
+async fn wait_for<F, T>(rx: &mut UnboundedReceiver<ExecutorEvent>, mut f: F) -> T
+where
+    F: FnMut(&ExecutorEvent) -> Option<T>,
+{
+    loop {
+        let evt = tokio::time::timeout(Duration::from_secs(15), rx.next())
+            .await
+            .expect("timed out waiting for an executor event")
+            .expect("event stream closed unexpectedly");
+        if let Some(v) = f(&evt) {
+            return v;
+        }
+    }
+}
+
+fn ready_to_merge_card(store: &Store, project_id: uuid::Uuid) -> Card {
+    let mut card = Card::new(project_id, "t", "d", CardConfig::default());
+    card.state = CardState::ReadyToMerge;
+    card.branch = Some("feat/thing".into());
+    card.pr = Some(PrInfo {
+        number: 7,
+        url: "https://github.com/example/repo/pull/7".into(),
+        title: "t".into(),
+        state: "open".into(),
+        reviewer: None,
+    });
+    store.upsert_card(&card).unwrap();
+    card
+}
+
+fn seeded(status: MergeStatus) -> (Store, Card, UnboundedReceiver<ExecutorEvent>) {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-conflict"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = ready_to_merge_card(&store, project.id);
+
+    let (handle, rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(RefusingForge { status }),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::Merge {
+        card_id: card.id,
+        delete_branch: true,
+    });
+    (store, card, rx)
+}
+
+/// The conflict is surfaced as its own event (carrying the PR and the base it
+/// conflicts with), and the card stays merge-able rather than being failed.
+#[tokio::test]
+async fn a_conflicting_merge_offers_to_resolve_instead_of_erroring() {
+    let (store, card, mut rx) = seeded(MergeStatus::Conflicting);
+
+    let (pr, base) = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::MergeConflict { pr_number, base } if e.card_id == card.id => {
+            Some((*pr_number, base.clone()))
+        }
+        // An error toast here would mean the conflict was reported as a failure.
+        ExecutorEventKind::Toast {
+            severity: Severity::Error,
+            message,
+        } => panic!("a conflict must not surface as an error: {message}"),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(pr, 7);
+    assert_eq!(base, "dev", "the dialog needs the branch being merged into");
+    assert!(
+        matches!(
+            store.get_card(card.id).unwrap().state,
+            CardState::ReadyToMerge
+        ),
+        "a conflicting card stays ready to merge — resolving is optional"
+    );
+}
+
+/// Every *other* merge failure (auth, protected branch, a failing required
+/// check) must still reach the user as an error. Matching on gh's error text
+/// would have swept these into the conflict dialog.
+#[tokio::test]
+async fn a_non_conflicting_merge_failure_still_errors() {
+    let (store, card, mut rx) = seeded(MergeStatus::Mergeable);
+
+    let msg = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Error,
+            message,
+        } => Some(message.clone()),
+        ExecutorEventKind::MergeConflict { .. } => {
+            panic!("a mergeable PR's failure is not a conflict")
+        }
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        msg.contains("not mergeable"),
+        "the forge's error must survive: {msg}"
+    );
+    assert!(matches!(
+        store.get_card(card.id).unwrap().state,
+        CardState::ReadyToMerge
+    ));
+}
+
+/// GitHub answers `UNKNOWN` while it recomputes mergeability. That is not "no
+/// conflict", but it is not a conflict either — after polling, the original
+/// merge error stands rather than a dialog appearing on a guess.
+#[tokio::test]
+async fn an_unknown_merge_status_is_never_guessed_into_a_conflict() {
+    let (_store, _card, mut rx) = seeded(MergeStatus::Unknown);
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Error,
+            ..
+        } => Some(()),
+        ExecutorEventKind::MergeConflict { .. } => panic!("UNKNOWN must not be read as a conflict"),
+        _ => None,
+    })
+    .await;
+}
+
+// --- resolving: an agent runs only when there is something to resolve --------
+
+/// Git whose merge always stops on a conflict, standing in for a branch whose
+/// base has moved. Everything else succeeds.
+struct ConflictingGit;
+
+#[async_trait]
+impl GitOps for ConflictingGit {
+    async fn merge_ref(&self, _: &Path, _: &str) -> usine_core::Result<MergeOutcome> {
+        Ok(MergeOutcome::Conflicted(vec!["src/lib.rs".into()]))
+    }
+    async fn fetch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn create_worktree(
+        &self,
+        _: &Path,
+        _: &str,
+        _: &Path,
+        _: &str,
+    ) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn remove_worktree(&self, _: &Path, _: &Path) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn worktree_add_existing(&self, _: &Path, _: &str, _: &Path) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn worktree_add_detached(&self, _: &Path, _: &Path, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn fetch_pr(&self, _: &Path, _: u64, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn reset_mixed(&self, _: &Path, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn rename_branch(&self, _: &Path, _: &str, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn delete_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+    async fn commit_all(&self, _: &Path, _: &str) -> usine_core::Result<bool> {
+        Ok(true)
+    }
+    async fn push(&self, _: &Path, _: &str) -> usine_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// Seed a `ReadyToMerge` card with an isolated worktree on disk (the launch
+/// tripwire refuses to run a write agent without one) and ask to resolve.
+fn resolving(
+    git: Arc<dyn GitOps>,
+    worktree: &Path,
+) -> (Store, Card, UnboundedReceiver<ExecutorEvent>) {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-conflict"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let mut card = ready_to_merge_card(&store, project.id);
+    card.worktree_path = Some(worktree.to_path_buf());
+    store.upsert_card(&card).unwrap();
+
+    let (handle, rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(RefusingForge {
+            status: MergeStatus::Conflicting,
+        }),
+        git,
+    });
+    handle.send(ExecutorCommand::ResolveConflicts { card_id: card.id });
+    (store, card, rx)
+}
+
+/// The resolution run happens in the card's own worktree, through the same
+/// applying-fixes loop a post-PR change uses — so it lands back on `ReadyToMerge`.
+#[tokio::test]
+async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, card, mut rx) = resolving(Arc::new(ConflictingGit), tmp.path());
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
+            c.state,
+            CardState::PrReview(usine_core::PrReviewSub::ApplyingFixes)
+        )
+        .then_some(()),
+        _ => None,
+    })
+    .await;
+}
+
+/// When the merge turns out clean — the base moved again, or someone updated the
+/// branch by hand — there is nothing for an agent to do. Spending a run (and a
+/// commit) on it would be waste, so the branch is just pushed and the card left
+/// exactly where it was, ready to merge again.
+#[tokio::test]
+async fn a_conflict_that_resolved_itself_costs_no_agent_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, card, mut rx) = resolving(Arc::new(SimGit), tmp.path());
+
+    let msg = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Success,
+            message,
+        } => Some(message.clone()),
+        ExecutorEventKind::CardUpdated(c)
+            if c.id == card.id && !matches!(c.state, CardState::ReadyToMerge) =>
+        {
+            panic!("a clean merge must not move the card: {:?}", c.state)
+        }
+        _ => None,
+    })
+    .await;
+
+    assert!(msg.contains("No conflicts left"), "got: {msg}");
+    assert!(matches!(
+        store.get_card(card.id).unwrap().state,
+        CardState::ReadyToMerge
+    ));
+}
+
+// --- real git: a conflicted merge is an outcome, a broken one is an error ----
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A repo on `dev` whose `feature` worktree and `dev` both edited `a.txt` — the
+/// shape of every PR that stops merging because its base moved.
+fn diverged_repo(tmp: &Path) -> (PathBuf, PathBuf) {
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "t@t.dev"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(&repo, &["branch", "-M", "dev"]);
+
+    let wt = tmp.join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+            "dev",
+        ],
+    );
+    std::fs::write(wt.join("a.txt"), "feature\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "feat"]);
+
+    // `dev` moves underneath the branch, touching the same line.
+    std::fs::write(repo.join("a.txt"), "dev\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "dev moves"]);
+    (repo, wt)
+}
+
+/// The conflict lives on the *remote's* base branch, so the merge is only
+/// correct if the fetch refreshed `origin/dev` first. `git fetch origin` with no
+/// refspec is what does that — a bare `git fetch origin dev` would only write
+/// `FETCH_HEAD`, leaving the merge to silently succeed against a stale ref.
+#[tokio::test]
+async fn fetching_the_remote_is_what_makes_the_base_merge_see_the_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    git(
+        tmp.path(),
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+
+    let repo = tmp.path().join("repo");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    );
+    git(&repo, &["config", "user.email", "t@t.dev"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(&repo, &["branch", "-M", "dev"]);
+    git(&repo, &["push", "-qu", "origin", "dev"]);
+
+    // The card's branch, in its own worktree, edits `a.txt`.
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+            "dev",
+        ],
+    );
+    std::fs::write(wt.join("a.txt"), "feature\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "feat"]);
+
+    // Meanwhile a *different* clone moves `dev` on the remote, touching the same
+    // line. It has to be another clone: pushing from `repo` would update its own
+    // `origin/dev` as a side effect, and nothing would be stale to fetch.
+    let other = tmp.path().join("other");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "dev",
+            origin.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    git(&other, &["config", "user.email", "o@o.dev"]);
+    git(&other, &["config", "user.name", "o"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(other.join("a.txt"), "dev\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-qm", "dev moves"]);
+    git(&other, &["push", "-q", "origin", "dev"]);
+
+    let gitops = RealGit;
+    // Without the fetch, `origin/dev` is stale and the merge is a clean no-op —
+    // the failure mode this ordering exists to prevent.
+    assert_eq!(
+        gitops.merge_ref(&wt, "origin/dev").await.unwrap(),
+        MergeOutcome::Clean,
+        "a stale origin/dev must look clean, proving the fetch below is load-bearing"
+    );
+
+    gitops.fetch(&wt, "origin").await.unwrap();
+    assert_eq!(
+        gitops.merge_ref(&wt, "origin/dev").await.unwrap(),
+        MergeOutcome::Conflicted(vec!["a.txt".to_string()]),
+    );
+    assert!(std::fs::read_to_string(wt.join("a.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+}
+
+#[tokio::test]
+async fn merge_ref_reports_conflicts_as_an_outcome_and_breakage_as_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_repo, wt) = diverged_repo(tmp.path());
+    let gitops = RealGit;
+
+    // A ref that doesn't exist leaves no unmerged paths, so it is a real failure
+    // — not an empty conflict handed to an agent with nothing to resolve.
+    gitops
+        .merge_ref(&wt, "origin/nonexistent")
+        .await
+        .expect_err("merging an unknown ref must be an error");
+
+    // The genuine conflict is an outcome, naming the file to resolve.
+    let outcome = gitops.merge_ref(&wt, "dev").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Conflicted(vec!["a.txt".to_string()]));
+    // ...and the worktree is left mid-merge, which is what lets the agent (and
+    // then `commit_all`) finish it.
+    assert!(wt.join(".git").exists() || wt.join(".git").is_file());
+    let conflicted = std::fs::read_to_string(wt.join("a.txt")).unwrap();
+    assert!(
+        conflicted.contains("<<<<<<<"),
+        "conflict markers must be present"
+    );
+
+    // Resolving and committing — exactly what the agent + `commit_all` do —
+    // concludes the merge, after which the same merge is a clean no-op.
+    std::fs::write(wt.join("a.txt"), "resolved\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "resolve"]);
+    assert_eq!(
+        gitops.merge_ref(&wt, "dev").await.unwrap(),
+        MergeOutcome::Clean
+    );
+}

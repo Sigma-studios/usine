@@ -1,0 +1,239 @@
+//! The per-entity actions dropdown (opened from the "⌄" chevron on a board card).
+//!
+//! Serves both boards: a card's lifecycle actions, and a PR-under-review's. The
+//! three that mean the same thing on both — show the diff, open in terminal, open
+//! in editor — are shared verbatim, which is the point: "open this in my editor"
+//! shouldn't be a card-only privilege just because review mode was built later.
+//!
+//! Like the confirm and toast hosts, it renders once at the app root from a
+//! global signal: an entity's overflow-clipping scroll column would otherwise cut
+//! the dropdown off, so the menu floats above the board at the click point.
+
+use dioxus::prelude::*;
+use usine_core::{ExecutorCommand, OpenTarget};
+use uuid::Uuid;
+
+use super::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
+use super::diffdialog::{open_diff_dialog, open_review_diff};
+use crate::state::AppState;
+
+/// Which board's entity the menu was opened on, plus the per-kind state that
+/// decides which entries apply.
+#[derive(Clone, PartialEq)]
+pub(crate) enum MenuKind {
+    Card {
+        /// "Back to starting block" only applies once a card has left the start.
+        can_reset: bool,
+        /// "Mark as done" is hidden when the card is already done.
+        can_done: bool,
+        /// "Show diff" shows once the card has committed work to diff.
+        can_diff: bool,
+    },
+    Review {
+        pr_number: u64,
+        /// Whether a checkout exists (or can be made) to open or run. False once
+        /// the review is published and its worktree has been torn down.
+        has_checkout: bool,
+    },
+}
+
+/// A request to open the actions menu, anchored at viewport (`x`, `y`).
+///
+/// The preview controls used to live here; they're now icon buttons on the card
+/// itself, where their live status (idle / starting / running) is visible without
+/// opening anything.
+#[derive(Clone)]
+pub(crate) struct CardMenuRequest {
+    pub kind: MenuKind,
+    /// The card id or review-task id, depending on `kind`.
+    pub target_id: Uuid,
+    pub title: String,
+    pub x: f64,
+    pub y: f64,
+}
+
+static CARD_MENU: GlobalSignal<Option<CardMenuRequest>> = Signal::global(|| None);
+
+pub(crate) fn open_card_menu(req: CardMenuRequest) {
+    *CARD_MENU.write() = Some(req);
+}
+
+fn dismiss() {
+    *CARD_MENU.write() = None;
+}
+
+#[component]
+pub fn CardMenuHost() -> Element {
+    let req = CARD_MENU.read().clone();
+    let Some(req) = req else {
+        return rsx! {};
+    };
+    let pos = format!("left: {}px; top: {}px;", req.x, req.y);
+    let id = req.target_id;
+
+    rsx! {
+        // Full-viewport catcher: a click anywhere outside the menu closes it.
+        div { class: "menu-backdrop", onclick: move |_| dismiss(),
+            div {
+                class: "card-menu",
+                style: "{pos}",
+                onclick: move |e| e.stop_propagation(),
+                match req.kind.clone() {
+                    MenuKind::Card { can_reset, can_done, can_diff } => rsx! {
+                        CardMenuItems {
+                            card_id: id,
+                            title: req.title.clone(),
+                            can_reset,
+                            can_done,
+                            can_diff,
+                        }
+                    },
+                    MenuKind::Review { pr_number, has_checkout } => rsx! {
+                        ReviewMenuItems { review_id: id, pr_number, has_checkout }
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CardMenuItems(
+    card_id: Uuid,
+    title: String,
+    can_reset: bool,
+    can_done: bool,
+    can_diff: bool,
+) -> Element {
+    let state = use_context::<AppState>();
+    let id = card_id;
+    // One title clone per handler (each closure moves its own copy).
+    let reset_title = title.clone();
+    let done_title = title.clone();
+    let del_title = title.clone();
+
+    rsx! {
+        if can_diff {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    open_diff_dialog(id);
+                },
+                "Show diff"
+            }
+        }
+        button {
+            class: "menu-item",
+            onclick: move |_| {
+                dismiss();
+                state.send(ExecutorCommand::OpenWorktree { card_id: id, target: OpenTarget::Terminal });
+            },
+            "Open in terminal"
+        }
+        button {
+            class: "menu-item",
+            onclick: move |_| {
+                dismiss();
+                state.send(ExecutorCommand::OpenWorktree { card_id: id, target: OpenTarget::Editor });
+            },
+            "Open in editor"
+        }
+        if can_reset {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    request_confirm(ConfirmRequest {
+                        title: "Back to starting block".into(),
+                        message: format!(
+                            "Send “{reset_title}” back to the starting block? This discards its current progress; any questions and answers so far are appended to the prompt."
+                        ),
+                        confirm_label: "Send back".into(),
+                        danger: false,
+                        action: ConfirmAction::Send(ExecutorCommand::BackToStart { card_id: id }),
+                    });
+                },
+                "Back to starting block"
+            }
+        }
+        if can_done {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    request_confirm(ConfirmRequest {
+                        title: "Mark as done".into(),
+                        message: format!(
+                            "Mark “{done_title}” as done? This stops any active run and preview."
+                        ),
+                        confirm_label: "Mark done".into(),
+                        danger: false,
+                        action: ConfirmAction::Send(ExecutorCommand::MarkDone { card_id: id }),
+                    });
+                },
+                "Mark as done"
+            }
+        }
+        button {
+            class: "menu-item danger",
+            onclick: move |_| {
+                dismiss();
+                request_confirm(ConfirmRequest {
+                    title: "Delete card".into(),
+                    message: format!("Delete “{del_title}”? This can't be undone."),
+                    confirm_label: "Delete".into(),
+                    danger: true,
+                    action: ConfirmAction::DeleteCard(id),
+                });
+            },
+            "Delete"
+        }
+    }
+}
+
+/// A PR-under-review's actions. "Show diff" works in every state (the PR head is
+/// fetched on demand); opening and running need a checkout, which every state but
+/// `Reviewed` either has or can make.
+#[component]
+fn ReviewMenuItems(review_id: Uuid, pr_number: u64, has_checkout: bool) -> Element {
+    let state = use_context::<AppState>();
+    let id = review_id;
+
+    rsx! {
+        button {
+            class: "menu-item",
+            onclick: move |_| {
+                dismiss();
+                open_review_diff(id);
+            },
+            "Show diff"
+        }
+        if has_checkout {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    state.send(ExecutorCommand::OpenReviewWorktree { review_id: id, target: OpenTarget::Terminal });
+                },
+                "Open in terminal"
+            }
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    state.send(ExecutorCommand::OpenReviewWorktree { review_id: id, target: OpenTarget::Editor });
+                },
+                "Open in editor"
+            }
+        }
+        button {
+            class: "menu-item danger",
+            onclick: move |_| {
+                dismiss();
+                super::confirm_dismiss_review(id, pr_number);
+            },
+            "Dismiss"
+        }
+    }
+}

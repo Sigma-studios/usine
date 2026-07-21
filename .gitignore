@@ -1,0 +1,4 @@
+target
+.DS_Store
+# Isolated data dir used when Usine previews itself (see README).
+.preview-data/

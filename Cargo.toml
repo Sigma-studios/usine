@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Usine"]
+
+# Dependencies shared by more than one crate are pinned once here and inherited
+# with `<dep>.workspace = true`, so versions and base features can't drift apart
+# across crates. Crate-specific features are added at the use site.
+[workspace.dependencies]
+directories = "6.0.0"
+futures = "0.3.32"
+tokio = { version = "1.52.3" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.23.3", features = ["v4"] }
+
+[profile.dev]
+# Faster incremental builds for the desktop app while iterating.
+opt-level = 1

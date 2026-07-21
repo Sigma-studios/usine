@@ -1,0 +1,57 @@
+//! usine-core: UI-agnostic domain logic for the Usine agent-workflow board.
+//!
+//! The crate has no UI dependencies. It owns the domain model, the pure card
+//! state machine, typed persistence, the provider abstraction, git/forge
+//! integration, and the async executor that ties them together.
+//!
+//! The modules are grouped by role: [`domain`] (pure types + state machine),
+//! [`infra`] (storage, paths, git/forge), and [`agent`] (the provider
+//! abstraction, executor, agent-I/O protocol, and reconciliation). [`error`] is
+//! cross-cutting and lives at the crate root. The re-exports below are the flat
+//! public surface the UI and CLI consume, so the internal grouping is free to
+//! change without touching them.
+
+pub mod agent;
+pub mod diff;
+pub mod domain;
+pub mod error;
+pub mod infra;
+
+pub use agent::events::{
+    AgentEvent, ExecutorCommand, ExecutorEvent, ExecutorEventKind, OpenTarget, RunControl, Severity,
+};
+pub use agent::executor::{spawn as spawn_executor, ExecutorConfig, ExecutorHandle};
+pub use agent::handoff::{parse_handoff, Handoff, HANDOFF_INSTRUCTION};
+pub use agent::plan::{parse_plan, plan_instruction, PlanQuestion, PLAN_QUESTIONS_INSTRUCTION};
+pub use agent::provider::claude::ClaudeProvider;
+pub use agent::provider::codex::CodexProvider;
+pub use agent::provider::sim::SimFactory;
+pub use agent::provider::{
+    AgentProvider, ProviderFactory, RealFactory, RunConfig, RunHandle, RunMode,
+};
+pub use agent::review::{
+    find_review_prompt, parse_pr_review, parse_self_review, parse_triage, PR_REVIEW_INSTRUCTION,
+    REVIEW_TRIAGE_INSTRUCTION, SELF_REVIEW_INSTRUCTION,
+};
+pub use agent::startup::{
+    reconcile_interrupted_reviews, reconcile_interrupted_runs, sync_base_branches,
+};
+pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
+pub use diff::{
+    anchor_drafts, compute_branch_diff, compute_card_diff, DiffData, DiffFile, DiffHunk, DiffLine,
+    DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
+};
+pub use domain::config::{AppSettings, CardConfig, PreviewPort, ProjectConfig};
+pub use domain::model::{
+    now_millis, supported_efforts, Card, CardState, CheckStatus, Column, Cost, DesignSub,
+    DraftComment, Effort, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo, PrReviewSub,
+    PreviewStatus, PreviewUrl, Project, Provider, ReviewColumn, ReviewComment, ReviewEvent,
+    ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub, Usage,
+};
+pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
+pub use error::{CoreError, Result};
+pub use infra::forge::{Forge, GhForge, MergeStatus, PrSummary, SimForge};
+pub use infra::git::{
+    remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
+};
+pub use infra::persistence::{rebuild_database, Store};
