@@ -138,7 +138,6 @@ body {
   background: var(--red); color: white; border-radius: 7px;
   font-size: 9px; font-weight: 700; line-height: 1;
 }
-.nav-item.active .proj-count { box-shadow: 0 0 0 1.5px var(--accent-2); }
 .proj-trash {
   flex: none; background: transparent; border: none; color: inherit; cursor: pointer;
   padding: 2px; border-radius: 4px; display: flex; align-items: center; opacity: 0;

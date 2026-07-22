@@ -77,7 +77,7 @@ pub fn Sidebar() -> Element {
                                 if attention_count > 0 {
                                     span {
                                         class: "proj-count",
-                                        title: "{attention_count} cards waiting on you",
+                                        title: if attention_count == 1 { "1 card waiting on you".to_string() } else { format!("{attention_count} cards waiting on you") },
                                         "{attention_count}"
                                     }
                                 }
