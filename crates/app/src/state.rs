@@ -110,9 +110,11 @@ impl AppState {
 
         // First startup only (no settings record yet, real mode): default the
         // provider to whichever agent CLI is actually installed — Codex when it
-        // is the sole one present, Claude otherwise. Persisted immediately, so
-        // it never overrides a later user choice. Demo mode uses simulated
-        // backends and must stay deterministic.
+        // is the sole one present, Claude otherwise. Persisted as soon as a CLI
+        // is found, so it never overrides a later user choice; with none found
+        // the Claude fallback stays unpersisted and detection re-runs next
+        // launch. Demo mode uses simulated backends and must stay
+        // deterministic.
         if !demo_mode() {
             let claude = usine_core::binary_on_path(Provider::Claude.binary());
             let codex = usine_core::binary_on_path(Provider::Codex.binary());
