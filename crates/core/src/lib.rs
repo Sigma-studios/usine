@@ -38,8 +38,8 @@ pub use agent::startup::{
 };
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
-    anchor_drafts, compute_branch_diff, compute_card_diff, DiffData, DiffFile, DiffHunk, DiffLine,
-    DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
+    anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, DiffData, DiffFile,
+    DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
 };
 pub use domain::config::{AppSettings, CardConfig, PreviewPort, ProjectConfig};
 pub use domain::model::{
@@ -50,7 +50,7 @@ pub use domain::model::{
 };
 pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
 pub use error::{CoreError, Result};
-pub use infra::forge::{Forge, GhForge, MergeStatus, PrSummary, SimForge};
+pub use infra::forge::{FailedCheck, Forge, GhForge, MergeStatus, PrSummary, SimForge};
 pub use infra::git::{
     remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
 };
