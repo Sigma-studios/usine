@@ -73,6 +73,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         card.state,
         CardState::AwaitingReview(ReviewSub::Reviewing | ReviewSub::ApplyingFixes)
     );
+    let is_selecting_fixes = matches!(
+        card.state,
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+    );
     let is_ready_for_pr = matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr));
     // The validation gate's three faces: the check running, the agent fixing a
     // failure, and the parked exhausted-budget failure.
@@ -107,13 +111,16 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
         }
 
-        // 1) Just implemented: the work is committed in the worktree. Test it,
-        //    run a self-review pass, or send it back to the agent to revise.
+        // 1) The recovery gate: the self-review normally auto-starts when the
+        //    implementation finishes, so a card only rests here after a cancelled
+        //    review or a failed auto-start. Re-run it, skip it, or send the work
+        //    back to the agent to revise.
         if is_ready_for_review {
             div { class: "section",
                 h3 { "Self-review" }
                 div { class: "hint",
-                    "Run an automated review pass over the committed diff (guided by the project's \
+                    "The self-review normally starts by itself when the implementation finishes. \
+                     Run the review pass over the committed diff (guided by the project's \
                      review.md, or a default prompt), or skip straight to the pull request."
                 }
                 div { class: "row",
@@ -155,10 +162,45 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
         }
 
-        // Self-review agent running.
+        // Self-review agent running. Cancelling parks the card back at the
+        // manual gate with all its options.
         if is_self_reviewing {
             div { class: "section",
                 div { class: "hint", "Self-review in progress…" }
+                button {
+                    class: "btn",
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
+                }
+            }
+        }
+
+        // The fix picker (rendered separately) is where an auto-reviewed card
+        // first parks, so the send-back affordance must be reachable from it too.
+        if is_selecting_fixes {
+            div { class: "section",
+                h3 { "Request changes" }
+                div { class: "hint",
+                    "Not happy with the implementation? Send it back to the agent to revise in its worktree."
+                }
+                div { class: "field",
+                    textarea {
+                        placeholder: "What should the agent change or improve?",
+                        value: "{revision}",
+                        oninput: move |e| revision.set(e.value()),
+                    }
+                }
+                button {
+                    class: "btn",
+                    onclick: move |_| {
+                        let fb = revision.read().trim().to_string();
+                        if !fb.is_empty() {
+                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                            revision.set(String::new());
+                        }
+                    },
+                    "Send back to implementing"
+                }
             }
         }
 
