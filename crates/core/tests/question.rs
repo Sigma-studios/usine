@@ -56,6 +56,9 @@ async fn a_question_from_awaiting_review_round_trips_with_an_answer() {
     let card_id = seed_card(&store, "/tmp/question-review");
     // Straight to implementing — the plan phase would block on a sim question.
     store.set_skip_plan(card_id, true).unwrap();
+    // Park at the manual gate: with the auto self-review on, its in-flight
+    // claim races the `AskQuestion` below and can silently drop it.
+    store.set_auto_review(card_id, false).unwrap();
     let (handle, mut rx) = spawn_with(&store);
 
     handle.send(ExecutorCommand::Start { card_id });
