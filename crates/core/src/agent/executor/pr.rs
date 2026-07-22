@@ -115,6 +115,18 @@ impl Executor {
         })?;
 
         self.apply(card_id, Transition::CreatePr)?;
+        // With no reviewer to wait on there is nothing the PR gate can ever
+        // receive, so advance to the merge gate now rather than making the card
+        // wait for the poll to notice. The PR was just created, so its recorded
+        // reviewer is authoritative — an explicit "no reviewer" advances even
+        // on a project with a configured one (see `PrInfo::effective_reviewer`).
+        // A draft still advances: `ReadyToMerge` gates it behind "Mark ready".
+        let card = self.store.get_card(card_id)?;
+        let reviewer = pr.effective_reviewer(project.config.reviewer.as_deref());
+        if card.no_reviewer_clears_merge(reviewer) {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ no reviewer assigned — ready to merge");
+        }
         let msg = if draft {
             format!("Draft PR #{number} created — add screenshots on GitHub, then mark it ready.")
         } else {
@@ -389,12 +401,18 @@ impl Executor {
     /// ([`Self::list_reviews`]). Callers derive the two comment counts with
     /// [`comment_counts`]. The unanswered count is `None` when the thread
     /// listing failed — it rides on GraphQL, unlike the other two — so callers
-    /// keep the card's previous value rather than guessing.
+    /// keep the card's previous value rather than guessing; the CI check status
+    /// follows the same convention when its fetch failed.
     pub(super) async fn fetch_review_status(
         &self,
         repo: &Path,
         pr_number: u64,
-    ) -> Result<(Vec<ReviewComment>, Vec<ReviewSummary>, Option<usize>)> {
+    ) -> Result<(
+        Vec<ReviewComment>,
+        Vec<ReviewSummary>,
+        Option<usize>,
+        Option<CheckStatus>,
+    )> {
         let comments = self.forge.fetch_comments(repo, pr_number).await?;
         let reviews = self.forge.list_submitted_reviews(repo, pr_number).await?;
         let unanswered = match self.forge.list_threads(repo, pr_number).await {
@@ -406,7 +424,14 @@ impl Executor {
                 None
             }
         };
-        Ok((comments, reviews, unanswered))
+        let checks = match self.forge.pr_checks(repo, pr_number).await {
+            Ok((status, _)) => Some(status),
+            Err(e) => {
+                tracing::warn!("review-status refresh: couldn't read checks for #{pr_number}: {e}");
+                None
+            }
+        };
+        Ok((comments, reviews, unanswered, checks))
     }
 
     /// Refresh the submitted reviews *and* the comment counts on the card's PR.
@@ -422,25 +447,29 @@ impl Executor {
             .pr
             .as_ref()
             .ok_or_else(|| CoreError::other("card has no PR to read reviews from"))?;
+        // Owned so it outlives the refreshed `card` below.
         let reviewer = pr
-            .reviewer
-            .as_deref()
-            .or(project.config.reviewer.as_deref());
-        let (comments, reviews, unanswered) =
+            .effective_reviewer(project.config.reviewer.as_deref())
+            .map(str::to_string);
+        let (comments, reviews, unanswered, checks) =
             self.fetch_review_status(&project.path, pr.number).await?;
-        let (by_reviewer, total) = comment_counts(&comments, reviewer);
-        // A failed thread listing keeps the previous count (see fetch_review_status).
+        let (by_reviewer, total) = comment_counts(&comments, reviewer.as_deref());
+        // A failed thread listing keeps the previous count (see fetch_review_status);
+        // a failed checks read likewise keeps the previous status.
         let unanswered = unanswered.unwrap_or(card.unanswered_count);
+        let checks = checks.unwrap_or(card.checks);
         let card = if reviews != card.reviews
             || by_reviewer != card.reviewer_comment_count
             || total != card.comment_count
             || unanswered != card.unanswered_count
+            || checks != card.checks
         {
             let updated = self.store.mutate_card(card_id, |c| {
                 c.reviews = reviews;
                 c.reviewer_comment_count = by_reviewer;
                 c.comment_count = total;
                 c.unanswered_count = unanswered;
+                c.checks = checks;
                 Ok(())
             })?;
             let _ = self
@@ -455,6 +484,9 @@ impl Executor {
         if card.approval_clears_merge() {
             self.apply(card_id, Transition::ReviewApproved)?;
             self.progress(card_id, "✔ approved with no comments — ready to merge");
+        } else if card.no_reviewer_clears_merge(reviewer.as_deref()) {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ no reviewer assigned — ready to merge");
         }
         Ok(())
     }
@@ -525,7 +557,22 @@ impl Executor {
     ///
     /// So: merge bare, transition, then remove the worktree to free the branch,
     /// and only then delete it locally and on the remote.
-    pub(super) async fn merge(&self, card_id: Uuid, delete_branch: bool) -> Result<()> {
+    ///
+    /// Before any of that, the PR's CI checks are re-read from the forge — the
+    /// authoritative gate, since the card's cached status can be a poll interval
+    /// stale. A red or still-running build blocks the merge (leaving the card in
+    /// `ReadyToMerge` with an offer: fix with an agent, or wait); `force` is the
+    /// user's explicit "merge anyway" and skips only this pre-check. No checks
+    /// configured, or an error *reading* them, doesn't block — a protected
+    /// branch still guards server-side. An already-merged PR isn't gated
+    /// either: red checks on a merged PR are moot, and the card must still
+    /// reach `Done`.
+    pub(super) async fn merge(
+        &self,
+        card_id: Uuid,
+        delete_branch: bool,
+        force: bool,
+    ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
         let pr_number = card
@@ -533,6 +580,44 @@ impl Executor {
             .as_ref()
             .map(|p| p.number)
             .ok_or_else(|| CoreError::other("card has no PR to merge"))?;
+
+        if !force {
+            if let Ok((status, failed)) = self.forge.pr_checks(&project.path, pr_number).await {
+                self.persist_checks(card_id, status);
+                // Red or pending checks gate the merge — but only a PR that
+                // still NEEDS merging. One merged on GitHub directly while its
+                // checks were red (or still running) must fall through to the
+                // already-merged path below: gating it would offer a fix run
+                // against a merged (possibly deleted) branch, or tell the user
+                // to wait for a green that will never come, and the card could
+                // never reach `Done` via Merge.
+                if matches!(status, CheckStatus::Failing | CheckStatus::Pending)
+                    && !self
+                        .forge
+                        .is_merged(&project.path, pr_number)
+                        .await
+                        .unwrap_or(false)
+                {
+                    if status == CheckStatus::Failing {
+                        // Not an error: a fixable state, like a merge conflict.
+                        // Offer the agent fix and leave the card at the gate.
+                        let names = failed.iter().map(|f| f.name.clone()).collect();
+                        let _ = self.evt_tx.unbounded_send(ExecutorEvent::checks_failed(
+                            card_id, pr_number, names,
+                        ));
+                    } else {
+                        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                            card_id,
+                            Severity::Warning,
+                            "CI checks are still running — merge once they're green, \
+                             or use Merge anyway"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+        }
 
         // A PR merged by an earlier attempt (or on GitHub directly) can't be
         // merged again — but the card still needs to reach `Done` and shed its
@@ -693,6 +778,101 @@ impl Executor {
             ),
         );
         let extra = conflict_prompt(&base, &files);
+        let card = self.apply(card_id, Transition::RequestPostPrChange)?;
+        self.launch(card, RunMode::ApplyFixes, Some(extra), None)
+            .await
+    }
+
+    /// Record a freshly-read check status on the card (best-effort — a persist
+    /// failure must not derail the merge or fix flow that read it). Deliberately
+    /// doesn't bump `updated_at`, matching the background poll: observing CI
+    /// isn't a user-facing edit and shouldn't reorder the board.
+    fn persist_checks(&self, card_id: Uuid, status: CheckStatus) {
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        if card.checks == status {
+            return;
+        }
+        if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+            c.checks = status;
+            Ok(())
+        }) {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        }
+    }
+
+    /// Fix the PR's failing CI checks with an agent, in the card's isolated
+    /// worktree. Mirrors [`Self::resolve_conflicts`]: everything up to the
+    /// transition is recoverable (the card stays in `ReadyToMerge`), and if the
+    /// checks turned green in the meantime no run is spent. The failed runs'
+    /// logs are fetched best-effort as prompt context; the run's completion
+    /// commits + pushes, which re-triggers CI, and the card loops back to
+    /// `ReadyToMerge`.
+    pub(super) async fn fix_checks(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let pr_number = card
+            .pr
+            .as_ref()
+            .map(|p| p.number)
+            .ok_or_else(|| CoreError::other("card has no PR to fix checks on"))?;
+
+        // Re-read rather than trusting the dialog's snapshot: a re-run or a
+        // teammate's push may have gone green since, and a run is not free.
+        let (status, failed) = self.forge.pr_checks(&project.path, pr_number).await?;
+        self.persist_checks(card_id, status);
+        if status != CheckStatus::Failing {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Success,
+                format!(
+                    "No failing checks left ({}) — try merging again.",
+                    status.label()
+                ),
+            ));
+            return Ok(());
+        }
+
+        self.ensure_branch_worktree(card_id).await?;
+
+        // Pull the failed runs' logs for the prompt — best-effort: a check
+        // whose URL isn't a GitHub Actions run (or a failed fetch) just means
+        // less context, and the agent can dig with `gh` itself.
+        self.progress(card_id, "Fetching failing checks' logs…");
+        let mut logs: Vec<(String, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for check in &failed {
+            let Some(run_id) = run_id_from_url(&check.url) else {
+                continue;
+            };
+            if !seen.insert(run_id) {
+                continue;
+            }
+            match self.forge.failed_run_log(&project.path, run_id).await {
+                Ok(log) if !log.trim().is_empty() => {
+                    let name = if check.workflow.is_empty() {
+                        check.name.clone()
+                    } else {
+                        check.workflow.clone()
+                    };
+                    logs.push((name, log_tail(&log, 200, 16 * 1024)));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("fix checks: couldn't fetch log of run {run_id}: {e}");
+                }
+            }
+        }
+
+        self.progress(
+            card_id,
+            &format!(
+                "{} failing check(s) — asking the agent to fix them…",
+                failed.len()
+            ),
+        );
+        let extra = checks_fix_prompt(pr_number, &failed, &logs);
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
