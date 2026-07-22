@@ -152,6 +152,7 @@ fn seeded(status: MergeStatus) -> (Store, Card, UnboundedReceiver<ExecutorEvent>
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
     (store, card, rx)
 }
