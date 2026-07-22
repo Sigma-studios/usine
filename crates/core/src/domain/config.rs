@@ -245,7 +245,15 @@ pub struct AppSettings {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        let base = CardConfig::default_for(Provider::Claude);
+        AppSettings::default_for(Provider::Claude)
+    }
+}
+
+impl AppSettings {
+    /// Sensible global defaults for a freshly chosen provider — the provider's
+    /// own model presets, not Claude's with the provider enum flipped.
+    pub fn default_for(provider: Provider) -> Self {
+        let base = CardConfig::default_for(provider);
         AppSettings {
             default_provider: base.provider,
             default_plan: base.plan,
@@ -255,9 +263,7 @@ impl Default for AppSettings {
             editor_command: None,
         }
     }
-}
 
-impl AppSettings {
     /// Build the [`ProjectConfig`] a new project should start with. Only the
     /// model defaults come from global settings; everything else (base branch,
     /// preview ports, worktree scripts) uses `ProjectConfig`'s own defaults.
@@ -392,6 +398,23 @@ mod tests {
             ..c
         };
         assert_eq!(c.review_spec(), ModelSpec::new("gpt-5-mini", Effort::Low));
+    }
+
+    #[test]
+    fn app_settings_default_for_carries_provider_presets() {
+        // Seeding Codex settings must bring Codex model ids along, not leave
+        // Claude's `opus` presets behind a flipped provider enum.
+        let codex = AppSettings::default_for(Provider::Codex);
+        let base = CardConfig::default_for(Provider::Codex);
+        assert_eq!(codex.default_provider, Provider::Codex);
+        assert_eq!(codex.default_plan, base.plan);
+        assert_eq!(codex.default_implement, base.implement);
+
+        // The plain Default is still the Claude preset.
+        assert_eq!(
+            AppSettings::default(),
+            AppSettings::default_for(Provider::Claude)
+        );
     }
 
     #[test]
