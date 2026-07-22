@@ -308,6 +308,31 @@ pub fn parse_mergeable(raw: &str) -> Mergeable {
     }
 }
 
+/// The JSON body for [`submit_review_args`]: the verdict, the summary text, and
+/// the inline comments, each anchored to a line on the PR's new (RIGHT) side.
+///
+/// Only line-anchored comments are included. The reviews endpoint has no
+/// file-level comments — `subject_type` belongs to the standalone comment API,
+/// and a comment with neither `line` nor `position` fails the whole review with
+/// HTTP 422 — so a line-less draft is the caller's to fold into `body` first
+/// (see [`crate::diff::fold_unanchorable`]).
+pub fn review_payload(event: ReviewEvent, body: &str, comments: &[DraftComment]) -> Value {
+    let comments_json: Vec<Value> = comments
+        .iter()
+        .filter_map(|c| {
+            let line = c.line?;
+            Some(serde_json::json!({
+                "path": c.path, "line": line, "side": "RIGHT", "body": c.body,
+            }))
+        })
+        .collect();
+    serde_json::json!({
+        "event": event.api_value(),
+        "body": body,
+        "comments": comments_json,
+    })
+}
+
 /// Submit a review on a PR. The JSON body (event + inline comments) is passed on
 /// stdin via `--input -`, since a nested `comments[]` array can't go through
 /// repeated `-f` flags.
@@ -648,25 +673,7 @@ impl Forge for GhForge {
         body: &str,
         comments: &[DraftComment],
     ) -> Result<()> {
-        let comments_json: Vec<Value> = comments
-            .iter()
-            .map(|c| match c.line {
-                // Inline comment anchored to a line on the PR's new (RIGHT) side.
-                Some(line) => serde_json::json!({
-                    "path": c.path, "line": line, "side": "RIGHT", "body": c.body,
-                }),
-                // No line → a file-level comment.
-                None => serde_json::json!({
-                    "path": c.path, "subject_type": "file", "body": c.body,
-                }),
-            })
-            .collect();
-        let payload = serde_json::json!({
-            "event": event.api_value(),
-            "body": body,
-            "comments": comments_json,
-        });
-        let stdin = serde_json::to_string(&payload)?;
+        let stdin = serde_json::to_string(&review_payload(event, body, comments))?;
         run_gh_stdin(repo, &submit_review_args(pr_number), &stdin)
             .await
             .map(|_| ())
@@ -951,6 +958,26 @@ impl Forge for SimForge {
     }
 }
 
+/// The message for a non-zero `gh` exit. Includes stdout as well as stderr:
+/// on an API error `gh api` prints only a terse `gh: <status> (HTTP nnn)` to
+/// stderr and puts the response body — the part that names *which* input the
+/// API refused — on stdout. Dropping stdout turns a self-explanatory 422 into
+/// a mystery.
+fn gh_failure_message(args: &[String], stdout: &[u8], stderr: &[u8]) -> String {
+    let mut msg = format!(
+        "gh {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(stderr).trim()
+    );
+    let body = String::from_utf8_lossy(stdout);
+    let body = body.trim();
+    if !body.is_empty() {
+        msg.push_str(" — ");
+        msg.push_str(body);
+    }
+    msg
+}
+
 async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
     let out = timeout(
         GH_TIMEOUT,
@@ -966,10 +993,10 @@ async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
     })?
     .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     if !out.status.success() {
-        return Err(CoreError::forge(format!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        return Err(CoreError::forge(gh_failure_message(
+            args,
+            &out.stdout,
+            &out.stderr,
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -1005,10 +1032,10 @@ async fn run_gh_stdin(cwd: &Path, args: &[String], stdin: &str) -> Result<String
         })?
         .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     if !out.status.success() {
-        return Err(CoreError::forge(format!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        return Err(CoreError::forge(gh_failure_message(
+            args,
+            &out.stdout,
+            &out.stderr,
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -1301,5 +1328,68 @@ mod tests {
             .iter()
             .any(|a| a == "repos/{owner}/{repo}/pulls/7/reviews"));
         assert!(args.windows(2).any(|w| w == ["--input", "-"]));
+    }
+
+    fn draft(path: &str, line: Option<u64>, body: &str) -> DraftComment {
+        DraftComment {
+            path: path.into(),
+            line,
+            body: body.into(),
+            severity: String::new(),
+            selected: true,
+        }
+    }
+
+    #[test]
+    fn review_payload_anchors_comments_on_the_right_side() {
+        let payload = review_payload(
+            ReviewEvent::RequestChanges,
+            "summary",
+            &[draft("src/a.rs", Some(12), "nit")],
+        );
+        assert_eq!(payload["event"], "REQUEST_CHANGES");
+        assert_eq!(payload["body"], "summary");
+        assert_eq!(
+            payload["comments"][0],
+            serde_json::json!({"path": "src/a.rs", "line": 12, "side": "RIGHT", "body": "nit"})
+        );
+    }
+
+    /// The reviews endpoint rejects the whole review over a comment with no
+    /// line (`subject_type` is not a thing there), so a line-less draft must
+    /// never reach the payload — folding it into the body is the caller's job.
+    #[test]
+    fn review_payload_never_emits_line_less_comments() {
+        let payload = review_payload(
+            ReviewEvent::Comment,
+            "s",
+            &[
+                draft("src/a.rs", Some(3), "inline"),
+                draft("src/b.rs", None, "file-level"),
+            ],
+        );
+        let comments = payload["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["line"], 3);
+        assert!(!payload.to_string().contains("subject_type"));
+    }
+
+    /// `gh api` puts the API's error body (the *reason*) on stdout and only a
+    /// terse status line on stderr — the message must carry both.
+    #[test]
+    fn gh_failure_message_includes_the_stdout_error_body() {
+        let msg = gh_failure_message(
+            &["api".into(), "x".into()],
+            br#"{"message":"Unprocessable Entity","errors":["line must be part of the diff"]}"#,
+            b"gh: Unprocessable Entity (HTTP 422)\n",
+        );
+        assert!(msg.contains("gh api x failed: gh: Unprocessable Entity (HTTP 422)"));
+        assert!(msg.contains("line must be part of the diff"));
+    }
+
+    #[test]
+    fn gh_failure_message_skips_an_empty_stdout() {
+        let msg = gh_failure_message(&["pr".into()], b"", b"boom\n");
+        assert_eq!(msg, "gh pr failed: boom");
     }
 }
