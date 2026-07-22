@@ -729,6 +729,33 @@ pub struct PrInfo {
     /// keeps those records loadable.
     #[serde(default)]
     pub reviewer: Option<String>,
+    /// Whether `reviewer` records the actual choice made when the PR was
+    /// opened — which makes `None` mean "the user explicitly asked for no
+    /// reviewer", not "unknown". Records persisted before this was captured
+    /// deserialize `false`, and only for them does
+    /// [`Self::effective_reviewer`] assume the project's configured reviewer.
+    #[serde(default)]
+    pub reviewer_recorded: bool,
+}
+
+impl PrInfo {
+    /// The reviewer whose verdict this PR is waiting on, shared by the eager
+    /// advance at PR creation, the background poll, and the manual refresh.
+    ///
+    /// `fallback` is the project's configured reviewer. It applies only to
+    /// legacy records that never captured a per-PR choice: on those, `None`
+    /// most plausibly means the PR was opened for the configured reviewer
+    /// before we stored it here. On a PR that did record its choice, `None` is
+    /// the user's explicit "no reviewer" and the fallback must NOT override it
+    /// — nobody was requested on GitHub, so no approval will ever land, and
+    /// waiting on the configured reviewer would strand the card at the PR gate.
+    pub fn effective_reviewer<'a>(&'a self, fallback: Option<&'a str>) -> Option<&'a str> {
+        if self.reviewer_recorded {
+            self.reviewer.as_deref()
+        } else {
+            self.reviewer.as_deref().or(fallback)
+        }
+    }
 }
 
 /// Token usage reported by a provider run.
@@ -1181,10 +1208,11 @@ impl Card {
     /// can go straight to the merge gate.
     ///
     /// The comment-triage chain (`FetchComments` → … → `AgentFixesDone`) is the
-    /// only other route into `ReadyToMerge`, and it needs a comment to chew on:
-    /// an approval submitted with no inline comments leaves the card parked in
-    /// `PrReview(Idle)` badging for attention that the panel offers no action
-    /// for. This is the predicate that unsticks it — see
+    /// other route into `ReadyToMerge` (besides [`Self::no_reviewer_clears_merge`]),
+    /// and it needs a comment to chew on: an approval submitted with no inline
+    /// comments leaves the card parked in `PrReview(Idle)` badging for attention
+    /// that the panel offers no action for. This is the predicate that unsticks
+    /// it — see
     /// [`Transition::ReviewApproved`](crate::domain::state_machine::Transition).
     ///
     /// Deliberately conservative on both sides. Any comment at all (from the
@@ -1197,6 +1225,23 @@ impl Card {
         matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
             && self.comment_count == 0
             && self.reviews.iter().any(ReviewSummary::is_approved)
+            && !self.reviews.iter().any(ReviewSummary::requests_changes)
+    }
+
+    /// Whether a PR with no reviewer to wait on can go straight to the merge
+    /// gate. A project without a configured reviewer opens PRs nobody is asked
+    /// to review: no approval will ever land, so [`Self::approval_clears_merge`]
+    /// never fires and the card would strand at the PR gate forever.
+    ///
+    /// `reviewer` is the *effective* reviewer — see
+    /// [`PrInfo::effective_reviewer`], which every caller goes through. Same
+    /// conservatism as the approval route: any comment from anyone
+    /// means the user triages it before merging, and an unsolicited
+    /// CHANGES_REQUESTED review blocks even though nobody was asked for it.
+    pub fn no_reviewer_clears_merge(&self, reviewer: Option<&str>) -> bool {
+        matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
+            && reviewer.is_none()
+            && self.comment_count == 0
             && !self.reviews.iter().any(ReviewSummary::requests_changes)
     }
 }
@@ -1406,6 +1451,58 @@ mod tests {
             card.state = s.clone();
             assert!(
                 !card.approval_clears_merge(),
+                "{s:?} should not auto-advance"
+            );
+        }
+    }
+
+    #[test]
+    fn no_reviewer_clears_merge_only_when_nobody_is_asked_and_nothing_landed() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::PrReview(PrReviewSub::Idle);
+
+        // Nobody to wait on, nothing landed → straight to the merge gate.
+        assert!(card.no_reviewer_clears_merge(None));
+
+        // An effective reviewer means the PR gate waits for their verdict.
+        assert!(!card.no_reviewer_clears_merge(Some("octocat")));
+
+        // Any comment at all means triage has work; the user reads it first.
+        card.comment_count = 1;
+        assert!(!card.no_reviewer_clears_merge(None));
+        card.comment_count = 0;
+
+        // A non-blocking drive-by review doesn't hold the card back...
+        card.reviews = vec![
+            ReviewSummary {
+                author: "bot".into(),
+                state: "COMMENTED".into(),
+            },
+            ReviewSummary {
+                author: "octocat".into(),
+                state: "APPROVED".into(),
+            },
+        ];
+        assert!(card.no_reviewer_clears_merge(None));
+
+        // ...but an unsolicited change request does.
+        card.reviews.push(ReviewSummary {
+            author: "hubot".into(),
+            state: "CHANGES_REQUESTED".into(),
+        });
+        assert!(!card.no_reviewer_clears_merge(None));
+        card.reviews.pop();
+
+        // Only from the idle PR gate.
+        for s in [
+            CardState::PrReview(PrReviewSub::FetchingComments),
+            CardState::PrReview(PrReviewSub::ApplyingFixes),
+            CardState::ReadyToMerge,
+            CardState::Done,
+        ] {
+            card.state = s.clone();
+            assert!(
+                !card.no_reviewer_clears_merge(None),
                 "{s:?} should not auto-advance"
             );
         }
