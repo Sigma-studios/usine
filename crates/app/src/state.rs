@@ -753,6 +753,7 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
         title: "Bump dependencies".into(),
         state: "open".into(),
         reviewer: Some("octocat".into()),
+        reviewer_recorded: true,
     });
 
     let cards = vec![

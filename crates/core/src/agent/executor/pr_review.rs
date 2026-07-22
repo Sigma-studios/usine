@@ -54,11 +54,20 @@ impl Executor {
             ) {
                 continue;
             }
-            let Some((pr_number, pr_reviewer)) =
-                card.pr.as_ref().map(|p| (p.number, p.reviewer.clone()))
-            else {
+            // Owned so it outlives the refreshed `card` below. An explicit
+            // no-reviewer choice stays `None` — only legacy PRs that never
+            // recorded one assume the project's configured reviewer (see
+            // `PrInfo::effective_reviewer`).
+            let Some((pr_number, reviewer)) = card.pr.as_ref().map(|p| {
+                (
+                    p.number,
+                    p.effective_reviewer(project.config.reviewer.as_deref())
+                        .map(str::to_string),
+                )
+            }) else {
                 continue;
             };
+            let reviewer = reviewer.as_deref();
             let (comments, reviews, unanswered) =
                 match self.fetch_review_status(&project.path, pr_number).await {
                     Ok(v) => v,
@@ -67,11 +76,6 @@ impl Executor {
                         continue;
                     }
                 };
-            // Prefer the reviewer captured on this PR; fall back to the project's
-            // configured reviewer for PRs opened before we stored it per-PR.
-            let reviewer = pr_reviewer
-                .as_deref()
-                .or(project.config.reviewer.as_deref());
             let (by_reviewer, total) = comment_counts(&comments, reviewer);
             // A failed thread listing keeps the previous count (see fetch_review_status).
             let unanswered = unanswered.unwrap_or(card.unanswered_count);
@@ -109,6 +113,15 @@ impl Executor {
                     continue;
                 }
                 self.progress(card.id, "✔ approved with no comments — ready to merge");
+            } else if card.no_reviewer_clears_merge(reviewer) {
+                // No reviewer was ever assigned, so no approval will ever come:
+                // this is the only way such a card reaches the merge gate. Also
+                // recovers cards stranded before create_pr advanced them eagerly.
+                if let Err(e) = self.apply(card.id, Transition::ReviewApproved) {
+                    tracing::warn!("PR-comment poll: auto-advance for #{pr_number} failed: {e}");
+                    continue;
+                }
+                self.progress(card.id, "✔ no reviewer assigned — ready to merge");
             }
         }
         Ok(())
