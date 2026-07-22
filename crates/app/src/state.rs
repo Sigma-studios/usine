@@ -372,6 +372,28 @@ impl AppState {
                     }),
                 });
             }
+            // The merge was refused because the PR's CI checks are failing. Same
+            // shape as the conflict offer: the card is still `ReadyToMerge`, and
+            // declining leaves the detail pane's "Merge anyway" available.
+            ExecutorEventKind::ChecksFailed { pr_number, failed } => {
+                let card_id = evt.card_id;
+                let names = if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nFailing: {}", failed.join(", "))
+                };
+                crate::ui::request_confirm(crate::ui::ConfirmRequest {
+                    title: "CI checks failing".into(),
+                    message: format!(
+                        "PR #{pr_number} can't be merged — its CI checks are failing.{names}\n\n\
+                         Have the agent investigate the failures, fix them, and push? \
+                         The checks re-run on the push."
+                    ),
+                    confirm_label: "Fix with AI".into(),
+                    danger: false,
+                    action: crate::ui::ConfirmAction::Send(ExecutorCommand::FixChecks { card_id }),
+                });
+            }
             ExecutorEventKind::UsageUpdated(snapshot) => {
                 let mut usage = self.usage;
                 usage.set(snapshot);

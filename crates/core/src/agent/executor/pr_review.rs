@@ -70,7 +70,7 @@ impl Executor {
                 continue;
             };
             let reviewer = reviewer.as_deref();
-            let (comments, reviews, unanswered) =
+            let (comments, reviews, unanswered, checks) =
                 match self.fetch_review_status(&project.path, pr_number).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -79,12 +79,15 @@ impl Executor {
                     }
                 };
             let (by_reviewer, total) = comment_counts(&comments, reviewer);
-            // A failed thread listing keeps the previous count (see fetch_review_status).
+            // A failed thread listing keeps the previous count (see fetch_review_status);
+            // a failed checks read likewise keeps the previous status.
             let unanswered = unanswered.unwrap_or(card.unanswered_count);
+            let checks = checks.unwrap_or(card.checks);
             let card = if by_reviewer != card.reviewer_comment_count
                 || total != card.comment_count
                 || unanswered != card.unanswered_count
                 || reviews != card.reviews
+                || checks != card.checks
             {
                 // Deliberately don't bump `updated_at`: a background refresh isn't
                 // a user-facing edit and shouldn't reorder the board.
@@ -93,6 +96,7 @@ impl Executor {
                     c.comment_count = total;
                     c.unanswered_count = unanswered;
                     c.reviews = reviews;
+                    c.checks = checks;
                     Ok(())
                 })?;
                 let _ = self
