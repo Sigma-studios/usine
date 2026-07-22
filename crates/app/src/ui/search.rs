@@ -1,4 +1,5 @@
-//! Browser-style find bar for the board: Ctrl+F / Cmd+F pops a small search box
+//! Browser-style find bar for the board: Cmd+F (Ctrl+F off macOS) pops a small
+//! search box
 //! in the top-right corner that live-filters cards by title. A single global
 //! holds the query; `SearchHost` renders the box at the app root, like the toast
 //! and confirm hosts, and the boards read `query()` to filter what they render.
@@ -42,29 +43,54 @@ fn focus_input() {
 
 #[component]
 pub fn SearchHost() -> Element {
-    // Register the global shortcut once and keep draining its channel for the
+    // Register the global shortcut and keep draining its channel for the
     // lifetime of the app. Modals own the keyboard while one is open (the diff
     // viewer has its own Cmd+F-adjacent semantics), so the shortcut defers to
-    // any `.modal-overlay` on screen.
+    // any `.modal-overlay` on screen. Escape is also caught here so the box
+    // closes even when focus has wandered off the input (e.g. after clicking a
+    // card): the listener sends `true` to open/refocus and `false` to close.
+    //
+    // On macOS the accelerator is Cmd only — Ctrl+F is the Cocoa emacs binding
+    // for "forward one character" inside text fields and must pass through.
     use_future(|| async {
-        let mut listener = dioxus::document::eval(
-            "document.addEventListener('keydown', function(e){\
-               if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey\
-                   && (e.key === 'f' || e.key === 'F')) {\
-                 if (document.querySelector('.modal-overlay')) return;\
+        let modifier = if cfg!(target_os = "macos") {
+            "e.metaKey && !e.ctrlKey"
+        } else {
+            "e.ctrlKey && !e.metaKey"
+        };
+        let js = format!(
+            "if (window.__usineSearchKeydown)\
+               document.removeEventListener('keydown', window.__usineSearchKeydown);\
+             window.__usineSearchKeydown = function(e){{\
+               if (document.querySelector('.modal-overlay')) return;\
+               if ({modifier} && !e.altKey && !e.shiftKey\
+                   && (e.key === 'f' || e.key === 'F')) {{\
                  e.preventDefault();\
                  dioxus.send(true);\
-               }\
-             });",
+               }} else if (e.key === 'Escape'\
+                          && document.getElementById('card-search-input')) {{\
+                 e.preventDefault();\
+                 dioxus.send(false);\
+               }}\
+             }};\
+             document.addEventListener('keydown', window.__usineSearchKeydown);"
         );
-        while listener.recv::<bool>().await.is_ok() {
-            let already_open = SEARCH.read().is_some();
-            if !already_open {
-                *SEARCH.write() = Some(String::new());
-                // First open is focused by `onmounted` below.
-            } else {
-                focus_input();
+        // The eval channel can die (e.g. a webview reload during dev). Re-eval
+        // to get a fresh channel; the JS replaces any listener a previous eval
+        // left behind, so re-registering never stacks handlers.
+        loop {
+            let mut listener = dioxus::document::eval(&js);
+            while let Ok(open) = listener.recv::<bool>().await {
+                if !open {
+                    close();
+                } else if SEARCH.read().is_none() {
+                    *SEARCH.write() = Some(String::new());
+                    // First open is focused by `onmounted` below.
+                } else {
+                    focus_input();
+                }
             }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
 
