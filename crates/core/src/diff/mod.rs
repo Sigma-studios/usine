@@ -16,7 +16,7 @@ mod compute;
 mod highlight;
 mod lang;
 
-pub use anchor::{anchor_drafts, DraftAnchors};
+pub use anchor::{anchor_drafts, fold_unanchorable, DraftAnchors};
 pub use compute::{compute_branch_diff, compute_card_diff};
 
 /// A file's change kind (git2's `Delta`, collapsed to what the UI shows).

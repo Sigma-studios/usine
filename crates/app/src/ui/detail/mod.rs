@@ -4,9 +4,12 @@
 //! the sibling files of this module.
 
 use dioxus::prelude::*;
-use usine_core::{Card, CardState, DesignSub, ExecutorCommand, PrReviewSub, ReviewSub};
+use usine_core::{
+    Card, CardState, CheckStatus, DesignSub, ExecutorCommand, PrReviewSub, ReviewSub,
+};
 use uuid::Uuid;
 
+use super::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 use super::diffdialog::open_diff_dialog;
 use super::icons::IconDiff;
 use crate::state::{AppState, BoardMode};
@@ -152,6 +155,9 @@ fn CardPanel(card: Card) -> Element {
         .unwrap_or(false);
     // Delete the head branch when merging — on by default.
     let mut delete_branch = use_signal(|| true);
+    // The PR's CI state as of the last poll/refresh; the executor re-reads it
+    // authoritatively when a merge is actually requested.
+    let checks = card.checks;
     let recap = state.review_recaps.read().get(&id).cloned();
     let mut post_pr_feedback = use_signal(String::new);
     let fail_msg = if let CardState::Failed { message, .. } = &card.state {
@@ -258,6 +264,15 @@ fn CardPanel(card: Card) -> Element {
                         "Mark ready for review"
                     }
                 } else {
+                    if checks.is_reportable() {
+                        div { class: "card-meta",
+                            span {
+                                class: "badge {checks.css_class()}",
+                                title: "{checks.label()}",
+                                "{checks.glyph()} CI"
+                            }
+                        }
+                    }
                     label { class: "checkbox-row",
                         input {
                             r#type: "checkbox",
@@ -269,16 +284,84 @@ fn CardPanel(card: Card) -> Element {
                         }
                         "Delete the branch after merging"
                     }
-                    button {
-                        class: "btn success",
-                        onclick: move |_| super::confirm_then_send(
-                            state,
-                            "Merge pull request",
-                            "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
-                            "Merge",
-                            ExecutorCommand::Merge { card_id: id, delete_branch: delete_branch() },
-                        ),
-                        "Merge PR"
+                    // A red or still-running build replaces the merge button with
+                    // its way out: fix with an agent (red only), wait/refresh, or
+                    // the explicit "Merge anyway" override. The executor re-checks
+                    // before merging anyway, so this gate is a convenience — the
+                    // real one can't be dodged by a stale panel.
+                    match checks {
+                        CheckStatus::Failing => rsx! {
+                            div { class: "hint",
+                                "The PR's CI checks are failing — GitHub's checks must pass before this merges cleanly. Have the agent fix them, or merge anyway if the failure is noise."
+                            }
+                            div { class: "option-row",
+                                button {
+                                    class: "btn primary",
+                                    onclick: move |_| state.send(ExecutorCommand::FixChecks { card_id: id }),
+                                    "Fix checks with AI"
+                                }
+                                button {
+                                    class: "btn",
+                                    onclick: move |_| state.fetch_reviews(id),
+                                    "Refresh checks"
+                                }
+                                button {
+                                    class: "btn subtle",
+                                    onclick: move |_| request_confirm(ConfirmRequest {
+                                        title: "Merge with failing checks?".into(),
+                                        message: "This PR's CI checks are failing. Merge it into the base branch anyway? This can't be undone.".into(),
+                                        confirm_label: "Merge anyway".into(),
+                                        danger: true,
+                                        action: ConfirmAction::Send(ExecutorCommand::Merge {
+                                            card_id: id,
+                                            delete_branch: delete_branch(),
+                                            force: true,
+                                        }),
+                                    }),
+                                    "Merge anyway"
+                                }
+                            }
+                        },
+                        CheckStatus::Pending => rsx! {
+                            div { class: "hint",
+                                "The PR's CI checks are still running. Merge once they're green — or merge anyway without waiting for them."
+                            }
+                            div { class: "option-row",
+                                button {
+                                    class: "btn",
+                                    onclick: move |_| state.fetch_reviews(id),
+                                    "Refresh checks"
+                                }
+                                button {
+                                    class: "btn subtle",
+                                    onclick: move |_| request_confirm(ConfirmRequest {
+                                        title: "Merge before checks finish?".into(),
+                                        message: "This PR's CI checks are still running. Merge it into the base branch without waiting for them? This can't be undone.".into(),
+                                        confirm_label: "Merge anyway".into(),
+                                        danger: false,
+                                        action: ConfirmAction::Send(ExecutorCommand::Merge {
+                                            card_id: id,
+                                            delete_branch: delete_branch(),
+                                            force: true,
+                                        }),
+                                    }),
+                                    "Merge anyway"
+                                }
+                            }
+                        },
+                        CheckStatus::Passing | CheckStatus::None => rsx! {
+                            button {
+                                class: "btn success",
+                                onclick: move |_| super::confirm_then_send(
+                                    state,
+                                    "Merge pull request",
+                                    "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
+                                    "Merge",
+                                    ExecutorCommand::Merge { card_id: id, delete_branch: delete_branch(), force: false },
+                                ),
+                                "Merge PR"
+                            }
+                        },
                     }
                 }
             }

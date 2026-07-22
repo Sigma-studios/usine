@@ -370,12 +370,13 @@ impl GitOps for RealGit {
             .await
             .map(|_| ())
             .map_err(|e| {
-                // Git's refusal wording varies by version ("checked out at" vs
-                // "used by worktree at"); normalise to one stable message.
+                // Git's refusal wording varies by version ("used by worktree
+                // at" vs "checked out at"); normalize it so callers can rely
+                // on the worktree conflict being named.
                 let msg = e.to_string();
                 if msg.contains("checked out at") || msg.contains("used by worktree") {
                     CoreError::other(format!(
-                        "branch '{branch}' is still held by a worktree; remove the worktree first ({msg})"
+                        "branch '{branch}' is still checked out in a worktree — remove the worktree first ({msg})"
                     ))
                 } else {
                     e

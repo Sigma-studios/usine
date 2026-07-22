@@ -127,6 +127,7 @@ fn ready_to_merge_card(store: &Store, project_id: uuid::Uuid) -> Card {
         title: "t".into(),
         state: "open".into(),
         reviewer: None,
+        reviewer_recorded: false,
     });
     store.upsert_card(&card).unwrap();
     card
@@ -151,6 +152,7 @@ fn seeded(status: MergeStatus) -> (Store, Card, UnboundedReceiver<ExecutorEvent>
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
     (store, card, rx)
 }

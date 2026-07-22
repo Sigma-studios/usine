@@ -544,6 +544,20 @@ impl CardState {
             )
     }
 
+    /// The urgent slice of [`Self::needs_attention`]: a run faulted, validation
+    /// gave up, or the agent is blocked on a question. Routine hand-offs (plan
+    /// approval, review, merge, fix selection) are deliberately excluded so the
+    /// red sidebar dot keeps meaning "something went wrong".
+    pub fn needs_urgent_attention(&self) -> bool {
+        matches!(
+            self,
+            CardState::Designing(DesignSub::Intervention(_))
+                | CardState::Implementing(RunSub::Intervention(_))
+                | CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
+                | CardState::Failed { .. }
+        )
+    }
+
     pub fn is_failed(&self) -> bool {
         matches!(self, CardState::Failed { .. })
     }
@@ -749,6 +763,33 @@ pub struct PrInfo {
     /// keeps those records loadable.
     #[serde(default)]
     pub reviewer: Option<String>,
+    /// Whether `reviewer` records the actual choice made when the PR was
+    /// opened — which makes `None` mean "the user explicitly asked for no
+    /// reviewer", not "unknown". Records persisted before this was captured
+    /// deserialize `false`, and only for them does
+    /// [`Self::effective_reviewer`] assume the project's configured reviewer.
+    #[serde(default)]
+    pub reviewer_recorded: bool,
+}
+
+impl PrInfo {
+    /// The reviewer whose verdict this PR is waiting on, shared by the eager
+    /// advance at PR creation, the background poll, and the manual refresh.
+    ///
+    /// `fallback` is the project's configured reviewer. It applies only to
+    /// legacy records that never captured a per-PR choice: on those, `None`
+    /// most plausibly means the PR was opened for the configured reviewer
+    /// before we stored it here. On a PR that did record its choice, `None` is
+    /// the user's explicit "no reviewer" and the fallback must NOT override it
+    /// — nobody was requested on GitHub, so no approval will ever land, and
+    /// waiting on the configured reviewer would strand the card at the PR gate.
+    pub fn effective_reviewer<'a>(&'a self, fallback: Option<&'a str>) -> Option<&'a str> {
+        if self.reviewer_recorded {
+            self.reviewer.as_deref()
+        } else {
+            self.reviewer.as_deref().or(fallback)
+        }
+    }
 }
 
 /// Token usage reported by a provider run.
@@ -1142,6 +1183,12 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub reviews: Vec<ReviewSummary>,
+    /// The rolled-up CI state of this card's PR, as of the last background poll
+    /// or manual refresh. Gates the merge button: a red or still-running build
+    /// blocks the merge (with an explicit "merge anyway" override), and a red
+    /// one offers an agent fix. `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub checks: CheckStatus,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1172,6 +1219,7 @@ impl Card {
             comment_count: 0,
             unanswered_count: 0,
             reviews: Vec::new(),
+            checks: CheckStatus::None,
             created_at: now,
             updated_at: now,
         }
@@ -1197,14 +1245,22 @@ impl Card {
                     || self.reviews.iter().any(ReviewSummary::is_actionable)))
     }
 
+    /// The urgent slice of [`Self::needs_attention`]. Pure delegation to
+    /// [`CardState::needs_urgent_attention`]: a landed review on a parked PR is
+    /// "waiting", never urgent.
+    pub fn needs_urgent_attention(&self) -> bool {
+        self.state.needs_urgent_attention()
+    }
+
     /// Whether an approval has landed with nothing left to triage, so the card
     /// can go straight to the merge gate.
     ///
     /// The comment-triage chain (`FetchComments` → … → `AgentFixesDone`) is the
-    /// only other route into `ReadyToMerge`, and it needs a comment to chew on:
-    /// an approval submitted with no inline comments leaves the card parked in
-    /// `PrReview(Idle)` badging for attention that the panel offers no action
-    /// for. This is the predicate that unsticks it — see
+    /// other route into `ReadyToMerge` (besides [`Self::no_reviewer_clears_merge`]),
+    /// and it needs a comment to chew on: an approval submitted with no inline
+    /// comments leaves the card parked in `PrReview(Idle)` badging for attention
+    /// that the panel offers no action for. This is the predicate that unsticks
+    /// it — see
     /// [`Transition::ReviewApproved`](crate::domain::state_machine::Transition).
     ///
     /// Deliberately conservative on both sides. Any comment at all (from the
@@ -1217,6 +1273,23 @@ impl Card {
         matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
             && self.comment_count == 0
             && self.reviews.iter().any(ReviewSummary::is_approved)
+            && !self.reviews.iter().any(ReviewSummary::requests_changes)
+    }
+
+    /// Whether a PR with no reviewer to wait on can go straight to the merge
+    /// gate. A project without a configured reviewer opens PRs nobody is asked
+    /// to review: no approval will ever land, so [`Self::approval_clears_merge`]
+    /// never fires and the card would strand at the PR gate forever.
+    ///
+    /// `reviewer` is the *effective* reviewer — see
+    /// [`PrInfo::effective_reviewer`], which every caller goes through. Same
+    /// conservatism as the approval route: any comment from anyone
+    /// means the user triages it before merging, and an unsolicited
+    /// CHANGES_REQUESTED review blocks even though nobody was asked for it.
+    pub fn no_reviewer_clears_merge(&self, reviewer: Option<&str>) -> bool {
+        matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
+            && reviewer.is_none()
+            && self.comment_count == 0
             && !self.reviews.iter().any(ReviewSummary::requests_changes)
     }
 }
@@ -1313,6 +1386,41 @@ mod tests {
             CardState::Done,
         ] {
             assert!(!s.needs_attention(), "{s:?} should not need attention");
+        }
+    }
+
+    #[test]
+    fn urgent_attention_is_the_broken_subset_of_attention() {
+        // Faulted, exhausted validation, and agent questions → red tier.
+        let urgent = [
+            CardState::Designing(DesignSub::Intervention(intervention())),
+            CardState::Implementing(RunSub::Intervention(intervention())),
+            CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                attempt: 3,
+                output: "boom".into(),
+            }),
+            CardState::Failed {
+                previous: Box::new(CardState::Implementing(RunSub::Running)),
+                message: "boom".into(),
+            },
+        ];
+        for s in urgent {
+            assert!(s.needs_urgent_attention(), "{s:?} should be urgent");
+            // Urgent ⊆ attention.
+            assert!(s.needs_attention(), "{s:?} urgent implies attention");
+        }
+
+        // Routine hand-offs badge but stay in the accent "waiting" tier.
+        for s in [
+            CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() }),
+            CardState::PrReview(PrReviewSub::SelectingFixes { verdicts: vec![] }),
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts: vec![] }),
+            CardState::AwaitingReview(ReviewSub::ReadyForReview),
+            CardState::AwaitingReview(ReviewSub::ReadyForPr),
+            CardState::ReadyToMerge,
+        ] {
+            assert!(s.needs_attention(), "{s:?} should need attention");
+            assert!(!s.needs_urgent_attention(), "{s:?} should not be urgent");
         }
     }
 
@@ -1460,6 +1568,58 @@ mod tests {
             card.state = s.clone();
             assert!(
                 !card.approval_clears_merge(),
+                "{s:?} should not auto-advance"
+            );
+        }
+    }
+
+    #[test]
+    fn no_reviewer_clears_merge_only_when_nobody_is_asked_and_nothing_landed() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::PrReview(PrReviewSub::Idle);
+
+        // Nobody to wait on, nothing landed → straight to the merge gate.
+        assert!(card.no_reviewer_clears_merge(None));
+
+        // An effective reviewer means the PR gate waits for their verdict.
+        assert!(!card.no_reviewer_clears_merge(Some("octocat")));
+
+        // Any comment at all means triage has work; the user reads it first.
+        card.comment_count = 1;
+        assert!(!card.no_reviewer_clears_merge(None));
+        card.comment_count = 0;
+
+        // A non-blocking drive-by review doesn't hold the card back...
+        card.reviews = vec![
+            ReviewSummary {
+                author: "bot".into(),
+                state: "COMMENTED".into(),
+            },
+            ReviewSummary {
+                author: "octocat".into(),
+                state: "APPROVED".into(),
+            },
+        ];
+        assert!(card.no_reviewer_clears_merge(None));
+
+        // ...but an unsolicited change request does.
+        card.reviews.push(ReviewSummary {
+            author: "hubot".into(),
+            state: "CHANGES_REQUESTED".into(),
+        });
+        assert!(!card.no_reviewer_clears_merge(None));
+        card.reviews.pop();
+
+        // Only from the idle PR gate.
+        for s in [
+            CardState::PrReview(PrReviewSub::FetchingComments),
+            CardState::PrReview(PrReviewSub::ApplyingFixes),
+            CardState::ReadyToMerge,
+            CardState::Done,
+        ] {
+            card.state = s.clone();
+            assert!(
+                !card.no_reviewer_clears_merge(None),
                 "{s:?} should not auto-advance"
             );
         }

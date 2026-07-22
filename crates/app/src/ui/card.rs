@@ -198,6 +198,16 @@ pub fn CardView(card: Card) -> Element {
                 } else {
                     span { class: "badge status", "{status}" }
                 }
+                // The PR's CI state, once it has one and any check reported —
+                // a red build is worth seeing from the board, before reaching
+                // for Merge.
+                if card.pr.is_some() && card.checks.is_reportable() {
+                    span {
+                        class: "badge {card.checks.css_class()}",
+                        title: "{card.checks.label()}",
+                        "{card.checks.glyph()} CI"
+                    }
+                }
             }
             div { class: "card-actions",
                 // Shield the action buttons' keydowns from the card handler too.
@@ -285,7 +295,7 @@ pub fn CardView(card: Card) -> Element {
                                 "Merge pull request",
                                 "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
                                 "Merge",
-                                ExecutorCommand::Merge { card_id: id, delete_branch: true },
+                                ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
                             );
                         },
                         "Merge"

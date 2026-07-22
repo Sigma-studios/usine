@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="crates/app/assets/logo.svg" alt="Usine logo" width="140">
+</p>
+
 # Usine
 
 Usine is a desktop app that orchestrates LLM coding agents (the `claude` and
@@ -9,9 +13,10 @@ gates.
 
 ## Install
 
-Usine is distributed as a Cargo package, so a single command builds it from
-source and drops a `usine` binary into `~/.cargo/bin` (already on your `PATH` if
-you use [rustup](https://rustup.rs/)):
+You'll need the Rust toolchain — if you don't have `cargo` yet, install it via
+[rustup](https://rustup.rs/) first. Usine is distributed as a Cargo package, so
+a single command builds it from source and drops a `usine` binary into
+`~/.cargo/bin` (which rustup already puts on your `PATH`):
 
 ```sh
 cargo install --git https://github.com/sigma-studios/usine usine-app --locked
