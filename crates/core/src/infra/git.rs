@@ -366,7 +366,22 @@ impl GitOps for RealGit {
     }
 
     async fn delete_branch(&self, repo: &Path, branch: &str) -> Result<()> {
-        run_git(repo, &delete_branch_args(branch)).await.map(|_| ())
+        run_git(repo, &delete_branch_args(branch))
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                // Git's refusal wording varies by version ("checked out at" vs
+                // "used by worktree at"); name the worktree conflict ourselves
+                // so callers can rely on one stable message.
+                let msg = e.to_string();
+                if msg.contains("checked out at") || msg.contains("worktree") {
+                    CoreError::other(format!(
+                        "branch '{branch}' is still held by a worktree; remove the worktree first: {msg}"
+                    ))
+                } else {
+                    e
+                }
+            })
     }
 
     async fn fetch(&self, dir: &Path, remote: &str) -> Result<()> {
