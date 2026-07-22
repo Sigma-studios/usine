@@ -99,8 +99,12 @@ async fn a_branch_is_only_deletable_once_its_worktree_is_gone() {
         .delete_branch(&repo, "feature")
         .await
         .expect_err("git must refuse to delete a branch checked out in a worktree");
+    // Git's wording for this refusal varies by version: >= 2.36 says
+    // "used by worktree at", older releases (Apple Git included) say
+    // "checked out at". Both are the same worktree conflict.
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("worktree"),
+        msg.contains("worktree") || msg.contains("checked out at"),
         "expected a worktree conflict, got: {err}"
     );
     assert!(local_branch_exists(&repo, "feature"));
@@ -266,6 +270,7 @@ fn ready_to_merge_card(store: &Store, project_id: uuid::Uuid) -> Card {
         title: "t".into(),
         state: "open".into(),
         reviewer: None,
+        reviewer_recorded: false,
     });
     store.upsert_card(&card).unwrap();
     card
@@ -293,6 +298,7 @@ async fn a_merged_card_reaches_done_even_when_every_cleanup_step_fails() {
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
 
     wait_for(&mut rx, |e| match &e.kind {
@@ -330,6 +336,7 @@ async fn failed_cleanup_warns_the_user() {
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
 
     let msg = wait_for(&mut rx, |e| match &e.kind {
@@ -454,6 +461,7 @@ async fn an_already_merged_pr_still_completes_the_card() {
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
 
     wait_for(&mut rx, |e| match &e.kind {

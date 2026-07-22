@@ -251,6 +251,19 @@ async fn finalize_run(
                                     Severity::Warning,
                                     format!("push failed: {e}"),
                                 ));
+                            } else if card.checks != CheckStatus::None {
+                                // The push re-triggers CI, so whatever status the
+                                // card cached (say, the `Failing` a fix run set out
+                                // to cure) is stale the moment it lands. Show
+                                // `Pending` now instead of leaving the red layout —
+                                // and its re-offered fix — up until the next poll.
+                                if let Ok(updated) = store.mutate_card(card_id, |c| {
+                                    c.checks = CheckStatus::Pending;
+                                    Ok(())
+                                }) {
+                                    let _ =
+                                        evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                                }
                             }
                         }
                         true
