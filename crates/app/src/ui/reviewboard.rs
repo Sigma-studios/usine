@@ -30,7 +30,11 @@ pub fn ReviewBoard() -> Element {
         };
     };
     let name = state.project_name(project_id);
-    let tasks = state.review_tasks_for(project_id);
+    let mut tasks = state.review_tasks_for(project_id);
+    // Live Ctrl+F/Cmd+F filter, on PR titles here.
+    if let Some(q) = super::search::query() {
+        tasks.retain(|t| super::search::matches(&t.pr_title, &q));
+    }
 
     rsx! {
         div { class: "review-area",

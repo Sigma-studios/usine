@@ -606,6 +606,25 @@ select option { background: var(--panel-2); color: var(--text); }
 .add-port { align-self: flex-start; }
 
 /* ----- Toasts ----- */
+/* Ctrl+F / Cmd+F card search: a browser-find-bar-style box pinned top-right.
+   Above the toasts (1000), below the card-menu backdrop (1500) and modals. */
+.card-search {
+  position: fixed; top: 12px; right: 16px; z-index: 1200;
+  display: flex; align-items: center; gap: 6px; padding: 8px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+.card-search input {
+  width: 220px; box-sizing: border-box; padding: 5px 8px; font-size: 12px;
+  color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+}
+.card-search input:focus { outline: none; border-color: var(--accent); }
+.card-search-close {
+  background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 14px;
+  padding: 2px 4px;
+}
+.card-search-close:hover { color: var(--text); }
+
 .toast-host {
   position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 1000;
   max-width: 360px;
