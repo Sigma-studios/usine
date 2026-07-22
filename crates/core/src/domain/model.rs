@@ -729,6 +729,33 @@ pub struct PrInfo {
     /// keeps those records loadable.
     #[serde(default)]
     pub reviewer: Option<String>,
+    /// Whether `reviewer` records the actual choice made when the PR was
+    /// opened — which makes `None` mean "the user explicitly asked for no
+    /// reviewer", not "unknown". Records persisted before this was captured
+    /// deserialize `false`, and only for them does
+    /// [`Self::effective_reviewer`] assume the project's configured reviewer.
+    #[serde(default)]
+    pub reviewer_recorded: bool,
+}
+
+impl PrInfo {
+    /// The reviewer whose verdict this PR is waiting on, shared by the eager
+    /// advance at PR creation, the background poll, and the manual refresh.
+    ///
+    /// `fallback` is the project's configured reviewer. It applies only to
+    /// legacy records that never captured a per-PR choice: on those, `None`
+    /// most plausibly means the PR was opened for the configured reviewer
+    /// before we stored it here. On a PR that did record its choice, `None` is
+    /// the user's explicit "no reviewer" and the fallback must NOT override it
+    /// — nobody was requested on GitHub, so no approval will ever land, and
+    /// waiting on the configured reviewer would strand the card at the PR gate.
+    pub fn effective_reviewer<'a>(&'a self, fallback: Option<&'a str>) -> Option<&'a str> {
+        if self.reviewer_recorded {
+            self.reviewer.as_deref()
+        } else {
+            self.reviewer.as_deref().or(fallback)
+        }
+    }
 }
 
 /// Token usage reported by a provider run.
@@ -1206,9 +1233,9 @@ impl Card {
     /// to review: no approval will ever land, so [`Self::approval_clears_merge`]
     /// never fires and the card would strand at the PR gate forever.
     ///
-    /// `reviewer` is the *effective* reviewer — the one captured on the PR, or
-    /// the project's configured fallback, exactly as the review poll computes
-    /// it. Same conservatism as the approval route: any comment from anyone
+    /// `reviewer` is the *effective* reviewer — see
+    /// [`PrInfo::effective_reviewer`], which every caller goes through. Same
+    /// conservatism as the approval route: any comment from anyone
     /// means the user triages it before merging, and an unsolicited
     /// CHANGES_REQUESTED review blocks even though nobody was asked for it.
     pub fn no_reviewer_clears_merge(&self, reviewer: Option<&str>) -> bool {

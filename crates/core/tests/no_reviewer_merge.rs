@@ -165,7 +165,7 @@ async fn creating_a_pr_without_a_reviewer_goes_straight_to_the_merge_gate() {
     .await;
 }
 
-fn idle_pr_card(store: &Store, project_id: uuid::Uuid) -> uuid::Uuid {
+fn idle_pr_card(store: &Store, project_id: uuid::Uuid, reviewer_recorded: bool) -> uuid::Uuid {
     let mut card = Card::new(project_id, "c", "Do the thing.", CardConfig::default());
     card.state = CardState::PrReview(PrReviewSub::Idle);
     card.branch = Some("feat/thing".into());
@@ -175,6 +175,7 @@ fn idle_pr_card(store: &Store, project_id: uuid::Uuid) -> uuid::Uuid {
         title: "t".into(),
         state: "open".into(),
         reviewer: None,
+        reviewer_recorded,
     });
     let card_id = card.id;
     store.upsert_card(&card).unwrap();
@@ -186,7 +187,7 @@ fn idle_pr_card(store: &Store, project_id: uuid::Uuid) -> uuid::Uuid {
 #[tokio::test]
 async fn the_poll_unsticks_a_stranded_card_when_no_reviewer_is_assigned() {
     let (store, project) = seeded_project(None);
-    let card_id = idle_pr_card(&store, project.id);
+    let card_id = idle_pr_card(&store, project.id, false);
     let (_handle, mut rx) = executor(&store);
 
     wait_for(&mut rx, |e| match &e.kind {
@@ -198,12 +199,62 @@ async fn the_poll_unsticks_a_stranded_card_when_no_reviewer_is_assigned() {
     .await;
 }
 
-/// With a reviewer configured on the project, a quiet PR means "still waiting
-/// for their verdict" — the card must stay parked at the PR gate.
+/// Explicitly picking "no reviewer" in the create-PR dialog must beat the
+/// project's configured reviewer: nobody was requested on GitHub, so no
+/// approval can ever land, and the card goes straight to the merge gate.
+#[tokio::test]
+async fn an_explicit_no_reviewer_choice_beats_the_configured_reviewer() {
+    let (store, project) = seeded_project(Some("octocat"));
+    let mut card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    card.state = CardState::AwaitingReview(ReviewSub::ReadyForPr);
+    card.branch = Some("usine/card-x".into());
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+    let (handle, mut rx) = executor(&store);
+
+    handle.send(ExecutorCommand::CreatePr {
+        card_id,
+        branch: "feat/thing".into(),
+        title: "t".into(),
+        body: "b".into(),
+        reviewer: None,
+        draft: false,
+    });
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => {
+            matches!(c.state, CardState::ReadyToMerge).then_some(())
+        }
+        _ => None,
+    })
+    .await;
+}
+
+/// Same choice, seen from the poll: a PR that *recorded* "no reviewer" on a
+/// project with a configured one still advances — the fallback is only for
+/// legacy records that never captured a choice (the test below).
+#[tokio::test]
+async fn the_poll_honors_a_recorded_no_reviewer_choice() {
+    let (store, project) = seeded_project(Some("octocat"));
+    let card_id = idle_pr_card(&store, project.id, true);
+    let (_handle, mut rx) = executor(&store);
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => {
+            matches!(c.state, CardState::ReadyToMerge).then_some(())
+        }
+        _ => None,
+    })
+    .await;
+}
+
+/// With a reviewer configured on the project and a legacy PR record that never
+/// captured a per-PR choice, a quiet PR means "still waiting for their
+/// verdict" — the card must stay parked at the PR gate.
 #[tokio::test]
 async fn a_configured_reviewer_keeps_the_card_waiting_at_the_pr_gate() {
     let (store, project) = seeded_project(Some("octocat"));
-    let card_id = idle_pr_card(&store, project.id);
+    let card_id = idle_pr_card(&store, project.id, false);
     let (_handle, _rx) = executor(&store);
 
     // The poll's first tick fires immediately; give it (and any wrongly-fired

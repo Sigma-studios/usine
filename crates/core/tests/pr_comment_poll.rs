@@ -32,6 +32,7 @@ async fn poll_refreshes_reviews_alongside_the_comment_count() {
         title: "t".into(),
         state: "open".into(),
         reviewer: Some("reviewer".into()),
+        reviewer_recorded: true,
     });
     let card_id = card.id;
     store.upsert_card(&card).unwrap();

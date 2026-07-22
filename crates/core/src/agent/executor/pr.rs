@@ -117,14 +117,12 @@ impl Executor {
         self.apply(card_id, Transition::CreatePr)?;
         // With no reviewer to wait on there is nothing the PR gate can ever
         // receive, so advance to the merge gate now rather than making the card
-        // wait for the poll to notice. Uses the effective reviewer (the one the
-        // forge stored on the PR, or the project fallback) like the poll does.
+        // wait for the poll to notice. The PR was just created, so its recorded
+        // reviewer is authoritative — an explicit "no reviewer" advances even
+        // on a project with a configured one (see `PrInfo::effective_reviewer`).
         // A draft still advances: `ReadyToMerge` gates it behind "Mark ready".
         let card = self.store.get_card(card_id)?;
-        let reviewer = pr
-            .reviewer
-            .as_deref()
-            .or(project.config.reviewer.as_deref());
+        let reviewer = pr.effective_reviewer(project.config.reviewer.as_deref());
         if card.no_reviewer_clears_merge(reviewer) {
             self.apply(card_id, Transition::ReviewApproved)?;
             self.progress(card_id, "✔ no reviewer assigned — ready to merge");
@@ -438,9 +436,8 @@ impl Executor {
             .ok_or_else(|| CoreError::other("card has no PR to read reviews from"))?;
         // Owned so it outlives the refreshed `card` below.
         let reviewer = pr
-            .reviewer
-            .clone()
-            .or_else(|| project.config.reviewer.clone());
+            .effective_reviewer(project.config.reviewer.as_deref())
+            .map(str::to_string);
         let (comments, reviews, unanswered) =
             self.fetch_review_status(&project.path, pr.number).await?;
         let (by_reviewer, total) = comment_counts(&comments, reviewer.as_deref());
