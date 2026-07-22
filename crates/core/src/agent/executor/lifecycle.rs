@@ -30,6 +30,12 @@ impl Executor {
         card_id: Uuid,
         extra: Option<String>,
     ) -> Result<()> {
+        // Stash this round's context so a retry of a faulted run re-launches
+        // the SAME round (`relaunch` reads it back) instead of silently
+        // re-answering the original description. The initial round (`None`)
+        // clears any stale stash from an earlier life of the card.
+        self.store
+            .set_investigation_extra(card_id, extra.as_deref())?;
         self.start_run(
             card_id,
             RunMode::Investigate,
@@ -87,6 +93,9 @@ impl Executor {
             Ok(())
         })?;
         if converted {
+            // The stashed round context described the investigation being
+            // promoted away from; the findings now live in the description.
+            let _ = self.store.set_investigation_extra(card_id, None);
             // Land on the default "design + implement" mode; the selector stays
             // editable in the starting block, including back to Investigate.
             self.store.set_skip_plan(card_id, false)?;
@@ -526,6 +535,8 @@ impl Executor {
         // re-plan saves a fresh one; a "skip plan" re-run rightly has none). The
         // hand-off recaps that same discarded attempt, so it goes too.
         let _ = self.store.delete_plan(card_id);
+        // Same for a discarded investigation's stashed round context.
+        let _ = self.store.set_investigation_extra(card_id, None);
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx
@@ -710,7 +721,12 @@ impl Executor {
             resume
         };
         let extra = match mode {
-            RunMode::Plan | RunMode::Investigate => None,
+            RunMode::Plan => None,
+            // Re-run the round that faulted, not just the original question: a
+            // follow-up round's context (prior conclusion + earlier rounds +
+            // the user's ask) was stashed at launch, so a retried follow-up
+            // doesn't silently overwrite it with a re-answer of round one.
+            RunMode::Investigate => self.store.get_investigation_extra(card_id).unwrap_or(None),
             RunMode::Implement => {
                 let plan = self.store.get_plan(card_id).unwrap_or(None);
                 Some(resume_extra(plan.as_deref()))

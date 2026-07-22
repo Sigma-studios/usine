@@ -5,15 +5,17 @@
 //! implementation whose description holds the findings while keeping the cost.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, AgentProvider, Card, CardConfig, CardKind, CardState, ExecutorCommand,
-    ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig, Provider,
-    ProviderFactory, Result, RunConfig, RunHandle, RunMode, SimFactory, SimForge, SimGit, Store,
+    spawn_executor, AgentProvider, Card, CardConfig, CardKind, CardState, CoreError,
+    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig,
+    Provider, ProviderFactory, Result, RunConfig, RunHandle, RunMode, SimFactory, SimForge,
+    SimGit, Store,
 };
 
 /// Every run config handed to a provider: `(mode, workdir, full prompt)`.
@@ -22,6 +24,9 @@ type Runs = Arc<Mutex<Vec<(RunMode, PathBuf, String)>>>;
 struct SpyProvider {
     inner: Arc<dyn AgentProvider>,
     runs: Runs,
+    /// When armed, the next `start` fails (before recording) — simulates a run
+    /// that can't launch at all, e.g. the CLI missing.
+    fail_next: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -33,6 +38,9 @@ impl AgentProvider for SpyProvider {
         self.inner.interactive()
     }
     async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            return Err(CoreError::other("simulated launch failure"));
+        }
         self.runs.lock().unwrap().push((
             cfg.mode,
             cfg.project_dir.clone(),
@@ -42,13 +50,17 @@ impl AgentProvider for SpyProvider {
     }
 }
 
-struct SpyFactory(Runs);
+struct SpyFactory {
+    runs: Runs,
+    fail_next: Arc<AtomicBool>,
+}
 
 impl ProviderFactory for SpyFactory {
     fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
         Arc::new(SpyProvider {
             inner: SimFactory.make(provider),
-            runs: self.0.clone(),
+            runs: self.runs.clone(),
+            fail_next: self.fail_next.clone(),
         })
     }
 }
@@ -93,9 +105,13 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     store.upsert_card(&card).unwrap();
 
     let runs: Runs = Arc::new(Mutex::new(Vec::new()));
+    let fail_next = Arc::new(AtomicBool::new(false));
     let (exec, mut rx) = spawn_executor(ExecutorConfig {
         store: store.clone(),
-        providers: Arc::new(SpyFactory(runs.clone())),
+        providers: Arc::new(SpyFactory {
+            runs: runs.clone(),
+            fail_next: fail_next.clone(),
+        }),
         forge: Arc::new(SimForge),
         git: Arc::new(SimGit),
     });
@@ -125,25 +141,26 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         _ => unreachable!(),
     };
 
-    // Follow-up → re-runs with the prior conclusion in context, re-concludes.
+    // Follow-up whose run fails to launch (CLI missing) → the card fails
+    // retryably, and the RETRY re-runs the follow-up ROUND — prior conclusion
+    // and the user's ask still in context — not just the original description.
+    fail_next.store(true, Ordering::SeqCst);
     exec.send(ExecutorCommand::FollowUpInvestigation {
         card_id,
         feedback: "How big does it get under real traffic?".into(),
     });
-    wait_for_state(&mut rx, |s| {
-        matches!(s, CardState::Investigating(usine_core::RunSub::Running))
-    })
-    .await;
+    wait_for_state(&mut rx, |s| matches!(s, CardState::Failed { .. })).await;
+    exec.send(ExecutorCommand::Retry { card_id });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Concluded { .. })).await;
     assert!(card.cost > first_cost, "follow-up spend accumulates");
     {
         let runs = runs.lock().unwrap();
-        assert_eq!(runs.len(), 2);
+        assert_eq!(runs.len(), 2, "the failed launch never reached a provider");
         let (mode, _, prompt) = &runs[1];
         assert_eq!(*mode, RunMode::Investigate);
         assert!(
             prompt.contains(first_conclusion.trim()),
-            "the prior conclusion rides along on the follow-up"
+            "the prior conclusion rides along on the retried follow-up"
         );
         assert!(prompt.contains("How big does it get under real traffic?"));
     }
@@ -158,8 +175,10 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     assert!(card.qa_log.is_empty(), "the folded Q&A log is cleared");
     assert!(!card.cost.is_zero(), "investigation spend stays on the card");
     assert!(card.last_session.is_none(), "the next run starts fresh");
-    // The conversion also resets the skip-plan flag to the default mode.
+    // The conversion also resets the skip-plan flag to the default mode and
+    // drops the stashed follow-up context (a retry artifact of the old life).
     assert!(!store.get_skip_plan(card_id).unwrap());
+    assert!(store.get_investigation_extra(card_id).unwrap().is_none());
 
     // Exclusive commands sent while another holds the card are dropped as
     // duplicates (the dispatcher's double-click guard), and each releases its
@@ -184,5 +203,18 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         matches!(s, CardState::Designing(usine_core::DesignSub::Running))
     })
     .await;
-    assert_eq!(runs.lock().unwrap().last().unwrap().0, RunMode::Plan);
+    // The Designing(Running) echo is emitted BEFORE the provider launches, so
+    // poll for the spy's record instead of asserting on it immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mode = loop {
+        if let Some((mode, _, _)) = runs.lock().unwrap().get(2) {
+            break *mode;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the plan run to reach the provider"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(mode, RunMode::Plan);
 }
