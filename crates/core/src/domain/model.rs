@@ -1122,6 +1122,12 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub reviews: Vec<ReviewSummary>,
+    /// The rolled-up CI state of this card's PR, as of the last background poll
+    /// or manual refresh. Gates the merge button: a red or still-running build
+    /// blocks the merge (with an explicit "merge anyway" override), and a red
+    /// one offers an agent fix. `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub checks: CheckStatus,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1152,6 +1158,7 @@ impl Card {
             comment_count: 0,
             unanswered_count: 0,
             reviews: Vec::new(),
+            checks: CheckStatus::None,
             created_at: now,
             updated_at: now,
         }

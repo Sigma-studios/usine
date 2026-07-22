@@ -293,6 +293,7 @@ async fn a_merged_card_reaches_done_even_when_every_cleanup_step_fails() {
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
 
     wait_for(&mut rx, |e| match &e.kind {
@@ -330,6 +331,7 @@ async fn failed_cleanup_warns_the_user() {
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
 
     let msg = wait_for(&mut rx, |e| match &e.kind {
@@ -454,6 +456,7 @@ async fn an_already_merged_pr_still_completes_the_card() {
     handle.send(ExecutorCommand::Merge {
         card_id: card.id,
         delete_branch: true,
+        force: false,
     });
 
     wait_for(&mut rx, |e| match &e.kind {
