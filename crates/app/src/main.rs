@@ -32,6 +32,18 @@ pub static LOGO_URI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 /// icon want raster pixels, not SVG).
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_filled.png"));
 
+/// The user-visible app name. Sim/demo windows are labeled so a test instance
+/// is never mistaken for the real one — in the window title, and in the macOS
+/// Dock via `set_macos_display_name` (Windows/Linux taskbars show the window
+/// title).
+fn app_display_name() -> &'static str {
+    if state::demo_mode() {
+        "Usine (test)"
+    } else {
+        "Usine"
+    }
+}
+
 fn main() {
     // Installed `usine`, launched from a shell: re-exec once into a detached
     // background session so the prompt returns immediately and the window
@@ -47,7 +59,7 @@ fn main() {
         .try_init();
 
     use dioxus::desktop::{Config, WindowBuilder};
-    let mut window = WindowBuilder::new().with_title("Usine");
+    let mut window = WindowBuilder::new().with_title(app_display_name());
     if let Some(icon) = load_window_icon() {
         window = window.with_window_icon(Some(icon));
     }
@@ -134,6 +146,73 @@ fn set_macos_dock_icon() {
     }
 }
 
+/// Rename the running process in the macOS Dock / Cmd+Tab switcher. We don't
+/// ship a `.app` bundle, so the Dock name comes from the LaunchServices
+/// registration and the only way to change it at runtime is the private
+/// LaunchServices SPI (the same one Chromium and the JDK use). Every symbol is
+/// resolved via `dlsym` and null-checked, so on a macOS that drops the SPI this
+/// silently does nothing and only the window title carries the label.
+///
+/// Returns whether the rename call succeeded. The process has to be registered
+/// with LaunchServices first, and that checkin can lag window creation by a
+/// while on a cold debug start — so the caller retries until this reports
+/// success.
+#[cfg(target_os = "macos")]
+fn set_macos_display_name(name: &str) -> bool {
+    use std::ffi::{c_int, c_void, CStr};
+
+    type LSGetCurrentApplicationASN = unsafe extern "C" fn() -> *const c_void;
+    type LSSetApplicationInformationItem = unsafe extern "C" fn(
+        c_int,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *mut *const c_void,
+    ) -> c_int;
+
+    unsafe {
+        let handle = libc::dlopen(
+            c"/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/LaunchServices".as_ptr(),
+            libc::RTLD_LAZY,
+        );
+        if handle.is_null() {
+            return false;
+        }
+        let sym = |name: &CStr| libc::dlsym(handle, name.as_ptr());
+        let get_asn = sym(c"_LSGetCurrentApplicationASN");
+        let set_item = sym(c"_LSSetApplicationInformationItem");
+        // A `CFStringRef const` global — dlsym gives its address, so deref once.
+        let display_name_key = sym(c"_kLSDisplayNameKey") as *const *const c_void;
+        if get_asn.is_null() || set_item.is_null() || display_name_key.is_null() {
+            return false;
+        }
+        let get_asn: LSGetCurrentApplicationASN = std::mem::transmute(get_asn);
+        let set_item: LSSetApplicationInformationItem = std::mem::transmute(set_item);
+
+        // The ASN and the dereferenced key come from the SPI too — treat them
+        // as just as untrustworthy as the symbols themselves. A null ASN also
+        // means "not checked in with LaunchServices yet", i.e. retry later.
+        let asn = get_asn();
+        let key = *display_name_key;
+        if asn.is_null() || key.is_null() {
+            return false;
+        }
+
+        // NSString is toll-free bridged to CFString, so its pointer passes
+        // straight through as the CFStringRef value.
+        let ns_name = objc2_foundation::NSString::from_str(name);
+        let name_ptr: *const c_void = (&raw const *ns_name).cast();
+        const K_LS_DEFAULT_SESSION_ID: c_int = -2;
+        set_item(
+            K_LS_DEFAULT_SESSION_ID,
+            asn,
+            key,
+            name_ptr,
+            std::ptr::null_mut(),
+        ) == 0
+    }
+}
+
 /// Reflect the number of cards waiting on the user as the macOS dock badge —
 /// the little red circle. Reactive: re-runs whenever the card list changes and
 /// clears the badge when nothing needs attention. Uses tao's
@@ -169,6 +248,22 @@ fn App() -> Element {
 
     #[cfg(target_os = "macos")]
     use_hook(set_macos_dock_icon);
+
+    // Label the Dock / Cmd+Tab entry of a sim window. LaunchServices checkin
+    // can lag well behind the first render, and a rename attempted before it
+    // is silently lost — so keep retrying until one sticks.
+    #[cfg(target_os = "macos")]
+    use_future(|| async {
+        if !state::demo_mode() {
+            return;
+        }
+        for _ in 0..60 {
+            if set_macos_display_name(app_display_name()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
 
     // Show a dock badge whenever cards are waiting on the user.
     #[cfg(target_os = "macos")]
