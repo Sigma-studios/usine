@@ -28,6 +28,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .and_then(|p| p.config.reviewer.clone())
         .unwrap_or_default();
     let mut reviewer = use_signal(|| default_reviewer);
+    // Draft text for the Agent Chat sections, owned here (and handed to each
+    // `AgentChatSection`) so typed-but-unsent text survives the card moving
+    // between the parked states.
+    let draft = use_signal(String::new);
     let branch = card.branch.clone().unwrap_or_default();
     // The PR branch name is required and starts blank: the user must deliberately
     // choose one rather than shipping the auto-generated `usine/…` name.
@@ -71,6 +75,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         card.state,
         CardState::AwaitingReview(ReviewSub::Reviewing | ReviewSub::ApplyingFixes)
     );
+    let is_selecting_fixes = matches!(
+        card.state,
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+    );
     let is_ready_for_pr = matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr));
     // The validation gate's three faces: the check running, the agent fixing a
     // failure, and the parked exhausted-budget failure.
@@ -105,13 +113,16 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
         }
 
-        // 1) Just implemented: the work is committed in the worktree. Test it,
-        //    run a self-review pass, or send it back to the agent to revise.
+        // 1) The recovery gate: the self-review normally auto-starts when the
+        //    implementation finishes, so a card only rests here after a cancelled
+        //    review or a failed auto-start. Re-run it, skip it, or send the work
+        //    back to the agent to revise.
         if is_ready_for_review {
             div { class: "section",
                 h3 { "Self-review" }
                 div { class: "hint",
-                    "Run an automated review pass over the committed diff (guided by the project's \
+                    "The self-review normally starts by itself when the implementation finishes. \
+                     Run the review pass over the committed diff (guided by the project's \
                      review.md, or a default prompt), or skip straight to the pull request."
                 }
                 div { class: "row",
@@ -129,6 +140,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
             super::AgentChatSection {
                 card_id: id,
+                text: draft,
                 hint: "Not happy with the implementation, or curious why it went a certain way? \
                        Request changes to send it back to the agent's worktree, or ask a question \
                        without sending it back.",
@@ -138,10 +150,31 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
         }
 
-        // Self-review agent running.
+        // Self-review agent running. Cancelling parks the card back at the
+        // manual gate with all its options.
         if is_self_reviewing {
             div { class: "section",
                 div { class: "hint", "Self-review in progress…" }
+                button {
+                    class: "btn",
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
+                }
+            }
+        }
+
+        // The fix picker (rendered separately) is where an auto-reviewed card
+        // first parks, so the send-back affordance must be reachable from it too.
+        if is_selecting_fixes {
+            super::AgentChatSection {
+                card_id: id,
+                text: draft,
+                hint: "Not happy with the implementation, or curious why it went a certain way? \
+                       Request changes to send it back to the agent's worktree, or ask a question \
+                       without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
             }
         }
 
@@ -204,6 +237,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // The parked failure can also bounce the work back wholesale.
             super::AgentChatSection {
                 card_id: id,
+                text: draft,
                 hint: "Request changes to send the work back to the agent's worktree, or ask a \
                        question about it without sending it back.",
                 on_request: move |fb: String| {
@@ -338,6 +372,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,
+                text: draft,
                 hint: "Spotted something before opening the PR, or want to double-check a \
                        decision? Request changes to send it back to the agent's worktree, or ask \
                        a question without sending it back.",

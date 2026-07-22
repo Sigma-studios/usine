@@ -72,6 +72,10 @@ pub struct AppState {
     /// Per-card "skip plan" flags, seeded from the store at startup and kept in
     /// sync via `SkipPlanChanged` events — so the UI never reads the store.
     pub skip_plans: Signal<HashMap<Uuid, bool>>,
+    /// Per-card auto-review flags (true = the self-review auto-starts when the
+    /// implementation finishes; on by default), seeded from the store at startup
+    /// and kept in sync via `AutoReviewChanged` events.
+    pub auto_reviews: Signal<HashMap<Uuid, bool>>,
     /// Per-card attached image paths (Claude-only), seeded at startup and kept in
     /// sync via `AttachmentsChanged` events.
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
@@ -169,6 +173,7 @@ impl AppState {
         let projects = store.list_projects().unwrap_or_default();
         let cards = store.list_cards().unwrap_or_default();
         let skip_plans = store.skip_plan_flags().unwrap_or_default();
+        let auto_reviews = store.auto_review_flags().unwrap_or_default();
         let attachments = store.all_attachments().unwrap_or_default();
         let review_recaps = store.all_review_recaps().unwrap_or_default();
         let answers = store.all_answers().unwrap_or_default();
@@ -204,6 +209,7 @@ impl AppState {
             reviewers: Signal::new(HashMap::new()),
             review_tasks: Signal::new(review_tasks),
             skip_plans: Signal::new(skip_plans),
+            auto_reviews: Signal::new(auto_reviews),
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
             answers: Signal::new(answers),
@@ -323,6 +329,11 @@ impl AppState {
                 let id = evt.card_id;
                 let mut skip_plans = self.skip_plans;
                 skip_plans.write().insert(id, skip);
+            }
+            ExecutorEventKind::AutoReviewChanged { auto } => {
+                let id = evt.card_id;
+                let mut auto_reviews = self.auto_reviews;
+                auto_reviews.write().insert(id, auto);
             }
             ExecutorEventKind::CardBusy { busy } => {
                 let id = evt.card_id;
@@ -617,6 +628,22 @@ impl AppState {
     /// Mark/unmark a card to skip planning. Only meaningful before it starts.
     pub fn set_card_skip_plan(&self, card_id: Uuid, skip: bool) {
         self.send(ExecutorCommand::SetSkipPlan { card_id, skip });
+    }
+
+    /// Whether a card auto-starts its self-review when the implementation
+    /// finishes (on by default). Read from the signal seeded at startup and kept
+    /// current by `AutoReviewChanged` events (no store access).
+    pub fn card_auto_review(&self, card_id: Uuid) -> bool {
+        self.auto_reviews
+            .read()
+            .get(&card_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Turn a card's automatic self-review on/off.
+    pub fn set_card_auto_review(&self, card_id: Uuid, auto: bool) {
+        self.send(ExecutorCommand::SetAutoReview { card_id, auto });
     }
 
     /// A card's attached image paths (the managed copies). Read from the signal

@@ -375,6 +375,7 @@ async fn finalize_run(
         transition,
         Transition::SelfFixesDone | Transition::ValidationFixDone
     );
+    let is_implement_done = matches!(transition, Transition::AgentImplementDone);
     apply_transition(store, evt_tx, card_id, transition)?;
     // The fix has committed + pushed above, so ask the executor to mark the fixed
     // comments' GitHub threads resolved. Routed back through the command channel
@@ -384,6 +385,14 @@ async fn finalize_run(
     }
     if needs_validation {
         run_validation_direct(executor, evt_tx, card_id);
+    }
+    // A finished implementation flows straight into the self-review pass — no
+    // manual step between "implemented" and the fix picker. `ReadyForReview` is
+    // now transient, but stays the parking spot for a cancelled or failed review,
+    // and the resting place for cards whose per-card toggle opted out of the
+    // auto-start (its manual Self-review / Skip review buttons still work).
+    if is_implement_done && store.get_auto_review(card_id).unwrap_or(true) {
+        start_self_review_direct(executor, evt_tx, card_id);
     }
     if !summary.is_empty() {
         transcript(store, evt_tx, card_id, format!("✔ {summary}"));
@@ -476,6 +485,53 @@ pub(super) fn run_validation_direct(
                         message: e.to_string(),
                     },
                 );
+            }
+        }
+    });
+}
+
+/// Auto-start the pre-PR self-review from the actor that just finalized an
+/// implement run. A DIRECT executor call, never a re-dispatched command — a
+/// command sent from here races the in-flight claim still held by whatever
+/// drove the implement run and would be silently dropped (see `Executor::self_ref`).
+fn start_self_review_direct(
+    executor: &Weak<Executor>,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+) {
+    let Some(exec) = executor.upgrade() else {
+        return;
+    };
+    let evt_tx = evt_tx.clone();
+    tokio::spawn(async move {
+        // Hold the exclusive in-flight claim across the launch, exactly as a
+        // dispatched `SelfReview` command would. Without it, the window between
+        // the `StartSelfReview` transition and the runs-map insert (a git
+        // worktree add + provider spawn) is unguarded: a Cancel/BackToStart/
+        // MarkDone landing there finds no run to kill, so the state transition
+        // sticks while the just-spawning review runs on as an orphan. The claim
+        // makes the dispatcher drop concurrent exclusive commands and — via
+        // `CardBusy` — has the UI disable the card's buttons for that window.
+        let Some(_guard) = claim(&exec.in_flight, &evt_tx, card_id) else {
+            // Another exclusive command owns the card right now (e.g. the user
+            // hit "Back to start" just as the implementation finished) — let it
+            // win; the card rests at `ReadyForReview` with the manual buttons.
+            return;
+        };
+        match exec.self_review(card_id).await {
+            Ok(()) => {}
+            // The user beat the auto-start to the gate (Skip review, Back to
+            // start, Mark done…) — their choice stands, nothing to report.
+            Err(CoreError::IllegalTransition(_)) => {}
+            // A failed launch already demoted the card to Failed (retryable);
+            // an earlier failure leaves it parked at `ReadyForReview`, where the
+            // manual Self-review / Skip review buttons remain. Just surface it.
+            Err(e) => {
+                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Error,
+                    e.to_string(),
+                ));
             }
         }
     });

@@ -12,16 +12,20 @@ use crate::state::AppState;
 /// Props: `hint` explains what "request changes" means at this stage;
 /// `on_request` dispatches the panel-specific change command with the typed
 /// text. `request_enabled_when_blank` lets the plan panel submit answered
-/// questions with no free-form text (its request folds both).
+/// questions with no free-form text (its request folds both). A caller that
+/// renders the section from several alternating parked states can pass its own
+/// `text` signal so a typed-but-unsent draft survives the moves between them.
 #[component]
 pub(super) fn AgentChatSection(
     card_id: Uuid,
     hint: String,
     on_request: EventHandler<String>,
     #[props(default = false)] request_enabled_when_blank: bool,
+    text: Option<Signal<String>>,
 ) -> Element {
     let state = use_context::<AppState>();
-    let mut text = use_signal(String::new);
+    let own_text = use_signal(String::new);
+    let mut text = text.unwrap_or(own_text);
     let exchange = state.answers.read().get(&card_id).cloned();
     let blank = text.read().trim().is_empty();
 
