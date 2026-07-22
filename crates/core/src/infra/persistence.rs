@@ -195,15 +195,18 @@ struct DismissedReviewsRecord {
     pr_numbers: Vec<u64>,
 }
 
-/// The latest Agent Chat answer for a card. Its own record (not a field on
-/// [`CardReviewRecord`]) so adding it doesn't change an existing record's
-/// layout.
+/// The latest Agent Chat exchange for a card: the question is stashed when the
+/// run starts, the answer filled in when it finishes. Its own record (not a
+/// field on [`CardReviewRecord`]) so adding it doesn't change an existing
+/// record's layout.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[native_model(id = 11, version = 1, with = Json)]
 #[native_db]
 struct CardAnswerRecord {
     #[primary_key]
     card_id: String,
+    #[serde(default)]
+    question: String,
     answer: String,
 }
 
@@ -564,14 +567,40 @@ impl Store {
 
     // --- Agent Chat answers ---------------------------------------------
 
-    /// Store (or replace) a card's latest Agent Chat answer.
-    pub fn set_answer(&self, card_id: Uuid, answer: &str) -> Result<()> {
+    /// Stash the question a starting Agent Chat run will answer, clearing any
+    /// previous exchange. `set_answer` completes it when the run finishes.
+    pub fn set_question(&self, card_id: Uuid, question: &str) -> Result<()> {
         let rec = CardAnswerRecord {
             card_id: card_id.to_string(),
-            answer: answer.to_string(),
+            question: question.to_string(),
+            answer: String::new(),
         };
         let rw = self.db.rw_transaction()?;
         let old: Option<CardAnswerRecord> = rw.get().primary(rec.card_id.clone())?;
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// The stashed question of the in-flight (or just-finished) Agent Chat run.
+    pub fn get_question(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.question).filter(|s: &String| !s.is_empty()))
+    }
+
+    /// Store a card's latest Agent Chat answer, keeping the stashed question.
+    pub fn set_answer(&self, card_id: Uuid, answer: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        let rec = CardAnswerRecord {
+            card_id: card_id.to_string(),
+            question: old.as_ref().map(|o| o.question.clone()).unwrap_or_default(),
+            answer: answer.to_string(),
+        };
         match old {
             Some(old) => rw.update(old, rec)?,
             None => rw.insert(rec)?,
@@ -596,8 +625,9 @@ impl Store {
         Ok(())
     }
 
-    /// All cards' answers, keyed by card id (loaded once at startup).
-    pub fn all_answers(&self) -> Result<HashMap<Uuid, String>> {
+    /// All cards' answered exchanges as `(question, answer)`, keyed by card id
+    /// (loaded once at startup). Pending records (no answer yet) are skipped.
+    pub fn all_answers(&self) -> Result<HashMap<Uuid, (String, String)>> {
         let r = self.db.r_transaction()?;
         let mut out = HashMap::new();
         for rec in r.scan().primary::<CardAnswerRecord>()?.all()? {
@@ -606,7 +636,7 @@ impl Store {
                 continue;
             }
             if let Ok(id) = Uuid::parse_str(&rec.card_id) {
-                out.insert(id, rec.answer);
+                out.insert(id, (rec.question, rec.answer));
             }
         }
         Ok(out)

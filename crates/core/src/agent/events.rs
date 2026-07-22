@@ -460,9 +460,10 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
-    /// A card's Agent Chat answer changed (`card_id` on the event). Empty means
-    /// the answer was cleared (e.g. "back to start") and the UI drops its entry.
-    AnswerUpdated { answer: String },
+    /// A card's Agent Chat exchange changed (`card_id` on the event). An empty
+    /// `answer` means it was cleared (e.g. "back to start", or a write run
+    /// superseding it) and the UI drops its entry.
+    AnswerUpdated { question: String, answer: String },
     /// A card's implementation hand-off changed (`card_id` on the event). An
     /// empty [`Handoff`] means the latest implement run produced none, and the UI
     /// drops the previous attempt's.
@@ -572,10 +573,15 @@ impl ExecutorEvent {
             },
         }
     }
-    pub fn answer_updated(card_id: Uuid, answer: impl Into<String>) -> Self {
+    pub fn answer_updated(
+        card_id: Uuid,
+        question: impl Into<String>,
+        answer: impl Into<String>,
+    ) -> Self {
         ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::AnswerUpdated {
+                question: question.into(),
                 answer: answer.into(),
             },
         }

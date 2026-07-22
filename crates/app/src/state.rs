@@ -76,9 +76,15 @@ pub struct AppState {
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
     /// Per-card fixes recap, seeded at startup and updated via `RecapUpdated`.
     pub review_recaps: Signal<HashMap<Uuid, String>>,
-    /// Per-card Agent Chat answer (the last question run's prose reply), seeded
-    /// at startup and updated via `AnswerUpdated` (empty removes the entry).
-    pub answers: Signal<HashMap<Uuid, String>>,
+    /// Per-card Agent Chat exchange — the last question asked and its prose
+    /// answer — seeded at startup and updated via `AnswerUpdated` (an empty
+    /// answer removes the entry).
+    pub answers: Signal<HashMap<Uuid, (String, String)>>,
+    /// Per-card draft answers to a proposed plan's structured questions, keyed
+    /// alongside the plan text they answer. Held here (not in the plan panel)
+    /// because asking a chat question unmounts the panel mid-edit — a
+    /// component-local signal would come back blank. In-memory only.
+    pub plan_drafts: Signal<HashMap<Uuid, (String, Vec<String>)>>,
     /// Per-card implementation hand-off — the recap, open questions, and testing
     /// checklist the implement run left for its reviewer. Seeded at startup and
     /// updated via `HandoffUpdated`.
@@ -174,6 +180,7 @@ impl AppState {
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
             answers: Signal::new(answers),
+            plan_drafts: Signal::new(HashMap::new()),
             handoffs: Signal::new(handoffs),
             previews: Signal::new(HashMap::new()),
             diffs: Signal::new(HashMap::new()),
@@ -243,6 +250,8 @@ impl AppState {
                 attachments.write().remove(&id);
                 let mut answers = self.answers;
                 answers.write().remove(&id);
+                let mut plan_drafts = self.plan_drafts;
+                plan_drafts.write().remove(&id);
                 if *self.selected_card.read() == Some(id) {
                     let mut selected = self.selected_card;
                     selected.set(None);
@@ -342,14 +351,15 @@ impl AppState {
                 let mut recaps = self.review_recaps;
                 recaps.write().insert(evt.card_id, recap);
             }
-            // An empty answer means it was cleared ("back to start"): drop the
-            // entry so the panel shows nothing.
-            ExecutorEventKind::AnswerUpdated { answer } => {
+            // An empty answer means the exchange was cleared ("back to start",
+            // or a write run superseding it): drop the entry so the panel shows
+            // nothing.
+            ExecutorEventKind::AnswerUpdated { question, answer } => {
                 let mut answers = self.answers;
                 if answer.is_empty() {
                     answers.write().remove(&evt.card_id);
                 } else {
-                    answers.write().insert(evt.card_id, answer);
+                    answers.write().insert(evt.card_id, (question, answer));
                 }
             }
             // An empty hand-off means the run left none: drop the entry so the

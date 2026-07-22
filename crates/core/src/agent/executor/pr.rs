@@ -380,8 +380,6 @@ impl Executor {
     /// prose answer. Self-contained like `revise` — no session resume.
     pub(super) async fn ask_question(&self, card_id: Uuid, question: String) -> Result<()> {
         let question = question.trim().to_string();
-        // Keep the exchange so a later "back to start" folds it into the prompt.
-        self.record_qa(card_id, format!("Question: {question}"));
         let card = self.store.get_card(card_id)?;
         let plan = self.store.get_plan(card_id).unwrap_or(None);
         let (transition, stage, plan) = match &card.state {
@@ -426,6 +424,12 @@ impl Executor {
         };
         let extra = question_extra(stage, plan.as_deref(), &question);
         let card = self.apply(card_id, transition)?;
+        // Only now that the run is really happening, stash the question on the
+        // answer record: `finalize_question` reads it back to render the
+        // exchange and to log the answered Q&A pair on the restart log. A bare
+        // question must never be logged up front — folded into a later prompt
+        // it would read as a standing, unanswered directive.
+        self.store.set_question(card_id, &question)?;
         self.launch(card, RunMode::Question, Some(extra), None)
             .await
     }

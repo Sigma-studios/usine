@@ -88,11 +88,17 @@ async fn a_question_from_awaiting_review_round_trips_with_an_answer() {
     .await;
     // The answer arrives, then the card lands back on ReadyForReview — a run
     // that changed no files must NOT be demoted by the no-commit guard.
-    let answer = wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::AnswerUpdated { answer } => Some(answer.clone()),
+    let (question, answer) = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::AnswerUpdated { question, answer } => {
+            Some((question.clone(), answer.clone()))
+        }
         _ => None,
     })
     .await;
+    assert_eq!(
+        question, "why did you adapt at the boundary?",
+        "the exchange carries the (trimmed) question for the panel"
+    );
     assert!(!answer.is_empty(), "the question run must yield an answer");
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
@@ -106,10 +112,30 @@ async fn a_question_from_awaiting_review_round_trips_with_an_answer() {
     })
     .await;
 
-    // The question is on the restart log (trimmed) and the answer is persisted.
+    // The *answered* exchange is on the restart log (never a bare question,
+    // which a later prompt would read as a standing directive), and the answer
+    // is persisted.
     let qa = store.get_card(card_id).unwrap().qa_log;
-    assert_eq!(qa, vec!["Question: why did you adapt at the boundary?"]);
+    assert_eq!(
+        qa,
+        vec![format!(
+            "Q: why did you adapt at the boundary?\nA: {answer}"
+        )]
+    );
     assert_eq!(store.get_answer(card_id).unwrap(), Some(answer));
+
+    // A later change request supersedes the exchange: the write run's launch
+    // clears it so the panel can't resurface an answer about replaced work.
+    handle.send(ExecutorCommand::ReviseImplementation {
+        card_id,
+        feedback: "tighten the boundary".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::AnswerUpdated { answer, .. } if answer.is_empty() => Some(()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(store.get_answer(card_id).unwrap(), None);
 }
 
 #[tokio::test]
@@ -216,4 +242,26 @@ async fn a_ready_to_merge_question_returns_without_touching_the_recap() {
         Some("fixed the two nits")
     );
     assert!(store.get_answer(card_id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_question_from_an_illegal_state_leaves_no_trace() {
+    let store = Store::open_in_memory().unwrap();
+    let card_id = seed_card(&store, "/tmp/question-illegal");
+    let (handle, mut rx) = spawn_with(&store);
+
+    // Questions can't be asked from the starting block — the command must be
+    // refused without recording anything (the refusal surfaces as a toast).
+    handle.send(ExecutorCommand::AskQuestion {
+        card_id,
+        question: "too early?".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    assert!(store.get_card(card_id).unwrap().qa_log.is_empty());
+    assert_eq!(store.get_question(card_id).unwrap(), None);
 }

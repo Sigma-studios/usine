@@ -1348,6 +1348,7 @@ mod tests {
             &store,
             &evt_tx,
             card.id,
+            RunMode::Plan,
             AgentEvent::Done {
                 result: "I've launched the exploration agents. I'll wait for their findings."
                     .into(),
@@ -1387,6 +1388,7 @@ mod tests {
             &store,
             &evt_tx,
             card.id,
+            RunMode::Plan,
             AgentEvent::Done {
                 result,
                 cost_usd: 0.0,
@@ -1420,6 +1422,7 @@ mod tests {
             &store,
             &evt_tx,
             card.id,
+            RunMode::Plan,
             AgentEvent::Done {
                 result: result.into(),
                 cost_usd: 0.0,
@@ -1436,6 +1439,41 @@ mod tests {
             ),
             "expected AwaitingApproval, got {:?}",
             got.state
+        );
+    }
+
+    /// A read-only Question run must not claim `last_session`: it rides a write
+    /// state, so a died run's Retry would `--resume` the Q&A conversation as a
+    /// write run. The resumable modes still record theirs.
+    #[test]
+    fn a_question_run_started_never_claims_last_session() {
+        let (store, card) = designing_card();
+        let (evt_tx, _evt_rx) = mpsc::unbounded::<ExecutorEvent>();
+        handle_event(
+            &store,
+            &evt_tx,
+            card.id,
+            RunMode::Question,
+            AgentEvent::Started {
+                session_id: "qa-session".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get_card(card.id).unwrap().last_session, None);
+
+        handle_event(
+            &store,
+            &evt_tx,
+            card.id,
+            RunMode::Plan,
+            AgentEvent::Started {
+                session_id: "plan-session".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_card(card.id).unwrap().last_session.as_deref(),
+            Some("plan-session")
         );
     }
 }

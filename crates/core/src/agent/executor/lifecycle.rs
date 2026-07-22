@@ -191,6 +191,20 @@ impl Executor {
         };
         let run_id = Uuid::new_v4();
         lock(&self.runs).insert(card.id, (run_id, handle.control));
+        // Any run that can change the work supersedes the last Agent Chat
+        // exchange — drop it so the panel doesn't come back showing an answer
+        // about work that no longer exists. Cleared only once the run really
+        // started; the read-only runs (question/review/triage) leave it alone
+        // (a question replaces it itself in `finalize_question`).
+        if matches!(
+            mode,
+            RunMode::Plan | RunMode::Implement | RunMode::ApplyFixes
+        ) {
+            let _ = self.store.delete_answer(card.id);
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::answer_updated(card.id, "", ""));
+        }
 
         tokio::spawn(run_actor(
             card.id,
@@ -442,7 +456,7 @@ impl Executor {
         let _ = self.store.delete_answer(card_id);
         let _ = self
             .evt_tx
-            .unbounded_send(ExecutorEvent::answer_updated(card_id, ""));
+            .unbounded_send(ExecutorEvent::answer_updated(card_id, "", ""));
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx

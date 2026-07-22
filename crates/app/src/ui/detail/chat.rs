@@ -22,14 +22,18 @@ pub(super) fn AgentChatSection(
 ) -> Element {
     let state = use_context::<AppState>();
     let mut text = use_signal(String::new);
-    let answer = state.answers.read().get(&card_id).cloned();
+    let exchange = state.answers.read().get(&card_id).cloned();
     let blank = text.read().trim().is_empty();
 
     rsx! {
         div { class: "section",
             h3 { "Agent Chat" }
             div { class: "hint", "{hint}" }
-            if let Some(answer) = answer {
+            if let Some((question, answer)) = exchange {
+                if !question.is_empty() {
+                    div { class: "hint", "You asked" }
+                    div { class: "plan-box", "{question}" }
+                }
                 div { class: "hint", "Answer" }
                 div { class: "plan-box", "{answer}" }
             }
