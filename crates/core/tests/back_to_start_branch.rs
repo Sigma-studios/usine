@@ -95,6 +95,9 @@ async fn back_to_start_deletes_the_discarded_branch() {
     let card_id = card.id;
     store.upsert_card(&card).unwrap();
     store.set_skip_plan(card_id, true).unwrap();
+    // Opt out of the auto self-review so the card parks at the manual gate —
+    // this test is about the branch teardown, not the review flow.
+    store.set_auto_review(card_id, false).unwrap();
 
     let deleted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (handle, mut rx) = spawn_executor(ExecutorConfig {

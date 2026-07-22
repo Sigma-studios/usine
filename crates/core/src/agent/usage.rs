@@ -163,7 +163,7 @@ const CODEX_SCAN_FILES: usize = 5;
 /// a window that has since rolled over.
 pub fn read_codex_usage(sessions_root: &Path, now_secs: i64) -> Option<ProviderUsage> {
     let mut files = collect_jsonl_files(sessions_root);
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     for (_, path) in files.into_iter().take(CODEX_SCAN_FILES) {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;

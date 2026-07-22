@@ -285,8 +285,7 @@ async fn finalize_run(
                                     c.checks = CheckStatus::Pending;
                                     Ok(())
                                 }) {
-                                    let _ =
-                                        evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                                    let _ = evt_tx.unbounded_send(ExecutorEvent::updated(updated));
                                 }
                             }
                         }
