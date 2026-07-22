@@ -8,6 +8,7 @@ pub mod commit;
 pub mod events;
 pub mod executor;
 pub mod handoff;
+pub mod investigate;
 pub mod plan;
 pub mod provider;
 pub mod review;

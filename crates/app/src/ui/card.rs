@@ -54,6 +54,9 @@ pub fn CardView(card: Card) -> Element {
             if usine_core::parse_plan(plan).1.is_empty()
     );
     let awaiting_review = matches!(st, CardState::AwaitingReview(_));
+    // An investigation finished: its conclusion is the deliverable — the primary
+    // action is to read it (in the detail panel, where follow-up/convert live).
+    let concluded = matches!(st, CardState::Concluded { .. });
     // Nothing to triage until someone has actually left comments — the background
     // poll keeps the count fresh while the card sits in `Idle`. Keyed off the
     // *total*, matching the detail panel's `can_triage`: a comment from a
@@ -232,6 +235,13 @@ pub fn CardView(card: Card) -> Element {
                         class: "btn primary",
                         onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
                         "Review"
+                    }
+                }
+                if concluded {
+                    button {
+                        class: "btn primary",
+                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                        "Read conclusion"
                     }
                 }
                 if can_read {

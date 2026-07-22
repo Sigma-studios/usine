@@ -2,7 +2,7 @@
 //! and the run configuration form.
 
 use dioxus::prelude::*;
-use usine_core::{Card, CardConfig, ExecutorCommand, Provider};
+use usine_core::{Card, CardConfig, CardKind, ExecutorCommand, Provider};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -136,6 +136,19 @@ pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
 // Config form
 // ---------------------------------------------------------------------------
 
+/// The three ways a card can run, folded from its kind + skip-plan flag. The
+/// selector below writes both: `kind` on the card's config, `skip_plan` in its
+/// persisted side flag.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Plan first, then implement (the default).
+    Design,
+    /// Implement straight from the description, no plan phase.
+    Direct,
+    /// Read-only investigation ending in a conclusion — no code changes.
+    Investigate,
+}
+
 #[component]
 pub(super) fn ConfigForm(card: Card) -> Element {
     let state = use_context::<AppState>();
@@ -143,11 +156,19 @@ pub(super) fn ConfigForm(card: Card) -> Element {
     let provider = card.config.provider;
     // "Skip plan" mark — persisted, settable only here (before the card starts).
     let mut skip = use_signal(|| state.card_skip_plan(id));
-    let start_label = if skip() {
-        "Start implementing"
+    let mode = if card.config.kind == CardKind::Investigation {
+        Mode::Investigate
+    } else if skip() {
+        Mode::Direct
     } else {
-        "Start designing"
+        Mode::Design
     };
+    let start_label = match mode {
+        Mode::Design => "Start designing",
+        Mode::Direct => "Start implementing",
+        Mode::Investigate => "Start investigation",
+    };
+    let mode_btn = |m: Mode| if mode == m { "btn primary" } else { "btn" };
 
     rsx! {
         div { class: "section",
@@ -159,54 +180,91 @@ pub(super) fn ConfigForm(card: Card) -> Element {
                     value: provider_value(provider),
                     onchange: move |e: Event<FormData>| {
                         // Switching provider resets the models to that provider's
-                        // defaults so the selectors always show valid options.
+                        // defaults so the selectors always show valid options —
+                        // but keeps the chosen mode (kind) intact.
                         state.update_card(id, |c| {
+                            let kind = c.config.kind;
                             c.config = CardConfig::default_for(parse_provider(&e.value()));
+                            c.config.kind = kind;
                         });
                     },
                     option { value: "claude", selected: provider_value(provider) == "claude", "Claude" }
                     option { value: "codex", selected: provider_value(provider) == "codex", "Codex" }
                 }
             }
-            label { class: "checkbox-row",
-                input {
-                    r#type: "checkbox",
-                    checked: skip(),
-                    onchange: move |_| {
-                        let v = !skip();
-                        skip.set(v);
-                        state.set_card_skip_plan(id, v);
-                    },
+            div { class: "field",
+                label { "Mode" }
+                div { class: "option-row",
+                    button {
+                        class: mode_btn(Mode::Design),
+                        onclick: move |_| {
+                            state.update_card(id, |c| c.config.kind = CardKind::Task);
+                            skip.set(false);
+                            state.set_card_skip_plan(id, false);
+                        },
+                        "Design + implement"
+                    }
+                    button {
+                        class: mode_btn(Mode::Direct),
+                        onclick: move |_| {
+                            state.update_card(id, |c| c.config.kind = CardKind::Task);
+                            skip.set(true);
+                            state.set_card_skip_plan(id, true);
+                        },
+                        "Implement directly"
+                    }
+                    button {
+                        class: mode_btn(Mode::Investigate),
+                        onclick: move |_| {
+                            state.update_card(id, |c| c.config.kind = CardKind::Investigation);
+                        },
+                        "Investigate only"
+                    }
                 }
-                span { "Skip planning — implement straight from the description" }
+                if mode == Mode::Investigate {
+                    div { class: "hint",
+                        "Read-only: the agent audits the code and returns a conclusion — no changes, no branch, no PR."
+                    }
+                }
             }
-            if !skip() {
+            if mode == Mode::Investigate {
                 div { class: "field",
-                    label { "Plan phase" }
+                    label { "Investigate phase" }
                     ModelEffortPicker {
                         provider,
                         spec: card.config.plan.clone(),
                         on_change: move |spec| state.update_card(id, |c| c.config.plan = spec),
                     }
                 }
-            }
-            div { class: "field",
-                label { "Implement phase" }
-                ModelEffortPicker {
-                    provider,
-                    spec: card.config.implement.clone(),
-                    on_change: move |spec| state.update_card(id, |c| c.config.implement = spec),
+            } else {
+                if mode == Mode::Design {
+                    div { class: "field",
+                        label { "Plan phase" }
+                        ModelEffortPicker {
+                            provider,
+                            spec: card.config.plan.clone(),
+                            on_change: move |spec| state.update_card(id, |c| c.config.plan = spec),
+                        }
+                    }
                 }
-            }
-            div { class: "field",
-                label { "Review phase" }
-                OptionalModelEffortPicker {
-                    provider,
-                    spec: card.config.review.clone(),
-                    inherit_label: "Same as implement",
-                    on_change: move |spec| state.update_card(id, |c| c.config.review = spec),
+                div { class: "field",
+                    label { "Implement phase" }
+                    ModelEffortPicker {
+                        provider,
+                        spec: card.config.implement.clone(),
+                        on_change: move |spec| state.update_card(id, |c| c.config.implement = spec),
+                    }
                 }
-                div { class: "hint", "Self-review and PR-comment triage." }
+                div { class: "field",
+                    label { "Review phase" }
+                    OptionalModelEffortPicker {
+                        provider,
+                        spec: card.config.review.clone(),
+                        inherit_label: "Same as implement",
+                        on_change: move |spec| state.update_card(id, |c| c.config.review = spec),
+                    }
+                    div { class: "hint", "Self-review and PR-comment triage." }
+                }
             }
             button {
                 class: "btn primary",
