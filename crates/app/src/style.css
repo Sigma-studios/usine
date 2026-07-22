@@ -249,6 +249,8 @@ select option { background: var(--panel-2); color: var(--text); }
 .badge.cost { background: var(--badge-cost-bg); color: var(--badge-cost-fg); }
 .badge.intervention { background: var(--amber); color: var(--intervention-fg); font-weight: 600; }
 .badge.status { background: var(--panel-2); color: var(--muted); }
+.badge.pr-link { font-family: ui-monospace, monospace; color: var(--muted); text-decoration: none; }
+.badge.pr-link:hover { color: var(--text); text-decoration: underline; }
 .spinner { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
