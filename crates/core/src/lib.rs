@@ -34,7 +34,8 @@ pub use agent::review::{
     REVIEW_TRIAGE_INSTRUCTION, SELF_REVIEW_INSTRUCTION,
 };
 pub use agent::startup::{
-    reconcile_interrupted_reviews, reconcile_interrupted_runs, sync_base_branches,
+    binary_on_path, reconcile_interrupted_reviews, reconcile_interrupted_runs,
+    seed_default_provider, sync_base_branches,
 };
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
