@@ -31,7 +31,6 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
     // just like a Ready-for-PR card — the agent updates the branch and pushes,
     // updating the open PR in place.
     let is_idle = matches!(card.state, CardState::PrReview(PrReviewSub::Idle));
-    let mut change_feedback = use_signal(String::new);
 
     // The background poll keeps `card.reviews` fresh alongside the comment count,
     // so the panel just renders what the card knows — no fetch on open.
@@ -100,29 +99,13 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
             }
         }
         if is_idle {
-            div { class: "section",
-                h3 { "Request a change" }
-                div { class: "hint",
-                    "Want to tweak the branch without waiting on a review? Send the change to the agent — it updates this PR in place."
-                }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change?",
-                        value: "{change_feedback}",
-                        oninput: move |e| change_feedback.set(e.value()),
-                    }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = change_feedback.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
-                            change_feedback.set(String::new());
-                        }
-                    },
-                    "Send change"
-                }
+            super::AgentChatSection {
+                card_id: id,
+                hint: "Want to tweak the branch without waiting on a review, or ask about the \
+                       work? A change updates this PR in place; a question leaves it untouched.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
+                },
             }
         }
         if is_fetching {

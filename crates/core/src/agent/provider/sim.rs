@@ -190,6 +190,28 @@ async fn simulate(
                 },
             });
         }
+        RunMode::Question => {
+            emit!(AgentEvent::Progress {
+                text: "📖 Reading the work in this worktree…".into()
+            });
+            pause!(400);
+            emit!(AgentEvent::Progress {
+                text: "💬 Writing an answer…".into()
+            });
+            pause!(400);
+            // Read-only by contract: a prose answer, no file writes.
+            emit!(AgentEvent::Done {
+                result: "Good question. The change keeps the existing call sites untouched by \
+                         adapting at the boundary, so nothing downstream needs to migrate; the \
+                         flag currently defaults to on. No defect found while checking this."
+                    .into(),
+                cost_usd: 0.03,
+                usage: Usage {
+                    input_tokens: 2_000,
+                    output_tokens: 400,
+                },
+            });
+        }
         RunMode::Investigate => {
             emit!(AgentEvent::Progress {
                 text: "🔎 Reading the code paths in question…".into()
