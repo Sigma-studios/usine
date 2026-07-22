@@ -124,8 +124,21 @@ body {
 .nav-item:hover { background: var(--panel-2); }
 .nav-item.active { background: var(--accent-2); color: white; }
 .nav-item.home { font-weight: 600; flex: 1; }
+/* Three-state health dot: bare = accent = cards waiting on you;
+   `.urgent` = failed / agent question; `.idle` = nothing pending. */
 .proj-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+.proj-dot.urgent { background: var(--red); }
+.proj-dot.idle { background: var(--border); }
 .proj-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Cards-waiting count: same geometry as `.proj-badge` but sitting in normal
+   flow, right-aligned against the name by the name's `flex: 1`. */
+.proj-count {
+  flex: none; min-width: 14px; height: 14px; padding: 0 3px; box-sizing: border-box;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--red); color: white; border-radius: 7px;
+  font-size: 9px; font-weight: 700; line-height: 1;
+}
+.nav-item.active .proj-count { box-shadow: 0 0 0 1.5px var(--accent-2); }
 .proj-trash {
   flex: none; background: transparent; border: none; color: inherit; cursor: pointer;
   padding: 2px; border-radius: 4px; display: flex; align-items: center; opacity: 0;

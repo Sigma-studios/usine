@@ -464,6 +464,24 @@ impl AppState {
             .unwrap_or(0)
     }
 
+    /// (waiting, urgent) card counts for a project's sidebar row — the
+    /// per-project slice of the dock badge's card count. `urgent` is the
+    /// subset that is failed or blocked on a question (red dot).
+    pub fn project_attention_counts(&self, project_id: Uuid) -> (usize, usize) {
+        let cards = self.cards.read();
+        let mut waiting = 0;
+        let mut urgent = 0;
+        for c in cards.iter().filter(|c| c.project_id == project_id) {
+            if c.needs_attention() {
+                waiting += 1;
+                if c.needs_urgent_attention() {
+                    urgent += 1;
+                }
+            }
+        }
+        (waiting, urgent)
+    }
+
     /// Total review tasks needing attention across all projects (dock badge).
     pub fn review_attention_count(&self) -> usize {
         self.review_tasks

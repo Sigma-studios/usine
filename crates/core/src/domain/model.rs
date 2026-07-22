@@ -529,6 +529,20 @@ impl CardState {
             )
     }
 
+    /// The urgent slice of [`Self::needs_attention`]: a run faulted, validation
+    /// gave up, or the agent is blocked on a question. Routine hand-offs (plan
+    /// approval, review, merge, fix selection) are deliberately excluded so the
+    /// red sidebar dot keeps meaning "something went wrong".
+    pub fn needs_urgent_attention(&self) -> bool {
+        matches!(
+            self,
+            CardState::Designing(DesignSub::Intervention(_))
+                | CardState::Implementing(RunSub::Intervention(_))
+                | CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
+                | CardState::Failed { .. }
+        )
+    }
+
     pub fn is_failed(&self) -> bool {
         matches!(self, CardState::Failed { .. })
     }
@@ -1177,6 +1191,13 @@ impl Card {
                     || self.reviews.iter().any(ReviewSummary::is_actionable)))
     }
 
+    /// The urgent slice of [`Self::needs_attention`]. Pure delegation to
+    /// [`CardState::needs_urgent_attention`]: a landed review on a parked PR is
+    /// "waiting", never urgent.
+    pub fn needs_urgent_attention(&self) -> bool {
+        self.state.needs_urgent_attention()
+    }
+
     /// Whether an approval has landed with nothing left to triage, so the card
     /// can go straight to the merge gate.
     ///
@@ -1288,6 +1309,41 @@ mod tests {
             CardState::Done,
         ] {
             assert!(!s.needs_attention(), "{s:?} should not need attention");
+        }
+    }
+
+    #[test]
+    fn urgent_attention_is_the_broken_subset_of_attention() {
+        // Faulted, exhausted validation, and agent questions → red tier.
+        let urgent = [
+            CardState::Designing(DesignSub::Intervention(intervention())),
+            CardState::Implementing(RunSub::Intervention(intervention())),
+            CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                attempt: 3,
+                output: "boom".into(),
+            }),
+            CardState::Failed {
+                previous: Box::new(CardState::Implementing(RunSub::Running)),
+                message: "boom".into(),
+            },
+        ];
+        for s in urgent {
+            assert!(s.needs_urgent_attention(), "{s:?} should be urgent");
+            // Urgent ⊆ attention.
+            assert!(s.needs_attention(), "{s:?} urgent implies attention");
+        }
+
+        // Routine hand-offs badge but stay in the accent "waiting" tier.
+        for s in [
+            CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() }),
+            CardState::PrReview(PrReviewSub::SelectingFixes { verdicts: vec![] }),
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts: vec![] }),
+            CardState::AwaitingReview(ReviewSub::ReadyForReview),
+            CardState::AwaitingReview(ReviewSub::ReadyForPr),
+            CardState::ReadyToMerge,
+        ] {
+            assert!(s.needs_attention(), "{s:?} should need attention");
+            assert!(!s.needs_urgent_attention(), "{s:?} should not be urgent");
         }
     }
 
