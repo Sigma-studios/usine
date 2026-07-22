@@ -164,10 +164,9 @@ mod tests {
     #[test]
     fn first_run_defaults_to_claude_otherwise() {
         // Both installed and Claude-only: both seed and persist Claude.
-        for installed in [
-            (|_: Provider| true) as fn(Provider) -> bool,
-            |p| p == Provider::Claude,
-        ] {
+        for installed in [(|_: Provider| true) as fn(Provider) -> bool, |p| {
+            p == Provider::Claude
+        }] {
             let store = Store::open_in_memory().unwrap();
             assert_eq!(
                 seed_default_provider(&store, installed).unwrap(),

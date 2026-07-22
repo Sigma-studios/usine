@@ -14,8 +14,8 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardKind, CardState, CoreError,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig,
-    Provider, ProviderFactory, Result, RunConfig, RunHandle, RunMode, SimFactory, SimForge,
-    SimGit, Store,
+    Provider, ProviderFactory, Result, RunConfig, RunHandle, RunMode, SimFactory, SimForge, SimGit,
+    Store,
 };
 
 /// Every run config handed to a provider: `(mode, workdir, full prompt)`.
@@ -41,11 +41,10 @@ impl AgentProvider for SpyProvider {
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(CoreError::other("simulated launch failure"));
         }
-        self.runs.lock().unwrap().push((
-            cfg.mode,
-            cfg.project_dir.clone(),
-            cfg.full_prompt(),
-        ));
+        self.runs
+            .lock()
+            .unwrap()
+            .push((cfg.mode, cfg.project_dir.clone(), cfg.full_prompt()));
         self.inner.start(cfg).await
     }
 }
@@ -98,9 +97,16 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     let project = Project::new("p", PathBuf::from("/tmp/p"), ProjectConfig::default());
     store.upsert_project(&project).unwrap();
 
-    let mut config = CardConfig::default();
-    config.kind = CardKind::Investigation;
-    let card = Card::new(project.id, "Audit the cache", "Is the cache bounded?", config);
+    let config = CardConfig {
+        kind: CardKind::Investigation,
+        ..Default::default()
+    };
+    let card = Card::new(
+        project.id,
+        "Audit the cache",
+        "Is the cache bounded?",
+        config,
+    );
     let card_id = card.id;
     store.upsert_card(&card).unwrap();
 
@@ -120,7 +126,10 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     exec.send(ExecutorCommand::Start { card_id });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Concluded { .. })).await;
     assert!(card.needs_attention(), "the conclusion drives the badge");
-    assert!(card.worktree_path.is_none(), "no worktree for investigations");
+    assert!(
+        card.worktree_path.is_none(),
+        "no worktree for investigations"
+    );
     assert!(card.branch.is_none(), "no branch either");
     assert!(!card.cost.is_zero(), "the run's cost lands on the card");
     let first_cost = card.cost;
@@ -187,10 +196,17 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     exec.send(ExecutorCommand::ConvertToImplementation { card_id });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::StartingBlock)).await;
     assert_eq!(card.config.kind, CardKind::Task);
-    assert!(card.description.contains("## Findings (from investigation)"));
-    assert!(card.description.contains("How big does it get under real traffic?"));
+    assert!(card
+        .description
+        .contains("## Findings (from investigation)"));
+    assert!(card
+        .description
+        .contains("How big does it get under real traffic?"));
     assert!(card.qa_log.is_empty(), "the folded Q&A log is cleared");
-    assert!(!card.cost.is_zero(), "investigation spend stays on the card");
+    assert!(
+        !card.cost.is_zero(),
+        "investigation spend stays on the card"
+    );
     assert!(card.last_session.is_none(), "the next run starts fresh");
     // The conversion also resets the skip-plan flag to the default mode and
     // drops the stashed follow-up context (a retry artifact of the old life).

@@ -443,9 +443,9 @@ impl Executor {
                 task.pr_number
             )
         };
-        let _ = self
-            .evt_tx
-            .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Success, toast));
+        let _ =
+            self.evt_tx
+                .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Success, toast));
         Ok(())
     }
 
