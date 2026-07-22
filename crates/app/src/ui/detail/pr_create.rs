@@ -6,7 +6,6 @@
 
 use dioxus::prelude::*;
 use usine_core::{Card, CardState, ExecutorCommand, Handoff, ReviewSub, MAX_VALIDATION_ATTEMPTS};
-use uuid::Uuid;
 
 use crate::state::AppState;
 
@@ -29,10 +28,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .and_then(|p| p.config.reviewer.clone())
         .unwrap_or_default();
     let mut reviewer = use_signal(|| default_reviewer);
-    // Free-form feedback for sending the implementation back to the agent,
-    // owned here (and handed to each `RequestChanges`) so typed-but-unsent
-    // feedback survives the card moving between the parked states.
-    let revision = use_signal(String::new);
+    // Draft text for the Agent Chat sections, owned here (and handed to each
+    // `AgentChatSection`) so typed-but-unsent text survives the card moving
+    // between the parked states.
+    let draft = use_signal(String::new);
     let branch = card.branch.clone().unwrap_or_default();
     // The PR branch name is required and starts blank: the user must deliberately
     // choose one rather than shipping the auto-generated `usine/…` name.
@@ -139,10 +138,15 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                     }
                 }
             }
-            RequestChanges {
+            super::AgentChatSection {
                 card_id: id,
-                revision,
-                hint: "Not happy with the implementation? Send it back to the agent to revise in its worktree.",
+                text: draft,
+                hint: "Not happy with the implementation, or curious why it went a certain way? \
+                       Request changes to send it back to the agent's worktree, or ask a question \
+                       without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
             }
         }
 
@@ -162,10 +166,15 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         // The fix picker (rendered separately) is where an auto-reviewed card
         // first parks, so the send-back affordance must be reachable from it too.
         if is_selecting_fixes {
-            RequestChanges {
+            super::AgentChatSection {
                 card_id: id,
-                revision,
-                hint: "Not happy with the implementation? Send it back to the agent to revise in its worktree.",
+                text: draft,
+                hint: "Not happy with the implementation, or curious why it went a certain way? \
+                       Request changes to send it back to the agent's worktree, or ask a question \
+                       without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
             }
         }
 
@@ -226,7 +235,15 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
             // The parked failure can also bounce the work back wholesale.
-            RequestChanges { card_id: id, revision }
+            super::AgentChatSection {
+                card_id: id,
+                text: draft,
+                hint: "Request changes to send the work back to the agent's worktree, or ask a \
+                       question about it without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
+            }
         }
 
         // 2) Ready to open the pull request.
@@ -353,46 +370,15 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
 
             // Still bounce the work back to the agent before opening the PR.
-            RequestChanges {
+            super::AgentChatSection {
                 card_id: id,
-                revision,
-                hint: "Spotted something before opening the PR? Send it back to the agent to revise in its worktree.",
-            }
-        }
-    }
-}
-
-/// The "Request changes" section every parked pre-PR state renders: free-form
-/// feedback that sends the finished implementation back to the agent to revise
-/// in its worktree. The `revision` signal is the caller's, so typed-but-unsent
-/// feedback survives the card moving between those states.
-#[component]
-fn RequestChanges(card_id: Uuid, revision: Signal<String>, hint: Option<String>) -> Element {
-    let state = use_context::<AppState>();
-    let mut revision = revision;
-    rsx! {
-        div { class: "section",
-            h3 { "Request changes" }
-            if let Some(hint) = hint {
-                div { class: "hint", "{hint}" }
-            }
-            div { class: "field",
-                textarea {
-                    placeholder: "What should the agent change or improve?",
-                    value: "{revision}",
-                    oninput: move |e| revision.set(e.value()),
-                }
-            }
-            button {
-                class: "btn",
-                onclick: move |_| {
-                    let fb = revision.read().trim().to_string();
-                    if !fb.is_empty() {
-                        state.send(ExecutorCommand::ReviseImplementation { card_id, feedback: fb });
-                        revision.set(String::new());
-                    }
+                text: draft,
+                hint: "Spotted something before opening the PR, or want to double-check a \
+                       decision? Request changes to send it back to the agent's worktree, or ask \
+                       a question without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },
-                "Send back to implementing"
             }
         }
     }

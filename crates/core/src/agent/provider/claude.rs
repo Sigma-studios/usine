@@ -69,9 +69,14 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     args.push("Agent,Task,ScheduleWakeup,Workflow".into());
 
     match cfg.mode {
-        // Read-only phases (planning, self-review, comment triage): restrict to
-        // read-only tools so the agent can inspect but never edit.
-        RunMode::Plan | RunMode::Review | RunMode::Triage | RunMode::Investigate => {
+        // Read-only phases (planning, self-review, comment triage, Q&A,
+        // investigation): restrict to read-only tools so the agent can inspect
+        // but never edit.
+        RunMode::Plan
+        | RunMode::Review
+        | RunMode::Triage
+        | RunMode::Question
+        | RunMode::Investigate => {
             args.push("--permission-mode".into());
             args.push("plan".into());
         }
@@ -333,6 +338,13 @@ mod tests {
             pair(&args, "--output-format").as_deref(),
             Some("stream-json")
         );
+    }
+
+    #[test]
+    fn question_args_are_read_only() {
+        let args = build_args(&cfg(RunMode::Question));
+        assert_eq!(pair(&args, "--permission-mode").as_deref(), Some("plan"));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]

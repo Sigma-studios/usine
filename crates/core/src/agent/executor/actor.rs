@@ -112,6 +112,9 @@ pub(super) async fn run_actor(
             (AgentEvent::Done { .. }, RunMode::Triage) => {
                 finalize_triage(&store, &evt_tx, card_id, evt)
             }
+            (AgentEvent::Done { .. }, RunMode::Question) => {
+                finalize_question(&store, &evt_tx, card_id, evt)
+            }
             (AgentEvent::Done { .. }, RunMode::Investigate) => {
                 finalize_investigation(&store, &evt_tx, card_id, evt)
             }
@@ -133,7 +136,7 @@ pub(super) async fn run_actor(
                     conclude_investigation(&store, &evt_tx, card_id, plan)
                 }
             }
-            _ => handle_event(&store, &evt_tx, card_id, evt),
+            _ => handle_event(&store, &evt_tx, card_id, mode, evt),
         };
         match result {
             Ok(()) => {}
@@ -570,6 +573,69 @@ fn finalize_triage(
     Ok(())
 }
 
+/// Finalize a read-only Agent Chat question run: record cost, persist + emit
+/// the prose answer, and apply the agent-done transition that lands the card
+/// back where the question was asked from. Never touches git — a question run
+/// changes no files by contract, so the no-commit guard in `finalize_run` must
+/// not see it — and never touches the hand-off or the fixes recap.
+fn finalize_question(
+    store: &Store,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+    evt: AgentEvent,
+) -> Result<()> {
+    let (answer, cost) = match evt {
+        AgentEvent::Done {
+            result, cost_usd, ..
+        } => (result, cost_usd),
+        _ => return Ok(()),
+    };
+    // Route back by the card's *current* running state (see `ask_question` for
+    // the entry edges). Any other state means a cancel/supersede race — skip.
+    let transition = match store.get_card(card_id)?.state {
+        // A plan-stage question: restore the stashed plan verbatim so the card
+        // returns to AwaitingApproval exactly as it left it. Without a stored
+        // plan (a delete raced us), demote rather than restore an empty plan.
+        CardState::Designing(DesignSub::Running) => match store.get_plan(card_id)? {
+            Some(plan) => Transition::AgentPlanReady { plan },
+            None => Transition::AgentError {
+                message: "the plan under discussion went missing — retry to re-plan".into(),
+            },
+        },
+        CardState::Implementing(RunSub::Running) => Transition::AgentImplementDone,
+        CardState::PrReview(PrReviewSub::ApplyingChange | PrReviewSub::ApplyingFixes) => {
+            Transition::AgentFixesDone
+        }
+        _ => return Ok(()),
+    };
+    let question = store
+        .get_question(card_id)
+        .unwrap_or(None)
+        .unwrap_or_default();
+    store.mutate_card(card_id, |c| {
+        c.cost += crate::Cost::from_usd(cost);
+        c.updated_at = now_millis();
+        // Only the *answered* exchange goes on the restart log — a bare
+        // question folded into a later prompt would read as a standing
+        // directive. Same "Q:/A:" shape the intervention answers use.
+        if !question.is_empty() && !answer.is_empty() {
+            c.qa_log.push(format!("Q: {question}\nA: {answer}"));
+        }
+        Ok(())
+    })?;
+    let _ = store.set_answer(card_id, &answer);
+    let _ = evt_tx.unbounded_send(ExecutorEvent::answer_updated(
+        card_id,
+        question,
+        answer.clone(),
+    ));
+    apply_transition(store, evt_tx, card_id, transition)?;
+    if !answer.is_empty() {
+        transcript(store, evt_tx, card_id, format!("✔ {answer}"));
+    }
+    Ok(())
+}
+
 /// The floor under an investigation conclusion: anything shorter is the agent
 /// bailing mid-thought on a dangling status line, not a verdict. Much lower
 /// than a plan's, since a one-sentence verdict is a legitimate conclusion.
@@ -657,18 +723,29 @@ pub(super) fn handle_event(
     store: &Store,
     evt_tx: &UnboundedSender<ExecutorEvent>,
     card_id: Uuid,
+    mode: RunMode,
     evt: AgentEvent,
 ) -> Result<()> {
     match evt {
         AgentEvent::Started { session_id } => {
-            // Remember the provider session so a later Resume can --resume it.
-            let _ = store.mutate_card(card_id, |c| {
-                if c.last_session.as_deref() != Some(session_id.as_str()) {
-                    c.last_session = Some(session_id.clone());
-                    c.updated_at = now_millis();
-                }
-                Ok(())
-            });
+            // Remember the provider session so a later Resume can --resume it —
+            // but only for the modes a retry actually resumes (see `relaunch`).
+            // The read-only side runs (question/review/triage) must not claim
+            // `last_session`: a died Question run leaves the card in a *write*
+            // running state, and its Retry would otherwise resume the read-only
+            // Q&A conversation as a write run.
+            if matches!(
+                mode,
+                RunMode::Plan | RunMode::Implement | RunMode::ApplyFixes
+            ) {
+                let _ = store.mutate_card(card_id, |c| {
+                    if c.last_session.as_deref() != Some(session_id.as_str()) {
+                        c.last_session = Some(session_id.clone());
+                        c.updated_at = now_millis();
+                    }
+                    Ok(())
+                });
+            }
             transcript(store, evt_tx, card_id, format!("● session {session_id}"));
         }
         AgentEvent::Progress { text } => {

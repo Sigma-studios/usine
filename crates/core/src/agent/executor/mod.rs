@@ -406,6 +406,9 @@ impl Executor {
             ExecutorCommand::ReviseImplementation { card_id, feedback } => {
                 self.revise(card_id, feedback).await
             }
+            ExecutorCommand::AskQuestion { card_id, question } => {
+                self.ask_question(card_id, question).await
+            }
             ExecutorCommand::FollowUpInvestigation { card_id, feedback } => {
                 self.follow_up_investigation(card_id, feedback).await
             }
@@ -989,6 +992,34 @@ fn revise_extra(plan: Option<&str>, feedback: &str) -> String {
          requested. Review the current changes and update them accordingly:\n\n",
     );
     s.push_str(feedback);
+    s
+}
+
+/// Extra prompt for an Agent Chat question: where the work currently sits, the
+/// plan when one exists, the user's question, and the read-only contract. The
+/// run is a fresh conversation, so the stage sentence anchors what "this work"
+/// means before the agent starts reading.
+fn question_extra(stage: &str, plan: Option<&str>, question: &str) -> String {
+    let mut s = String::new();
+    s.push_str(stage);
+    s.push_str("\n\n");
+    if let Some(plan) = plan {
+        let (plan, _) = crate::agent::plan::parse_plan(plan);
+        if !plan.trim().is_empty() {
+            s.push_str("The plan for this work:\n");
+            s.push_str(plan.trim());
+            s.push_str("\n\n");
+        }
+    }
+    s.push_str("The user has a question about this work — answer it, do not change anything:\n\n");
+    s.push_str(question);
+    s.push_str(
+        "\n\nThis is a READ-ONLY turn: do NOT modify, create, or delete any files, and do not \
+         commit or push. Inspect whatever you need, then answer concisely in your final message. \
+         Do not ask questions back — state your assumptions instead. If investigating the \
+         question reveals a real defect, say so plainly; the user will decide whether to send a \
+         change request.",
+    );
     s
 }
 
@@ -1685,6 +1716,7 @@ mod tests {
             &store,
             &evt_tx,
             card.id,
+            RunMode::Plan,
             AgentEvent::Done {
                 result: "I've launched the exploration agents. I'll wait for their findings."
                     .into(),
@@ -1724,6 +1756,7 @@ mod tests {
             &store,
             &evt_tx,
             card.id,
+            RunMode::Plan,
             AgentEvent::Done {
                 result,
                 cost_usd: 0.0,
@@ -1757,6 +1790,7 @@ mod tests {
             &store,
             &evt_tx,
             card.id,
+            RunMode::Plan,
             AgentEvent::Done {
                 result: result.into(),
                 cost_usd: 0.0,
@@ -1773,6 +1807,41 @@ mod tests {
             ),
             "expected AwaitingApproval, got {:?}",
             got.state
+        );
+    }
+
+    /// A read-only Question run must not claim `last_session`: it rides a write
+    /// state, so a died run's Retry would `--resume` the Q&A conversation as a
+    /// write run. The resumable modes still record theirs.
+    #[test]
+    fn a_question_run_started_never_claims_last_session() {
+        let (store, card) = designing_card();
+        let (evt_tx, _evt_rx) = mpsc::unbounded::<ExecutorEvent>();
+        handle_event(
+            &store,
+            &evt_tx,
+            card.id,
+            RunMode::Question,
+            AgentEvent::Started {
+                session_id: "qa-session".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get_card(card.id).unwrap().last_session, None);
+
+        handle_event(
+            &store,
+            &evt_tx,
+            card.id,
+            RunMode::Plan,
+            AgentEvent::Started {
+                session_id: "plan-session".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_card(card.id).unwrap().last_session.as_deref(),
+            Some("plan-session")
         );
     }
 }

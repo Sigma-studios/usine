@@ -15,6 +15,7 @@ use super::icons::IconDiff;
 use crate::state::{AppState, BoardMode};
 use crate::ui::widgets::provider_value;
 
+mod chat;
 mod conclusion;
 mod edit;
 mod fixes;
@@ -24,6 +25,7 @@ mod pr_review;
 mod review;
 mod transcript;
 
+use chat::AgentChatSection;
 use conclusion::ConclusionPanel;
 use edit::{Attachments, ConfigForm, EditableTask};
 use fixes::FixSelection;
@@ -159,7 +161,6 @@ fn CardPanel(card: Card) -> Element {
     // authoritatively when a merge is actually requested.
     let checks = card.checks;
     let recap = state.review_recaps.read().get(&id).cloned();
-    let mut post_pr_feedback = use_signal(String::new);
     let fail_msg = if let CardState::Failed { message, .. } = &card.state {
         Some(message.clone())
     } else {
@@ -365,29 +366,13 @@ fn CardPanel(card: Card) -> Element {
                     }
                 }
             }
-            div { class: "section",
-                h3 { "Request another change" }
-                div { class: "hint",
-                    "Not happy with a fix, or have a reviewer follow-up? Send it back to the agent."
-                }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change?",
-                        value: "{post_pr_feedback}",
-                        oninput: move |e| post_pr_feedback.set(e.value()),
-                    }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = post_pr_feedback.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
-                            post_pr_feedback.set(String::new());
-                        }
-                    },
-                    "Send change"
-                }
+            AgentChatSection {
+                card_id: id,
+                hint: "Not happy with a fix, have a reviewer follow-up, or a question about the \
+                       work? Request a change, or ask without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
+                },
             }
         }
 

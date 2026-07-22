@@ -384,6 +384,68 @@ impl Executor {
             .await
     }
 
+    /// Ask the agent a question about the card's current work without sending
+    /// it back for changes. Reuses the existing "send back" transitions to
+    /// enter a running state (so the state machine needs no new edges) and runs
+    /// a strictly read-only [`RunMode::Question`] turn; `finalize_question`
+    /// (see `actor.rs`) lands the card back where it started and records the
+    /// prose answer. Self-contained like `revise` — no session resume.
+    pub(super) async fn ask_question(&self, card_id: Uuid, question: String) -> Result<()> {
+        let question = question.trim().to_string();
+        let card = self.store.get_card(card_id)?;
+        let plan = self.store.get_plan(card_id).unwrap_or(None);
+        let (transition, stage, plan) = match &card.state {
+            // Plan approval: the plan text lives only in the state and
+            // `RejectPlan` discards it, so stash the RAW plan (questions block
+            // included) for `finalize_question` to restore verbatim. Benign:
+            // a later approve re-saves the parsed clean plan.
+            CardState::Designing(DesignSub::AwaitingApproval { plan }) => {
+                self.store.save_plan(card_id, plan)?;
+                (
+                    Transition::RejectPlan,
+                    "The proposed plan below is under review; nothing is implemented yet.",
+                    Some(plan.clone()),
+                )
+            }
+            CardState::AwaitingReview(
+                ReviewSub::ReadyForReview
+                | ReviewSub::ReadyForPr
+                | ReviewSub::ValidationFailed { .. },
+            ) => (
+                Transition::RequestChanges,
+                "The implementation is complete and committed in this worktree, under review \
+                 before a pull request is opened.",
+                plan,
+            ),
+            CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge => {
+                // The question runs read-only, but make sure the branch is
+                // checked out here so the agent looks at the PR's actual code
+                // (mirrors `request_post_pr_change`).
+                self.ensure_branch_worktree(card_id).await?;
+                (
+                    Transition::RequestPostPrChange,
+                    "This card's pull request is open; its branch is checked out in this worktree.",
+                    plan,
+                )
+            }
+            _ => {
+                return Err(CoreError::IllegalTransition(
+                    "questions can only be asked while the work is parked for your review".into(),
+                ))
+            }
+        };
+        let extra = question_extra(stage, plan.as_deref(), &question);
+        let card = self.apply(card_id, transition)?;
+        // Only now that the run is really happening, stash the question on the
+        // answer record: `finalize_question` reads it back to render the
+        // exchange and to log the answered Q&A pair on the restart log. A bare
+        // question must never be logged up front — folded into a later prompt
+        // it would read as a standing, unanswered directive.
+        self.store.set_question(card_id, &question)?;
+        self.launch(card, RunMode::Question, Some(extra), None)
+            .await
+    }
+
     /// Look up the project's reviewer candidates and hand them back to the UI.
     /// Project-scoped, so it emits a `Reviewers` event rather than a card update.
     pub(super) async fn list_reviewers(&self, project_id: Uuid) -> Result<()> {

@@ -113,6 +113,12 @@ pub enum ExecutorCommand {
     /// From "awaiting review", send the implementation back to the agent with
     /// requested changes; the card returns to Implementing in its worktree.
     ReviseImplementation { card_id: Uuid, feedback: String },
+    /// Ask the agent a question about its work without sending it back for
+    /// changes: a strictly read-only turn from any Agent Chat panel (plan
+    /// approval, awaiting review, PR idle, ready-to-merge). The card rides the
+    /// matching "send back" transition while answering and returns to where it
+    /// started; the answer arrives via `AnswerUpdated`.
+    AskQuestion { card_id: Uuid, question: String },
     /// From `Concluded`: dig deeper — re-run the investigation with the prior
     /// conclusion, the earlier rounds, and this follow-up as context (the
     /// investigation twin of `RejectPlan`'s re-plan loop).
@@ -305,6 +311,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ApplyFixes { card_id, .. }
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
+            | ExecutorCommand::AskQuestion { card_id, .. }
             | ExecutorCommand::FollowUpInvestigation { card_id, .. }
             | ExecutorCommand::ConvertToImplementation { card_id }
             | ExecutorCommand::Merge { card_id, .. }
@@ -398,6 +405,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::ApplyFixes { .. }
                 | ExecutorCommand::CreatePr { .. }
                 | ExecutorCommand::ReviseImplementation { .. }
+                | ExecutorCommand::AskQuestion { .. }
                 | ExecutorCommand::FollowUpInvestigation { .. }
                 | ExecutorCommand::ConvertToImplementation { .. }
                 | ExecutorCommand::Merge { .. }
@@ -486,6 +494,10 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
+    /// A card's Agent Chat exchange changed (`card_id` on the event). An empty
+    /// `answer` means it was cleared (e.g. "back to start", or a write run
+    /// superseding it) and the UI drops its entry.
+    AnswerUpdated { question: String, answer: String },
     /// A card's implementation hand-off changed (`card_id` on the event). An
     /// empty [`Handoff`] means the latest implement run produced none, and the UI
     /// drops the previous attempt's.
@@ -603,6 +615,19 @@ impl ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::RecapUpdated {
                 recap: recap.into(),
+            },
+        }
+    }
+    pub fn answer_updated(
+        card_id: Uuid,
+        question: impl Into<String>,
+        answer: impl Into<String>,
+    ) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::AnswerUpdated {
+                question: question.into(),
+                answer: answer.into(),
             },
         }
     }
