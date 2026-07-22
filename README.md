@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark.svg">
+    <img src="crates/app/assets/logo.svg" alt="Usine logo" width="140">
+  </picture>
+</p>
+
 # Usine
 
 Usine is a desktop app that orchestrates LLM coding agents (the `claude` and
