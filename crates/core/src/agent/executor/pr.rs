@@ -549,7 +549,9 @@ impl Executor {
     /// `ReadyToMerge` with an offer: fix with an agent, or wait); `force` is the
     /// user's explicit "merge anyway" and skips only this pre-check. No checks
     /// configured, or an error *reading* them, doesn't block — a protected
-    /// branch still guards server-side.
+    /// branch still guards server-side. An already-merged PR isn't gated
+    /// either: red checks on a merged PR are moot, and the card must still
+    /// reach `Done`.
     pub(super) async fn merge(
         &self,
         card_id: Uuid,
@@ -567,17 +569,28 @@ impl Executor {
         if !force {
             if let Ok((status, failed)) = self.forge.pr_checks(&project.path, pr_number).await {
                 self.persist_checks(card_id, status);
-                match status {
-                    CheckStatus::Failing => {
+                // Red or pending checks gate the merge — but only a PR that
+                // still NEEDS merging. One merged on GitHub directly while its
+                // checks were red (or still running) must fall through to the
+                // already-merged path below: gating it would offer a fix run
+                // against a merged (possibly deleted) branch, or tell the user
+                // to wait for a green that will never come, and the card could
+                // never reach `Done` via Merge.
+                if matches!(status, CheckStatus::Failing | CheckStatus::Pending)
+                    && !self
+                        .forge
+                        .is_merged(&project.path, pr_number)
+                        .await
+                        .unwrap_or(false)
+                {
+                    if status == CheckStatus::Failing {
                         // Not an error: a fixable state, like a merge conflict.
                         // Offer the agent fix and leave the card at the gate.
                         let names = failed.iter().map(|f| f.name.clone()).collect();
                         let _ = self.evt_tx.unbounded_send(ExecutorEvent::checks_failed(
                             card_id, pr_number, names,
                         ));
-                        return Ok(());
-                    }
-                    CheckStatus::Pending => {
+                    } else {
                         let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                             card_id,
                             Severity::Warning,
@@ -585,9 +598,8 @@ impl Executor {
                              or use Merge anyway"
                                 .to_string(),
                         ));
-                        return Ok(());
                     }
-                    CheckStatus::Passing | CheckStatus::None => {}
+                    return Ok(());
                 }
             }
         }

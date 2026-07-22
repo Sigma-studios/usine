@@ -27,6 +27,9 @@ use usine_core::{
 struct CheckedForge {
     checks: CheckStatus,
     merge_fails: bool,
+    /// The PR was already merged (on GitHub directly): `merge` refuses like gh
+    /// does, and `is_merged` answers true.
+    merged: bool,
     merge_called: AtomicBool,
 }
 
@@ -35,6 +38,7 @@ impl CheckedForge {
         CheckedForge {
             checks,
             merge_fails: false,
+            merged: false,
             merge_called: AtomicBool::new(false),
         }
     }
@@ -62,12 +66,14 @@ impl Forge for CheckedForge {
         self.merge_called.store(true, Ordering::SeqCst);
         if self.merge_fails {
             Err(CoreError::forge("gh pr merge 7 --squash failed"))
+        } else if self.merged {
+            Err(CoreError::forge("pull request #7 is already merged"))
         } else {
             Ok(())
         }
     }
     async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
-        Ok(false)
+        Ok(self.merged)
     }
     async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<MergeStatus> {
         Ok(if self.merge_fails {
@@ -311,6 +317,7 @@ async fn a_forced_merge_still_surfaces_conflicts() {
     let forge = Arc::new(CheckedForge {
         checks: CheckStatus::Failing,
         merge_fails: true,
+        merged: false,
         merge_called: AtomicBool::new(false),
     });
     let (store, card, mut rx) = merging(forge.clone(), true);
@@ -328,6 +335,40 @@ async fn a_forced_merge_still_surfaces_conflicts() {
         store.get_card(card.id).unwrap().state,
         CardState::ReadyToMerge
     ));
+}
+
+/// A PR merged on GitHub directly while its checks were red (or pending) must
+/// still reach `Done` through the plain Merge button: the checks gate only
+/// guards a PR that still needs merging. Gating here would offer a fix run
+/// against a merged (possibly deleted) branch — or a wait for a green that
+/// will never come — and the card could never shed its worktree.
+#[tokio::test]
+async fn an_already_merged_pr_is_not_gated_on_its_red_checks() {
+    for status in [CheckStatus::Failing, CheckStatus::Pending] {
+        let forge = Arc::new(CheckedForge {
+            checks: status,
+            merge_fails: false,
+            merged: true,
+            merge_called: AtomicBool::new(false),
+        });
+        let (store, card, mut rx) = merging(forge.clone(), false);
+
+        wait_for(&mut rx, |e| match &e.kind {
+            ExecutorEventKind::CardUpdated(c) if c.id == card.id => {
+                matches!(c.state, CardState::Done).then_some(())
+            }
+            ExecutorEventKind::ChecksFailed { .. } => {
+                panic!("an already-merged PR must not be gated on its checks")
+            }
+            _ => None,
+        })
+        .await;
+
+        assert!(matches!(
+            store.get_card(card.id).unwrap().state,
+            CardState::Done
+        ));
+    }
 }
 
 // --- fixing: an agent runs only while the checks are actually red ------------
@@ -366,7 +407,7 @@ fn fixing(
 async fn fixing_checks_hands_the_failures_to_an_agent() {
     let tmp = tempfile::tempdir().unwrap();
     let forge = Arc::new(CheckedForge::new(CheckStatus::Failing));
-    let (_store, card, mut rx) = fixing(forge, tmp.path());
+    let (store, card, mut rx) = fixing(forge, tmp.path());
 
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
@@ -377,6 +418,21 @@ async fn fixing_checks_hands_the_failures_to_an_agent() {
         _ => None,
     })
     .await;
+
+    // The sim run completes: its push re-triggers CI, so the card must come
+    // back to `ReadyToMerge` showing `Pending` — not the stale `Failing` the
+    // fix set out to cure, which would re-offer the fix while CI re-runs.
+    let checks = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if c.id == card.id && matches!(c.state, CardState::ReadyToMerge) =>
+        {
+            Some(c.checks)
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(checks, CheckStatus::Pending);
+    assert_eq!(store.get_card(card.id).unwrap().checks, CheckStatus::Pending);
 }
 
 /// If the checks went green between the dialog and the click — a re-run, a
