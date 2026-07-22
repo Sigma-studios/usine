@@ -99,8 +99,12 @@ async fn a_branch_is_only_deletable_once_its_worktree_is_gone() {
         .delete_branch(&repo, "feature")
         .await
         .expect_err("git must refuse to delete a branch checked out in a worktree");
+    // Git's wording for this refusal varies by version: >= 2.36 says
+    // "used by worktree at", older releases (Apple Git included) say
+    // "checked out at". Both are the same worktree conflict.
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("worktree"),
+        msg.contains("worktree") || msg.contains("checked out at"),
         "expected a worktree conflict, got: {err}"
     );
     assert!(local_branch_exists(&repo, "feature"));
@@ -266,6 +270,7 @@ fn ready_to_merge_card(store: &Store, project_id: uuid::Uuid) -> Card {
         title: "t".into(),
         state: "open".into(),
         reviewer: None,
+        reviewer_recorded: false,
     });
     store.upsert_card(&card).unwrap();
     card

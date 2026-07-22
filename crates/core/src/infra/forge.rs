@@ -667,6 +667,7 @@ impl Forge for GhForge {
             title: title.to_string(),
             state: if draft { "draft" } else { "open" }.to_string(),
             reviewer: normalize_reviewer(reviewer),
+            reviewer_recorded: true,
         })
     }
 
@@ -938,6 +939,7 @@ impl Forge for SimForge {
             title: title.to_string(),
             state: if draft { "draft" } else { "open" }.to_string(),
             reviewer: normalize_reviewer(reviewer),
+            reviewer_recorded: true,
         })
     }
 
