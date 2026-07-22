@@ -156,6 +156,8 @@ pub(super) fn ConfigForm(card: Card) -> Element {
     let provider = card.config.provider;
     // "Skip plan" mark — persisted, settable only here (before the card starts).
     let mut skip = use_signal(|| state.card_skip_plan(id));
+    // Auto self-review toggle — persisted like skip-plan, on by default.
+    let mut auto_review = use_signal(|| state.card_auto_review(id));
     let mode = if card.config.kind == CardKind::Investigation {
         Mode::Investigate
     } else if skip() {
@@ -225,6 +227,21 @@ pub(super) fn ConfigForm(card: Card) -> Element {
                     div { class: "hint",
                         "Read-only: the agent audits the code and returns a conclusion — no changes, no branch, no PR."
                     }
+                }
+            }
+            if mode != Mode::Investigate {
+                // Investigations are read-only: nothing to self-review.
+                label { class: "checkbox-row",
+                    input {
+                        r#type: "checkbox",
+                        checked: auto_review(),
+                        onchange: move |_| {
+                            let v = !auto_review();
+                            auto_review.set(v);
+                            state.set_card_auto_review(id, v);
+                        },
+                    }
+                    span { "Self-review automatically when the implementation finishes" }
                 }
             }
             if mode == Mode::Investigate {

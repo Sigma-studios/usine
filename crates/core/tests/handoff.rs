@@ -178,11 +178,10 @@ async fn only_implement_runs_are_asked_for_a_hand_off() {
     let (_store, prompts, handle, mut rx, card_id) = setup("/tmp/handoff-modes");
 
     handle.send(ExecutorCommand::Start { card_id });
-    wait_for_the_gate(&mut rx).await;
 
-    // Self-review, then apply its fixes — a write run that reports through the
-    // fixes recap instead, and so must not be asked for a hand-off of its own.
-    handle.send(ExecutorCommand::SelfReview { card_id });
+    // The self-review auto-starts on implement-done; apply its fixes — a write
+    // run that reports through the fixes recap instead, and so must not be
+    // asked for a hand-off of its own.
     let ids = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
             CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {

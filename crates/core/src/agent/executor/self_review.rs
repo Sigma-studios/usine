@@ -13,9 +13,11 @@ impl Executor {
         self.run_validation(card_id).await
     }
 
-    /// From `AwaitingReview(ReadyForReview)`: run a read-only self-review over the
-    /// committed diff, guided by the project's `review.md` (or a default prompt).
-    /// The agent emits structured verdicts parsed in `finalize_self_review`.
+    /// Run a read-only self-review over the committed diff, guided by the
+    /// project's `review.md` (or a default prompt). Auto-started when an
+    /// implement run finalizes (see `start_self_review_direct`), and manually
+    /// re-runnable from `ReadyForReview` or the fix picker. The agent emits
+    /// structured verdicts parsed in `finalize_self_review`.
     ///
     /// The run is a fresh conversation whose only statement of intent is the card's
     /// description, so it's also handed the card's background (approved plan, the

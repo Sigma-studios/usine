@@ -318,8 +318,6 @@ async fn sim_pipeline() -> anyhow::Result<()> {
     // field-only edits too (branch rename, worktree clear), and acting on those
     // would double-dispatch the same command.
     let mut last_label = String::new();
-    // Run the self-review pass once, then skip it on the loop back.
-    let mut self_reviewed = false;
     // Trigger the comment triage once, from the PR gate.
     let mut comments_fetched = false;
     while let Some(evt) = rx.next().await {
@@ -367,16 +365,10 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                     CardState::Designing(DesignSub::AwaitingApproval { .. }) => {
                         exec.send(ExecutorCommand::ApprovePlan { card_id });
                     }
-                    // Walk the pre-PR review gate: run the self-review pass once,
-                    // then skip on to the PR (the work stays in the worktree).
-                    CardState::AwaitingReview(ReviewSub::ReadyForReview) => {
-                        if self_reviewed {
-                            exec.send(ExecutorCommand::SkipReview { card_id });
-                        } else {
-                            self_reviewed = true;
-                            exec.send(ExecutorCommand::SelfReview { card_id });
-                        }
-                    }
+                    // The executor auto-starts the self-review pass when the
+                    // implementation lands, so the gate needs no push from here;
+                    // the `SelectingFixes` arm below applies all its findings.
+                    CardState::AwaitingReview(ReviewSub::ReadyForReview) => {}
                     CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {
                         let ids = verdicts.iter().map(|v| v.comment.id).collect();
                         exec.send(ExecutorCommand::ApplySelfFixes {
@@ -606,6 +598,14 @@ async fn real_e2e() -> anyhow::Result<()> {
                     CardState::AwaitingReview(ReviewSub::ReadyForReview) => {
                         println!("→ SkipReview");
                         exec.send(ExecutorCommand::SkipReview { card_id });
+                    }
+                    // The executor auto-starts the self-review on implement-done;
+                    // this run deliberately skips it (a real review run costs real
+                    // tokens), so cancel — the card parks back at `ReadyForReview`
+                    // and the SkipReview arm above fires on the next label change.
+                    CardState::AwaitingReview(ReviewSub::Reviewing) => {
+                        println!("→ Cancel (skipping the auto self-review)");
+                        exec.send(ExecutorCommand::Cancel { card_id });
                     }
                     CardState::AwaitingReview(ReviewSub::ReadyForPr) => {
                         println!("→ CreatePr");

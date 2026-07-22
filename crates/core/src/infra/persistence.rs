@@ -133,6 +133,11 @@ struct CardOptionsRecord {
     card_id: String,
     /// Skip the design/plan phase and implement straight from the description.
     skip_plan: bool,
+    /// Opt OUT of the automatic self-review pass that follows a finished
+    /// implementation. Stored negatively so the default (auto-review ON) is the
+    /// serde default, which also keeps records written before this field loadable.
+    #[serde(default)]
+    skip_auto_review: bool,
 }
 
 /// The managed copies of a card's attached images, kept in their own record so
@@ -628,12 +633,46 @@ impl Store {
     }
 
     pub fn set_skip_plan(&self, card_id: Uuid, skip_plan: bool) -> Result<()> {
-        let rec = CardOptionsRecord {
-            card_id: card_id.to_string(),
-            skip_plan,
-        };
+        self.mutate_options(card_id, |o| o.skip_plan = skip_plan)
+    }
+
+    /// Whether the card auto-starts its self-review pass when the implementation
+    /// finishes. On by default; the toggle stores the opt-out.
+    pub fn get_auto_review(&self, card_id: Uuid) -> Result<bool> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardOptionsRecord> = r.get().primary(card_id.to_string())?;
+        Ok(!rec.map(|r| r.skip_auto_review).unwrap_or(false))
+    }
+
+    /// All stored auto-review flags (true = auto-review on), keyed by card id.
+    /// Loaded once at startup into a UI signal, like [`Self::skip_plan_flags`].
+    pub fn auto_review_flags(&self) -> Result<HashMap<Uuid, bool>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardOptionsRecord>()?.all()? {
+            let rec = rec?;
+            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
+                out.insert(id, !rec.skip_auto_review);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_auto_review(&self, card_id: Uuid, auto: bool) -> Result<()> {
+        self.mutate_options(card_id, |o| o.skip_auto_review = !auto)
+    }
+
+    /// Read-modify-write the card's options record so setting one option can't
+    /// reset the others to their defaults.
+    fn mutate_options(&self, card_id: Uuid, f: impl FnOnce(&mut CardOptionsRecord)) -> Result<()> {
         let rw = self.db.rw_transaction()?;
-        let old: Option<CardOptionsRecord> = rw.get().primary(rec.card_id.clone())?;
+        let old: Option<CardOptionsRecord> = rw.get().primary(card_id.to_string())?;
+        let mut rec = old.clone().unwrap_or(CardOptionsRecord {
+            card_id: card_id.to_string(),
+            skip_plan: false,
+            skip_auto_review: false,
+        });
+        f(&mut rec);
         match old {
             Some(old) => rw.update(old, rec)?,
             None => rw.insert(rec)?,

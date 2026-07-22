@@ -601,6 +601,13 @@ impl Executor {
                     .unbounded_send(ExecutorEvent::skip_plan_changed(card_id, skip));
                 Ok(())
             }
+            ExecutorCommand::SetAutoReview { card_id, auto } => {
+                self.store.set_auto_review(card_id, auto)?;
+                let _ = self
+                    .evt_tx
+                    .unbounded_send(ExecutorEvent::auto_review_changed(card_id, auto));
+                Ok(())
+            }
             ExecutorCommand::AttachImage { card_id, src } => {
                 let dest = copy_attachment(card_id, &src)?;
                 let mut paths = self.store.get_attachments(card_id).unwrap_or_default();

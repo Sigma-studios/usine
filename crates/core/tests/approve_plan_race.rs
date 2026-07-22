@@ -139,26 +139,31 @@ async fn duplicate_approve_plan_is_dropped() {
     });
     let _ = tokio::time::timeout(Duration::from_secs(10), drain).await;
 
-    // Exactly one busy cycle: the dropped duplicate never claims, so it can't
-    // flip the card back to idle while the winner is still working.
+    // One busy cycle for the approve: the dropped duplicate never claims, so it
+    // can't flip the card back to idle while the winner is still working. The
+    // sim implement run can finish inside the drain window, and the auto
+    // self-review that follows rightly claims the card for a busy cycle of its
+    // own — so anchor on the approve's cycle (everything up to its release, the
+    // first `busy=false`) rather than the whole trace. A duplicate that claimed
+    // would land its extra `busy=true` inside that window.
     let trace = trace.lock().unwrap();
+    let release = trace
+        .iter()
+        .position(|e| e == "busy=false")
+        .expect("the approve's claim is released");
+    let approve = &trace[..=release];
     assert_eq!(
-        trace.iter().filter(|e| *e == "busy=true").count(),
+        approve.iter().filter(|e| *e == "busy=true").count(),
         1,
         "only the winning approve marks the card busy, got: {trace:?}"
-    );
-    assert_eq!(
-        trace.iter().filter(|e| *e == "busy=false").count(),
-        1,
-        "the claim is released exactly once, got: {trace:?}"
     );
     // Ordering: busy is released only *after* the card has advanced, so the UI
     // never has a frame where the card looks both idle and un-approved. (The
     // run actor may emit further `Implementing` updates in between, hence
     // anchoring on the first one rather than an exact sequence.)
-    let pos = |e: &str| trace.iter().position(|x| x == e);
+    let pos = |e: &str| approve.iter().position(|x| x == e);
     assert!(
-        pos("busy=true") < pos("implementing") && pos("implementing") < pos("busy=false"),
+        pos("implementing").is_some() && pos("busy=true") < pos("implementing"),
         "busy must span the whole approve, got: {trace:?}"
     );
 

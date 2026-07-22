@@ -72,24 +72,27 @@ where
     }
 }
 
-/// The prompt of the first run in `mode`.
+/// The prompt of the LAST run in `mode` — the auto-started self-review means an
+/// earlier attempt can leave its own review prompt behind, and it's always the
+/// latest pass whose context is under test.
 fn prompt_for(prompts: &Prompts, mode: RunMode) -> String {
     prompts
         .lock()
         .unwrap()
         .iter()
+        .rev()
         .find(|(m, _)| *m == mode)
         .map(|(_, p)| p.clone())
         .unwrap_or_else(|| panic!("no {mode:?} run was launched"))
 }
 
-/// Await the card parking at the pre-PR review gate.
-async fn wait_for_the_gate(rx: &mut UnboundedReceiver<ExecutorEvent>) {
+/// Await the auto-started self-review parking at the fix picker.
+async fn wait_for_the_picker(rx: &mut UnboundedReceiver<ExecutorEvent>) {
     wait_for(rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c)
             if matches!(
                 c.state,
-                CardState::AwaitingReview(ReviewSub::ReadyForReview)
+                CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
             ) =>
         {
             Some(())
@@ -132,15 +135,17 @@ async fn the_self_review_sees_the_plan_and_the_users_mid_flight_changes() {
         git: Arc::new(SimGit),
     });
 
-    // Implement, then ask for a change from the awaiting-review gate.
+    // Implement — the self-review auto-starts and parks at the picker — then
+    // ask for a change from there (the picker's own send-back edge).
     handle.send(ExecutorCommand::Start { card_id });
-    wait_for_the_gate(&mut rx).await;
+    wait_for_the_picker(&mut rx).await;
 
     handle.send(ExecutorCommand::ReviseImplementation {
         card_id,
         feedback: "Use a channel instead of a mutex.".into(),
     });
-    // Back through implementing, and out at the gate again.
+    // Back through implementing, and out at the picker again via the
+    // auto-started second review pass.
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if matches!(c.state, CardState::Implementing(_)) => {
             Some(())
@@ -148,17 +153,7 @@ async fn the_self_review_sees_the_plan_and_the_users_mid_flight_changes() {
         _ => None,
     })
     .await;
-    wait_for_the_gate(&mut rx).await;
-
-    handle.send(ExecutorCommand::SelfReview { card_id });
-    wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::CardUpdated(c) => match &c.state {
-            CardState::AwaitingReview(ReviewSub::SelectingFixes { .. }) => Some(()),
-            _ => None,
-        },
-        _ => None,
-    })
-    .await;
+    wait_for_the_picker(&mut rx).await;
 
     let review = prompt_for(&prompts, RunMode::Review);
     // The original description still anchors the review…
@@ -209,7 +204,7 @@ async fn a_do_over_drops_the_plan_so_it_cant_leak_into_the_next_review() {
     });
 
     handle.send(ExecutorCommand::Start { card_id });
-    wait_for_the_gate(&mut rx).await;
+    wait_for_the_picker(&mut rx).await;
 
     // A genuine do-over discards the attempt — and its plan with it.
     handle.send(ExecutorCommand::BackToStart { card_id });
@@ -225,19 +220,13 @@ async fn a_do_over_drops_the_plan_so_it_cant_leak_into_the_next_review() {
         None,
         "back to start must drop the discarded attempt's plan"
     );
+    // The discarded attempt's own auto-review saw the stale plan by design —
+    // drop its recorded prompt so only the re-run's review is under test.
+    prompts.lock().unwrap().clear();
 
     // Re-run with planning skipped: there's no plan now, so none reaches the review.
     handle.send(ExecutorCommand::Start { card_id });
-    wait_for_the_gate(&mut rx).await;
-    handle.send(ExecutorCommand::SelfReview { card_id });
-    wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::CardUpdated(c) => match &c.state {
-            CardState::AwaitingReview(ReviewSub::SelectingFixes { .. }) => Some(()),
-            _ => None,
-        },
-        _ => None,
-    })
-    .await;
+    wait_for_the_picker(&mut rx).await;
 
     let review = prompt_for(&prompts, RunMode::Review);
     assert!(
