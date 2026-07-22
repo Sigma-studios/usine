@@ -532,6 +532,8 @@ impl AppState {
     }
 
     /// Total review tasks needing attention across all projects (dock badge).
+    /// The badge is macOS-only (`use_dock_badge`), so this is too.
+    #[cfg(target_os = "macos")]
     pub fn review_attention_count(&self) -> usize {
         self.review_tasks
             .read()
