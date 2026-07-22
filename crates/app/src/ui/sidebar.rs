@@ -56,14 +56,31 @@ pub fn Sidebar() -> Element {
                         let class = if active { "nav-item active" } else { "nav-item" };
                         let path = project.path.display().to_string();
                         let review_count = state.project_review_count(pid);
+                        let (attention_count, urgent_count) = state.project_attention_counts(pid);
+                        // Three-state health dot: red = failed / agent question,
+                        // accent = waiting on you, dim = idle.
+                        let dot_class = if urgent_count > 0 {
+                            "proj-dot urgent"
+                        } else if attention_count > 0 {
+                            "proj-dot"
+                        } else {
+                            "proj-dot idle"
+                        };
                         rsx! {
                             div {
                                 key: "{pid}",
                                 class: "{class}",
                                 title: "{path}",
                                 onclick: move |_| state.select_view(SelectedView::Project(pid)),
-                                span { class: "proj-dot" }
+                                span { class: "{dot_class}" }
                                 span { class: "proj-name", "{name}" }
+                                if attention_count > 0 {
+                                    span {
+                                        class: "proj-count",
+                                        title: if attention_count == 1 { "1 card waiting on you".to_string() } else { format!("{attention_count} cards waiting on you") },
+                                        "{attention_count}"
+                                    }
+                                }
                                 button {
                                     // Always visible (not hover-only) so completed
                                     // reviews stay reachable even with nothing pending.
