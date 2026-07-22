@@ -113,6 +113,16 @@ pub enum ExecutorCommand {
     /// From "awaiting review", send the implementation back to the agent with
     /// requested changes; the card returns to Implementing in its worktree.
     ReviseImplementation { card_id: Uuid, feedback: String },
+    /// From `Concluded`: dig deeper — re-run the investigation with the prior
+    /// conclusion, the earlier rounds, and this follow-up as context (the
+    /// investigation twin of `RejectPlan`'s re-plan loop).
+    FollowUpInvestigation { card_id: Uuid, feedback: String },
+    /// From `Concluded`: convert the card, in place, into an implementation —
+    /// fold the conclusion into the description under a findings section, flip
+    /// the kind to Task, and reset to the starting block so the user shapes the
+    /// implementation prompt from there. Cost is kept (the investigation was
+    /// real spend on this card); the session is cleared so the next run is fresh.
+    ConvertToImplementation { card_id: Uuid },
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
@@ -151,12 +161,23 @@ pub enum ExecutorCommand {
     /// Stop a PR-under-review's preview (kill the process tree, run teardown).
     StopReviewPreview { review_id: Uuid },
     /// Merge the pull request. `delete_branch` also deletes the head branch on the
-    /// forge after a successful merge.
-    Merge { card_id: Uuid, delete_branch: bool },
+    /// forge after a successful merge. `force` skips the CI-checks pre-check (the
+    /// user's explicit "merge anyway" for flaky or still-running checks); the
+    /// conflict handling downstream is never skipped.
+    Merge {
+        card_id: Uuid,
+        delete_branch: bool,
+        force: bool,
+    },
     /// From `ReadyToMerge`, after a merge failed on conflicts: merge the base
     /// branch into the card's branch inside its worktree and hand the conflicts
     /// to an agent. Loops back through applying fixes to `ReadyToMerge`.
     ResolveConflicts { card_id: Uuid },
+    /// From `ReadyToMerge`, after the merge gate found the PR's CI checks red:
+    /// hand the failing checks (with their run logs) to an agent in the card's
+    /// worktree. Loops back through applying fixes to `ReadyToMerge`; the push
+    /// re-triggers CI.
+    FixChecks { card_id: Uuid },
     /// From `AwaitingReview(ReadyForReview)`: skip the self-review pass entirely.
     SkipReview { card_id: Uuid },
     /// From `AwaitingReview(ReadyForReview)`: run the self-review agent over the
@@ -284,8 +305,11 @@ impl ExecutorCommand {
             | ExecutorCommand::ApplyFixes { card_id, .. }
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
+            | ExecutorCommand::FollowUpInvestigation { card_id, .. }
+            | ExecutorCommand::ConvertToImplementation { card_id }
             | ExecutorCommand::Merge { card_id, .. }
             | ExecutorCommand::ResolveConflicts { card_id }
+            | ExecutorCommand::FixChecks { card_id }
             | ExecutorCommand::SkipReview { card_id }
             | ExecutorCommand::SelfReview { card_id }
             | ExecutorCommand::ApplySelfFixes { card_id, .. }
@@ -374,8 +398,11 @@ impl ExecutorCommand {
                 | ExecutorCommand::ApplyFixes { .. }
                 | ExecutorCommand::CreatePr { .. }
                 | ExecutorCommand::ReviseImplementation { .. }
+                | ExecutorCommand::FollowUpInvestigation { .. }
+                | ExecutorCommand::ConvertToImplementation { .. }
                 | ExecutorCommand::Merge { .. }
                 | ExecutorCommand::ResolveConflicts { .. }
+                | ExecutorCommand::FixChecks { .. }
                 | ExecutorCommand::SkipReview { .. }
                 | ExecutorCommand::SelfReview { .. }
                 | ExecutorCommand::ApplySelfFixes { .. }
@@ -476,6 +503,11 @@ pub enum ExecutorEventKind {
     /// (`card_id` on the event). The card is left in `ReadyToMerge`; the UI asks
     /// whether an agent should resolve the conflicts (`ResolveConflicts`).
     MergeConflict { pr_number: u64, base: String },
+    /// The card's merge was refused because its PR's CI checks are failing
+    /// (`card_id` on the event). `failed` names the failing checks. The card is
+    /// left in `ReadyToMerge`; the UI asks whether an agent should fix the
+    /// checks (`FixChecks`).
+    ChecksFailed { pr_number: u64, failed: Vec<String> },
     /// The providers' account-level rate-limit usage changed (session/weekly
     /// windows for the usage bar); the UI replaces its snapshot wholesale.
     /// Not card-scoped.
@@ -614,6 +646,12 @@ impl ExecutorEvent {
                 pr_number,
                 base: base.into(),
             },
+        }
+    }
+    pub fn checks_failed(card_id: Uuid, pr_number: u64, failed: Vec<String>) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::ChecksFailed { pr_number, failed },
         }
     }
 }

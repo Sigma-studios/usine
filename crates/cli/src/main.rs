@@ -406,6 +406,7 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                     CardState::ReadyToMerge => exec.send(ExecutorCommand::Merge {
                         card_id,
                         delete_branch: true,
+                        force: false,
                     }),
                     CardState::Done => {
                         println!("✔ Done — smoke test complete");

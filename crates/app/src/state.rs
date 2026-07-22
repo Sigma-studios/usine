@@ -14,8 +14,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
     spawn_executor, AppSettings, Card, CardState, DesignSub, DiffState, ExecutorCommand,
     ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle, Forge, GhForge, GitOps,
-    Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, ProviderFactory, RealFactory, RealGit,
-    ReviewSub, ReviewTask, RunSub, Severity, SimFactory, SimForge, SimGit, Store, UsageSnapshot,
+    Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, Provider, ProviderFactory, RealFactory,
+    RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory, SimForge, SimGit, Store,
+    UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -110,6 +111,32 @@ impl AppState {
     /// first run. Runs once, inside the root `use_context_provider`.
     pub fn init() -> Self {
         let store = open_store();
+
+        // First startup only (no settings record yet, real mode): default the
+        // provider to whichever agent CLI is actually installed — Codex when it
+        // is the sole one present, Claude otherwise. Persisted as soon as a CLI
+        // is found, so it never overrides a later user choice; with none found
+        // the Claude fallback stays unpersisted and detection re-runs next
+        // launch. Demo mode uses simulated backends and must stay
+        // deterministic.
+        if !demo_mode() {
+            let claude = usine_core::binary_on_path(Provider::Claude.binary());
+            let codex = usine_core::binary_on_path(Provider::Codex.binary());
+            match usine_core::seed_default_provider(&store, |p| match p {
+                Provider::Claude => claude,
+                Provider::Codex => codex,
+            }) {
+                Ok(Some(Provider::Codex)) => {
+                    push_toast(Severity::Info, "Claude CLI not found — defaulting to Codex")
+                }
+                Ok(Some(Provider::Claude)) if !claude && !codex => push_toast(
+                    Severity::Warning,
+                    "No agent CLI found on PATH — install claude or codex",
+                ),
+                _ => {}
+            }
+        }
+
         let settings = store.settings().unwrap_or_default();
 
         // Seed the sample board only in demo mode; real mode starts empty.
@@ -381,6 +408,28 @@ impl AppState {
                     action: crate::ui::ConfirmAction::Send(ExecutorCommand::ResolveConflicts {
                         card_id,
                     }),
+                });
+            }
+            // The merge was refused because the PR's CI checks are failing. Same
+            // shape as the conflict offer: the card is still `ReadyToMerge`, and
+            // declining leaves the detail pane's "Merge anyway" available.
+            ExecutorEventKind::ChecksFailed { pr_number, failed } => {
+                let card_id = evt.card_id;
+                let names = if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nFailing: {}", failed.join(", "))
+                };
+                crate::ui::request_confirm(crate::ui::ConfirmRequest {
+                    title: "CI checks failing".into(),
+                    message: format!(
+                        "PR #{pr_number} can't be merged — its CI checks are failing.{names}\n\n\
+                         Have the agent investigate the failures, fix them, and push? \
+                         The checks re-run on the push."
+                    ),
+                    confirm_label: "Fix with AI".into(),
+                    danger: false,
+                    action: crate::ui::ConfirmAction::Send(ExecutorCommand::FixChecks { card_id }),
                 });
             }
             ExecutorEventKind::UsageUpdated(snapshot) => {

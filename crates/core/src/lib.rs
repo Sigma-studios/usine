@@ -22,6 +22,7 @@ pub use agent::events::{
 };
 pub use agent::executor::{spawn as spawn_executor, ExecutorConfig, ExecutorHandle};
 pub use agent::handoff::{parse_handoff, Handoff, HANDOFF_INSTRUCTION};
+pub use agent::investigate::{investigate_instruction, INVESTIGATE_INSTRUCTION};
 pub use agent::plan::{parse_plan, plan_instruction, PlanQuestion, PLAN_QUESTIONS_INSTRUCTION};
 pub use agent::provider::claude::ClaudeProvider;
 pub use agent::provider::codex::CodexProvider;
@@ -34,14 +35,15 @@ pub use agent::review::{
     REVIEW_TRIAGE_INSTRUCTION, SELF_REVIEW_INSTRUCTION,
 };
 pub use agent::startup::{
-    reconcile_interrupted_reviews, reconcile_interrupted_runs, sync_base_branches,
+    binary_on_path, reconcile_interrupted_reviews, reconcile_interrupted_runs,
+    seed_default_provider, sync_base_branches,
 };
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
-    anchor_drafts, compute_branch_diff, compute_card_diff, DiffData, DiffFile, DiffHunk, DiffLine,
-    DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
+    anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, DiffData, DiffFile,
+    DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
 };
-pub use domain::config::{AppSettings, CardConfig, PreviewPort, ProjectConfig};
+pub use domain::config::{AppSettings, CardConfig, CardKind, PreviewPort, ProjectConfig};
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardState, CheckStatus, Column, Cost, DesignSub,
     DraftComment, Effort, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo, PrReviewSub,
@@ -50,7 +52,7 @@ pub use domain::model::{
 };
 pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
 pub use error::{CoreError, Result};
-pub use infra::forge::{Forge, GhForge, MergeStatus, PrSummary, SimForge};
+pub use infra::forge::{FailedCheck, Forge, GhForge, MergeStatus, PrSummary, SimForge};
 pub use infra::git::{
     remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
 };

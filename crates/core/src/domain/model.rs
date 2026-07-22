@@ -440,6 +440,14 @@ pub enum ReviewSub {
 pub enum CardState {
     StartingBlock,
     Designing(DesignSub),
+    /// A read-only investigation run (an "investigate only" card — see
+    /// [`crate::domain::config::CardKind`]). Shares [`RunSub`] with
+    /// `Implementing` so mid-run questions park on the same intervention flow.
+    Investigating(RunSub),
+    /// The investigation finished; its conclusion awaits the user. From here the
+    /// card can take a follow-up round (back to `Investigating`), convert into
+    /// an implementation (via `ResetToStart`), or be marked done.
+    Concluded { conclusion: String },
     Implementing(RunSub),
     AwaitingReview(ReviewSub),
     PrReview(PrReviewSub),
@@ -460,6 +468,11 @@ impl CardState {
         match self {
             CardState::StartingBlock => Column::StartingBlock,
             CardState::Designing(_) => Column::Designing,
+            // Investigations borrow the two "thinking" columns: the run sits
+            // with Designing, and the finished conclusion parks with the other
+            // work awaiting the user's read.
+            CardState::Investigating(_) => Column::Designing,
+            CardState::Concluded { .. } => Column::AwaitingReview,
             CardState::Implementing(_) => Column::Implementing,
             // The pre-PR gate spans two columns: the freshly-implemented work
             // awaiting the user's review sits in `AwaitingReview`; the active
@@ -500,6 +513,7 @@ impl CardState {
         matches!(
             self,
             CardState::Designing(DesignSub::Intervention(_))
+                | CardState::Investigating(RunSub::Intervention(_))
                 | CardState::Implementing(RunSub::Intervention(_))
                 | CardState::Designing(DesignSub::AwaitingApproval { .. })
                 | CardState::PrReview(PrReviewSub::SelectingFixes { .. })
@@ -524,7 +538,8 @@ impl CardState {
                     ReviewSub::ReadyForReview
                         | ReviewSub::ReadyForPr
                         | ReviewSub::ValidationFailed { .. }
-                ) | CardState::ReadyToMerge
+                ) | CardState::Concluded { .. }
+                    | CardState::ReadyToMerge
                     | CardState::Failed { .. }
             )
     }
@@ -552,6 +567,7 @@ impl CardState {
         matches!(
             self,
             CardState::Designing(DesignSub::Running)
+                | CardState::Investigating(RunSub::Running)
                 | CardState::Implementing(RunSub::Running)
                 | CardState::AwaitingReview(
                     ReviewSub::Reviewing
@@ -569,6 +585,7 @@ impl CardState {
     pub fn intervention(&self) -> Option<&Intervention> {
         match self {
             CardState::Designing(DesignSub::Intervention(i)) => Some(i),
+            CardState::Investigating(RunSub::Intervention(i)) => Some(i),
             CardState::Implementing(RunSub::Intervention(i)) => Some(i),
             _ => None,
         }
@@ -588,6 +605,9 @@ impl CardState {
                     "needs answers"
                 }
             }
+            CardState::Investigating(RunSub::Running) => "investigating…",
+            CardState::Investigating(RunSub::Intervention(_)) => "needs answer",
+            CardState::Concluded { .. } => "conclusion ready",
             CardState::Implementing(RunSub::Running) => "implementing…",
             CardState::Implementing(RunSub::Intervention(_)) => "needs answer",
             CardState::AwaitingReview(ReviewSub::ReadyForReview) => "awaiting review",
@@ -1163,6 +1183,12 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub reviews: Vec<ReviewSummary>,
+    /// The rolled-up CI state of this card's PR, as of the last background poll
+    /// or manual refresh. Gates the merge button: a red or still-running build
+    /// blocks the merge (with an explicit "merge anyway" override), and a red
+    /// one offers an agent fix. `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub checks: CheckStatus,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1193,6 +1219,7 @@ impl Card {
             comment_count: 0,
             unanswered_count: 0,
             reviews: Vec::new(),
+            checks: CheckStatus::None,
             created_at: now,
             updated_at: now,
         }
@@ -1324,6 +1351,10 @@ mod tests {
             CardState::Implementing(RunSub::Intervention(intervention())),
             CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() }),
             CardState::PrReview(PrReviewSub::SelectingFixes { verdicts: vec![] }),
+            CardState::Investigating(RunSub::Intervention(intervention())),
+            CardState::Concluded {
+                conclusion: "the cache is bounded".into(),
+            },
             CardState::AwaitingReview(ReviewSub::ReadyForReview),
             CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts: vec![] }),
             CardState::AwaitingReview(ReviewSub::ReadyForPr),
@@ -1343,6 +1374,7 @@ mod tests {
         for s in [
             CardState::StartingBlock,
             CardState::Designing(DesignSub::Running),
+            CardState::Investigating(RunSub::Running),
             CardState::Implementing(RunSub::Running),
             CardState::AwaitingReview(ReviewSub::Reviewing),
             CardState::AwaitingReview(ReviewSub::ApplyingFixes),
@@ -1418,6 +1450,35 @@ mod tests {
 
         // The new variants round-trip through the store's JSON codec shape.
         for s in [validating, fixing, parked] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn investigation_states_membership_columns_and_serde() {
+        let running = CardState::Investigating(RunSub::Running);
+        let parked = CardState::Investigating(RunSub::Intervention(intervention()));
+        let concluded = CardState::Concluded {
+            conclusion: "the auth flow re-validates on every request".into(),
+        };
+
+        // The run behaves like any other agent run; the conclusion is a park
+        // that badges (it *is* the notification) without being an intervention.
+        assert!(running.is_running() && !running.needs_attention());
+        assert!(parked.needs_intervention());
+        assert_eq!(parked.intervention().unwrap().request_id, "r1");
+        assert!(concluded.needs_attention() && !concluded.needs_intervention());
+        assert!(!concluded.is_running());
+
+        // Investigating renders with Designing; the conclusion parks with the
+        // other work awaiting the user's read.
+        assert_eq!(running.column(), Column::Designing);
+        assert_eq!(parked.column(), Column::Designing);
+        assert_eq!(concluded.column(), Column::AwaitingReview);
+
+        // The new variants round-trip through the store's JSON codec shape.
+        for s in [running, parked, concluded] {
             let json = serde_json::to_string(&s).unwrap();
             assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
         }

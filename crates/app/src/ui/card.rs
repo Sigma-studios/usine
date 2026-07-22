@@ -54,6 +54,9 @@ pub fn CardView(card: Card) -> Element {
             if usine_core::parse_plan(plan).1.is_empty()
     );
     let awaiting_review = matches!(st, CardState::AwaitingReview(_));
+    // An investigation finished: its conclusion is the deliverable — the primary
+    // action is to read it (in the detail panel, where follow-up/convert live).
+    let concluded = matches!(st, CardState::Concluded { .. });
     // Nothing to triage until someone has actually left comments — the background
     // poll keeps the count fresh while the card sits in `Idle`. Keyed off the
     // *total*, matching the detail panel's `can_triage`: a comment from a
@@ -75,6 +78,9 @@ pub fn CardView(card: Card) -> Element {
         .as_ref()
         .map(|p| p.state == "draft")
         .unwrap_or(false);
+    // Surface the PR from the board itself — until now only the detail panel
+    // showed it, while the review board already prefixes its cards with #N.
+    let pr_link = card.pr.as_ref().map(|p| (p.number, p.url.clone()));
     // The worktree holds committed, reviewable work from just-implemented through
     // PR review until merge. "Show diff" lives in the card actions menu; the
     // preview controls sit inline on the card and need a run command configured.
@@ -195,6 +201,31 @@ pub fn CardView(card: Card) -> Element {
                 } else {
                     span { class: "badge status", "{status}" }
                 }
+                if let Some((number, url)) = pr_link {
+                    a {
+                        class: "badge pr-link",
+                        href: "{url}",
+                        target: "_blank",
+                        rel: "noreferrer",
+                        title: "Open pull request on GitHub",
+                        // Don't let a click on the link also select the card, and
+                        // shield its Enter activation from the card's onkeydown
+                        // (which prevents the default action).
+                        onclick: move |e| e.stop_propagation(),
+                        onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
+                        "#{number}"
+                    }
+                }
+                // The PR's CI state, once it has one and any check reported —
+                // a red build is worth seeing from the board, before reaching
+                // for Merge.
+                if card.pr.is_some() && card.checks.is_reportable() {
+                    span {
+                        class: "badge {card.checks.css_class()}",
+                        title: "{card.checks.label()}",
+                        "{card.checks.glyph()} CI"
+                    }
+                }
             }
             div { class: "card-actions",
                 // Shield the action buttons' keydowns from the card handler too.
@@ -232,6 +263,13 @@ pub fn CardView(card: Card) -> Element {
                         class: "btn primary",
                         onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
                         "Review"
+                    }
+                }
+                if concluded {
+                    button {
+                        class: "btn primary",
+                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                        "Read conclusion"
                     }
                 }
                 if can_read {
@@ -275,7 +313,7 @@ pub fn CardView(card: Card) -> Element {
                                 "Merge pull request",
                                 "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
                                 "Merge",
-                                ExecutorCommand::Merge { card_id: id, delete_branch: true },
+                                ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
                             );
                         },
                         "Merge"

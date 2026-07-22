@@ -49,6 +49,19 @@ pub struct PrSummary {
     pub mergeable: Mergeable,
 }
 
+/// One failing check from a PR's `statusCheckRollup` — enough to name it in a
+/// dialog and (via `url`, when it points at a GitHub Actions run) fetch its
+/// failed-step log for the fixing agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCheck {
+    /// The check's name (e.g. `test`), or the status context (e.g. `ci/lint`).
+    pub name: String,
+    /// The workflow the check belongs to, when reported (`CheckRun`s only).
+    pub workflow: String,
+    /// The check's details page — an Actions run URL for GitHub Actions checks.
+    pub url: String,
+}
+
 /// Cap on any single `gh` invocation so a hung command (auth prompt, network
 /// stall) can't block a run actor indefinitely.
 const GH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -279,9 +292,7 @@ pub fn rollup_status(rollup: &Value) -> CheckStatus {
             .or_else(|| node.get("state").and_then(Value::as_str))
             .unwrap_or("");
         match outcome.to_ascii_uppercase().as_str() {
-            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ERROR" | "STARTUP_FAILURE" => {
-                return CheckStatus::Failing
-            }
+            o if is_failed_outcome(o) => return CheckStatus::Failing,
             "PENDING" | "EXPECTED" => {
                 pending = true;
                 reported = true;
@@ -297,6 +308,93 @@ pub fn rollup_status(rollup: &Value) -> CheckStatus {
     }
 }
 
+/// Read one PR's `statusCheckRollup`. Deliberately `gh pr view` and not
+/// `gh pr checks`: the latter exits non-zero when checks are failing or still
+/// running — exactly the states this call exists to observe — which would trip
+/// `run_gh`'s error handling.
+pub fn pr_checks_args(pr_number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        pr_number.to_string(),
+        "--json".into(),
+        "statusCheckRollup".into(),
+    ]
+}
+
+/// Whether a settled check outcome (a `CheckRun`'s `conclusion` or a
+/// `StatusContext`'s `state`, uppercased) counts as a failure. Shared between
+/// [`rollup_status`] (which only needs the verdict) and [`rollup_failures`]
+/// (which needs the failing nodes themselves).
+fn is_failed_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ERROR" | "STARTUP_FAILURE"
+    )
+}
+
+/// The failing nodes of a `statusCheckRollup` array, named for the "fix checks"
+/// dialog and prompt. Handles both node shapes: `CheckRun` (name + workflowName
+/// + detailsUrl) and `StatusContext` (context + targetUrl).
+pub fn rollup_failures(rollup: &Value) -> Vec<FailedCheck> {
+    let Some(nodes) = rollup.as_array() else {
+        return Vec::new();
+    };
+    nodes
+        .iter()
+        .filter(|node| {
+            let outcome = node
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| node.get("state").and_then(Value::as_str))
+                .unwrap_or("");
+            is_failed_outcome(&outcome.to_ascii_uppercase())
+        })
+        .map(|node| {
+            let text = |key: &str| {
+                node.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let name = match text("name") {
+                n if !n.is_empty() => n,
+                _ => text("context"),
+            };
+            let url = match text("detailsUrl") {
+                u if !u.is_empty() => u,
+                _ => text("targetUrl"),
+            };
+            FailedCheck {
+                name,
+                workflow: text("workflowName"),
+                url,
+            }
+        })
+        .collect()
+}
+
+/// The GitHub Actions run id embedded in a check's details URL
+/// (`…/actions/runs/<id>[/job/<job>]`), if it is an Actions URL at all — a
+/// third-party status context links elsewhere and yields `None`.
+pub fn run_id_from_url(url: &str) -> Option<u64> {
+    let (_, rest) = url.split_once("/actions/runs/")?;
+    let id = rest.split(['/', '?', '#']).next()?;
+    id.parse().ok()
+}
+
+/// The failed steps' log of one Actions run — the raw material for the fixing
+/// agent's prompt.
+pub fn run_log_args(run_id: u64) -> Vec<String> {
+    vec![
+        "run".into(),
+        "view".into(),
+        run_id.to_string(),
+        "--log-failed".into(),
+    ]
+}
+
 /// Map GitHub's `mergeable` enum onto [`Mergeable`]. Anything other than the two
 /// definitive answers (notably `UNKNOWN`, returned while GitHub computes the
 /// merge) stays `Unknown` so the UI can stay silent rather than guess.
@@ -306,6 +404,31 @@ pub fn parse_mergeable(raw: &str) -> Mergeable {
         "CONFLICTING" => Mergeable::Conflicting,
         _ => Mergeable::Unknown,
     }
+}
+
+/// The JSON body for [`submit_review_args`]: the verdict, the summary text, and
+/// the inline comments, each anchored to a line on the PR's new (RIGHT) side.
+///
+/// Only line-anchored comments are included. The reviews endpoint has no
+/// file-level comments — `subject_type` belongs to the standalone comment API,
+/// and a comment with neither `line` nor `position` fails the whole review with
+/// HTTP 422 — so a line-less draft is the caller's to fold into `body` first
+/// (see [`crate::diff::fold_unanchorable`]).
+pub fn review_payload(event: ReviewEvent, body: &str, comments: &[DraftComment]) -> Value {
+    let comments_json: Vec<Value> = comments
+        .iter()
+        .filter_map(|c| {
+            let line = c.line?;
+            Some(serde_json::json!({
+                "path": c.path, "line": line, "side": "RIGHT", "body": c.body,
+            }))
+        })
+        .collect();
+    serde_json::json!({
+        "event": event.api_value(),
+        "body": body,
+        "comments": comments_json,
+    })
 }
 
 /// Submit a review on a PR. The JSON body (event + inline comments) is passed on
@@ -504,6 +627,23 @@ pub trait Forge: Send + Sync {
     /// last). This is what tells an answered comment from one still awaiting a
     /// reaction — the flat comment list can't.
     async fn list_threads(&self, repo: &Path, pr_number: u64) -> Result<Vec<ReviewThread>>;
+
+    /// The PR's rolled-up CI state plus the failing checks, if any. Defaults to
+    /// "no checks" so forges that don't model CI (the sim, test doubles) keep
+    /// merging unimpeded.
+    async fn pr_checks(
+        &self,
+        _repo: &Path,
+        _pr_number: u64,
+    ) -> Result<(CheckStatus, Vec<FailedCheck>)> {
+        Ok((CheckStatus::None, Vec::new()))
+    }
+
+    /// The failed-step log of one GitHub Actions run. Best-effort context for
+    /// the fixing agent; the default has nothing to offer.
+    async fn failed_run_log(&self, _repo: &Path, _run_id: u64) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// Real GitHub forge via the `gh` CLI.
@@ -648,25 +788,7 @@ impl Forge for GhForge {
         body: &str,
         comments: &[DraftComment],
     ) -> Result<()> {
-        let comments_json: Vec<Value> = comments
-            .iter()
-            .map(|c| match c.line {
-                // Inline comment anchored to a line on the PR's new (RIGHT) side.
-                Some(line) => serde_json::json!({
-                    "path": c.path, "line": line, "side": "RIGHT", "body": c.body,
-                }),
-                // No line → a file-level comment.
-                None => serde_json::json!({
-                    "path": c.path, "subject_type": "file", "body": c.body,
-                }),
-            })
-            .collect();
-        let payload = serde_json::json!({
-            "event": event.api_value(),
-            "body": body,
-            "comments": comments_json,
-        });
-        let stdin = serde_json::to_string(&payload)?;
+        let stdin = serde_json::to_string(&review_payload(event, body, comments))?;
         run_gh_stdin(repo, &submit_review_args(pr_number), &stdin)
             .await
             .map(|_| ())
@@ -781,6 +903,24 @@ impl Forge for GhForge {
             .ok_or_else(|| CoreError::other(format!("unexpected repo name from gh: {nwo:?}")))?;
         let json = run_gh(repo, &review_threads_query_args(owner, name, pr_number)).await?;
         Ok(parse_review_threads(&serde_json::from_str(&json)?))
+    }
+
+    async fn pr_checks(
+        &self,
+        repo: &Path,
+        pr_number: u64,
+    ) -> Result<(CheckStatus, Vec<FailedCheck>)> {
+        let json = run_gh(repo, &pr_checks_args(pr_number)).await?;
+        let value: Value = serde_json::from_str(&json)?;
+        let rollup = value
+            .get("statusCheckRollup")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok((rollup_status(&rollup), rollup_failures(&rollup)))
+    }
+
+    async fn failed_run_log(&self, repo: &Path, run_id: u64) -> Result<String> {
+        run_gh(repo, &run_log_args(run_id)).await
     }
 }
 
@@ -951,6 +1091,26 @@ impl Forge for SimForge {
     }
 }
 
+/// The message for a non-zero `gh` exit. Includes stdout as well as stderr:
+/// on an API error `gh api` prints only a terse `gh: <status> (HTTP nnn)` to
+/// stderr and puts the response body — the part that names *which* input the
+/// API refused — on stdout. Dropping stdout turns a self-explanatory 422 into
+/// a mystery.
+fn gh_failure_message(args: &[String], stdout: &[u8], stderr: &[u8]) -> String {
+    let mut msg = format!(
+        "gh {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(stderr).trim()
+    );
+    let body = String::from_utf8_lossy(stdout);
+    let body = body.trim();
+    if !body.is_empty() {
+        msg.push_str(" — ");
+        msg.push_str(body);
+    }
+    msg
+}
+
 async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
     let out = timeout(
         GH_TIMEOUT,
@@ -966,10 +1126,10 @@ async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
     })?
     .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     if !out.status.success() {
-        return Err(CoreError::forge(format!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        return Err(CoreError::forge(gh_failure_message(
+            args,
+            &out.stdout,
+            &out.stderr,
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -1005,10 +1165,10 @@ async fn run_gh_stdin(cwd: &Path, args: &[String], stdin: &str) -> Result<String
         })?
         .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     if !out.status.success() {
-        return Err(CoreError::forge(format!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        return Err(CoreError::forge(gh_failure_message(
+            args,
+            &out.stdout,
+            &out.stderr,
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -1178,6 +1338,86 @@ mod tests {
         assert_eq!(rollup_status(&legacy), CheckStatus::Pending);
     }
 
+    /// The pre-merge checks read must go through `gh pr view` — `gh pr checks`
+    /// exits non-zero on failing/pending checks, the very states being observed.
+    #[test]
+    fn pr_checks_read_the_rollup_via_pr_view() {
+        let args = pr_checks_args(7);
+        assert_eq!(args[..3], ["pr".to_string(), "view".into(), "7".into()]);
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--json", "statusCheckRollup"]));
+    }
+
+    #[test]
+    fn rollup_failures_extract_both_node_shapes() {
+        let rollup = serde_json::json!([
+            {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "name": "lint", "workflowName": "CI", "detailsUrl": "https://x/actions/runs/1/job/2"},
+            {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE",
+             "name": "test", "workflowName": "CI",
+             "detailsUrl": "https://github.com/o/r/actions/runs/42/job/7"},
+            {"__typename": "StatusContext", "state": "ERROR",
+             "context": "ci/build", "targetUrl": "https://ci.example.com/b/9"},
+            {"__typename": "CheckRun", "status": "IN_PROGRESS", "name": "e2e"},
+        ]);
+        let failed = rollup_failures(&rollup);
+        assert_eq!(
+            failed,
+            vec![
+                FailedCheck {
+                    name: "test".into(),
+                    workflow: "CI".into(),
+                    url: "https://github.com/o/r/actions/runs/42/job/7".into(),
+                },
+                FailedCheck {
+                    name: "ci/build".into(),
+                    workflow: "".into(),
+                    url: "https://ci.example.com/b/9".into(),
+                },
+            ]
+        );
+        assert!(rollup_failures(&Value::Null).is_empty());
+    }
+
+    /// The failing set and the rolled-up verdict must agree: exactly the
+    /// outcomes that fail the rollup produce a `FailedCheck`.
+    #[test]
+    fn rollup_failures_match_the_rollup_verdict() {
+        for outcome in [
+            "FAILURE",
+            "TIMED_OUT",
+            "CANCELLED",
+            "ERROR",
+            "STARTUP_FAILURE",
+        ] {
+            let rollup = serde_json::json!([
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": outcome, "name": "c"},
+            ]);
+            assert_eq!(rollup_status(&rollup), CheckStatus::Failing, "{outcome}");
+            assert_eq!(rollup_failures(&rollup).len(), 1, "{outcome}");
+        }
+    }
+
+    #[test]
+    fn run_id_is_parsed_only_from_actions_urls() {
+        assert_eq!(
+            run_id_from_url("https://github.com/o/r/actions/runs/123456/job/789"),
+            Some(123456)
+        );
+        assert_eq!(
+            run_id_from_url("https://github.com/o/r/actions/runs/42"),
+            Some(42)
+        );
+        assert_eq!(run_id_from_url("https://ci.example.com/build/9"), None);
+        assert_eq!(run_id_from_url(""), None);
+    }
+
+    #[test]
+    fn run_log_asks_for_the_failed_steps_only() {
+        assert_eq!(run_log_args(42), ["run", "view", "42", "--log-failed"]);
+    }
+
     #[test]
     fn mergeable_maps_only_the_definitive_answers() {
         assert_eq!(parse_mergeable("MERGEABLE"), Mergeable::Clean);
@@ -1301,5 +1541,68 @@ mod tests {
             .iter()
             .any(|a| a == "repos/{owner}/{repo}/pulls/7/reviews"));
         assert!(args.windows(2).any(|w| w == ["--input", "-"]));
+    }
+
+    fn draft(path: &str, line: Option<u64>, body: &str) -> DraftComment {
+        DraftComment {
+            path: path.into(),
+            line,
+            body: body.into(),
+            severity: String::new(),
+            selected: true,
+        }
+    }
+
+    #[test]
+    fn review_payload_anchors_comments_on_the_right_side() {
+        let payload = review_payload(
+            ReviewEvent::RequestChanges,
+            "summary",
+            &[draft("src/a.rs", Some(12), "nit")],
+        );
+        assert_eq!(payload["event"], "REQUEST_CHANGES");
+        assert_eq!(payload["body"], "summary");
+        assert_eq!(
+            payload["comments"][0],
+            serde_json::json!({"path": "src/a.rs", "line": 12, "side": "RIGHT", "body": "nit"})
+        );
+    }
+
+    /// The reviews endpoint rejects the whole review over a comment with no
+    /// line (`subject_type` is not a thing there), so a line-less draft must
+    /// never reach the payload — folding it into the body is the caller's job.
+    #[test]
+    fn review_payload_never_emits_line_less_comments() {
+        let payload = review_payload(
+            ReviewEvent::Comment,
+            "s",
+            &[
+                draft("src/a.rs", Some(3), "inline"),
+                draft("src/b.rs", None, "file-level"),
+            ],
+        );
+        let comments = payload["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["line"], 3);
+        assert!(!payload.to_string().contains("subject_type"));
+    }
+
+    /// `gh api` puts the API's error body (the *reason*) on stdout and only a
+    /// terse status line on stderr — the message must carry both.
+    #[test]
+    fn gh_failure_message_includes_the_stdout_error_body() {
+        let msg = gh_failure_message(
+            &["api".into(), "x".into()],
+            br#"{"message":"Unprocessable Entity","errors":["line must be part of the diff"]}"#,
+            b"gh: Unprocessable Entity (HTTP 422)\n",
+        );
+        assert!(msg.contains("gh api x failed: gh: Unprocessable Entity (HTTP 422)"));
+        assert!(msg.contains("line must be part of the diff"));
+    }
+
+    #[test]
+    fn gh_failure_message_skips_an_empty_stdout() {
+        let msg = gh_failure_message(&["pr".into()], b"", b"boom\n");
+        assert_eq!(msg, "gh pr failed: boom");
     }
 }

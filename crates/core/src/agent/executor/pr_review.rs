@@ -2,6 +2,8 @@
 //! read-only review agent in a worktree, and publishing the drafted review.
 
 use super::*;
+use crate::diff::{compute_branch_diff, fold_unanchorable, DiffData};
+use crate::infra::git::remote_tracking_base;
 
 impl Executor {
     /// Background loop: every [`REVIEW_POLL_INTERVAL`], for each project (a) scan
@@ -68,7 +70,7 @@ impl Executor {
                 continue;
             };
             let reviewer = reviewer.as_deref();
-            let (comments, reviews, unanswered) =
+            let (comments, reviews, unanswered, checks) =
                 match self.fetch_review_status(&project.path, pr_number).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -77,12 +79,15 @@ impl Executor {
                     }
                 };
             let (by_reviewer, total) = comment_counts(&comments, reviewer);
-            // A failed thread listing keeps the previous count (see fetch_review_status).
+            // A failed thread listing keeps the previous count (see fetch_review_status);
+            // a failed checks read likewise keeps the previous status.
             let unanswered = unanswered.unwrap_or(card.unanswered_count);
+            let checks = checks.unwrap_or(card.checks);
             let card = if by_reviewer != card.reviewer_comment_count
                 || total != card.comment_count
                 || unanswered != card.unanswered_count
                 || reviews != card.reviews
+                || checks != card.checks
             {
                 // Deliberately don't bump `updated_at`: a background refresh isn't
                 // a user-facing edit and shouldn't reorder the board.
@@ -91,6 +96,7 @@ impl Executor {
                     c.comment_count = total;
                     c.unanswered_count = unanswered;
                     c.reviews = reviews;
+                    c.checks = checks;
                     Ok(())
                 })?;
                 let _ = self
@@ -384,6 +390,14 @@ impl Executor {
 
     /// Publish the checked, edited drafted comments as a single GitHub review, tear
     /// down the review worktree, and move the task to `Reviewed`.
+    ///
+    /// GitHub validates the review atomically: one comment anchored to a line
+    /// outside the PR's diff — an agent commenting on pre-existing code does
+    /// this routinely — and the whole POST is refused with a 422, losing every
+    /// other comment with it. So the selected drafts are re-anchored against
+    /// the PR's diff first, and whatever can't be placed inline (out-of-diff
+    /// lines, unknown paths, file-level drafts) is folded into the review body
+    /// — keeping the promise the diff viewer's unplaced-comments banner makes.
     pub(super) async fn publish_review(
         &self,
         review_id: Uuid,
@@ -394,8 +408,12 @@ impl Executor {
         let task = self.store.get_review_task(review_id)?;
         let project = self.store.get_project(task.project_id)?;
         let selected: Vec<DraftComment> = drafts.into_iter().filter(|d| d.selected).collect();
+        let n_selected = selected.len();
+        let diff = self.anchoring_diff(&task, &project).await;
+        let (inline, body) = fold_unanchorable(diff.as_ref(), selected, &body);
+        let folded = n_selected - inline.len();
         self.forge
-            .submit_review(&project.path, task.pr_number, event, &body, &selected)
+            .submit_review(&project.path, task.pr_number, event, &body, &inline)
             .await?;
 
         if let Some(wt) = task.worktree_path.clone() {
@@ -415,12 +433,59 @@ impl Executor {
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::review_task_updated(updated));
-        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
-            Uuid::nil(),
-            Severity::Success,
-            format!("Review published on PR #{}", task.pr_number),
-        ));
+        // Say when comments rode the summary instead of the diff — the confirm
+        // dialog promised N inline comments, and silence would read as loss.
+        let toast = if folded == 0 {
+            format!("Review published on PR #{}", task.pr_number)
+        } else {
+            format!(
+                "Review published on PR #{} ({folded} comment(s) folded into the summary)",
+                task.pr_number
+            )
+        };
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Success, toast));
         Ok(())
+    }
+
+    /// The PR's diff, recomputed for anchoring at publish time. Best-effort by
+    /// design: any failure degrades to `None` — the publish then goes ahead
+    /// with every line-anchored comment inline and GitHub as the judge (whose
+    /// verdict the forge error now carries in full).
+    ///
+    /// The PR head is *not* refetched here: its local branch is checked out in
+    /// the review worktree until after the publish, so a fetch into it would be
+    /// refused — and the drafts were written against that checkout anyway, so
+    /// it's also the honest base for anchoring them. Only the base's
+    /// remote-tracking ref is refreshed (harmless, and a stale base widens the
+    /// diff into keeping anchors GitHub would refuse).
+    async fn anchoring_diff(&self, task: &ReviewTask, project: &Project) -> Option<DiffData> {
+        let branch = task.local_branch();
+        let base = task.diff_base(project.config.effective_base_branch());
+        if let Err(e) = self.git.fetch(&project.path, "origin").await {
+            tracing::warn!(
+                "publish #{}: refreshing origin before anchoring failed: {e}",
+                task.pr_number
+            );
+        }
+        let repo = project.path.clone();
+        let computed = tokio::task::spawn_blocking(move || {
+            let base = remote_tracking_base(&repo, &base);
+            compute_branch_diff(&repo, &base, &branch)
+        })
+        .await;
+        match computed {
+            Ok(Ok(data)) => Some(data),
+            Ok(Err(e)) => {
+                tracing::warn!("publish #{}: anchoring diff failed: {e}", task.pr_number);
+                None
+            }
+            Err(e) => {
+                tracing::warn!("publish #{}: anchoring diff panicked: {e}", task.pr_number);
+                None
+            }
+        }
     }
 
     /// Drop a review task entirely: cancel any run, remove its worktree, delete the
