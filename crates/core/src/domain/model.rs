@@ -447,7 +447,9 @@ pub enum CardState {
     /// The investigation finished; its conclusion awaits the user. From here the
     /// card can take a follow-up round (back to `Investigating`), convert into
     /// an implementation (via `ResetToStart`), or be marked done.
-    Concluded { conclusion: String },
+    Concluded {
+        conclusion: String,
+    },
     Implementing(RunSub),
     AwaitingReview(ReviewSub),
     PrReview(PrReviewSub),

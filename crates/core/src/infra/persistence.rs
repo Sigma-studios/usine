@@ -557,7 +557,10 @@ impl Store {
         if let Some(rec) = rw.get().primary::<CardAnswerRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
-        if let Some(rec) = rw.get().primary::<CardInvestigationRecord>(id.to_string())? {
+        if let Some(rec) = rw
+            .get()
+            .primary::<CardInvestigationRecord>(id.to_string())?
+        {
             rw.remove(rec)?;
         }
         rw.commit()?;

@@ -19,7 +19,12 @@ pub fn BoardArea() -> Element {
 #[component]
 pub fn Board() -> Element {
     let state = use_context::<AppState>();
-    let cards = state.visible_cards();
+    let mut cards = state.visible_cards();
+    // Live Ctrl+F/Cmd+F filter; column counts follow since they're computed
+    // from the list handed to each column.
+    if let Some(q) = super::search::query() {
+        cards.retain(|c| super::search::matches(&c.title, &q));
+    }
 
     rsx! {
         div { class: "board",

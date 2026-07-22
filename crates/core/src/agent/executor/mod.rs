@@ -1564,8 +1564,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let project = Project::new("p", PathBuf::from("/tmp/p"), ProjectConfig::default());
         store.upsert_project(&project).unwrap();
-        let mut config = CardConfig::default();
-        config.kind = CardKind::Investigation;
+        let config = CardConfig {
+            kind: CardKind::Investigation,
+            ..Default::default()
+        };
         let mut card = Card::new(project.id, "c", "d", config);
         card.state = CardState::Investigating(RunSub::Running);
         store.upsert_card(&card).unwrap();
@@ -1624,7 +1626,11 @@ mod tests {
         .unwrap();
 
         let got = store.get_card(card.id).unwrap();
-        assert!(got.state.is_failed(), "expected Failed, got {:?}", got.state);
+        assert!(
+            got.state.is_failed(),
+            "expected Failed, got {:?}",
+            got.state
+        );
         assert_eq!(got.cost, crate::Cost::from_usd(0.02));
 
         // A short-but-real verdict (>= the floor) still concludes.

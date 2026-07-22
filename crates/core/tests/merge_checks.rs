@@ -433,7 +433,10 @@ async fn fixing_checks_hands_the_failures_to_an_agent() {
     })
     .await;
     assert_eq!(checks, CheckStatus::Pending);
-    assert_eq!(store.get_card(card.id).unwrap().checks, CheckStatus::Pending);
+    assert_eq!(
+        store.get_card(card.id).unwrap().checks,
+        CheckStatus::Pending
+    );
 }
 
 /// If the checks went green between the dialog and the click — a re-run, a
