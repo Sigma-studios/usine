@@ -102,6 +102,10 @@ pub(super) async fn run_actor(
         // owns its own Failed-demotion for an abandoned plan turn).
         let is_terminal_finalize =
             matches!(&evt, AgentEvent::Done { .. }) && !matches!(mode, RunMode::Plan);
+        // A provider error can park the card at `Failed` (via `handle_event`'s
+        // Error arm) — remembered so the reap below can key off it after `evt`
+        // has been consumed.
+        let was_error = matches!(&evt, AgentEvent::Error { .. });
         let result = match (&evt, mode) {
             (AgentEvent::Done { .. }, RunMode::Implement | RunMode::ApplyFixes) => {
                 finalize_run(&store, &evt_tx, &git, &cmd_tx, &executor, card_id, evt).await
@@ -135,6 +139,7 @@ pub(super) async fn run_actor(
             }
             _ => handle_event(&store, &evt_tx, card_id, evt),
         };
+        let mut demoted = false;
         match result {
             Ok(()) => {}
             // The card was deleted mid-run — stop quietly, no error toast.
@@ -165,8 +170,21 @@ pub(super) async fn run_actor(
                             message: e.to_string(),
                         },
                     );
+                    demoted = true;
                 }
             }
+        }
+        // An agent error (or the demotion above) parked the card — light-stop
+        // its preview. Keyed on the *resulting* `Failed` state so a cancel the
+        // sim surfaces as an Error event (the cancel handler already re-parked
+        // the card elsewhere) stays a user-driven stop, out of scope here.
+        if (was_error || demoted)
+            && store
+                .get_card(card_id)
+                .map(|c| c.state.is_failed())
+                .unwrap_or(false)
+        {
+            reap_idle_preview_direct(&executor, card_id);
         }
     }
     // The self-review runs in a throwaway detached scratch worktree that only this
@@ -337,6 +355,8 @@ async fn finalize_run(
             },
         )?;
         let _ = evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Warning, message));
+        // The card parked at `Failed` — light-stop the preview this run brought up.
+        reap_idle_preview_direct(executor, card_id);
         return Ok(());
     }
 
@@ -373,6 +393,12 @@ async fn finalize_run(
         Transition::SelfFixesDone | Transition::ValidationFixDone
     );
     apply_transition(store, evt_tx, card_id, transition)?;
+    // The card just parked (`ReadyForReview`, `ReadyToMerge`, or PR-review
+    // idle): light-stop the preview this run brought up. The validation routes
+    // keep it — the gate continues and reaps at its own end.
+    if !needs_validation {
+        reap_idle_preview_direct(executor, card_id);
+    }
     // The fix has committed + pushed above, so ask the executor to mark the fixed
     // comments' GitHub threads resolved. Routed back through the command channel
     // (rather than blocking here) since it's a best-effort forge call.
@@ -434,9 +460,27 @@ async fn finalize_self_review(
     if matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) {
         run_validation_direct(executor, evt_tx, card_id);
     }
+    // Findings parked the card at `SelectingFixes` — light-stop the preview
+    // while the user picks. (The clean case above rides the gate, whose own
+    // hooks reap at its end.)
+    if matches!(
+        card.state,
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+    ) {
+        reap_idle_preview_direct(executor, card_id);
+    }
     // The throwaway detached scratch worktree is torn down when the actor exits
     // (see `run_actor`), which covers this happy path and every abnormal one.
     Ok(())
+}
+
+/// Light-stop a parked card's preview from an actor task that only holds a
+/// `Weak<Executor>` (mirrors [`run_validation_direct`]). Best-effort: a dead
+/// executor means shutdown, which reaps all previews itself.
+pub(super) fn reap_idle_preview_direct(executor: &Weak<Executor>, card_id: Uuid) {
+    if let Some(exec) = executor.upgrade() {
+        tokio::spawn(async move { exec.reap_idle_preview(card_id).await });
+    }
 }
 
 /// Continue the validation gate from an actor task with a direct executor call
