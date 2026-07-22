@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark.svg">
-    <img src="crates/app/assets/logo.svg" alt="Usine logo" width="140">
-  </picture>
+  <img src="crates/app/assets/logo.svg" alt="Usine logo" width="140">
 </p>
 
 # Usine
