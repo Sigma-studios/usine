@@ -58,22 +58,8 @@ async fn card_at_the_fix_picker() -> (
         git: Arc::new(SimGit),
     });
 
-    // Implement, then run the self-review pass over the committed diff.
+    // Implement; the self-review pass auto-starts when the run lands.
     handle.send(ExecutorCommand::Start { card_id });
-    wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::CardUpdated(c)
-            if matches!(
-                c.state,
-                CardState::AwaitingReview(ReviewSub::ReadyForReview)
-            ) =>
-        {
-            Some(())
-        }
-        _ => None,
-    })
-    .await;
-
-    handle.send(ExecutorCommand::SelfReview { card_id });
     let verdicts = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
             CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {

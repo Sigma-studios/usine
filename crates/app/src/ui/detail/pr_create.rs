@@ -6,6 +6,7 @@
 
 use dioxus::prelude::*;
 use usine_core::{Card, CardState, ExecutorCommand, Handoff, ReviewSub, MAX_VALIDATION_ATTEMPTS};
+use uuid::Uuid;
 
 use crate::state::AppState;
 
@@ -28,8 +29,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .and_then(|p| p.config.reviewer.clone())
         .unwrap_or_default();
     let mut reviewer = use_signal(|| default_reviewer);
-    // Free-form feedback for sending the implementation back to the agent.
-    let mut revision = use_signal(String::new);
+    // Free-form feedback for sending the implementation back to the agent,
+    // owned here (and handed to each `RequestChanges`) so typed-but-unsent
+    // feedback survives the card moving between the parked states.
+    let revision = use_signal(String::new);
     let branch = card.branch.clone().unwrap_or_default();
     // The PR branch name is required and starts blank: the user must deliberately
     // choose one rather than shipping the auto-generated `usine/…` name.
@@ -73,6 +76,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         card.state,
         CardState::AwaitingReview(ReviewSub::Reviewing | ReviewSub::ApplyingFixes)
     );
+    let is_selecting_fixes = matches!(
+        card.state,
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+    );
     let is_ready_for_pr = matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr));
     // The validation gate's three faces: the check running, the agent fixing a
     // failure, and the parked exhausted-budget failure.
@@ -107,13 +114,16 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
         }
 
-        // 1) Just implemented: the work is committed in the worktree. Test it,
-        //    run a self-review pass, or send it back to the agent to revise.
+        // 1) The recovery gate: the self-review normally auto-starts when the
+        //    implementation finishes, so a card only rests here after a cancelled
+        //    review or a failed auto-start. Re-run it, skip it, or send the work
+        //    back to the agent to revise.
         if is_ready_for_review {
             div { class: "section",
                 h3 { "Self-review" }
                 div { class: "hint",
-                    "Run an automated review pass over the committed diff (guided by the project's \
+                    "The self-review normally starts by itself when the implementation finishes. \
+                     Run the review pass over the committed diff (guided by the project's \
                      review.md, or a default prompt), or skip straight to the pull request."
                 }
                 div { class: "row",
@@ -129,36 +139,33 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                     }
                 }
             }
+            RequestChanges {
+                card_id: id,
+                revision,
+                hint: "Not happy with the implementation? Send it back to the agent to revise in its worktree.",
+            }
+        }
+
+        // Self-review agent running. Cancelling parks the card back at the
+        // manual gate with all its options.
+        if is_self_reviewing {
             div { class: "section",
-                h3 { "Request changes" }
-                div { class: "hint",
-                    "Not happy with the implementation? Send it back to the agent to revise in its worktree."
-                }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change or improve?",
-                        value: "{revision}",
-                        oninput: move |e| revision.set(e.value()),
-                    }
-                }
+                div { class: "hint", "Self-review in progress…" }
                 button {
                     class: "btn",
-                    onclick: move |_| {
-                        let fb = revision.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
-                            revision.set(String::new());
-                        }
-                    },
-                    "Send back to implementing"
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
                 }
             }
         }
 
-        // Self-review agent running.
-        if is_self_reviewing {
-            div { class: "section",
-                div { class: "hint", "Self-review in progress…" }
+        // The fix picker (rendered separately) is where an auto-reviewed card
+        // first parks, so the send-back affordance must be reachable from it too.
+        if is_selecting_fixes {
+            RequestChanges {
+                card_id: id,
+                revision,
+                hint: "Not happy with the implementation? Send it back to the agent to revise in its worktree.",
             }
         }
 
@@ -219,27 +226,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
             // The parked failure can also bounce the work back wholesale.
-            div { class: "section",
-                h3 { "Request changes" }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change or improve?",
-                        value: "{revision}",
-                        oninput: move |e| revision.set(e.value()),
-                    }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = revision.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
-                            revision.set(String::new());
-                        }
-                    },
-                    "Send back to implementing"
-                }
-            }
+            RequestChanges { card_id: id, revision }
         }
 
         // 2) Ready to open the pull request.
@@ -366,29 +353,46 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
 
             // Still bounce the work back to the agent before opening the PR.
-            div { class: "section",
-                h3 { "Request changes" }
-                div { class: "hint",
-                    "Spotted something before opening the PR? Send it back to the agent to revise in its worktree."
+            RequestChanges {
+                card_id: id,
+                revision,
+                hint: "Spotted something before opening the PR? Send it back to the agent to revise in its worktree.",
+            }
+        }
+    }
+}
+
+/// The "Request changes" section every parked pre-PR state renders: free-form
+/// feedback that sends the finished implementation back to the agent to revise
+/// in its worktree. The `revision` signal is the caller's, so typed-but-unsent
+/// feedback survives the card moving between those states.
+#[component]
+fn RequestChanges(card_id: Uuid, revision: Signal<String>, hint: Option<String>) -> Element {
+    let state = use_context::<AppState>();
+    let mut revision = revision;
+    rsx! {
+        div { class: "section",
+            h3 { "Request changes" }
+            if let Some(hint) = hint {
+                div { class: "hint", "{hint}" }
+            }
+            div { class: "field",
+                textarea {
+                    placeholder: "What should the agent change or improve?",
+                    value: "{revision}",
+                    oninput: move |e| revision.set(e.value()),
                 }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change or improve?",
-                        value: "{revision}",
-                        oninput: move |e| revision.set(e.value()),
+            }
+            button {
+                class: "btn",
+                onclick: move |_| {
+                    let fb = revision.read().trim().to_string();
+                    if !fb.is_empty() {
+                        state.send(ExecutorCommand::ReviseImplementation { card_id, feedback: fb });
+                        revision.set(String::new());
                     }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = revision.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
-                            revision.set(String::new());
-                        }
-                    },
-                    "Send back to implementing"
-                }
+                },
+                "Send back to implementing"
             }
         }
     }
