@@ -190,6 +190,34 @@ async fn simulate(
                 },
             });
         }
+        RunMode::Investigate => {
+            emit!(AgentEvent::Progress {
+                text: "🔎 Reading the code paths in question…".into()
+            });
+            pause!(500);
+            emit!(AgentEvent::Progress {
+                text: "🧵 Tracing call sites…".into()
+            });
+            pause!(500);
+            emit!(AgentEvent::Done {
+                result: "## Findings\n\n\
+                    - The request cache in `src/cache.rs:42` is keyed by URL and never evicted; \
+                    it grows unboundedly under varied traffic.\n\
+                    - `src/handler.rs:118` clones the whole response body into the cache even for \
+                    streaming responses.\n\n\
+                    ## Verdict\n\n\
+                    The cache is NOT bounded. Adding an LRU cap (~1k entries) at the insert site \
+                    in `src/cache.rs:42` would fix both issues; the streaming clone should be \
+                    skipped outright.\n\n\
+                    If you want, a follow-up could size the cap against production traffic."
+                    .into(),
+                cost_usd: 0.06,
+                usage: Usage {
+                    input_tokens: 5_000,
+                    output_tokens: 900,
+                },
+            });
+        }
         RunMode::Triage => {
             emit!(AgentEvent::Progress {
                 text: "🧭 Triaging review comments…".into()

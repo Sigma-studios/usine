@@ -112,6 +112,27 @@ pub(super) async fn run_actor(
             (AgentEvent::Done { .. }, RunMode::Triage) => {
                 finalize_triage(&store, &evt_tx, card_id, evt)
             }
+            (AgentEvent::Done { .. }, RunMode::Investigate) => {
+                finalize_investigation(&store, &evt_tx, card_id, evt)
+            }
+            // A stray PlanReady in investigate mode (an ExitPlanMode the
+            // instruction failed to head off) is the agent's conclusion, not a
+            // plan — `AgentPlanReady` would be an illegal move here anyway. A
+            // draft under the conclusion floor (e.g. a trivial "done") is
+            // ignored outright: the run continues past the rejected tool call,
+            // and its final result goes through the same floor in
+            // `finalize_investigation`, failing retryably if it's also trivial —
+            // rather than parking the card on a useless conclusion here.
+            (AgentEvent::PlanReady { .. }, RunMode::Investigate) => {
+                let AgentEvent::PlanReady { plan } = evt else {
+                    unreachable!()
+                };
+                if plan.trim().chars().count() < MIN_CONCLUSION_CHARS {
+                    Ok(())
+                } else {
+                    conclude_investigation(&store, &evt_tx, card_id, plan)
+                }
+            }
             _ => handle_event(&store, &evt_tx, card_id, evt),
         };
         match result {
@@ -491,6 +512,85 @@ fn finalize_triage(
         Transition::CommentsFetched { verdicts },
     )?;
     Ok(())
+}
+
+/// The floor under an investigation conclusion: anything shorter is the agent
+/// bailing mid-thought on a dangling status line, not a verdict. Much lower
+/// than a plan's, since a one-sentence verdict is a legitimate conclusion.
+/// Shared by the run's final result and a stray in-run ExitPlanMode draft.
+const MIN_CONCLUSION_CHARS: usize = 40;
+
+/// Park an investigation on its conclusion, with the transcript line the
+/// concluded panel's history keys off. Tolerates losing a race (a cancel landed
+/// first, or a stray PlanReady already concluded the card).
+fn conclude_investigation(
+    store: &Store,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+    conclusion: String,
+) -> Result<()> {
+    match apply_transition(
+        store,
+        evt_tx,
+        card_id,
+        Transition::AgentConcluded { conclusion },
+    ) {
+        Ok(_) => {
+            transcript(store, evt_tx, card_id, "✔ investigation concluded".into());
+            Ok(())
+        }
+        Err(CoreError::IllegalTransition(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Finalize a read-only investigation run: record cost and park the card on its
+/// conclusion. A result under [`MIN_CONCLUSION_CHARS`] fails the run (retryable)
+/// instead.
+pub(super) fn finalize_investigation(
+    store: &Store,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+    evt: AgentEvent,
+) -> Result<()> {
+    let (result_text, cost) = match evt {
+        AgentEvent::Done {
+            result, cost_usd, ..
+        } => (result, cost_usd),
+        _ => return Ok(()),
+    };
+    let card = store.get_card(card_id)?;
+    // Already concluded: a stray PlanReady carried the conclusion (see
+    // `run_actor`); just record this run's cost. Any other state lost a
+    // cancel/supersede race — skip entirely.
+    let already_concluded = matches!(card.state, CardState::Concluded { .. });
+    if !matches!(card.state, CardState::Investigating(_)) && !already_concluded {
+        return Ok(());
+    }
+    store.mutate_card(card_id, |c| {
+        c.cost += crate::Cost::from_usd(cost);
+        c.updated_at = now_millis();
+        Ok(())
+    })?;
+    if already_concluded {
+        return Ok(());
+    }
+    if result_text.trim().chars().count() < MIN_CONCLUSION_CHARS {
+        let message = "The investigation ended without producing a conclusion — the agent \
+                       stopped mid-turn. Retry to investigate again."
+            .to_string();
+        apply_transition(
+            store,
+            evt_tx,
+            card_id,
+            Transition::AgentError {
+                message: message.clone(),
+            },
+        )?;
+        let _ = evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Warning, message));
+        return Ok(());
+    }
+    conclude_investigation(store, evt_tx, card_id, result_text)
 }
 
 /// Handle the non-finalizing events of a run. `NeedsInput` (parking) and

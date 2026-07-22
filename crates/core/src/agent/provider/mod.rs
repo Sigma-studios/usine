@@ -34,6 +34,9 @@ pub enum RunMode {
     Review,
     /// Read-only triage of PR review comments; emits structured verdicts.
     Triage,
+    /// Read-only investigation/audit in the main checkout; the final response is
+    /// the conclusion the card parks on.
+    Investigate,
 }
 
 /// Everything a provider needs to launch one run.

@@ -22,6 +22,7 @@ pub use agent::events::{
 };
 pub use agent::executor::{spawn as spawn_executor, ExecutorConfig, ExecutorHandle};
 pub use agent::handoff::{parse_handoff, Handoff, HANDOFF_INSTRUCTION};
+pub use agent::investigate::{investigate_instruction, INVESTIGATE_INSTRUCTION};
 pub use agent::plan::{parse_plan, plan_instruction, PlanQuestion, PLAN_QUESTIONS_INSTRUCTION};
 pub use agent::provider::claude::ClaudeProvider;
 pub use agent::provider::codex::CodexProvider;
@@ -42,7 +43,7 @@ pub use diff::{
     anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, DiffData, DiffFile,
     DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
 };
-pub use domain::config::{AppSettings, CardConfig, PreviewPort, ProjectConfig};
+pub use domain::config::{AppSettings, CardConfig, CardKind, PreviewPort, ProjectConfig};
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardState, CheckStatus, Column, Cost, DesignSub,
     DraftComment, Effort, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo, PrReviewSub,
