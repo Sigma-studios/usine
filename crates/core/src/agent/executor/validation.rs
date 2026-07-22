@@ -183,14 +183,21 @@ fn fix_validation_direct(
                 .map(|c| c.state.is_running())
                 .unwrap_or(false)
             {
-                let _ = apply_transition(
+                let demoted = apply_transition(
                     &store,
                     &evt_tx,
                     card_id,
                     Transition::AgentError {
                         message: e.to_string(),
                     },
-                );
+                )
+                .is_ok();
+                // Failing to launch the fix run (e.g. the provider CLI is
+                // missing) parks the card at `Failed` with no actor behind it
+                // — light-stop the preview the pipeline left up.
+                if demoted {
+                    exec.reap_idle_preview(card_id).await;
+                }
             }
         }
     });

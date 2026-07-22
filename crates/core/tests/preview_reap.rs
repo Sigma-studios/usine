@@ -13,9 +13,10 @@ use std::time::Duration;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, Card, CardConfig, CardState, ExecutorCommand, ExecutorConfig, ExecutorEvent,
-    ExecutorEventKind, PreviewStatus, Project, ProjectConfig, ReviewSub, SimFactory, SimForge,
-    SimGit, Store,
+    spawn_executor, AgentProvider, Card, CardConfig, CardState, CoreError, ExecutorCommand,
+    ExecutorConfig, ExecutorEvent, ExecutorEventKind, PreviewStatus, Project, ProjectConfig,
+    Provider, ProviderFactory, ReviewSub, RunConfig, RunHandle, SimFactory, SimForge, SimGit,
+    Store,
 };
 
 async fn wait_for<F, T>(rx: &mut UnboundedReceiver<ExecutorEvent>, mut f: F) -> T
@@ -157,6 +158,67 @@ async fn validation_pass_reaps_light_without_teardown() {
     assert!(
         !wt.path().join("torn-down").exists(),
         "the teardown script must not run on a parked-card reap"
+    );
+}
+
+/// A provider whose `start` always fails — the "CLI isn't installed" case.
+struct FailingProvider(Provider);
+
+#[async_trait::async_trait]
+impl AgentProvider for FailingProvider {
+    fn provider(&self) -> Provider {
+        self.0
+    }
+
+    async fn start(&self, _cfg: RunConfig) -> usine_core::Result<RunHandle> {
+        Err(CoreError::other("the provider CLI is not installed"))
+    }
+}
+
+struct FailingFactory;
+
+impl ProviderFactory for FailingFactory {
+    fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
+        Arc::new(FailingProvider(provider))
+    }
+}
+
+/// A launch failure parks the card at `Failed` without ever entering
+/// `run_actor`, so `launch` itself must reap: here a validation fix run's
+/// provider fails to start while the mid-gate preview is still up.
+#[tokio::test]
+async fn failed_fix_launch_reaps_the_preview() {
+    let wt = tempfile::tempdir().unwrap();
+    let (store, card_id) = seed(
+        ProjectConfig {
+            validate_script: Some("exit 1".into()),
+            ..ProjectConfig::default()
+        },
+        CardState::AwaitingReview(ReviewSub::ValidationFailed {
+            attempt: 1,
+            output: "NOPE".into(),
+        }),
+        wt.path(),
+    );
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(FailingFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+
+    // Bring the preview up first (the state a mid-gate card holds), then ask
+    // for one more fix: the provider can't start, demoting the card to Failed.
+    handle.send(ExecutorCommand::StartPreview { card_id });
+    wait_for_preview(&mut rx, card_id, PreviewStatus::Running).await;
+    handle.send(ExecutorCommand::FixValidation { card_id });
+
+    wait_for_preview(&mut rx, card_id, PreviewStatus::Stopped).await;
+    let card = store.get_card(card_id).unwrap();
+    assert!(
+        card.state.is_failed(),
+        "card should be parked at Failed, got {:?}",
+        card.state
     );
 }
 

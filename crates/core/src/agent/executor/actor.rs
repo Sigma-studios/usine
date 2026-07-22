@@ -460,15 +460,12 @@ async fn finalize_self_review(
     if matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) {
         run_validation_direct(executor, evt_tx, card_id);
     }
-    // Findings parked the card at `SelectingFixes` — light-stop the preview
-    // while the user picks. (The clean case above rides the gate, whose own
-    // hooks reap at its end.)
-    if matches!(
-        card.state,
-        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
-    ) {
-        reap_idle_preview_direct(executor, card_id);
-    }
+    // Findings park the card at `SelectingFixes` with no reap: a review run
+    // never dispatches `EnsurePreview`, and every route into `Reviewing` passed
+    // through a park that already reaped the pipeline's preview — so anything
+    // alive here was started by the user, who's about to pick fixes and wants
+    // the app up.
+    //
     // The throwaway detached scratch worktree is torn down when the actor exits
     // (see `run_actor`), which covers this happy path and every abnormal one.
     Ok(())
@@ -509,14 +506,20 @@ pub(super) fn run_validation_direct(
                 .map(|c| c.state.is_running())
                 .unwrap_or(false)
             {
-                let _ = apply_transition(
+                let demoted = apply_transition(
                     &exec.store,
                     &evt_tx,
                     card_id,
                     Transition::AgentError {
                         message: e.to_string(),
                     },
-                );
+                )
+                .is_ok();
+                // The demotion parked the card at `Failed` outside `run_actor`'s
+                // reach — light-stop the preview the pipeline left up.
+                if demoted {
+                    exec.reap_idle_preview(card_id).await;
+                }
             }
         }
     });

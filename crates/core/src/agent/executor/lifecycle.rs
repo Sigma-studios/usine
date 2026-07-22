@@ -274,14 +274,21 @@ impl Executor {
                 // run backs it (e.g. the CLI isn't installed). Mark it Failed so
                 // it's recoverable instead of stranded mid-column, then surface
                 // the error.
-                let _ = apply_transition(
+                let demoted = apply_transition(
                     &self.store,
                     &self.evt_tx,
                     card.id,
                     Transition::AgentError {
                         message: format!("failed to start run: {e}"),
                     },
-                );
+                )
+                .is_ok();
+                // A `Failed` park `run_actor` never sees: a mid-gate launch
+                // (e.g. a validation fix run) deliberately kept the previous
+                // run's preview alive, so light-stop it here.
+                if demoted {
+                    self.reap_idle_preview(card.id).await;
+                }
                 return Err(e);
             }
         };
