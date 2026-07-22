@@ -75,6 +75,9 @@ pub fn CardView(card: Card) -> Element {
         .as_ref()
         .map(|p| p.state == "draft")
         .unwrap_or(false);
+    // Surface the PR from the board itself — until now only the detail panel
+    // showed it, while the review board already prefixes its cards with #N.
+    let pr_link = card.pr.as_ref().map(|p| (p.number, p.url.clone()));
     // The worktree holds committed, reviewable work from just-implemented through
     // PR review until merge. "Show diff" lives in the card actions menu; the
     // preview controls sit inline on the card and need a run command configured.
@@ -194,6 +197,21 @@ pub fn CardView(card: Card) -> Element {
                     span { class: "badge intervention", "needs answer" }
                 } else {
                     span { class: "badge status", "{status}" }
+                }
+                if let Some((number, url)) = pr_link {
+                    a {
+                        class: "badge pr-link",
+                        href: "{url}",
+                        target: "_blank",
+                        rel: "noreferrer",
+                        title: "Open pull request on GitHub",
+                        // Don't let a click on the link also select the card, and
+                        // shield its Enter activation from the card's onkeydown
+                        // (which prevents the default action).
+                        onclick: move |e| e.stop_propagation(),
+                        onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
+                        "#{number}"
+                    }
                 }
                 // The PR's CI state, once it has one and any check reported —
                 // a red build is worth seeing from the board, before reaching
