@@ -115,6 +115,20 @@ impl Executor {
         })?;
 
         self.apply(card_id, Transition::CreatePr)?;
+        // With no reviewer to wait on there is nothing the PR gate can ever
+        // receive, so advance to the merge gate now rather than making the card
+        // wait for the poll to notice. Uses the effective reviewer (the one the
+        // forge stored on the PR, or the project fallback) like the poll does.
+        // A draft still advances: `ReadyToMerge` gates it behind "Mark ready".
+        let card = self.store.get_card(card_id)?;
+        let reviewer = pr
+            .reviewer
+            .as_deref()
+            .or(project.config.reviewer.as_deref());
+        if card.no_reviewer_clears_merge(reviewer) {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ no reviewer assigned — ready to merge");
+        }
         let msg = if draft {
             format!("Draft PR #{number} created — add screenshots on GitHub, then mark it ready.")
         } else {
@@ -422,13 +436,14 @@ impl Executor {
             .pr
             .as_ref()
             .ok_or_else(|| CoreError::other("card has no PR to read reviews from"))?;
+        // Owned so it outlives the refreshed `card` below.
         let reviewer = pr
             .reviewer
-            .as_deref()
-            .or(project.config.reviewer.as_deref());
+            .clone()
+            .or_else(|| project.config.reviewer.clone());
         let (comments, reviews, unanswered) =
             self.fetch_review_status(&project.path, pr.number).await?;
-        let (by_reviewer, total) = comment_counts(&comments, reviewer);
+        let (by_reviewer, total) = comment_counts(&comments, reviewer.as_deref());
         // A failed thread listing keeps the previous count (see fetch_review_status).
         let unanswered = unanswered.unwrap_or(card.unanswered_count);
         let card = if reviews != card.reviews
@@ -455,6 +470,9 @@ impl Executor {
         if card.approval_clears_merge() {
             self.apply(card_id, Transition::ReviewApproved)?;
             self.progress(card_id, "✔ approved with no comments — ready to merge");
+        } else if card.no_reviewer_clears_merge(reviewer.as_deref()) {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ no reviewer assigned — ready to merge");
         }
         Ok(())
     }

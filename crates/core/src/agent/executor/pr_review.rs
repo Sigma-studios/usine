@@ -109,6 +109,15 @@ impl Executor {
                     continue;
                 }
                 self.progress(card.id, "✔ approved with no comments — ready to merge");
+            } else if card.no_reviewer_clears_merge(reviewer) {
+                // No reviewer was ever assigned, so no approval will ever come:
+                // this is the only way such a card reaches the merge gate. Also
+                // recovers cards stranded before create_pr advanced them eagerly.
+                if let Err(e) = self.apply(card.id, Transition::ReviewApproved) {
+                    tracing::warn!("PR-comment poll: auto-advance for #{pr_number} failed: {e}");
+                    continue;
+                }
+                self.progress(card.id, "✔ no reviewer assigned — ready to merge");
             }
         }
         Ok(())

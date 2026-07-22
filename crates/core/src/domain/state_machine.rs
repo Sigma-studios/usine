@@ -86,11 +86,15 @@ pub enum Transition {
         verdicts: Vec<FixVerdict>,
     },
     AgentFixesDone,
-    /// A reviewer approved the PR with nothing left to triage, so the card can
-    /// skip the comment-triage chain and go straight to the merge gate. Fired by
-    /// the review poll (and its manual ↻ twin) off
-    /// [`Card::approval_clears_merge`](crate::domain::model::Card::approval_clears_merge),
-    /// which owns the "is it really clear?" rules.
+    /// The PR gate has nothing left to wait for, so the card can skip the
+    /// comment-triage chain and go straight to the merge gate: either a reviewer
+    /// approved with nothing left to triage, or no reviewer was ever assigned
+    /// (so no approval will ever come). Fired by the review poll (and its manual
+    /// ↻ twin, and — for the no-reviewer case — PR creation itself) off
+    /// [`Card::approval_clears_merge`](crate::domain::model::Card::approval_clears_merge)
+    /// and
+    /// [`Card::no_reviewer_clears_merge`](crate::domain::model::Card::no_reviewer_clears_merge),
+    /// which own the "is it really clear?" rules.
     ReviewApproved,
     AgentError {
         message: String,
