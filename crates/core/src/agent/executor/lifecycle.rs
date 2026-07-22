@@ -56,7 +56,7 @@ impl Executor {
             RunMode::Plan => card.config.plan.clone(),
             // The read-only phases share the review spec, which falls back to
             // `implement` when the card has no override.
-            RunMode::Review | RunMode::Triage => card.config.review_spec(),
+            RunMode::Review | RunMode::Triage | RunMode::Question => card.config.review_spec(),
             RunMode::Implement | RunMode::ApplyFixes => card.config.implement.clone(),
         };
         let project_dir = match mode {
@@ -74,8 +74,9 @@ impl Executor {
                         .clone()
                         .unwrap_or_else(|| project.path.clone())
                 }),
-            // Triage is read-only — running in the main tree is harmless.
-            RunMode::Triage => card
+            // Triage and Q&A are read-only — running in the main tree is
+            // harmless (a plan-stage question has no worktree yet).
+            RunMode::Triage | RunMode::Question => card
                 .worktree_path
                 .clone()
                 .unwrap_or_else(|| project.path.clone()),
@@ -437,6 +438,11 @@ impl Executor {
         // re-plan saves a fresh one; a "skip plan" re-run rightly has none). The
         // hand-off recaps that same discarded attempt, so it goes too.
         let _ = self.store.delete_plan(card_id);
+        // The Agent Chat answer describes the discarded attempt too.
+        let _ = self.store.delete_answer(card_id);
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::answer_updated(card_id, ""));
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx
@@ -635,6 +641,10 @@ impl Executor {
                 let comments = self.store.get_pending_comments(card_id).unwrap_or_default();
                 Some(triage_prompt(&comments))
             }
+            // Unreachable: relaunch derives the mode from the card's state,
+            // which never maps to Question — a died question run is retried as
+            // its state's normal mode instead (the user re-asks if needed).
+            RunMode::Question => None,
         };
         self.launch(card, mode, extra, resume).await
     }

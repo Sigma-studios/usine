@@ -112,6 +112,9 @@ pub(super) async fn run_actor(
             (AgentEvent::Done { .. }, RunMode::Triage) => {
                 finalize_triage(&store, &evt_tx, card_id, evt)
             }
+            (AgentEvent::Done { .. }, RunMode::Question) => {
+                finalize_question(&store, &evt_tx, card_id, evt)
+            }
             _ => handle_event(&store, &evt_tx, card_id, evt),
         };
         match result {
@@ -477,6 +480,55 @@ fn finalize_triage(
         card_id,
         Transition::CommentsFetched { verdicts },
     )?;
+    Ok(())
+}
+
+/// Finalize a read-only Agent Chat question run: record cost, persist + emit
+/// the prose answer, and apply the agent-done transition that lands the card
+/// back where the question was asked from. Never touches git — a question run
+/// changes no files by contract, so the no-commit guard in `finalize_run` must
+/// not see it — and never touches the hand-off or the fixes recap.
+fn finalize_question(
+    store: &Store,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+    evt: AgentEvent,
+) -> Result<()> {
+    let (answer, cost) = match evt {
+        AgentEvent::Done {
+            result, cost_usd, ..
+        } => (result, cost_usd),
+        _ => return Ok(()),
+    };
+    // Route back by the card's *current* running state (see `ask_question` for
+    // the entry edges). Any other state means a cancel/supersede race — skip.
+    let transition = match store.get_card(card_id)?.state {
+        // A plan-stage question: restore the stashed plan verbatim so the card
+        // returns to AwaitingApproval exactly as it left it. Without a stored
+        // plan (a delete raced us), demote rather than restore an empty plan.
+        CardState::Designing(DesignSub::Running) => match store.get_plan(card_id)? {
+            Some(plan) => Transition::AgentPlanReady { plan },
+            None => Transition::AgentError {
+                message: "the plan under discussion went missing — retry to re-plan".into(),
+            },
+        },
+        CardState::Implementing(RunSub::Running) => Transition::AgentImplementDone,
+        CardState::PrReview(PrReviewSub::ApplyingChange | PrReviewSub::ApplyingFixes) => {
+            Transition::AgentFixesDone
+        }
+        _ => return Ok(()),
+    };
+    store.mutate_card(card_id, |c| {
+        c.cost += crate::Cost::from_usd(cost);
+        c.updated_at = now_millis();
+        Ok(())
+    })?;
+    let _ = store.set_answer(card_id, &answer);
+    let _ = evt_tx.unbounded_send(ExecutorEvent::answer_updated(card_id, answer.clone()));
+    apply_transition(store, evt_tx, card_id, transition)?;
+    if !answer.is_empty() {
+        transcript(store, evt_tx, card_id, format!("✔ {answer}"));
+    }
     Ok(())
 }
 

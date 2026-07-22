@@ -195,6 +195,18 @@ struct DismissedReviewsRecord {
     pr_numbers: Vec<u64>,
 }
 
+/// The latest Agent Chat answer for a card. Its own record (not a field on
+/// [`CardReviewRecord`]) so adding it doesn't change an existing record's
+/// layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 11, version = 1, with = Json)]
+#[native_db]
+struct CardAnswerRecord {
+    #[primary_key]
+    card_id: String,
+    answer: String,
+}
+
 const SETTINGS_ID: u8 = 1;
 
 /// Model registry. Must be `'static` so the [`Database`] can be `'static` and
@@ -234,6 +246,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<DismissedReviewsRecord>()
         .expect("define DismissedReviewsRecord");
+    models
+        .define::<CardAnswerRecord>()
+        .expect("define CardAnswerRecord");
     models
 });
 
@@ -295,6 +310,7 @@ impl Store {
         self.refresh_type::<CardAttachmentsRecord>();
         self.refresh_type::<CardReviewRecord>();
         self.refresh_type::<DismissedReviewsRecord>();
+        self.refresh_type::<CardAnswerRecord>();
     }
 
     /// Refresh one record type in its own transaction, best-effort: an undecodable
@@ -504,6 +520,9 @@ impl Store {
         if let Some(rec) = rw.get().primary::<CardReviewRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
+        if let Some(rec) = rw.get().primary::<CardAnswerRecord>(id.to_string())? {
+            rw.remove(rec)?;
+        }
         rw.commit()?;
         Ok(())
     }
@@ -541,6 +560,56 @@ impl Store {
         }
         rw.commit()?;
         Ok(())
+    }
+
+    // --- Agent Chat answers ---------------------------------------------
+
+    /// Store (or replace) a card's latest Agent Chat answer.
+    pub fn set_answer(&self, card_id: Uuid, answer: &str) -> Result<()> {
+        let rec = CardAnswerRecord {
+            card_id: card_id.to_string(),
+            answer: answer.to_string(),
+        };
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(rec.card_id.clone())?;
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    pub fn get_answer(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.answer).filter(|s: &String| !s.is_empty()))
+    }
+
+    /// Drop a card's stored answer (used by "back to start"). Idempotent.
+    pub fn delete_answer(&self, card_id: Uuid) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        if let Some(rec) = rw.get().primary::<CardAnswerRecord>(card_id.to_string())? {
+            rw.remove(rec)?;
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// All cards' answers, keyed by card id (loaded once at startup).
+    pub fn all_answers(&self) -> Result<HashMap<Uuid, String>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardAnswerRecord>()?.all()? {
+            let rec = rec?;
+            if rec.answer.is_empty() {
+                continue;
+            }
+            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
+                out.insert(id, rec.answer);
+            }
+        }
+        Ok(out)
     }
 
     // --- per-card options ----------------------------------------------
@@ -927,6 +996,7 @@ pub fn rebuild_database(old: &Path, new: &Path) -> Result<Vec<(&'static str, usi
     copy_table!(CardReviewRecord, "reviews");
     copy_table!(ReviewTaskRecord, "review_tasks");
     copy_table!(DismissedReviewsRecord, "dismissed_reviews");
+    copy_table!(CardAnswerRecord, "answers");
 
     rw.commit()?;
     Ok(report)

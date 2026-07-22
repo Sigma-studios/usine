@@ -405,6 +405,9 @@ impl Executor {
             ExecutorCommand::ReviseImplementation { card_id, feedback } => {
                 self.revise(card_id, feedback).await
             }
+            ExecutorCommand::AskQuestion { card_id, question } => {
+                self.ask_question(card_id, question).await
+            }
             ExecutorCommand::ListReviewers { project_id } => self.list_reviewers(project_id).await,
             ExecutorCommand::RefreshUsage => {
                 self.refresh_usage().await;
@@ -920,6 +923,34 @@ fn revise_extra(plan: Option<&str>, feedback: &str) -> String {
          requested. Review the current changes and update them accordingly:\n\n",
     );
     s.push_str(feedback);
+    s
+}
+
+/// Extra prompt for an Agent Chat question: where the work currently sits, the
+/// plan when one exists, the user's question, and the read-only contract. The
+/// run is a fresh conversation, so the stage sentence anchors what "this work"
+/// means before the agent starts reading.
+fn question_extra(stage: &str, plan: Option<&str>, question: &str) -> String {
+    let mut s = String::new();
+    s.push_str(stage);
+    s.push_str("\n\n");
+    if let Some(plan) = plan {
+        let (plan, _) = crate::agent::plan::parse_plan(plan);
+        if !plan.trim().is_empty() {
+            s.push_str("The plan for this work:\n");
+            s.push_str(plan.trim());
+            s.push_str("\n\n");
+        }
+    }
+    s.push_str("The user has a question about this work — answer it, do not change anything:\n\n");
+    s.push_str(question);
+    s.push_str(
+        "\n\nThis is a READ-ONLY turn: do NOT modify, create, or delete any files, and do not \
+         commit or push. Inspect whatever you need, then answer concisely in your final message. \
+         Do not ask questions back — state your assumptions instead. If investigating the \
+         question reveals a real defect, say so plainly; the user will decide whether to send a \
+         change request.",
+    );
     s
 }
 

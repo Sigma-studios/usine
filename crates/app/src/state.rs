@@ -76,6 +76,9 @@ pub struct AppState {
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
     /// Per-card fixes recap, seeded at startup and updated via `RecapUpdated`.
     pub review_recaps: Signal<HashMap<Uuid, String>>,
+    /// Per-card Agent Chat answer (the last question run's prose reply), seeded
+    /// at startup and updated via `AnswerUpdated` (empty removes the entry).
+    pub answers: Signal<HashMap<Uuid, String>>,
     /// Per-card implementation hand-off — the recap, open questions, and testing
     /// checklist the implement run left for its reviewer. Seeded at startup and
     /// updated via `HandoffUpdated`.
@@ -135,6 +138,7 @@ impl AppState {
         let skip_plans = store.skip_plan_flags().unwrap_or_default();
         let attachments = store.all_attachments().unwrap_or_default();
         let review_recaps = store.all_review_recaps().unwrap_or_default();
+        let answers = store.all_answers().unwrap_or_default();
         let handoffs = store.all_handoffs().unwrap_or_default();
         // Group persisted review tasks by project for the review board.
         let mut review_tasks: HashMap<Uuid, Vec<ReviewTask>> = HashMap::new();
@@ -169,6 +173,7 @@ impl AppState {
             skip_plans: Signal::new(skip_plans),
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
+            answers: Signal::new(answers),
             handoffs: Signal::new(handoffs),
             previews: Signal::new(HashMap::new()),
             diffs: Signal::new(HashMap::new()),
@@ -236,6 +241,8 @@ impl AppState {
                 transcripts.write().remove(&id);
                 let mut attachments = self.attachments;
                 attachments.write().remove(&id);
+                let mut answers = self.answers;
+                answers.write().remove(&id);
                 if *self.selected_card.read() == Some(id) {
                     let mut selected = self.selected_card;
                     selected.set(None);
@@ -334,6 +341,16 @@ impl AppState {
             ExecutorEventKind::RecapUpdated { recap } => {
                 let mut recaps = self.review_recaps;
                 recaps.write().insert(evt.card_id, recap);
+            }
+            // An empty answer means it was cleared ("back to start"): drop the
+            // entry so the panel shows nothing.
+            ExecutorEventKind::AnswerUpdated { answer } => {
+                let mut answers = self.answers;
+                if answer.is_empty() {
+                    answers.write().remove(&evt.card_id);
+                } else {
+                    answers.write().insert(evt.card_id, answer);
+                }
             }
             // An empty hand-off means the run left none: drop the entry so the
             // panel shows nothing rather than the previous attempt's recap.

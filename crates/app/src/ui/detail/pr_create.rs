@@ -28,8 +28,6 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .and_then(|p| p.config.reviewer.clone())
         .unwrap_or_default();
     let mut reviewer = use_signal(|| default_reviewer);
-    // Free-form feedback for sending the implementation back to the agent.
-    let mut revision = use_signal(String::new);
     let branch = card.branch.clone().unwrap_or_default();
     // The PR branch name is required and starts blank: the user must deliberately
     // choose one rather than shipping the auto-generated `usine/…` name.
@@ -129,29 +127,14 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                     }
                 }
             }
-            div { class: "section",
-                h3 { "Request changes" }
-                div { class: "hint",
-                    "Not happy with the implementation? Send it back to the agent to revise in its worktree."
-                }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change or improve?",
-                        value: "{revision}",
-                        oninput: move |e| revision.set(e.value()),
-                    }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = revision.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
-                            revision.set(String::new());
-                        }
-                    },
-                    "Send back to implementing"
-                }
+            super::AgentChatSection {
+                card_id: id,
+                hint: "Not happy with the implementation, or curious why it went a certain way? \
+                       Request changes to send it back to the agent's worktree, or ask a question \
+                       without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
             }
         }
 
@@ -219,26 +202,13 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
             // The parked failure can also bounce the work back wholesale.
-            div { class: "section",
-                h3 { "Request changes" }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change or improve?",
-                        value: "{revision}",
-                        oninput: move |e| revision.set(e.value()),
-                    }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = revision.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
-                            revision.set(String::new());
-                        }
-                    },
-                    "Send back to implementing"
-                }
+            super::AgentChatSection {
+                card_id: id,
+                hint: "Request changes to send the work back to the agent's worktree, or ask a \
+                       question about it without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
             }
         }
 
@@ -366,29 +336,14 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
 
             // Still bounce the work back to the agent before opening the PR.
-            div { class: "section",
-                h3 { "Request changes" }
-                div { class: "hint",
-                    "Spotted something before opening the PR? Send it back to the agent to revise in its worktree."
-                }
-                div { class: "field",
-                    textarea {
-                        placeholder: "What should the agent change or improve?",
-                        value: "{revision}",
-                        oninput: move |e| revision.set(e.value()),
-                    }
-                }
-                button {
-                    class: "btn",
-                    onclick: move |_| {
-                        let fb = revision.read().trim().to_string();
-                        if !fb.is_empty() {
-                            state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
-                            revision.set(String::new());
-                        }
-                    },
-                    "Send back to implementing"
-                }
+            super::AgentChatSection {
+                card_id: id,
+                hint: "Spotted something before opening the PR, or want to double-check a \
+                       decision? Request changes to send it back to the agent's worktree, or ask \
+                       a question without sending it back.",
+                on_request: move |fb: String| {
+                    state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
+                },
             }
         }
     }

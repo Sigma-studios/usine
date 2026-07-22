@@ -14,20 +14,17 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
     let has_questions = !questions.is_empty();
     let n = questions.len();
     let mut answers = use_signal(|| vec![String::new(); n]);
-    let mut feedback = use_signal(String::new);
     let questions_for_submit = questions.clone();
-    // A question is "answered" once it has a picked option or typed text. The
-    // plan can be sent back to refine either when every question is answered or
-    // when there's free-form text — both inputs share one submit button, so
-    // neither is silently dropped.
+    // A question is "answered" once it has a picked option or typed text. With
+    // every question answered, the plan can be sent back even with no free-form
+    // text — the answers alone are the feedback.
     let all_answered = answers.read().iter().all(|a| !a.trim().is_empty());
-    let has_feedback = !feedback.read().trim().is_empty();
-    let can_submit = (has_questions && all_answered) || has_feedback;
-    let submit_class = if has_questions { "btn primary" } else { "btn" };
-    let submit_hint = if has_questions {
-        "Answer every question, or request changes below, to send the plan back."
+    let chat_hint = if has_questions {
+        "Answer the questions above and/or type below, then request changes to send the plan \
+         back — or ask the agent a question about its plan without re-planning."
     } else {
-        "Type a change request to send the plan back."
+        "Request changes to send the plan back to design, or ask the agent a question about \
+         its plan without re-planning."
     };
 
     rsx! {
@@ -99,41 +96,29 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                     }
                 }
             }
-            div { class: "field",
-                label { r#for: "plan-feedback", "Request changes (free-form)" }
-                textarea {
-                    id: "plan-feedback",
-                    placeholder: "Anything else to change?",
-                    value: "{feedback}",
-                    oninput: move |e| feedback.set(e.value()),
+        }
+
+        super::AgentChatSection {
+            card_id,
+            hint: chat_hint,
+            request_enabled_when_blank: has_questions && all_answered,
+            on_request: move |text: String| {
+                let cur = answers.read();
+                let any_answered = cur.iter().any(|a| !a.trim().is_empty());
+                // Fold answered questions and free-form notes into one
+                // feedback blob so neither input is lost on send-back.
+                let mut parts: Vec<String> = Vec::new();
+                if has_questions && any_answered {
+                    parts.push(build_answers_feedback(&questions_for_submit, &cur));
                 }
-                button {
-                    class: "{submit_class}",
-                    disabled: !can_submit,
-                    onclick: move |_| {
-                        let cur = answers.read();
-                        let any_answered = cur.iter().any(|a| !a.trim().is_empty());
-                        // Fold answered questions and free-form notes into one
-                        // feedback blob so neither input is lost on send-back.
-                        let mut parts: Vec<String> = Vec::new();
-                        if has_questions && any_answered {
-                            parts.push(build_answers_feedback(&questions_for_submit, &cur));
-                        }
-                        let fb = feedback.read().trim().to_string();
-                        if !fb.is_empty() {
-                            parts.push(fb);
-                        }
-                        let combined = parts.join("\n\n");
-                        if !combined.is_empty() {
-                            state.send(ExecutorCommand::RejectPlan { card_id, feedback: combined });
-                        }
-                    },
-                    "Send back to design"
+                if !text.is_empty() {
+                    parts.push(text);
                 }
-                if !can_submit {
-                    div { class: "hint", "{submit_hint}" }
+                let combined = parts.join("\n\n");
+                if !combined.is_empty() {
+                    state.send(ExecutorCommand::RejectPlan { card_id, feedback: combined });
                 }
-            }
+            },
         }
     }
 }

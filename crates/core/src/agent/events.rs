@@ -113,6 +113,12 @@ pub enum ExecutorCommand {
     /// From "awaiting review", send the implementation back to the agent with
     /// requested changes; the card returns to Implementing in its worktree.
     ReviseImplementation { card_id: Uuid, feedback: String },
+    /// Ask the agent a question about its work without sending it back for
+    /// changes: a strictly read-only turn from any Agent Chat panel (plan
+    /// approval, awaiting review, PR idle, ready-to-merge). The card rides the
+    /// matching "send back" transition while answering and returns to where it
+    /// started; the answer arrives via `AnswerUpdated`.
+    AskQuestion { card_id: Uuid, question: String },
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
@@ -281,6 +287,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ApplyFixes { card_id, .. }
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
+            | ExecutorCommand::AskQuestion { card_id, .. }
             | ExecutorCommand::Merge { card_id, .. }
             | ExecutorCommand::ResolveConflicts { card_id }
             | ExecutorCommand::SkipReview { card_id }
@@ -370,6 +377,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::ApplyFixes { .. }
                 | ExecutorCommand::CreatePr { .. }
                 | ExecutorCommand::ReviseImplementation { .. }
+                | ExecutorCommand::AskQuestion { .. }
                 | ExecutorCommand::Merge { .. }
                 | ExecutorCommand::ResolveConflicts { .. }
                 | ExecutorCommand::SkipReview { .. }
@@ -452,6 +460,9 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
+    /// A card's Agent Chat answer changed (`card_id` on the event). Empty means
+    /// the answer was cleared (e.g. "back to start") and the UI drops its entry.
+    AnswerUpdated { answer: String },
     /// A card's implementation hand-off changed (`card_id` on the event). An
     /// empty [`Handoff`] means the latest implement run produced none, and the UI
     /// drops the previous attempt's.
@@ -558,6 +569,14 @@ impl ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::RecapUpdated {
                 recap: recap.into(),
+            },
+        }
+    }
+    pub fn answer_updated(card_id: Uuid, answer: impl Into<String>) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::AnswerUpdated {
+                answer: answer.into(),
             },
         }
     }
