@@ -95,6 +95,62 @@ pub fn anchor_drafts(data: &DiffData, drafts: &[DraftComment]) -> DraftAnchors {
     anchors
 }
 
+/// Split a review's drafts into the comments GitHub will accept inline and a
+/// review body carrying the rest.
+///
+/// GitHub validates a review atomically: one comment anchored outside the PR's
+/// diff and the whole POST is refused (HTTP 422), taking every other comment
+/// down with it. File-level comments can't go inline at all — the reviews
+/// endpoint has no `subject_type`; that belongs to the standalone comment API.
+/// So everything unpostable is folded into the review body instead, each with
+/// its `path:line`, which is exactly what the diff viewer's unplaced-comments
+/// banner promises.
+///
+/// `diff` is best-effort: `None` (it couldn't be computed) folds only the
+/// drafts that are unpostable regardless of the diff — the line-less ones —
+/// and leaves the line-anchored rest for GitHub to judge.
+pub fn fold_unanchorable(
+    diff: Option<&DiffData>,
+    drafts: Vec<DraftComment>,
+    body: &str,
+) -> (Vec<DraftComment>, String) {
+    let postable: Vec<bool> = match diff {
+        Some(data) => {
+            // Inline-postable is exactly "landed on a diff line" — file-level
+            // and unplaced drafts both fold.
+            let anchors = anchor_drafts(data, &drafts);
+            let mut ok = vec![false; drafts.len()];
+            for indices in anchors.by_line.values() {
+                for &ci in indices {
+                    ok[ci] = true;
+                }
+            }
+            ok
+        }
+        None => drafts.iter().map(|d| d.line.is_some()).collect(),
+    };
+    let (inline, folded): (Vec<_>, Vec<_>) = {
+        let mut ok = postable.into_iter();
+        drafts.into_iter().partition(|_| ok.next().unwrap_or(false))
+    };
+    if folded.is_empty() {
+        return (inline, body.to_string());
+    }
+    let mut out = body.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n---\n");
+    }
+    out.push_str("Comments that couldn't be attached to a diff line:\n");
+    for d in &folded {
+        out.push('\n');
+        match d.line {
+            Some(l) => out.push_str(&format!("**`{}:{l}`** — {}\n", d.path, d.body)),
+            None => out.push_str(&format!("**`{}`** — {}\n", d.path, d.body)),
+        }
+    }
+    (inline, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +282,70 @@ mod tests {
             files: vec![file("src/a.rs", &[Some(1)])],
         };
         assert_eq!(anchor_drafts(&data, &[]), DraftAnchors::default());
+    }
+
+    // --- fold_unanchorable --------------------------------------------------
+
+    #[test]
+    fn fold_keeps_anchorable_comments_inline_and_body_untouched() {
+        let data = DiffData {
+            files: vec![file("src/a.rs", &[Some(10), Some(11)])],
+        };
+        let (inline, body) =
+            fold_unanchorable(Some(&data), vec![draft("src/a.rs", Some(11))], "LGTM");
+        assert_eq!(inline.len(), 1);
+        assert_eq!(body, "LGTM");
+    }
+
+    #[test]
+    fn fold_moves_out_of_diff_line_into_body() {
+        let data = DiffData {
+            files: vec![file("src/a.rs", &[Some(10), Some(11)])],
+        };
+        let drafts = vec![draft("src/a.rs", Some(11)), draft("src/a.rs", Some(400))];
+        let (inline, body) = fold_unanchorable(Some(&data), drafts, "Summary.");
+        // The in-diff comment stays inline; the out-of-diff one rides the body
+        // with its path:line so nothing is lost.
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].line, Some(11));
+        assert!(body.starts_with("Summary.\n\n---\n"));
+        assert!(body.contains("**`src/a.rs:400`**"));
+    }
+
+    #[test]
+    fn fold_moves_unknown_path_into_body() {
+        let data = DiffData {
+            files: vec![file("src/a.rs", &[Some(1)])],
+        };
+        let (inline, body) =
+            fold_unanchorable(Some(&data), vec![draft("src/nope.rs", Some(1))], "");
+        assert!(inline.is_empty());
+        assert!(body.contains("**`src/nope.rs:1`**"));
+        // An empty summary doesn't grow a dangling separator.
+        assert!(!body.starts_with("\n"));
+        assert!(!body.contains("---"));
+    }
+
+    /// The reviews endpoint has no file-level comments, so a line-less draft
+    /// folds even though its path is in the diff.
+    #[test]
+    fn fold_moves_file_level_comment_into_body() {
+        let data = DiffData {
+            files: vec![file("src/a.rs", &[Some(1)])],
+        };
+        let (inline, body) = fold_unanchorable(Some(&data), vec![draft("src/a.rs", None)], "S");
+        assert!(inline.is_empty());
+        assert!(body.contains("**`src/a.rs`**"));
+    }
+
+    /// Without a diff to judge against, only the certainly-unpostable (line-less)
+    /// drafts fold; line-anchored ones are left for GitHub to validate.
+    #[test]
+    fn fold_without_diff_only_folds_line_less_drafts() {
+        let drafts = vec![draft("src/a.rs", Some(400)), draft("src/b.rs", None)];
+        let (inline, body) = fold_unanchorable(None, drafts, "S");
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].line, Some(400));
+        assert!(body.contains("**`src/b.rs`**"));
     }
 }

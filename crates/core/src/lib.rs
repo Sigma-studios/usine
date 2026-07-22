@@ -38,8 +38,8 @@ pub use agent::startup::{
 };
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
-    anchor_drafts, compute_branch_diff, compute_card_diff, DiffData, DiffFile, DiffHunk, DiffLine,
-    DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
+    anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, DiffData, DiffFile,
+    DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
 };
 pub use domain::config::{AppSettings, CardConfig, PreviewPort, ProjectConfig};
 pub use domain::model::{
