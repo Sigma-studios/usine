@@ -1,11 +1,79 @@
 //! One-time startup reconciliation the app runs before showing the board. Kept
 //! in core (not the UI layer) so it's unit-testable and the view stays thin.
 
-use crate::domain::model::{now_millis, ReviewStatus};
+use crate::domain::config::AppSettings;
+use crate::domain::model::{now_millis, Provider, ReviewStatus};
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::Result;
 use crate::infra::git::detect_base_branch;
 use crate::infra::persistence::Store;
+
+/// On the very first startup (no settings record yet), pick the default
+/// provider from which agent CLIs are installed: Codex when it is the sole one
+/// present, Claude otherwise. Persists the seeded settings — so the choice is
+/// made once and never overrides a later user decision — only when at least one
+/// CLI was actually found: with neither installed (fresh machine, or a packaged
+/// launch under a minimal PATH) it falls back to Claude without persisting, so
+/// detection re-runs on the next startup once a CLI exists. Availability is
+/// injected (`installed`) so tests don't depend on the host's PATH. Returns the
+/// seeded provider; `None` when settings already exist.
+pub fn seed_default_provider(
+    store: &Store,
+    installed: impl Fn(Provider) -> bool,
+) -> Result<Option<Provider>> {
+    if store.has_settings()? {
+        return Ok(None);
+    }
+    let (claude, codex) = (installed(Provider::Claude), installed(Provider::Codex));
+    if !claude && !codex {
+        return Ok(Some(Provider::Claude));
+    }
+    let provider = if codex && !claude {
+        Provider::Codex
+    } else {
+        Provider::Claude
+    };
+    store.save_settings(&AppSettings::default_for(provider))?;
+    Ok(Some(provider))
+}
+
+/// Whether `name` resolves to something `Command::new(name)` can spawn when a
+/// run launches the agent CLI. On Windows that means `name.exe` only: since the
+/// CVE-2024-24576 hardening, `Command` refuses to run `.cmd`/`.bat` shims (what
+/// npm installs for codex) under the bare name, so counting them here would
+/// report a CLI as available whose runs then fail at spawn.
+pub fn binary_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        if cfg!(windows) {
+            is_executable_file(&dir.join(name).with_extension("exe"))
+        } else {
+            is_executable_file(&dir.join(name))
+        }
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // `metadata` follows symlinks (the claude installer symlinks
+    // `~/.local/bin/claude`), unlike `symlink_metadata`.
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
 
 /// After a restart, a card persisted in a "running" sub-state has no process
 /// behind it. Mark each as interrupted (a `Failed` state carrying `message`, off
@@ -75,6 +143,68 @@ mod tests {
     use crate::domain::config::CardConfig;
     use crate::domain::model::{Card, CardState, Project, RunSub};
     use std::path::PathBuf;
+
+    #[test]
+    fn first_run_seeds_codex_when_it_is_the_only_cli() {
+        let store = Store::open_in_memory().unwrap();
+        let codex_only = |p: Provider| p == Provider::Codex;
+
+        let seeded = seed_default_provider(&store, codex_only).unwrap();
+        assert_eq!(seeded, Some(Provider::Codex));
+
+        // The persisted settings carry Codex model presets, not Claude's.
+        let settings = store.settings().unwrap();
+        assert_eq!(settings.default_provider, Provider::Codex);
+        assert_eq!(settings, AppSettings::default_for(Provider::Codex));
+
+        // The check is one-shot: a second startup does nothing.
+        assert_eq!(seed_default_provider(&store, codex_only).unwrap(), None);
+    }
+
+    #[test]
+    fn first_run_defaults_to_claude_otherwise() {
+        // Both installed and Claude-only: both seed and persist Claude.
+        for installed in [
+            (|_: Provider| true) as fn(Provider) -> bool,
+            |p| p == Provider::Claude,
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            assert_eq!(
+                seed_default_provider(&store, installed).unwrap(),
+                Some(Provider::Claude)
+            );
+            assert_eq!(store.settings().unwrap().default_provider, Provider::Claude);
+        }
+    }
+
+    #[test]
+    fn no_cli_found_defaults_to_claude_without_disarming_detection() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            seed_default_provider(&store, |_| false).unwrap(),
+            Some(Provider::Claude)
+        );
+        // Nothing was persisted, so detection stays armed…
+        assert!(!store.has_settings().unwrap());
+        // …and installing codex before the next launch still seeds Codex.
+        assert_eq!(
+            seed_default_provider(&store, |p| p == Provider::Codex).unwrap(),
+            Some(Provider::Codex)
+        );
+        assert_eq!(store.settings().unwrap().default_provider, Provider::Codex);
+    }
+
+    #[test]
+    fn existing_settings_are_never_overridden() {
+        let store = Store::open_in_memory().unwrap();
+        // The user already chose Claude; installing only codex later must not
+        // flip their settings.
+        store.save_settings(&AppSettings::default()).unwrap();
+
+        let seeded = seed_default_provider(&store, |p| p == Provider::Codex).unwrap();
+        assert_eq!(seeded, None);
+        assert_eq!(store.settings().unwrap().default_provider, Provider::Claude);
+    }
 
     #[test]
     fn reconcile_marks_running_cards_failed() {

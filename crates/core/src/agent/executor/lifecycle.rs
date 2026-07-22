@@ -5,15 +5,106 @@ use super::actor::run_actor;
 use super::*;
 
 impl Executor {
-    /// Start a card. By default it enters the design/plan phase; if the card is
-    /// marked "skip plan" it goes straight to implementing from its description.
+    /// Start a card. An investigation card runs its read-only investigate phase;
+    /// a task enters the design/plan phase by default, or goes straight to
+    /// implementing from its description if it is marked "skip plan".
     pub(super) async fn start(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        if card.config.kind == CardKind::Investigation {
+            return self.start_investigate(card_id, None).await;
+        }
         if self.store.get_skip_plan(card_id).unwrap_or(false) {
             self.start_implement(card_id).await
         } else {
             self.start_run(card_id, RunMode::Plan, Transition::StartPlan, None)
                 .await
         }
+    }
+
+    /// Launch a read-only investigation run: no worktree, no branch — it reads
+    /// the main checkout like a plan run. Shared by the initial start (from the
+    /// starting block) and the follow-up loop (from `Concluded`, with the prior
+    /// rounds riding in `extra`).
+    pub(super) async fn start_investigate(
+        &self,
+        card_id: Uuid,
+        extra: Option<String>,
+    ) -> Result<()> {
+        // Stash this round's context so a retry of a faulted run re-launches
+        // the SAME round (`relaunch` reads it back) instead of silently
+        // re-answering the original description. The initial round (`None`)
+        // clears any stale stash from an earlier life of the card.
+        self.store
+            .set_investigation_extra(card_id, extra.as_deref())?;
+        self.start_run(
+            card_id,
+            RunMode::Investigate,
+            Transition::StartInvestigate,
+            extra,
+        )
+        .await
+    }
+
+    /// From `Concluded`: re-run the investigation with the prior conclusion, all
+    /// earlier rounds, and the user's follow-up as context. Mirrors the
+    /// reject-plan loop: the re-run is a fresh conversation, so without this it
+    /// has no memory of what it concluded or what the user already asked.
+    pub(super) async fn follow_up_investigation(
+        &self,
+        card_id: Uuid,
+        feedback: String,
+    ) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let prev = match &card.state {
+            CardState::Concluded { conclusion } => Some(conclusion.clone()),
+            _ => None,
+        };
+        // Build the extra from the qa_log BEFORE recording this round, so it
+        // holds exactly the earlier rounds (same ordering as RejectPlan).
+        let extra = followup_extra(prev.as_deref(), &card.qa_log, &feedback);
+        self.record_qa(card_id, format!("Follow-up: {}", feedback.trim()));
+        self.start_investigate(card_id, Some(extra)).await
+    }
+
+    /// From `Concluded`: convert the card, in place, into an implementation. A
+    /// promotion, not a discard — unlike `back_to_start` there is no worktree,
+    /// branch, PR, plan, or hand-off to tear down (investigations own none), the
+    /// cost is kept (the investigation was real spend on this card's life), and
+    /// the conclusion is folded into the description under a marked findings
+    /// section (plain text afterward, so the user can trim it in the editor).
+    pub(super) async fn convert_to_implementation(&self, card_id: Uuid) -> Result<()> {
+        let mut converted = false;
+        let updated = self.store.mutate_card(card_id, |c| {
+            // Tolerate a double-click race: only a concluded card converts.
+            let CardState::Concluded { conclusion } = c.state.clone() else {
+                return Ok(());
+            };
+            c.description = fold_findings(&c.description, &conclusion);
+            if !c.qa_log.is_empty() {
+                c.description = fold_qa(&c.description, &c.qa_log);
+                c.qa_log.clear();
+            }
+            c.config.kind = CardKind::Task;
+            c.state = transition(&c.state, Transition::ResetToStart)?;
+            // The next run is a fresh conversation with the findings in-prompt.
+            c.last_session = None;
+            c.updated_at = now_millis();
+            converted = true;
+            Ok(())
+        })?;
+        if converted {
+            // The stashed round context described the investigation being
+            // promoted away from; the findings now live in the description.
+            let _ = self.store.set_investigation_extra(card_id, None);
+            // Land on the default "design + implement" mode; the selector stays
+            // editable in the starting block, including back to Investigate.
+            self.store.set_skip_plan(card_id, false)?;
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::skip_plan_changed(card_id, false));
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        }
+        Ok(())
     }
 
     /// The "no plan" path: create the worktree + branch up front (normally done
@@ -53,14 +144,16 @@ impl Executor {
     ) -> Result<()> {
         let project = self.store.get_project(card.project_id)?;
         let spec = match mode {
-            RunMode::Plan => card.config.plan.clone(),
+            // Investigations run on the plan spec — the "thinking" phase's model.
+            RunMode::Plan | RunMode::Investigate => card.config.plan.clone(),
             // The read-only phases share the review spec, which falls back to
             // `implement` when the card has no override.
             RunMode::Review | RunMode::Triage | RunMode::Question => card.config.review_spec(),
             RunMode::Implement | RunMode::ApplyFixes => card.config.implement.clone(),
         };
         let project_dir = match mode {
-            RunMode::Plan => project.path.clone(),
+            // Read-only pre-work runs (plan, investigate) read the main checkout.
+            RunMode::Plan | RunMode::Investigate => project.path.clone(),
             // Self-review is read-only, so run it in a throwaway DETACHED worktree
             // at the branch's committed HEAD. The card's own worktree is a valid
             // place too, but the detached scratch gives a clean view of exactly
@@ -117,14 +210,18 @@ impl Executor {
         if !attachments.is_empty() {
             base = append_attachments(base, &attachments);
         }
-        let prompt = if mode == RunMode::Plan {
-            format!(
+        let prompt = match mode {
+            RunMode::Plan => format!(
                 "{}\n\n{}",
                 base,
                 crate::agent::plan::plan_instruction(card.config.provider)
-            )
-        } else {
-            base
+            ),
+            RunMode::Investigate => format!(
+                "{}\n\n{}",
+                base,
+                crate::agent::investigate::investigate_instruction(card.config.provider)
+            ),
+            _ => base,
         };
         // Write runs author their own commit message in the repo's own style; the
         // executor uses it when committing the worktree (see `finalize_run`), so
@@ -397,6 +494,7 @@ impl Executor {
         // One-shot provider: resume with the answer as the next turn.
         let mode = match &card.state {
             CardState::Designing(_) => RunMode::Plan,
+            CardState::Investigating(_) => RunMode::Investigate,
             CardState::Implementing(_) => RunMode::Implement,
             _ => return Ok(()),
         };
@@ -457,6 +555,8 @@ impl Executor {
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::answer_updated(card_id, "", ""));
+        // Same for a discarded investigation's stashed round context.
+        let _ = self.store.set_investigation_extra(card_id, None);
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx
@@ -610,6 +710,7 @@ impl Executor {
         }
         let mode = match &card.state {
             CardState::Designing(_) => RunMode::Plan,
+            CardState::Investigating(_) => RunMode::Investigate,
             CardState::Implementing(_) => RunMode::Implement,
             CardState::AwaitingReview(ReviewSub::Reviewing) => RunMode::Review,
             CardState::AwaitingReview(ReviewSub::ApplyingFixes) => RunMode::ApplyFixes,
@@ -631,13 +732,21 @@ impl Executor {
             self.ensure_branch_worktree(card_id).await?;
             card = self.store.get_card(card_id)?;
         }
-        let resume = if matches!(mode, RunMode::Plan | RunMode::Review | RunMode::Triage) {
+        let resume = if matches!(
+            mode,
+            RunMode::Plan | RunMode::Review | RunMode::Triage | RunMode::Investigate
+        ) {
             None
         } else {
             resume
         };
         let extra = match mode {
             RunMode::Plan => None,
+            // Re-run the round that faulted, not just the original question: a
+            // follow-up round's context (prior conclusion + earlier rounds +
+            // the user's ask) was stashed at launch, so a retried follow-up
+            // doesn't silently overwrite it with a re-answer of round one.
+            RunMode::Investigate => self.store.get_investigation_extra(card_id).unwrap_or(None),
             RunMode::Implement => {
                 let plan = self.store.get_plan(card_id).unwrap_or(None);
                 Some(resume_extra(plan.as_deref()))

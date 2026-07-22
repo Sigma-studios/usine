@@ -171,6 +171,20 @@ struct CardReviewRecord {
     handoff: String,
 }
 
+/// The extra context of the current investigation round: the follow-up prompt
+/// built from the prior conclusion and the earlier rounds. Kept so a retry of a
+/// faulted round re-launches with the same context instead of silently
+/// re-answering only the original description. Absent for the initial round.
+/// Its own record so adding it doesn't change the `Card` record layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 11, version = 1, with = Json)]
+#[native_db]
+struct CardInvestigationRecord {
+    #[primary_key]
+    card_id: String,
+    extra: String,
+}
+
 /// A pull request the user is reviewing (someone else's PR). Its own top-level
 /// record — distinct from `CardRecord` — because a foreign PR has no owned
 /// branch/worktree/card. `project_id` is lifted for the per-project filter.
@@ -200,7 +214,7 @@ struct DismissedReviewsRecord {
 /// field on [`CardReviewRecord`]) so adding it doesn't change an existing
 /// record's layout.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[native_model(id = 11, version = 1, with = Json)]
+#[native_model(id = 12, version = 1, with = Json)]
 #[native_db]
 struct CardAnswerRecord {
     #[primary_key]
@@ -243,6 +257,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<CardReviewRecord>()
         .expect("define CardReviewRecord");
+    models
+        .define::<CardInvestigationRecord>()
+        .expect("define CardInvestigationRecord");
     models
         .define::<ReviewTaskRecord>()
         .expect("define ReviewTaskRecord");
@@ -329,6 +346,15 @@ impl Store {
     }
 
     // --- settings -------------------------------------------------------
+
+    /// Whether a settings record has ever been written — i.e. this is NOT a
+    /// first startup. [`Self::settings`] hides absence behind `Default`, so
+    /// first-run detection needs this explicit probe.
+    pub fn has_settings(&self) -> Result<bool> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<SettingsRecord> = r.get().primary(SETTINGS_ID)?;
+        Ok(rec.is_some())
+    }
 
     pub fn settings(&self) -> Result<AppSettings> {
         let r = self.db.r_transaction()?;
@@ -526,6 +552,9 @@ impl Store {
         if let Some(rec) = rw.get().primary::<CardAnswerRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
+        if let Some(rec) = rw.get().primary::<CardInvestigationRecord>(id.to_string())? {
+            rw.remove(rec)?;
+        }
         rw.commit()?;
         Ok(())
     }
@@ -640,6 +669,37 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    // --- investigation context ------------------------------------------
+
+    /// Stash (or, with `None`, clear) the current investigation round's extra
+    /// context so a retry re-launches the same round (see the record's doc).
+    pub fn set_investigation_extra(&self, card_id: Uuid, extra: Option<&str>) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardInvestigationRecord> = rw.get().primary(card_id.to_string())?;
+        match (old, extra) {
+            (old, Some(extra)) => {
+                let rec = CardInvestigationRecord {
+                    card_id: card_id.to_string(),
+                    extra: extra.to_string(),
+                };
+                match old {
+                    Some(old) => rw.update(old, rec)?,
+                    None => rw.insert(rec)?,
+                }
+            }
+            (Some(old), None) => rw.remove(old).map(|_| ())?,
+            (None, None) => {}
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    pub fn get_investigation_extra(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardInvestigationRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.extra))
     }
 
     // --- per-card options ----------------------------------------------

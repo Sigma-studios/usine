@@ -119,6 +119,16 @@ pub enum ExecutorCommand {
     /// matching "send back" transition while answering and returns to where it
     /// started; the answer arrives via `AnswerUpdated`.
     AskQuestion { card_id: Uuid, question: String },
+    /// From `Concluded`: dig deeper — re-run the investigation with the prior
+    /// conclusion, the earlier rounds, and this follow-up as context (the
+    /// investigation twin of `RejectPlan`'s re-plan loop).
+    FollowUpInvestigation { card_id: Uuid, feedback: String },
+    /// From `Concluded`: convert the card, in place, into an implementation —
+    /// fold the conclusion into the description under a findings section, flip
+    /// the kind to Task, and reset to the starting block so the user shapes the
+    /// implementation prompt from there. Cost is kept (the investigation was
+    /// real spend on this card); the session is cleared so the next run is fresh.
+    ConvertToImplementation { card_id: Uuid },
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
@@ -299,6 +309,8 @@ impl ExecutorCommand {
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
             | ExecutorCommand::AskQuestion { card_id, .. }
+            | ExecutorCommand::FollowUpInvestigation { card_id, .. }
+            | ExecutorCommand::ConvertToImplementation { card_id }
             | ExecutorCommand::Merge { card_id, .. }
             | ExecutorCommand::ResolveConflicts { card_id }
             | ExecutorCommand::FixChecks { card_id }
@@ -390,6 +402,8 @@ impl ExecutorCommand {
                 | ExecutorCommand::CreatePr { .. }
                 | ExecutorCommand::ReviseImplementation { .. }
                 | ExecutorCommand::AskQuestion { .. }
+                | ExecutorCommand::FollowUpInvestigation { .. }
+                | ExecutorCommand::ConvertToImplementation { .. }
                 | ExecutorCommand::Merge { .. }
                 | ExecutorCommand::ResolveConflicts { .. }
                 | ExecutorCommand::FixChecks { .. }

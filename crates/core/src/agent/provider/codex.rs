@@ -75,8 +75,13 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     ];
 
     match cfg.mode {
-        // Read-only phases (planning, self-review, comment triage, Q&A).
-        RunMode::Plan | RunMode::Review | RunMode::Triage | RunMode::Question => {
+        // Read-only phases (planning, self-review, comment triage, Q&A,
+        // investigation).
+        RunMode::Plan
+        | RunMode::Review
+        | RunMode::Triage
+        | RunMode::Question
+        | RunMode::Investigate => {
             args.push("--sandbox".into());
             args.push("read-only".into());
         }
@@ -313,6 +318,15 @@ mod tests {
     #[test]
     fn question_is_read_only() {
         let args = build_args(&cfg(RunMode::Question, Effort::Medium));
+        assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("network_access") || a == "--add-dir"));
+    }
+
+    #[test]
+    fn investigate_is_read_only_sandboxed() {
+        let args = build_args(&cfg(RunMode::Investigate, Effort::Medium));
         assert!(args.windows(2).any(|w| w == ["--sandbox", "read-only"]));
         assert!(!args
             .iter()

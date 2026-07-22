@@ -16,6 +16,7 @@ use crate::state::{AppState, BoardMode};
 use crate::ui::widgets::provider_value;
 
 mod chat;
+mod conclusion;
 mod edit;
 mod fixes;
 mod plan;
@@ -25,6 +26,7 @@ mod review;
 mod transcript;
 
 use chat::AgentChatSection;
+use conclusion::ConclusionPanel;
 use edit::{Attachments, ConfigForm, EditableTask};
 use fixes::FixSelection;
 use plan::PlanApproval;
@@ -203,6 +205,10 @@ fn CardPanel(card: Card) -> Element {
 
         if let CardState::Designing(DesignSub::AwaitingApproval { plan }) = &card.state {
             PlanApproval { card_id: id, plan: plan.clone() }
+        }
+
+        if let CardState::Concluded { conclusion } = &card.state {
+            ConclusionPanel { card_id: id, conclusion: conclusion.clone() }
         }
 
         if matches!(card.state, CardState::AwaitingReview(_)) {
@@ -456,6 +462,9 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::Designing(DesignSub::Running) => "design-run",
         CardState::Designing(DesignSub::Intervention(_)) => "design-iv",
         CardState::Designing(DesignSub::AwaitingApproval { .. }) => "design-approve",
+        CardState::Investigating(usine_core::RunSub::Running) => "invest-run",
+        CardState::Investigating(usine_core::RunSub::Intervention(_)) => "invest-iv",
+        CardState::Concluded { .. } => "concluded",
         CardState::Implementing(usine_core::RunSub::Running) => "impl-run",
         CardState::Implementing(usine_core::RunSub::Intervention(_)) => "impl-iv",
         CardState::AwaitingReview(_) => "await-review",
