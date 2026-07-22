@@ -250,6 +250,9 @@ pub enum ExecutorCommand {
     SaveSettings { settings: Box<AppSettings> },
     /// Set a card's "skip plan" option.
     SetSkipPlan { card_id: Uuid, skip: bool },
+    /// Set whether the card auto-starts its self-review pass when the
+    /// implementation finishes (on by default).
+    SetAutoReview { card_id: Uuid, auto: bool },
     /// Copy an image into the card's managed attachments dir (`src` = the file
     /// the user picked). Claude-only; the path is injected into the prompt.
     AttachImage { card_id: Uuid, src: PathBuf },
@@ -307,6 +310,7 @@ impl ExecutorCommand {
             | ExecutorCommand::RetryFresh { card_id }
             | ExecutorCommand::DeleteCard { card_id }
             | ExecutorCommand::SetSkipPlan { card_id, .. }
+            | ExecutorCommand::SetAutoReview { card_id, .. }
             | ExecutorCommand::AttachImage { card_id, .. }
             | ExecutorCommand::AttachImageBytes { card_id, .. }
             | ExecutorCommand::DetachImage { card_id, .. } => *card_id,
@@ -397,6 +401,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::SaveProject { .. }
                 | ExecutorCommand::SaveSettings { .. }
                 | ExecutorCommand::SetSkipPlan { .. }
+                | ExecutorCommand::SetAutoReview { .. }
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }
@@ -425,6 +430,8 @@ pub enum ExecutorEventKind {
     SettingsUpdated(Box<AppSettings>),
     /// A card's skip-plan flag changed (`card_id` on the event).
     SkipPlanChanged { skip: bool },
+    /// A card's auto-review flag changed (`card_id` on the event).
+    AutoReviewChanged { auto: bool },
     /// A lifecycle-advancing command started (`busy: true`) or finished
     /// (`busy: false`) for the card. Those commands do their git/forge work
     /// *before* transitioning, so between the click and the resulting
@@ -512,6 +519,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::SkipPlanChanged { skip },
+        }
+    }
+    pub fn auto_review_changed(card_id: Uuid, auto: bool) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::AutoReviewChanged { auto },
         }
     }
     pub fn attachments_changed(card_id: Uuid, paths: Vec<PathBuf>) -> Self {

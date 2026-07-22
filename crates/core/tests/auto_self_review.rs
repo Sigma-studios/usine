@@ -91,6 +91,34 @@ async fn a_finished_implementation_reviews_itself_to_the_fix_picker() {
 }
 
 #[tokio::test]
+async fn opting_out_parks_the_finished_implementation_at_the_manual_gate() {
+    let (store, handle, mut rx, card_id) = setup("/tmp/auto-self-review-optout");
+    // The per-card toggle (on by default), flipped off before the card starts.
+    store.set_auto_review(card_id, false).unwrap();
+
+    handle.send(ExecutorCommand::Start { card_id });
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            CardState::AwaitingReview(ReviewSub::ReadyForReview) => Some(()),
+            CardState::AwaitingReview(ReviewSub::Reviewing) => {
+                panic!("an opted-out card must not auto-start its self-review")
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    // …and it *stays* there: no review sneaks in after the gate is reached.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(matches!(
+        store.get_card(card_id).unwrap().state,
+        CardState::AwaitingReview(ReviewSub::ReadyForReview)
+    ));
+}
+
+#[tokio::test]
 async fn cancelling_the_auto_review_parks_at_the_manual_gate() {
     let (store, handle, mut rx, card_id) = setup("/tmp/auto-self-review-cancel");
 

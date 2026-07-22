@@ -351,8 +351,10 @@ async fn finalize_run(
     }
     // A finished implementation flows straight into the self-review pass — no
     // manual step between "implemented" and the fix picker. `ReadyForReview` is
-    // now transient, but stays the parking spot for a cancelled or failed review.
-    if is_implement_done {
+    // now transient, but stays the parking spot for a cancelled or failed review,
+    // and the resting place for cards whose per-card toggle opted out of the
+    // auto-start (its manual Self-review / Skip review buttons still work).
+    if is_implement_done && store.get_auto_review(card_id).unwrap_or(true) {
         start_self_review_direct(executor, evt_tx, card_id);
     }
     if !summary.is_empty() {
@@ -465,6 +467,20 @@ fn start_self_review_direct(
     };
     let evt_tx = evt_tx.clone();
     tokio::spawn(async move {
+        // Hold the exclusive in-flight claim across the launch, exactly as a
+        // dispatched `SelfReview` command would. Without it, the window between
+        // the `StartSelfReview` transition and the runs-map insert (a git
+        // worktree add + provider spawn) is unguarded: a Cancel/BackToStart/
+        // MarkDone landing there finds no run to kill, so the state transition
+        // sticks while the just-spawning review runs on as an orphan. The claim
+        // makes the dispatcher drop concurrent exclusive commands and — via
+        // `CardBusy` — has the UI disable the card's buttons for that window.
+        let Some(_guard) = claim(&exec.in_flight, &evt_tx, card_id) else {
+            // Another exclusive command owns the card right now (e.g. the user
+            // hit "Back to start" just as the implementation finished) — let it
+            // win; the card rests at `ReadyForReview` with the manual buttons.
+            return;
+        };
         match exec.self_review(card_id).await {
             Ok(()) => {}
             // The user beat the auto-start to the gate (Skip review, Back to
