@@ -23,6 +23,8 @@ pub enum Transition {
     // --- user-triggered ---
     StartPlan,
     StartImplement,
+    /// Start (or, from `Concluded`, follow up on) a read-only investigation run.
+    StartInvestigate,
     AnswerIntervention,
     ApprovePlan,
     RejectPlan,
@@ -66,6 +68,10 @@ pub enum Transition {
     AgentNeedsInput(Intervention),
     AgentPlanReady {
         plan: String,
+    },
+    /// The investigation run finished with its conclusion.
+    AgentConcluded {
+        conclusion: String,
     },
     AgentImplementDone,
     /// The self-review agent produced its verdicts on the committed diff.
@@ -133,6 +139,24 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         }
         (S::Designing(DesignSub::AwaitingApproval { .. }), T::RejectPlan) => {
             S::Designing(DesignSub::Running)
+        }
+
+        // Investigating (the read-only "investigate only" cards). Starts from
+        // the starting block; a follow-up round re-enters from the conclusion.
+        (S::StartingBlock, T::StartInvestigate) => S::Investigating(RunSub::Running),
+        (S::Concluded { .. }, T::StartInvestigate) => S::Investigating(RunSub::Running),
+        (S::Investigating(RunSub::Running), T::AgentNeedsInput(i)) => {
+            S::Investigating(RunSub::Intervention(i))
+        }
+        (S::Investigating(RunSub::Intervention(_)), T::AnswerIntervention) => {
+            S::Investigating(RunSub::Running)
+        }
+        (S::Investigating(RunSub::Running), T::AgentConcluded { conclusion }) => {
+            S::Concluded { conclusion }
+        }
+        // As in the other phases: tolerate a terminal racing a parked question.
+        (S::Investigating(RunSub::Intervention(_)), T::AgentConcluded { conclusion }) => {
+            S::Concluded { conclusion }
         }
 
         // Implementing
@@ -304,6 +328,7 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         // live run first); already-done is idempotent.
         (_, T::MarkDone) => S::Done,
         (S::Designing(_), T::Cancel) => S::StartingBlock,
+        (S::Investigating(_), T::Cancel) => S::StartingBlock,
         (S::Implementing(_), T::Cancel) => S::StartingBlock,
         (S::AwaitingReview(ReviewSub::Reviewing), T::Cancel) => {
             S::AwaitingReview(ReviewSub::ReadyForReview)
@@ -683,6 +708,103 @@ mod tests {
             assert!(failed.is_failed());
             assert_eq!(transition(&failed, Transition::Retry).unwrap(), running);
         }
+    }
+
+    /// Drive an investigation card through its whole lifecycle: start, park on a
+    /// question, answer, conclude, follow up, re-conclude — then the exits.
+    #[test]
+    fn investigation_happy_path_and_follow_up_loop() {
+        let s = transition(&CardState::StartingBlock, Transition::StartInvestigate).unwrap();
+        assert!(matches!(s, CardState::Investigating(RunSub::Running)));
+
+        let s = transition(&s, Transition::AgentNeedsInput(intervention())).unwrap();
+        assert!(s.needs_intervention());
+        let s = transition(&s, Transition::AnswerIntervention).unwrap();
+        assert!(matches!(s, CardState::Investigating(RunSub::Running)));
+
+        let s = transition(
+            &s,
+            Transition::AgentConcluded {
+                conclusion: "verdict: the cache is unbounded".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(s, CardState::Concluded { ref conclusion }
+            if conclusion.contains("unbounded")));
+        assert!(s.needs_attention());
+
+        // Follow-up: dig deeper from the conclusion, then re-conclude.
+        let s = transition(&s, Transition::StartInvestigate).unwrap();
+        assert!(matches!(s, CardState::Investigating(RunSub::Running)));
+        let s = transition(
+            &s,
+            Transition::AgentConcluded {
+                conclusion: "second round".into(),
+            },
+        )
+        .unwrap();
+
+        // Exits: convert rides ResetToStart; MarkDone finishes the card. A
+        // conclusion can never jump straight into a run — conversion goes back
+        // through the starting block.
+        assert!(matches!(
+            transition(&s, Transition::ResetToStart).unwrap(),
+            CardState::StartingBlock
+        ));
+        assert!(matches!(
+            transition(&s, Transition::MarkDone).unwrap(),
+            CardState::Done
+        ));
+        assert!(transition(&s, Transition::StartImplement).is_err());
+        assert!(transition(&s, Transition::StartPlan).is_err());
+    }
+
+    #[test]
+    fn investigation_terminal_exits_intervention_and_faults_recover() {
+        // A terminal conclusion racing a parked question must not wedge.
+        let parked = CardState::Investigating(RunSub::Intervention(intervention()));
+        let s = transition(
+            &parked,
+            Transition::AgentConcluded {
+                conclusion: "c".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(s, CardState::Concluded { .. }));
+
+        // Cancel returns to the starting block, like the other pre-work runs.
+        let running = CardState::Investigating(RunSub::Running);
+        assert!(matches!(
+            transition(&running, Transition::Cancel).unwrap(),
+            CardState::StartingBlock
+        ));
+
+        // The generic fault edge + retry cover the run like any other.
+        let failed = transition(
+            &running,
+            Transition::AgentError {
+                message: "Interrupted".into(),
+            },
+        )
+        .unwrap();
+        assert!(failed.is_failed());
+        assert_eq!(transition(&failed, Transition::Retry).unwrap(), running);
+
+        // AgentConcluded is only legal from an investigation run.
+        assert!(transition(
+            &CardState::Designing(DesignSub::Running),
+            Transition::AgentConcluded {
+                conclusion: "c".into()
+            }
+        )
+        .is_err());
+        assert!(transition(
+            &CardState::StartingBlock,
+            Transition::AgentConcluded {
+                conclusion: "c".into()
+            }
+        )
+        .is_err());
     }
 
     #[test]

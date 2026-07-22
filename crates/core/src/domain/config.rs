@@ -46,11 +46,31 @@ pub fn resolve_open_command(template: &str, dir: &Path) -> Option<Vec<String>> {
     Some(argv)
 }
 
+/// What a card *is*: a change to implement, or a read-only investigation whose
+/// deliverable is a conclusion. Investigations run in the main checkout with no
+/// worktree/branch/PR, on the card's `plan` spec, and end parked on their
+/// conclusion (see `CardState::Concluded`). A card can change kind while it sits
+/// in the starting block — including a concluded investigation converted into an
+/// implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CardKind {
+    /// Implement a change (the default; every record written before this field
+    /// existed is a task).
+    #[default]
+    Task,
+    /// Read-only: investigate/audit and return a conclusion, no code changes.
+    Investigation,
+}
+
 /// Per-card execution config. The plan, implement, and review phases are
 /// configured independently (different model and/or effort), per the product spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardConfig {
     pub provider: Provider,
+    /// Task vs. investigation — see [`CardKind`]. `#[serde(default)]` keeps
+    /// records written before this field existed loadable (as tasks).
+    #[serde(default)]
+    pub kind: CardKind,
     pub plan: ModelSpec,
     pub implement: ModelSpec,
     /// Model for the read-only review phases — self-review and PR-comment
@@ -68,6 +88,7 @@ impl CardConfig {
         match provider {
             Provider::Claude => CardConfig {
                 provider,
+                kind: CardKind::default(),
                 plan: ModelSpec::new("opus", Effort::XHigh),
                 implement: ModelSpec::new("opus", Effort::Medium),
                 review: None,
@@ -79,6 +100,7 @@ impl CardConfig {
             // Usine's codex provider only supports ChatGPT login.
             Provider::Codex => CardConfig {
                 provider,
+                kind: CardKind::default(),
                 plan: ModelSpec::new("gpt-5.5", Effort::High),
                 implement: ModelSpec::new("gpt-5.5", Effort::Medium),
                 review: None,
@@ -173,6 +195,7 @@ impl ProjectConfig {
     pub fn new_card_config(&self) -> CardConfig {
         CardConfig {
             provider: self.default_provider,
+            kind: CardKind::default(),
             plan: self.default_plan.clone(),
             implement: self.default_implement.clone(),
             review: self.default_review.clone(),
@@ -387,6 +410,8 @@ mod tests {
         }"#;
         let c: CardConfig = serde_json::from_str(json).expect("loads without the review field");
         assert_eq!(c.review, None);
+        // Records written before the kind field existed load as tasks.
+        assert_eq!(c.kind, CardKind::Task);
         assert_eq!(
             c.review_spec(),
             ModelSpec::new("gpt-5-codex", Effort::Medium)

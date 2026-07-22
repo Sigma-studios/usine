@@ -71,7 +71,7 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     match cfg.mode {
         // Read-only phases (planning, self-review, comment triage): restrict to
         // read-only tools so the agent can inspect but never edit.
-        RunMode::Plan | RunMode::Review | RunMode::Triage => {
+        RunMode::Plan | RunMode::Review | RunMode::Triage | RunMode::Investigate => {
             args.push("--permission-mode".into());
             args.push("plan".into());
         }
@@ -333,6 +333,15 @@ mod tests {
             pair(&args, "--output-format").as_deref(),
             Some("stream-json")
         );
+    }
+
+    #[test]
+    fn investigate_args_are_read_only() {
+        // Investigations must never be able to edit: same read-only plan
+        // permission mode as the other inspect-only phases.
+        let args = build_args(&cfg(RunMode::Investigate));
+        assert_eq!(pair(&args, "--permission-mode").as_deref(), Some("plan"));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]

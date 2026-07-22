@@ -30,6 +30,7 @@ use crate::agent::events::{
 };
 use crate::agent::handoff::Handoff;
 use crate::agent::provider::{ProviderFactory, RunConfig, RunMode};
+use crate::domain::config::CardKind;
 use crate::domain::model::{
     now_millis, Card, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict, Intervention,
     PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary,
@@ -405,6 +406,12 @@ impl Executor {
             ExecutorCommand::ReviseImplementation { card_id, feedback } => {
                 self.revise(card_id, feedback).await
             }
+            ExecutorCommand::FollowUpInvestigation { card_id, feedback } => {
+                self.follow_up_investigation(card_id, feedback).await
+            }
+            ExecutorCommand::ConvertToImplementation { card_id } => {
+                self.convert_to_implementation(card_id).await
+            }
             ExecutorCommand::ListReviewers { project_id } => self.list_reviewers(project_id).await,
             ExecutorCommand::RefreshUsage => {
                 self.refresh_usage().await;
@@ -714,6 +721,55 @@ fn fold_qa(description: &str, qa_log: &[String]) -> String {
     out
 }
 
+/// Fold an investigation's conclusion into the task description when the card
+/// converts into an implementation, under a clearly-marked findings section.
+/// Plain description text afterward — the user can trim it in the editor before
+/// starting the implementation.
+fn fold_findings(description: &str, conclusion: &str) -> String {
+    format!(
+        "{}\n\n---\n## Findings (from investigation)\n\n{}\n",
+        description.trim_end(),
+        conclusion.trim()
+    )
+}
+
+/// Build the extra context for a follow-up investigation round: the prior
+/// conclusion, the earlier rounds' follow-ups, and this round's ask. The twin of
+/// [`replan_extra`] — the re-run is a fresh conversation, so without this it has
+/// no memory of what it concluded or what the user already asked.
+fn followup_extra(prev_conclusion: Option<&str>, prior_qa: &[String], feedback: &str) -> String {
+    let mut s = String::new();
+    if let Some(prev) = prev_conclusion {
+        if !prev.trim().is_empty() {
+            s.push_str("The conclusion you previously reached:\n\n");
+            s.push_str(prev.trim());
+            s.push_str("\n\n");
+        }
+    }
+    let prior: Vec<&str> = prior_qa
+        .iter()
+        .map(|e| e.trim())
+        .filter(|e| !e.is_empty())
+        .collect();
+    if !prior.is_empty() {
+        s.push_str("Questions and follow-ups from earlier rounds — already addressed above:\n");
+        for e in prior {
+            // Indent continuation lines so a multi-line entry stays one bullet.
+            s.push_str("- ");
+            s.push_str(&e.replace('\n', "\n  "));
+            s.push('\n');
+        }
+        s.push('\n');
+    }
+    s.push_str("The user followed up with:\n\n");
+    s.push_str(feedback.trim());
+    s.push_str(
+        "\n\nInvestigate further and write your updated conclusion out in full — it replaces the \
+         previous one, so restate what still stands.",
+    );
+    s
+}
+
 /// Append a note listing the card's attached file paths so the agent reads
 /// them before starting (Claude's Read tool handles images via vision; Codex
 /// reads text with its shell tools and receives images via `codex exec -i`).
@@ -811,6 +867,10 @@ fn answer_extra(
     }
     let continuation = if mode == RunMode::Plan {
         "Continue refining the plan from where you left off, applying this decision."
+    } else if mode == RunMode::Investigate {
+        // Read-only in the main repo, like Plan: never point it at "partial
+        // changes", which would mean the user's own uncommitted work.
+        "Continue the investigation from where you left off, applying this decision."
     } else {
         "Continue from where you left off, applying this decision. The working tree may already \
          contain partial changes from the interrupted attempt — review them and continue rather \
@@ -1175,7 +1235,7 @@ fn triage_prompt(comments: &[crate::domain::model::ReviewComment]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::actor::handle_event;
+    use super::actor::{finalize_investigation, handle_event};
     use super::*;
     use uuid::Uuid;
 
@@ -1454,6 +1514,155 @@ mod tests {
         card.state = CardState::Designing(DesignSub::Running);
         store.upsert_card(&card).unwrap();
         (store, card)
+    }
+
+    /// Build an in-memory store holding a card mid-investigation, ready to
+    /// receive an investigate-mode `Done`.
+    fn investigating_card() -> (Store, Card) {
+        use crate::domain::config::{CardConfig, ProjectConfig};
+        use crate::domain::model::Project;
+        use std::path::PathBuf;
+
+        let store = Store::open_in_memory().unwrap();
+        let project = Project::new("p", PathBuf::from("/tmp/p"), ProjectConfig::default());
+        store.upsert_project(&project).unwrap();
+        let mut config = CardConfig::default();
+        config.kind = CardKind::Investigation;
+        let mut card = Card::new(project.id, "c", "d", config);
+        card.state = CardState::Investigating(RunSub::Running);
+        store.upsert_card(&card).unwrap();
+        (store, card)
+    }
+
+    #[test]
+    fn investigation_done_parks_on_the_conclusion_and_records_cost() {
+        use crate::domain::model::Usage;
+
+        let (store, card) = investigating_card();
+        let (evt_tx, _evt_rx) = mpsc::unbounded::<ExecutorEvent>();
+        let conclusion = "## Verdict\n\nThe cache at src/cache.rs:42 is unbounded — it needs an \
+                          LRU cap at the insert site.";
+        finalize_investigation(
+            &store,
+            &evt_tx,
+            card.id,
+            AgentEvent::Done {
+                result: conclusion.into(),
+                cost_usd: 0.07,
+                usage: Usage::default(),
+            },
+        )
+        .unwrap();
+
+        let got = store.get_card(card.id).unwrap();
+        assert!(
+            matches!(got.state, CardState::Concluded { ref conclusion }
+                if conclusion.contains("unbounded")),
+            "expected Concluded, got {:?}",
+            got.state
+        );
+        assert!(got.needs_attention(), "the conclusion drives the badge");
+        assert_eq!(got.cost, crate::Cost::from_usd(0.07));
+    }
+
+    /// A dangling status line is an abandoned turn, not a conclusion — but the
+    /// floor is far lower than a plan's: a one-sentence verdict is legitimate.
+    #[test]
+    fn investigation_done_with_a_dangling_status_line_fails_instead() {
+        use crate::domain::model::Usage;
+
+        let (store, card) = investigating_card();
+        let (evt_tx, _evt_rx) = mpsc::unbounded::<ExecutorEvent>();
+        finalize_investigation(
+            &store,
+            &evt_tx,
+            card.id,
+            AgentEvent::Done {
+                result: "I'll wait for the findings.".into(),
+                cost_usd: 0.02,
+                usage: Usage::default(),
+            },
+        )
+        .unwrap();
+
+        let got = store.get_card(card.id).unwrap();
+        assert!(got.state.is_failed(), "expected Failed, got {:?}", got.state);
+        assert_eq!(got.cost, crate::Cost::from_usd(0.02));
+
+        // A short-but-real verdict (>= the floor) still concludes.
+        let (store, card) = investigating_card();
+        finalize_investigation(
+            &store,
+            &evt_tx,
+            card.id,
+            AgentEvent::Done {
+                result: "Verdict: yes, the cache is bounded to 1k entries.".into(),
+                cost_usd: 0.01,
+                usage: Usage::default(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            store.get_card(card.id).unwrap().state,
+            CardState::Concluded { .. }
+        ));
+    }
+
+    /// A Done racing a cancel (the card already left Investigating) must not
+    /// transition or bill the card the user abandoned.
+    #[test]
+    fn investigation_done_after_cancel_is_a_no_op() {
+        use crate::domain::model::Usage;
+
+        let (store, card) = investigating_card();
+        store
+            .mutate_card(card.id, |c| {
+                c.state = CardState::StartingBlock; // a Cancel landed first
+                Ok(())
+            })
+            .unwrap();
+        let (evt_tx, _evt_rx) = mpsc::unbounded::<ExecutorEvent>();
+        finalize_investigation(
+            &store,
+            &evt_tx,
+            card.id,
+            AgentEvent::Done {
+                result: "a perfectly fine conclusion that arrived too late".into(),
+                cost_usd: 0.05,
+                usage: Usage::default(),
+            },
+        )
+        .unwrap();
+        let got = store.get_card(card.id).unwrap();
+        assert!(matches!(got.state, CardState::StartingBlock));
+        assert!(got.cost.is_zero());
+    }
+
+    #[test]
+    fn followup_extra_carries_the_conclusion_and_every_earlier_round() {
+        let prior = vec!["Follow-up: how big does it get in practice?".to_string()];
+        let s = followup_extra(
+            Some("The cache is unbounded."),
+            &prior,
+            "Check the eviction path too.",
+        );
+        assert!(s.contains("The cache is unbounded."));
+        assert!(s.contains("- Follow-up: how big does it get in practice?"));
+        assert!(s.contains("Check the eviction path too."));
+
+        // First round: just the ask, no phantom history sections.
+        let s = followup_extra(None, &[], "Dig into the auth flow.");
+        assert!(!s.contains("previously reached"));
+        assert!(!s.contains("earlier rounds"));
+        assert!(s.contains("Dig into the auth flow."));
+    }
+
+    #[test]
+    fn fold_findings_appends_a_marked_section() {
+        let d = fold_findings("Audit the cache.\n", "It is unbounded (src/cache.rs:42).");
+        assert!(d.starts_with("Audit the cache."));
+        assert!(d.contains("## Findings (from investigation)"));
+        assert!(d.contains("src/cache.rs:42"));
     }
 
     /// A plan run whose final result is too short to be a plan and carries no
