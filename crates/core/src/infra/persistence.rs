@@ -311,6 +311,15 @@ impl Store {
 
     // --- settings -------------------------------------------------------
 
+    /// Whether a settings record has ever been written — i.e. this is NOT a
+    /// first startup. [`Self::settings`] hides absence behind `Default`, so
+    /// first-run detection needs this explicit probe.
+    pub fn has_settings(&self) -> Result<bool> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<SettingsRecord> = r.get().primary(SETTINGS_ID)?;
+        Ok(rec.is_some())
+    }
+
     pub fn settings(&self) -> Result<AppSettings> {
         let r = self.db.r_transaction()?;
         let rec: Option<SettingsRecord> = r.get().primary(SETTINGS_ID)?;
