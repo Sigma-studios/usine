@@ -208,6 +208,12 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         (S::AwaitingReview(ReviewSub::SelectingFixes { .. }), T::StartSelfReview) => {
             S::AwaitingReview(ReviewSub::Reviewing)
         }
+        // The picker is where an auto-reviewed implementation first parks, so it
+        // must also offer the wholesale bounce back to the agent that the
+        // `ReadyForReview` gate offers.
+        (S::AwaitingReview(ReviewSub::SelectingFixes { .. }), T::RequestChanges) => {
+            S::Implementing(RunSub::Running)
+        }
         // Self-review is a single pass: once fixes are applied, advance to the PR
         // rather than looping back for another review.
         (S::AwaitingReview(ReviewSub::ApplyingFixes), T::SelfFixesDone) => {
@@ -488,6 +494,18 @@ mod tests {
 
         let s = transition(&s, Transition::Merge).unwrap();
         assert!(matches!(s, CardState::Done));
+    }
+
+    #[test]
+    fn the_fix_picker_can_send_the_work_back_to_the_agent() {
+        // With the self-review auto-started, the picker is where a finished
+        // implementation first parks — it must offer the same wholesale bounce
+        // back to implementing that `ReadyForReview` does.
+        let s = CardState::AwaitingReview(ReviewSub::SelectingFixes {
+            verdicts: verdicts(),
+        });
+        let s = transition(&s, Transition::RequestChanges).unwrap();
+        assert!(matches!(s, CardState::Implementing(RunSub::Running)));
     }
 
     #[test]

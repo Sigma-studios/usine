@@ -133,6 +133,11 @@ struct CardOptionsRecord {
     card_id: String,
     /// Skip the design/plan phase and implement straight from the description.
     skip_plan: bool,
+    /// Opt OUT of the automatic self-review pass that follows a finished
+    /// implementation. Stored negatively so the default (auto-review ON) is the
+    /// serde default, which also keeps records written before this field loadable.
+    #[serde(default)]
+    skip_auto_review: bool,
 }
 
 /// The managed copies of a card's attached images, kept in their own record so
@@ -209,6 +214,21 @@ struct DismissedReviewsRecord {
     pr_numbers: Vec<u64>,
 }
 
+/// The latest Agent Chat exchange for a card: the question is stashed when the
+/// run starts, the answer filled in when it finishes. Its own record (not a
+/// field on [`CardReviewRecord`]) so adding it doesn't change an existing
+/// record's layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 12, version = 1, with = Json)]
+#[native_db]
+struct CardAnswerRecord {
+    #[primary_key]
+    card_id: String,
+    #[serde(default)]
+    question: String,
+    answer: String,
+}
+
 const SETTINGS_ID: u8 = 1;
 
 /// Model registry. Must be `'static` so the [`Database`] can be `'static` and
@@ -251,6 +271,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<DismissedReviewsRecord>()
         .expect("define DismissedReviewsRecord");
+    models
+        .define::<CardAnswerRecord>()
+        .expect("define CardAnswerRecord");
     models
 });
 
@@ -312,6 +335,7 @@ impl Store {
         self.refresh_type::<CardAttachmentsRecord>();
         self.refresh_type::<CardReviewRecord>();
         self.refresh_type::<DismissedReviewsRecord>();
+        self.refresh_type::<CardAnswerRecord>();
     }
 
     /// Refresh one record type in its own transaction, best-effort: an undecodable
@@ -530,6 +554,9 @@ impl Store {
         if let Some(rec) = rw.get().primary::<CardReviewRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
+        if let Some(rec) = rw.get().primary::<CardAnswerRecord>(id.to_string())? {
+            rw.remove(rec)?;
+        }
         if let Some(rec) = rw
             .get()
             .primary::<CardInvestigationRecord>(id.to_string())?
@@ -573,6 +600,83 @@ impl Store {
         }
         rw.commit()?;
         Ok(())
+    }
+
+    // --- Agent Chat answers ---------------------------------------------
+
+    /// Stash the question a starting Agent Chat run will answer, clearing any
+    /// previous exchange. `set_answer` completes it when the run finishes.
+    pub fn set_question(&self, card_id: Uuid, question: &str) -> Result<()> {
+        let rec = CardAnswerRecord {
+            card_id: card_id.to_string(),
+            question: question.to_string(),
+            answer: String::new(),
+        };
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(rec.card_id.clone())?;
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// The stashed question of the in-flight (or just-finished) Agent Chat run.
+    pub fn get_question(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.question).filter(|s: &String| !s.is_empty()))
+    }
+
+    /// Store a card's latest Agent Chat answer, keeping the stashed question.
+    pub fn set_answer(&self, card_id: Uuid, answer: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        let rec = CardAnswerRecord {
+            card_id: card_id.to_string(),
+            question: old.as_ref().map(|o| o.question.clone()).unwrap_or_default(),
+            answer: answer.to_string(),
+        };
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    pub fn get_answer(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.answer).filter(|s: &String| !s.is_empty()))
+    }
+
+    /// Drop a card's stored answer (used by "back to start"). Idempotent.
+    pub fn delete_answer(&self, card_id: Uuid) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        if let Some(rec) = rw.get().primary::<CardAnswerRecord>(card_id.to_string())? {
+            rw.remove(rec)?;
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// All cards' answered exchanges as `(question, answer)`, keyed by card id
+    /// (loaded once at startup). Pending records (no answer yet) are skipped.
+    pub fn all_answers(&self) -> Result<HashMap<Uuid, (String, String)>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardAnswerRecord>()?.all()? {
+            let rec = rec?;
+            if rec.answer.is_empty() {
+                continue;
+            }
+            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
+                out.insert(id, (rec.question, rec.answer));
+            }
+        }
+        Ok(out)
     }
 
     // --- investigation context ------------------------------------------
@@ -631,12 +735,46 @@ impl Store {
     }
 
     pub fn set_skip_plan(&self, card_id: Uuid, skip_plan: bool) -> Result<()> {
-        let rec = CardOptionsRecord {
-            card_id: card_id.to_string(),
-            skip_plan,
-        };
+        self.mutate_options(card_id, |o| o.skip_plan = skip_plan)
+    }
+
+    /// Whether the card auto-starts its self-review pass when the implementation
+    /// finishes. On by default; the toggle stores the opt-out.
+    pub fn get_auto_review(&self, card_id: Uuid) -> Result<bool> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardOptionsRecord> = r.get().primary(card_id.to_string())?;
+        Ok(!rec.map(|r| r.skip_auto_review).unwrap_or(false))
+    }
+
+    /// All stored auto-review flags (true = auto-review on), keyed by card id.
+    /// Loaded once at startup into a UI signal, like [`Self::skip_plan_flags`].
+    pub fn auto_review_flags(&self) -> Result<HashMap<Uuid, bool>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardOptionsRecord>()?.all()? {
+            let rec = rec?;
+            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
+                out.insert(id, !rec.skip_auto_review);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_auto_review(&self, card_id: Uuid, auto: bool) -> Result<()> {
+        self.mutate_options(card_id, |o| o.skip_auto_review = !auto)
+    }
+
+    /// Read-modify-write the card's options record so setting one option can't
+    /// reset the others to their defaults.
+    fn mutate_options(&self, card_id: Uuid, f: impl FnOnce(&mut CardOptionsRecord)) -> Result<()> {
         let rw = self.db.rw_transaction()?;
-        let old: Option<CardOptionsRecord> = rw.get().primary(rec.card_id.clone())?;
+        let old: Option<CardOptionsRecord> = rw.get().primary(card_id.to_string())?;
+        let mut rec = old.clone().unwrap_or(CardOptionsRecord {
+            card_id: card_id.to_string(),
+            skip_plan: false,
+            skip_auto_review: false,
+        });
+        f(&mut rec);
         match old {
             Some(old) => rw.update(old, rec)?,
             None => rw.insert(rec)?,
@@ -990,6 +1128,7 @@ pub fn rebuild_database(old: &Path, new: &Path) -> Result<Vec<(&'static str, usi
     copy_table!(CardReviewRecord, "reviews");
     copy_table!(ReviewTaskRecord, "review_tasks");
     copy_table!(DismissedReviewsRecord, "dismissed_reviews");
+    copy_table!(CardAnswerRecord, "answers");
 
     rw.commit()?;
     Ok(report)

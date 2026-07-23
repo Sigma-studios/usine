@@ -113,6 +113,12 @@ pub enum ExecutorCommand {
     /// From "awaiting review", send the implementation back to the agent with
     /// requested changes; the card returns to Implementing in its worktree.
     ReviseImplementation { card_id: Uuid, feedback: String },
+    /// Ask the agent a question about its work without sending it back for
+    /// changes: a strictly read-only turn from any Agent Chat panel (plan
+    /// approval, awaiting review, PR idle, ready-to-merge). The card rides the
+    /// matching "send back" transition while answering and returns to where it
+    /// started; the answer arrives via `AnswerUpdated`.
+    AskQuestion { card_id: Uuid, question: String },
     /// From `Concluded`: dig deeper — re-run the investigation with the prior
     /// conclusion, the earlier rounds, and this follow-up as context (the
     /// investigation twin of `RejectPlan`'s re-plan loop).
@@ -271,6 +277,9 @@ pub enum ExecutorCommand {
     SaveSettings { settings: Box<AppSettings> },
     /// Set a card's "skip plan" option.
     SetSkipPlan { card_id: Uuid, skip: bool },
+    /// Set whether the card auto-starts its self-review pass when the
+    /// implementation finishes (on by default).
+    SetAutoReview { card_id: Uuid, auto: bool },
     /// Copy an image into the card's managed attachments dir (`src` = the file
     /// the user picked). Claude-only; the path is injected into the prompt.
     AttachImage { card_id: Uuid, src: PathBuf },
@@ -302,6 +311,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ApplyFixes { card_id, .. }
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
+            | ExecutorCommand::AskQuestion { card_id, .. }
             | ExecutorCommand::FollowUpInvestigation { card_id, .. }
             | ExecutorCommand::ConvertToImplementation { card_id }
             | ExecutorCommand::Merge { card_id, .. }
@@ -331,6 +341,7 @@ impl ExecutorCommand {
             | ExecutorCommand::RetryFresh { card_id }
             | ExecutorCommand::DeleteCard { card_id }
             | ExecutorCommand::SetSkipPlan { card_id, .. }
+            | ExecutorCommand::SetAutoReview { card_id, .. }
             | ExecutorCommand::AttachImage { card_id, .. }
             | ExecutorCommand::AttachImageBytes { card_id, .. }
             | ExecutorCommand::DetachImage { card_id, .. } => *card_id,
@@ -394,6 +405,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::ApplyFixes { .. }
                 | ExecutorCommand::CreatePr { .. }
                 | ExecutorCommand::ReviseImplementation { .. }
+                | ExecutorCommand::AskQuestion { .. }
                 | ExecutorCommand::FollowUpInvestigation { .. }
                 | ExecutorCommand::ConvertToImplementation { .. }
                 | ExecutorCommand::Merge { .. }
@@ -424,6 +436,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::SaveProject { .. }
                 | ExecutorCommand::SaveSettings { .. }
                 | ExecutorCommand::SetSkipPlan { .. }
+                | ExecutorCommand::SetAutoReview { .. }
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }
@@ -452,6 +465,8 @@ pub enum ExecutorEventKind {
     SettingsUpdated(Box<AppSettings>),
     /// A card's skip-plan flag changed (`card_id` on the event).
     SkipPlanChanged { skip: bool },
+    /// A card's auto-review flag changed (`card_id` on the event).
+    AutoReviewChanged { auto: bool },
     /// A lifecycle-advancing command started (`busy: true`) or finished
     /// (`busy: false`) for the card. Those commands do their git/forge work
     /// *before* transitioning, so between the click and the resulting
@@ -479,6 +494,10 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
+    /// A card's Agent Chat exchange changed (`card_id` on the event). An empty
+    /// `answer` means it was cleared (e.g. "back to start", or a write run
+    /// superseding it) and the UI drops its entry.
+    AnswerUpdated { question: String, answer: String },
     /// A card's implementation hand-off changed (`card_id` on the event). An
     /// empty [`Handoff`] means the latest implement run produced none, and the UI
     /// drops the previous attempt's.
@@ -546,6 +565,12 @@ impl ExecutorEvent {
             kind: ExecutorEventKind::SkipPlanChanged { skip },
         }
     }
+    pub fn auto_review_changed(card_id: Uuid, auto: bool) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::AutoReviewChanged { auto },
+        }
+    }
     pub fn attachments_changed(card_id: Uuid, paths: Vec<PathBuf>) -> Self {
         ExecutorEvent {
             card_id,
@@ -590,6 +615,19 @@ impl ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::RecapUpdated {
                 recap: recap.into(),
+            },
+        }
+    }
+    pub fn answer_updated(
+        card_id: Uuid,
+        question: impl Into<String>,
+        answer: impl Into<String>,
+    ) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::AnswerUpdated {
+                question: question.into(),
+                answer: answer.into(),
             },
         }
     }

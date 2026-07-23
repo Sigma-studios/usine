@@ -72,11 +72,24 @@ pub struct AppState {
     /// Per-card "skip plan" flags, seeded from the store at startup and kept in
     /// sync via `SkipPlanChanged` events — so the UI never reads the store.
     pub skip_plans: Signal<HashMap<Uuid, bool>>,
+    /// Per-card auto-review flags (true = the self-review auto-starts when the
+    /// implementation finishes; on by default), seeded from the store at startup
+    /// and kept in sync via `AutoReviewChanged` events.
+    pub auto_reviews: Signal<HashMap<Uuid, bool>>,
     /// Per-card attached image paths (Claude-only), seeded at startup and kept in
     /// sync via `AttachmentsChanged` events.
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
     /// Per-card fixes recap, seeded at startup and updated via `RecapUpdated`.
     pub review_recaps: Signal<HashMap<Uuid, String>>,
+    /// Per-card Agent Chat exchange — the last question asked and its prose
+    /// answer — seeded at startup and updated via `AnswerUpdated` (an empty
+    /// answer removes the entry).
+    pub answers: Signal<HashMap<Uuid, (String, String)>>,
+    /// Per-card draft answers to a proposed plan's structured questions, keyed
+    /// alongside the plan text they answer. Held here (not in the plan panel)
+    /// because asking a chat question unmounts the panel mid-edit — a
+    /// component-local signal would come back blank. In-memory only.
+    pub plan_drafts: Signal<HashMap<Uuid, (String, Vec<String>)>>,
     /// Per-card implementation hand-off — the recap, open questions, and testing
     /// checklist the implement run left for its reviewer. Seeded at startup and
     /// updated via `HandoffUpdated`.
@@ -160,8 +173,10 @@ impl AppState {
         let projects = store.list_projects().unwrap_or_default();
         let cards = store.list_cards().unwrap_or_default();
         let skip_plans = store.skip_plan_flags().unwrap_or_default();
+        let auto_reviews = store.auto_review_flags().unwrap_or_default();
         let attachments = store.all_attachments().unwrap_or_default();
         let review_recaps = store.all_review_recaps().unwrap_or_default();
+        let answers = store.all_answers().unwrap_or_default();
         let handoffs = store.all_handoffs().unwrap_or_default();
         // Group persisted review tasks by project for the review board.
         let mut review_tasks: HashMap<Uuid, Vec<ReviewTask>> = HashMap::new();
@@ -194,8 +209,11 @@ impl AppState {
             reviewers: Signal::new(HashMap::new()),
             review_tasks: Signal::new(review_tasks),
             skip_plans: Signal::new(skip_plans),
+            auto_reviews: Signal::new(auto_reviews),
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
+            answers: Signal::new(answers),
+            plan_drafts: Signal::new(HashMap::new()),
             handoffs: Signal::new(handoffs),
             previews: Signal::new(HashMap::new()),
             diffs: Signal::new(HashMap::new()),
@@ -263,6 +281,10 @@ impl AppState {
                 transcripts.write().remove(&id);
                 let mut attachments = self.attachments;
                 attachments.write().remove(&id);
+                let mut answers = self.answers;
+                answers.write().remove(&id);
+                let mut plan_drafts = self.plan_drafts;
+                plan_drafts.write().remove(&id);
                 if *self.selected_card.read() == Some(id) {
                     let mut selected = self.selected_card;
                     selected.set(None);
@@ -307,6 +329,11 @@ impl AppState {
                 let id = evt.card_id;
                 let mut skip_plans = self.skip_plans;
                 skip_plans.write().insert(id, skip);
+            }
+            ExecutorEventKind::AutoReviewChanged { auto } => {
+                let id = evt.card_id;
+                let mut auto_reviews = self.auto_reviews;
+                auto_reviews.write().insert(id, auto);
             }
             ExecutorEventKind::CardBusy { busy } => {
                 let id = evt.card_id;
@@ -361,6 +388,17 @@ impl AppState {
             ExecutorEventKind::RecapUpdated { recap } => {
                 let mut recaps = self.review_recaps;
                 recaps.write().insert(evt.card_id, recap);
+            }
+            // An empty answer means the exchange was cleared ("back to start",
+            // or a write run superseding it): drop the entry so the panel shows
+            // nothing.
+            ExecutorEventKind::AnswerUpdated { question, answer } => {
+                let mut answers = self.answers;
+                if answer.is_empty() {
+                    answers.write().remove(&evt.card_id);
+                } else {
+                    answers.write().insert(evt.card_id, (question, answer));
+                }
             }
             // An empty hand-off means the run left none: drop the entry so the
             // panel shows nothing rather than the previous attempt's recap.
@@ -532,8 +570,9 @@ impl AppState {
     }
 
     /// Total review tasks needing attention across all projects (dock badge).
-    /// The badge is macOS-only (`use_dock_badge`), so this is too.
-    #[cfg(target_os = "macos")]
+    /// Only called from the macOS-only dock badge effect, so it's dead code on
+    /// other platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn review_attention_count(&self) -> usize {
         self.review_tasks
             .read()
@@ -592,6 +631,22 @@ impl AppState {
     /// Mark/unmark a card to skip planning. Only meaningful before it starts.
     pub fn set_card_skip_plan(&self, card_id: Uuid, skip: bool) {
         self.send(ExecutorCommand::SetSkipPlan { card_id, skip });
+    }
+
+    /// Whether a card auto-starts its self-review when the implementation
+    /// finishes (on by default). Read from the signal seeded at startup and kept
+    /// current by `AutoReviewChanged` events (no store access).
+    pub fn card_auto_review(&self, card_id: Uuid) -> bool {
+        self.auto_reviews
+            .read()
+            .get(&card_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Turn a card's automatic self-review on/off.
+    pub fn set_card_auto_review(&self, card_id: Uuid, auto: bool) {
+        self.send(ExecutorCommand::SetAutoReview { card_id, auto });
     }
 
     /// A card's attached image paths (the managed copies). Read from the signal
