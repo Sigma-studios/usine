@@ -93,6 +93,9 @@ async fn implement_done_park_reaps_the_preview() {
         CardState::AwaitingReview(ReviewSub::ReadyForReview),
         wt.path(),
     );
+    // Opt out of the auto self-review so the finished run parks at
+    // `ReadyForReview` instead of continuing into the review pass.
+    store.set_auto_review(card_id, false).unwrap();
     let (handle, mut rx) = executor(&store);
 
     // A revise runs the implement phase in the existing worktree; its
