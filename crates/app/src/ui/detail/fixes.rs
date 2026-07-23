@@ -40,8 +40,12 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     };
 
     // Grow each edit box to fit its text (same script as the review drafts
-    // panel: idempotent, keeps sizing on every keystroke).
+    // panel: idempotent, keeps sizing on every keystroke). Unlike that panel,
+    // textareas here appear and disappear as rows are (un)checked — reply boxes
+    // mount when a row is unchecked — so the effect subscribes to `edits` to
+    // re-wire whatever the toggle just put in the DOM.
     use_effect(move || {
+        edits.read();
         dioxus::document::eval(
             "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
              var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
