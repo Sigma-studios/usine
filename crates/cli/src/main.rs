@@ -370,10 +370,18 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                     // the `SelectingFixes` arm below applies all its findings.
                     CardState::AwaitingReview(ReviewSub::ReadyForReview) => {}
                     CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {
-                        let ids = verdicts.iter().map(|v| v.comment.id).collect();
+                        // Apply every finding, whatever the triage said.
+                        let all = verdicts
+                            .iter()
+                            .cloned()
+                            .map(|mut v| {
+                                v.selected = true;
+                                v
+                            })
+                            .collect();
                         exec.send(ExecutorCommand::ApplySelfFixes {
                             card_id,
-                            selected_comment_ids: ids,
+                            verdicts: all,
                             note: String::new(),
                         });
                     }
@@ -392,14 +400,9 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                     CardState::PrReview(PrReviewSub::Idle) => {}
                     CardState::PrReview(PrReviewSub::SelectingFixes { verdicts }) => {
                         // Fix only the ones triaged as worth fixing; the rest get a reply.
-                        let ids = verdicts
-                            .iter()
-                            .filter(|v| v.selected)
-                            .map(|v| v.comment.id)
-                            .collect();
                         exec.send(ExecutorCommand::ApplyFixes {
                             card_id,
-                            selected_comment_ids: ids,
+                            verdicts: verdicts.clone(),
                             note: String::new(),
                         });
                     }

@@ -721,6 +721,10 @@ select option { background: var(--panel-2); color: var(--text); }
   border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
   width: 100%; resize: none; overflow-y: hidden; line-height: 1.5;
 }
+/* The editable "reply if ignored" box under an unchecked triage comment. */
+.comment .reply-edit { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.comment .reply-label { font-size: 12px; color: var(--muted); }
+
 /* A drafted comment is collapsible and starts open: the body is the thing being
    reviewed. Collapsed, its severity and location stay visible. */
 .comment .draft > summary {

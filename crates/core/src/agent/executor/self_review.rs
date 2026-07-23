@@ -62,30 +62,28 @@ impl Executor {
         Ok(wt)
     }
 
-    /// Apply the self-review fixes the user selected, plus their free-form `note`
-    /// if they typed one. With neither, just advance to the PR. Like every agent
+    /// Apply the self-review fixes the user checked — from the verdicts as the
+    /// user left them (bodies may be edited), plus their free-form `note` if
+    /// they typed one. With neither, just advance to the PR. Like every agent
     /// *write* run, the fix happens in the card's ISOLATED worktree — never the
     /// main working copy. Commits (no push, since there's no PR yet) and advances
     /// to `ReadyForPr`.
     pub(super) async fn apply_self_fixes(
         &self,
         card_id: Uuid,
-        selected_ids: Vec<u64>,
+        verdicts: Vec<FixVerdict>,
         note: String,
     ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
-        let selected: Vec<FixVerdict> = match &card.state {
-            CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => verdicts
-                .iter()
-                .filter(|v| selected_ids.contains(&v.comment.id))
-                .cloned()
-                .collect(),
-            _ => {
-                return Err(CoreError::IllegalTransition(
-                    "can only apply self-review fixes while selecting fixes".into(),
-                ))
-            }
-        };
+        if !matches!(
+            &card.state,
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+        ) {
+            return Err(CoreError::IllegalTransition(
+                "can only apply self-review fixes while selecting fixes".into(),
+            ));
+        }
+        let selected: Vec<FixVerdict> = verdicts.into_iter().filter(|v| v.selected).collect();
         let note = note.trim().to_string();
         if selected.is_empty() && note.is_empty() {
             // Nothing to fix — go straight to the PR (through the validation

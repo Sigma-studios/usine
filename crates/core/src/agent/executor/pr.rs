@@ -201,31 +201,31 @@ impl Executor {
         self.launch(card, RunMode::Triage, Some(extra), None).await
     }
 
-    /// Apply the selected PR-comment fixes and reply to the ignored ones. The
-    /// checked comments — plus the user's free-form `note`, if any — go to an
-    /// agent run (which commits + pushes and captures a fixes recap); each
-    /// unchecked comment with a drafted reply gets that reply posted on GitHub.
-    /// With neither a checked comment nor a note, records a recap and advances.
+    /// Apply the checked PR-comment fixes and reply to the ignored ones — from
+    /// the verdicts as the user left them, edits included. The checked comments
+    /// — plus the user's free-form `note`, if any — go to an agent run (which
+    /// commits + pushes and captures a fixes recap); each unchecked comment with
+    /// a (possibly edited) reply gets that reply posted on GitHub. With neither
+    /// a checked comment nor a note, records a recap and advances.
     pub(super) async fn apply_fixes(
         &self,
         card_id: Uuid,
-        selected_ids: Vec<u64>,
+        verdicts: Vec<FixVerdict>,
         note: String,
     ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
         let pr_number = card.pr.as_ref().map(|p| p.number);
-        let verdicts: Vec<FixVerdict> = match &card.state {
-            CardState::PrReview(PrReviewSub::SelectingFixes { verdicts }) => verdicts.clone(),
-            _ => {
-                return Err(CoreError::IllegalTransition(
-                    "can only apply fixes while selecting fixes".into(),
-                ))
-            }
-        };
-        let (checked, ignored): (Vec<FixVerdict>, Vec<FixVerdict>) = verdicts
-            .into_iter()
-            .partition(|v| selected_ids.contains(&v.comment.id));
+        if !matches!(
+            &card.state,
+            CardState::PrReview(PrReviewSub::SelectingFixes { .. })
+        ) {
+            return Err(CoreError::IllegalTransition(
+                "can only apply fixes while selecting fixes".into(),
+            ));
+        }
+        let (checked, ignored): (Vec<FixVerdict>, Vec<FixVerdict>) =
+            verdicts.into_iter().partition(|v| v.selected);
 
         // Reply to the ignored comments with the agent's short explanation
         // (best-effort — a failed reply shouldn't block applying the fixes).
