@@ -751,10 +751,16 @@ pub(super) async fn kill_group(pid: u32) {
 /// Send `sig` to the process group led by `group` (negated pid) and, belt-and-
 /// suspenders, to each pid in `pids` individually — covering children that left
 /// the group. `kill` signals every valid target even if some are already gone.
+///
+/// The `--` before the operands is load-bearing: without it, procps-ng's
+/// `kill` (Linux) parses the negated group as an option and degenerates to
+/// `kill(-1, sig)` — a signal to every process the user owns, which on a CI
+/// runner takes down the runner itself.
 #[cfg(unix)]
 async fn signal_all(sig: &str, group: u32, pids: &[u32]) {
-    let mut args: Vec<String> = Vec::with_capacity(pids.len() + 2);
+    let mut args: Vec<String> = Vec::with_capacity(pids.len() + 3);
     args.push(sig.to_string());
+    args.push("--".to_string());
     args.push(format!("-{group}"));
     args.extend(pids.iter().map(u32::to_string));
     let _ = Command::new("kill")
@@ -824,11 +830,12 @@ pub(super) fn reap_all_blocking(leaders: &[u32]) {
 }
 
 /// Blocking twin of [`signal_all`]: signal each process group (negated leader
-/// pid) plus each individual target pid.
+/// pid) plus each individual target pid. The `--` matters — see [`signal_all`].
 #[cfg(unix)]
 fn signal_pids_blocking(sig: &str, leaders: &[u32], pids: &[u32]) {
-    let mut args: Vec<String> = Vec::with_capacity(leaders.len() + pids.len() + 1);
+    let mut args: Vec<String> = Vec::with_capacity(leaders.len() + pids.len() + 2);
     args.push(sig.to_string());
+    args.push("--".to_string());
     args.extend(leaders.iter().map(|g| format!("-{g}")));
     args.extend(pids.iter().map(u32::to_string));
     let _ = std::process::Command::new("kill")
