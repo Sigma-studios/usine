@@ -5,6 +5,12 @@
 //! project's setup script (deps, an isolated per-worktree DB, free ports) and
 //! then its `run_script` as a persistent process, surfacing the
 //! clickable URLs. Nothing touches the user's main checkout.
+//!
+//! A preview auto-started for a write run lives only as long as the automated
+//! pipeline: when the card parks, the finalizers light-stop it
+//! ([`Executor::reap_idle_preview`]) — process tree killed, teardown script
+//! skipped — so idle cards don't accumulate running apps while a restart
+//! stays warm.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -160,8 +166,10 @@ impl Executor {
     }
 
     /// Bring a card's preview up alongside a write run, so the agent can test its
-    /// work against the running app (see [`crate::agent::testing`]) and the human
-    /// who reviews next arrives at a warm, already-serving build. Quietly a no-op
+    /// work against the running app (see [`crate::agent::testing`]). The app lives
+    /// for the automated pipeline and is reaped when the card parks
+    /// ([`Self::reap_idle_preview`]) — the light kill keeps the worktree's infra
+    /// up, so a manual restart from the card is fast. Quietly a no-op
     /// when there is nothing to do: a preview already up (or setting up) is
     /// reused, and a project with no run script — or a card with no worktree —
     /// simply has no app to run (the agent's prompt omits the testing instruction
@@ -505,6 +513,50 @@ impl Executor {
         }
     }
 
+    /// Light-stop a card's preview once its automated pipeline parks: kill the
+    /// app's process tree but skip the teardown script, so per-worktree infra
+    /// (DB, containers) stays up and a restart — manual or the next run's
+    /// `EnsurePreview` — is warm and fast. Best-effort and infallible; called
+    /// from every finalizer that leaves the card in a parked state.
+    ///
+    /// Race-safe by construction: bail when the card has no preview slot (no
+    /// spurious `Stopped` for cards that never previewed), when the card is
+    /// running again (the racing next run keeps its app), or when the slot
+    /// changed hands since the snapshot (a concurrent stop already reaped it;
+    /// a newer claim owns an app this park has no business killing). A slot
+    /// still only reserved (`pid: None`) is just removed — the in-flight
+    /// launcher self-reaps at its next registration checkpoint, the same
+    /// contract as [`Self::kill_preview`].
+    pub(super) async fn reap_idle_preview(&self, card_id: Uuid) {
+        let Some(generation) = lock(&self.previews).get(&card_id).map(|h| h.generation) else {
+            return;
+        };
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        if card.state.is_running() {
+            return;
+        }
+        let handle = {
+            let mut map = lock(&self.previews);
+            match map.get(&card_id) {
+                Some(h) if h.generation == generation => map.remove(&card_id),
+                _ => return,
+            }
+        };
+        if let Some(PreviewHandle { pid: Some(pid), .. }) = handle {
+            kill_group(pid).await;
+        }
+        if let Some(wt) = card.worktree_path.as_deref() {
+            clear_preview_info(wt);
+        }
+        self.progress(
+            card_id,
+            "▷ preview stopped — card parked (restart it from the card)",
+        );
+        self.emit_preview(card_id, PreviewStatus::Stopped, Vec::new());
+    }
+
     /// Reap a card's running preview (if any): drop its slot first so the reaper
     /// stays quiet, then SIGTERM→SIGKILL the whole process group. A slot that is
     /// only reserved (no pid yet) has no process to kill — removing it is
@@ -699,10 +751,16 @@ pub(super) async fn kill_group(pid: u32) {
 /// Send `sig` to the process group led by `group` (negated pid) and, belt-and-
 /// suspenders, to each pid in `pids` individually — covering children that left
 /// the group. `kill` signals every valid target even if some are already gone.
+///
+/// The `--` before the operands is load-bearing: without it, procps-ng's
+/// `kill` (Linux) parses the negated group as an option and degenerates to
+/// `kill(-1, sig)` — a signal to every process the user owns, which on a CI
+/// runner takes down the runner itself.
 #[cfg(unix)]
 async fn signal_all(sig: &str, group: u32, pids: &[u32]) {
-    let mut args: Vec<String> = Vec::with_capacity(pids.len() + 2);
+    let mut args: Vec<String> = Vec::with_capacity(pids.len() + 3);
     args.push(sig.to_string());
+    args.push("--".to_string());
     args.push(format!("-{group}"));
     args.extend(pids.iter().map(u32::to_string));
     let _ = Command::new("kill")
@@ -772,11 +830,12 @@ pub(super) fn reap_all_blocking(leaders: &[u32]) {
 }
 
 /// Blocking twin of [`signal_all`]: signal each process group (negated leader
-/// pid) plus each individual target pid.
+/// pid) plus each individual target pid. The `--` matters — see [`signal_all`].
 #[cfg(unix)]
 fn signal_pids_blocking(sig: &str, leaders: &[u32], pids: &[u32]) {
-    let mut args: Vec<String> = Vec::with_capacity(leaders.len() + pids.len() + 1);
+    let mut args: Vec<String> = Vec::with_capacity(leaders.len() + pids.len() + 2);
     args.push(sig.to_string());
+    args.push("--".to_string());
     args.extend(leaders.iter().map(|g| format!("-{g}")));
     args.extend(pids.iter().map(u32::to_string));
     let _ = std::process::Command::new("kill")

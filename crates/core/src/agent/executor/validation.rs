@@ -17,6 +17,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
+use super::actor::reap_idle_preview_direct;
 use super::preview::kill_group;
 use super::*;
 use crate::domain::config::ProjectConfig;
@@ -51,6 +52,11 @@ impl Executor {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
         let Some(cmd) = validate_command(&project.config) else {
+            // No gate configured: every fresh entry to `ReadyForPr` funnels
+            // through here, so this is where "parked with no gate" lands —
+            // light-stop the preview the run left behind. The helper's
+            // running-state guard makes it a no-op on any non-parked caller.
+            self.reap_idle_preview(card_id).await;
             return Ok(());
         };
         match &card.state {
@@ -177,14 +183,21 @@ fn fix_validation_direct(
                 .map(|c| c.state.is_running())
                 .unwrap_or(false)
             {
-                let _ = apply_transition(
+                let demoted = apply_transition(
                     &store,
                     &evt_tx,
                     card_id,
                     Transition::AgentError {
                         message: e.to_string(),
                     },
-                );
+                )
+                .is_ok();
+                // Failing to launch the fix run (e.g. the provider CLI is
+                // missing) parks the card at `Failed` with no actor behind it
+                // — light-stop the preview the pipeline left up.
+                if demoted {
+                    exec.reap_idle_preview(card_id).await;
+                }
             }
         }
     });
@@ -301,6 +314,8 @@ async fn validation_actor(
                     message: format!("failed to run the validate command `{cmd}`: {e}"),
                 },
             );
+            // Parked at `Failed` — light-stop the preview the pipeline left up.
+            reap_idle_preview_direct(&executor, card_id);
             cleanup(&validations, &runs);
             return;
         }
@@ -360,6 +375,8 @@ async fn validation_actor(
                         VALIDATION_TIMEOUT.as_secs() / 60
                     ),
                 });
+                // Parked at `Failed` — light-stop the preview.
+                reap_idle_preview_direct(&executor, card_id);
                 cleanup(&validations, &runs);
                 return;
             }
@@ -387,6 +404,9 @@ async fn validation_actor(
         Ok(s) if s.success() => {
             let _ = apply_transition(&store, &evt_tx, card_id, Transition::ValidationPassed);
             transcript(&store, &evt_tx, card_id, "✔ validation passed".to_string());
+            // The gate is done and the card parked at `ReadyForPr` —
+            // light-stop the preview the pipeline brought up.
+            reap_idle_preview_direct(&executor, card_id);
         }
         Ok(s) => {
             let mut output = lock(&tail).render();
@@ -428,6 +448,8 @@ async fn validation_actor(
                             card_id,
                             "✖ validation failed — attempt budget exhausted".to_string(),
                         );
+                        // Parked at `ValidationFailed` — light-stop the preview.
+                        reap_idle_preview_direct(&executor, card_id);
                     }
                     _ => {}
                 }
@@ -442,6 +464,8 @@ async fn validation_actor(
                     message: format!("validation command failed to run: {e}"),
                 },
             );
+            // Parked at `Failed` — light-stop the preview.
+            reap_idle_preview_direct(&executor, card_id);
         }
     }
     cleanup(&validations, &runs);

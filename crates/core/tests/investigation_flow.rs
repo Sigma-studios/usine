@@ -150,6 +150,19 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         _ => unreachable!(),
     };
 
+    // Exclusive commands release their per-card claim (`busy: false`) only
+    // *after* their `CardUpdated` echoes; one sent while another still holds
+    // the card is dropped as a duplicate (the dispatcher's double-click
+    // guard). So whenever the awaited echo is emitted from inside a command
+    // handler, drain the release before sending the next command.
+    async fn wait_released(rx: &mut UnboundedReceiver<ExecutorEvent>) {
+        wait_for(rx, |evt| match &evt.kind {
+            ExecutorEventKind::CardBusy { busy: false } => Some(()),
+            _ => None,
+        })
+        .await
+    }
+
     // Follow-up whose run fails to launch (CLI missing) → the card fails
     // retryably, and the RETRY re-runs the follow-up ROUND — prior conclusion
     // and the user's ask still in context — not just the original description.
@@ -159,6 +172,10 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         feedback: "How big does it get under real traffic?".into(),
     });
     wait_for_state(&mut rx, |s| matches!(s, CardState::Failed { .. })).await;
+    // The `Failed` echo comes from *inside* the follow-up handler, which still
+    // holds the card's exclusive claim — a `Retry` sent right away can be
+    // dropped as a duplicate. Wait for the release (`busy: false`) first.
+    wait_released(&mut rx).await;
     exec.send(ExecutorCommand::Retry { card_id });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Concluded { .. })).await;
     assert!(card.cost > first_cost, "follow-up spend accumulates");
@@ -196,17 +213,8 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     assert!(!store.get_skip_plan(card_id).unwrap());
     assert!(store.get_investigation_extra(card_id).unwrap().is_none());
 
-    // Exclusive commands sent while another holds the card are dropped as
-    // duplicates (the dispatcher's double-click guard), and each releases its
-    // claim (`busy: false`) only *after* its `CardUpdated` echo — so drain the
-    // first convert's release before sending the next command.
-    async fn wait_released(rx: &mut UnboundedReceiver<ExecutorEvent>) {
-        wait_for(rx, |evt| match &evt.kind {
-            ExecutorEventKind::CardBusy { busy: false } => Some(()),
-            _ => None,
-        })
-        .await
-    }
+    // The `StartingBlock` echo is likewise emitted mid-handler — drain the
+    // convert's release before sending the next command.
     wait_released(&mut rx).await;
 
     // Converting a card that isn't concluded is a silent no-op (double-click).

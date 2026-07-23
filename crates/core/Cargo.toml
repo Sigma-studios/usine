@@ -33,4 +33,6 @@ tracing-subscriber.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+# Tests implement `AgentProvider` (an async-trait trait) to simulate failures.
+async-trait = "0.1.89"
 tempfile = "3.27.0"
