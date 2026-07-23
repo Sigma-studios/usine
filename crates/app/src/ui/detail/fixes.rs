@@ -1,24 +1,23 @@
 //! The fix-selection panel, shared by PR-comment triage and self-review: lets
-//! the user pick which findings to apply and add a free-form comment of their
-//! own, which the fix run addresses alongside them.
-
-use std::collections::HashSet;
+//! the user pick which findings to apply — editing the AI's proposed text
+//! first, since that text is exactly what the fix run (or the GitHub reply)
+//! receives — and add a free-form comment of their own, which the fix run
+//! addresses alongside them.
 
 use dioxus::prelude::*;
 use usine_core::{ExecutorCommand, FixVerdict};
 use uuid::Uuid;
 
+use super::review::fallback_rows;
 use crate::state::AppState;
 
 #[component]
 pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review: bool) -> Element {
     let state = use_context::<AppState>();
-    let initial: HashSet<u64> = verdicts
-        .iter()
-        .filter(|v| v.selected)
-        .map(|v| v.comment.id)
-        .collect();
-    let mut selected = use_signal(|| initial);
+    // The user's working copy of the verdicts: checkbox state and edited text
+    // live here, and the apply command sends it wholesale. The panel remounts
+    // on every state change (keyed in `detail/mod.rs`), so no reseeding needed.
+    let mut edits = use_signal(|| verdicts.clone());
     let mut note = use_signal(String::new);
     let heading = if self_review {
         "Self-review findings"
@@ -31,7 +30,7 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     // advances (skipping to the PR for a self-review, ignoring the comments and
     // moving to merge for PR triage), so it says that instead.
     let has_note = !note.read().trim().is_empty();
-    let any_selected = !selected.read().is_empty();
+    let any_selected = edits.read().iter().any(|v| v.selected);
     let apply_label = match (any_selected, has_note) {
         (true, true) => "Apply selected fixes & note",
         (true, false) => "Apply selected fixes",
@@ -40,13 +39,29 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
         (false, false) => "Ignore comments and continue",
     };
 
+    // Grow each edit box to fit its text (same script as the review drafts
+    // panel: idempotent, keeps sizing on every keystroke). Unlike that panel,
+    // textareas here appear and disappear as rows are (un)checked — reply boxes
+    // mount when a row is unchecked — so the effect subscribes to `edits` to
+    // re-wire whatever the toggle just put in the DOM.
+    use_effect(move || {
+        edits.read();
+        dioxus::document::eval(
+            "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
+             var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
+             if(!el.dataset.growInit){el.dataset.growInit='1';el.addEventListener('input',fit);}\
+             fit();});})();",
+        );
+    });
+
+    let rows_snapshot = edits.read().clone();
     rsx! {
         div { class: "section",
             h3 { "{heading}" }
-            for v in verdicts.iter() {
+            for (i, v) in rows_snapshot.iter().enumerate() {
                 {
                     let cid = v.comment.id;
-                    let checked = selected.read().contains(&cid);
+                    let checked = v.selected;
                     let path = match v.comment.line {
                         Some(l) => format!("{}:{}", v.comment.path, l),
                         None => v.comment.path.clone(),
@@ -63,18 +78,19 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     };
                     let verdict_label = if v.worth_fixing { "fix" } else { "skip" };
                     let vclass = if v.worth_fixing { "verdict-yes" } else { "verdict-no" };
-                    // For PR comments, preview the reply that will be posted if the
-                    // comment is left unchecked (i.e. not fixed).
+                    // For PR comments, the reply posted if the comment is left
+                    // unchecked (i.e. not fixed) — editable, and offered even when
+                    // the agent drafted none, so the user can add their own.
                     let reply = v.reply.clone();
-                    let show_reply = !self_review && !reply.trim().is_empty() && !checked;
+                    let show_reply = !self_review && !checked;
                     rsx! {
                         div { key: "{cid}", class: "comment",
                             input {
                                 r#type: "checkbox",
                                 checked,
                                 onchange: move |_| {
-                                    let mut set = selected.write();
-                                    if set.contains(&cid) { set.remove(&cid); } else { set.insert(cid); }
+                                    let mut list = edits.write();
+                                    list[i].selected = !list[i].selected;
                                 },
                             }
                             div { class: "comment-main",
@@ -84,12 +100,34 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                     span { class: "path", "{path}" }
                                 }
                                 div { class: "rationale", "{rationale}" }
-                                details { class: "orig",
-                                    summary { "original comment" }
-                                    div { class: "orig-body", "{body}" }
+                                if self_review {
+                                    // The finding text IS the fix instruction the
+                                    // agent receives — let the user reword it.
+                                    textarea {
+                                        class: "review-comment-edit autogrow",
+                                        rows: "{fallback_rows(&body)}",
+                                        value: "{body}",
+                                        oninput: move |e| edits.write()[i].comment.body = e.value(),
+                                    }
+                                } else {
+                                    // A reviewer's comment isn't ours to edit; the
+                                    // free-form note below steers how it gets fixed.
+                                    details { class: "orig",
+                                        summary { "original comment" }
+                                        div { class: "orig-body", "{body}" }
+                                    }
                                 }
                                 if show_reply {
-                                    div { class: "hint", "↳ reply if ignored: {reply}" }
+                                    div { class: "reply-edit",
+                                        label { class: "reply-label", "↳ reply posted if left unchecked" }
+                                        textarea {
+                                            class: "review-comment-edit autogrow",
+                                            rows: "{fallback_rows(&reply)}",
+                                            placeholder: "No reply — leave empty to ignore silently.",
+                                            value: "{reply}",
+                                            oninput: move |e| edits.write()[i].reply = e.value(),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -113,12 +151,12 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                 button {
                     class: "btn primary",
                     onclick: move |_| {
-                        let ids: Vec<u64> = selected.read().iter().cloned().collect();
+                        let verdicts = edits.read().clone();
                         let text = note.read().trim().to_string();
                         if self_review {
-                            state.send(ExecutorCommand::ApplySelfFixes { card_id, selected_comment_ids: ids, note: text });
+                            state.send(ExecutorCommand::ApplySelfFixes { card_id, verdicts, note: text });
                         } else {
-                            state.send(ExecutorCommand::ApplyFixes { card_id, selected_comment_ids: ids, note: text });
+                            state.send(ExecutorCommand::ApplyFixes { card_id, verdicts, note: text });
                         }
                     },
                     "{apply_label}"

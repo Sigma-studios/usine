@@ -405,7 +405,7 @@ fn DraftSelection(
 /// A `rows` estimate used only until the autogrow script measures the box for
 /// real — and as the final height if scripting is unavailable. Counts hard line
 /// breaks and allows one wrapped line per ~72 characters.
-fn fallback_rows(body: &str) -> usize {
+pub(super) fn fallback_rows(body: &str) -> usize {
     let rows: usize = body.lines().map(|l| 1 + l.len() / 72).sum();
     rows.clamp(2, 24)
 }

@@ -389,9 +389,9 @@ impl Executor {
             ExecutorCommand::FetchComments { card_id } => self.fetch_comments(card_id).await,
             ExecutorCommand::ApplyFixes {
                 card_id,
-                selected_comment_ids,
+                verdicts,
                 note,
-            } => self.apply_fixes(card_id, selected_comment_ids, note).await,
+            } => self.apply_fixes(card_id, verdicts, note).await,
             ExecutorCommand::CreatePr {
                 card_id,
                 branch,
@@ -455,12 +455,9 @@ impl Executor {
             ExecutorCommand::SelfReview { card_id } => self.self_review(card_id).await,
             ExecutorCommand::ApplySelfFixes {
                 card_id,
-                selected_comment_ids,
+                verdicts,
                 note,
-            } => {
-                self.apply_self_fixes(card_id, selected_comment_ids, note)
-                    .await
-            }
+            } => self.apply_self_fixes(card_id, verdicts, note).await,
             ExecutorCommand::SkipToPr { card_id } => self.skip_to_pr(card_id).await,
             ExecutorCommand::RunValidation { card_id } => self.run_validation(card_id).await,
             ExecutorCommand::FixValidation { card_id } => self.fix_validation(card_id).await,
