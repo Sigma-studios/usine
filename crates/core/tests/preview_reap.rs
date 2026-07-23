@@ -145,7 +145,7 @@ async fn validation_pass_reaps_light_without_teardown() {
     // Done routes through the validation gate, whose pass parks the card.
     handle.send(ExecutorCommand::ApplySelfFixes {
         card_id,
-        selected_comment_ids: Vec::new(),
+        verdicts: Vec::new(),
         note: "tweak".into(),
     });
 
@@ -242,7 +242,7 @@ async fn exhausted_validation_budget_reaps_the_preview() {
 
     handle.send(ExecutorCommand::ApplySelfFixes {
         card_id,
-        selected_comment_ids: Vec::new(),
+        verdicts: Vec::new(),
         note: "tweak".into(),
     });
 

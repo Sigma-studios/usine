@@ -13,7 +13,8 @@ use crate::agent::handoff::Handoff;
 use crate::agent::usage::UsageSnapshot;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
-    Card, DraftComment, PreviewStatus, PreviewUrl, Project, ReviewEvent, ReviewTask, Usage,
+    Card, DraftComment, FixVerdict, PreviewStatus, PreviewUrl, Project, ReviewEvent, ReviewTask,
+    Usage,
 };
 
 /// Severity for a user-facing toast.
@@ -90,12 +91,14 @@ pub enum ExecutorCommand {
     RejectPlan { card_id: Uuid, feedback: String },
     /// Fetch and triage PR review comments.
     FetchComments { card_id: Uuid },
-    /// Apply the selected review-comment fixes. `note` is the user's own
+    /// Apply the (edited, checked) review-comment fixes — the verdicts as the
+    /// user left them, edits included: checked bodies go to the fix run,
+    /// unchecked replies get posted on GitHub. `note` is the user's own
     /// free-form instruction, applied alongside the checked comments; a run
     /// happens when either is non-empty.
     ApplyFixes {
         card_id: Uuid,
-        selected_comment_ids: Vec<u64>,
+        verdicts: Vec<FixVerdict>,
         note: String,
     },
     /// Create the pull request with the (already confirmed) fields. `branch` is
@@ -189,12 +192,13 @@ pub enum ExecutorCommand {
     /// From `AwaitingReview(ReadyForReview)`: run the self-review agent over the
     /// committed diff (using the project's `review.md` or a default prompt).
     SelfReview { card_id: Uuid },
-    /// Apply the self-review fixes the user selected. `note` is the user's own
-    /// free-form instruction, applied alongside the checked findings; a run
-    /// happens when either is non-empty.
+    /// Apply the (edited, checked) self-review fixes — the verdicts as the user
+    /// left them, edits included; the checked bodies are what the fix run
+    /// receives. `note` is the user's own free-form instruction, applied
+    /// alongside the checked findings; a run happens when either is non-empty.
     ApplySelfFixes {
         card_id: Uuid,
-        selected_comment_ids: Vec<u64>,
+        verdicts: Vec<FixVerdict>,
         note: String,
     },
     /// From the self-review fix picker: skip applying fixes and open the PR.

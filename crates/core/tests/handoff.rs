@@ -182,19 +182,22 @@ async fn only_implement_runs_are_asked_for_a_hand_off() {
     // The self-review auto-starts on implement-done; apply its fixes — a write
     // run that reports through the fixes recap instead, and so must not be
     // asked for a hand-off of its own.
-    let ids = wait_for(&mut rx, |e| match &e.kind {
+    let mut verdicts = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
             CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {
-                Some(verdicts.iter().map(|v| v.comment.id).collect::<Vec<_>>())
+                Some(verdicts.clone())
             }
             _ => None,
         },
         _ => None,
     })
     .await;
+    for v in &mut verdicts {
+        v.selected = true;
+    }
     handle.send(ExecutorCommand::ApplySelfFixes {
         card_id,
-        selected_comment_ids: ids,
+        verdicts,
         note: String::new(),
     });
     wait_for(&mut rx, |e| match &e.kind {
