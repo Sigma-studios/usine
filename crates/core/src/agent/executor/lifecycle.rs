@@ -275,14 +275,21 @@ impl Executor {
                 // run backs it (e.g. the CLI isn't installed). Mark it Failed so
                 // it's recoverable instead of stranded mid-column, then surface
                 // the error.
-                let _ = apply_transition(
+                let demoted = apply_transition(
                     &self.store,
                     &self.evt_tx,
                     card.id,
                     Transition::AgentError {
                         message: format!("failed to start run: {e}"),
                     },
-                );
+                )
+                .is_ok();
+                // A `Failed` park `run_actor` never sees: a mid-gate launch
+                // (e.g. a validation fix run) deliberately kept the previous
+                // run's preview alive, so light-stop it here.
+                if demoted {
+                    self.reap_idle_preview(card.id).await;
+                }
                 return Err(e);
             }
         };
@@ -319,8 +326,10 @@ impl Executor {
         ));
         // Bring the worktree's app up alongside every write run (setup script,
         // then `run_script`, executor-owned like any preview) so the agent can
-        // verify its work in the running app and the human who reviews next
-        // arrives at a warm build. Routed through the command channel — this
+        // verify its work in the running app. It lives for the automated
+        // pipeline: the finalizers light-stop it when the card parks
+        // (`reap_idle_preview`), leaving the worktree's infra warm for a fast
+        // manual restart. Routed through the command channel — this
         // launch usually runs inside an exclusive command, and a slow setup
         // (deps, docker) must not hold the card busy or delay the agent.
         if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
