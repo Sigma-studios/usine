@@ -90,11 +90,13 @@ pub fn CardView(card: Card) -> Element {
         st.effective(),
         CardState::AwaitingReview(_) | CardState::PrReview(_) | CardState::ReadyToMerge
     );
-    // Previews also show while implementing: the executor brings the app up
-    // alongside every write run (so the agent can test against it), and that
-    // running server needs its status and stop control visible from the start —
-    // not only once the card reaches review.
-    let previewable = reviewable || matches!(st.effective(), CardState::Implementing(_));
+    // The executor brings the app up alongside every write run, but that
+    // preview is the *agent's* tool for testing its own work — surfacing Stop
+    // there would let the user yank the app out from under a mid-run agent.
+    // Controls only appear once the pipeline parks and it's the user's turn to
+    // test (previews are light-stopped at every automated park, so they'll read
+    // Idle and offer a warm restart).
+    let previewable = reviewable && !running;
     let run_configured = state
         .projects
         .read()
