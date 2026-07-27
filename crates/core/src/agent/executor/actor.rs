@@ -351,37 +351,62 @@ async fn finalize_run(
         false
     };
 
-    // Guard: a code run that committed nothing produced no work. Advancing it to
-    // review strands an empty branch — it looks done but the diff is empty and any
-    // PR opened from it would be empty too. Demote to Failed (a running state's
-    // only escape hatch here) with a clear reason so Retry/Resume can recover it.
-    // This is the common "the agent answered in prose without ever editing files"
-    // case: `git add -A` finds nothing to stage, `git commit` reports nothing to
-    // commit, and without this the card would sail through review to "ready for PR".
+    // Guard: an implement run that committed nothing onto an EMPTY branch produced
+    // no work. Advancing it to review strands that empty branch — it looks done
+    // but the diff is empty and any PR opened from it would be empty too. Demote
+    // to Failed (a running state's only escape hatch here) with a clear reason so
+    // Retry/Resume can recover it. This is the common "the agent answered in prose
+    // without ever editing files" case: `git add -A` finds nothing to stage, `git
+    // commit` reports nothing to commit, and without this the card would sail
+    // through review to "ready for PR".
     //
-    // A clean tree is not proof of that for an IMPLEMENT run, though: a retried
-    // run whose earlier attempt already committed the work finds it finished and
-    // — exactly as `resume_extra` instructs — verifies and stops without editing.
-    // Demoting that run re-arms the same retry with the same context: an
-    // unwinnable loop (the fix-run sibling of the one `relaunch` solves by
-    // restoring the fix extra). The branch already carrying commits beyond the
-    // base is what separates the two cases, so only a truly empty branch demotes.
-    // Scoped to implement runs: a fix run's branch is never empty, so this test
-    // would blind the guard there entirely.
+    // A clean tree is not proof of that once work exists, though — demoting then
+    // re-arms the same retry with the same restored context, an unwinnable loop:
+    //  - An implement retry whose earlier attempt already committed finds the work
+    //    finished and — exactly as `resume_extra` instructs — verifies and stops.
+    //    The branch carrying commits beyond the base separates it from the empty
+    //    case, so it advances.
+    //  - A fix run's branch is never empty (the empty-PR disaster can't happen),
+    //    and every fix transition lands at a gate that re-checks the result: the
+    //    ReadyForPr diff, the re-run validation check, the PR the user merges by
+    //    hand. A no-op fix run therefore advances with a warning — its recap says
+    //    what the agent concluded — dropping the stashed "Fix applied" lines so
+    //    it leaves no false claim on the log.
     if !committed {
-        let prior_work = matches!(transition, Transition::AgentImplementDone)
-            && card.branch.is_some()
-            && match card.worktree_path.clone().filter(|d| *d != project.path) {
-                Some(dir) => {
-                    let base = crate::infra::git::remote_tracking_base(
-                        &project.path,
-                        project.config.effective_base_branch(),
-                    );
-                    git.branch_has_commits(&dir, &base).await.unwrap_or(false)
-                }
-                None => false,
-            };
-        if prior_work {
+        if matches!(transition, Transition::AgentImplementDone) {
+            let prior_work = card.branch.is_some()
+                && match card.worktree_path.clone().filter(|d| *d != project.path) {
+                    Some(dir) => {
+                        let base = crate::infra::git::remote_tracking_base(
+                            &project.path,
+                            project.config.effective_base_branch(),
+                        );
+                        git.branch_has_commits(&dir, &base).await.unwrap_or(false)
+                    }
+                    None => false,
+                };
+            if !prior_work {
+                let message = "The run finished without changing any files, so nothing was \
+                               committed to the branch. Retry to run it again."
+                    .to_string();
+                apply_transition(
+                    store,
+                    evt_tx,
+                    card_id,
+                    Transition::AgentError {
+                        message: message.clone(),
+                    },
+                )?;
+                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Warning,
+                    message,
+                ));
+                // The card parked at `Failed` — light-stop the preview this run
+                // brought up.
+                reap_idle_preview_direct(executor, card_id);
+                return Ok(());
+            }
             let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
                 card_id,
                 Severity::Info,
@@ -390,22 +415,31 @@ async fn finalize_run(
                     .to_string(),
             ));
         } else {
-            let message = "The run finished without changing any files, so nothing was \
-                           committed to the branch. Retry to run it again."
-                .to_string();
-            apply_transition(
-                store,
-                evt_tx,
+            let _ = store.take_pending_fix_qa(card_id);
+            // An earlier attempt may have landed its commit and died before the
+            // push (an app restart between the two) — idempotent when there is
+            // nothing new to send.
+            if card.pr.is_some() {
+                if let (Some(branch), Some(dir)) = (
+                    card.branch.clone(),
+                    card.worktree_path.clone().filter(|d| *d != project.path),
+                ) {
+                    if let Err(e) = git.push(&dir, &branch).await {
+                        let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                            card_id,
+                            Severity::Warning,
+                            format!("push failed: {e}"),
+                        ));
+                    }
+                }
+            }
+            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
                 card_id,
-                Transition::AgentError {
-                    message: message.clone(),
-                },
-            )?;
-            let _ =
-                evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Warning, message));
-            // The card parked at `Failed` — light-stop the preview this run brought up.
-            reap_idle_preview_direct(executor, card_id);
-            return Ok(());
+                Severity::Warning,
+                "The fix run finished without changing any files — the agent judged nothing \
+                 needed changing. Advancing so the next step can verify that."
+                    .to_string(),
+            ));
         }
     }
 
