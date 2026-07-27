@@ -205,8 +205,9 @@ async fn an_edited_finding_reaches_the_fix_prompt_as_edited() {
     // carries the user's wording, since the edited verdicts went wholesale.
     let qa = store.get_card(card_id).unwrap().qa_log;
     assert!(
-        qa.iter().any(|l| l.starts_with("Fix applied per review comment:")
-            && l.contains("EDITED: only rename the log field")),
+        qa.iter()
+            .any(|l| l.starts_with("Fix applied per review comment:")
+                && l.contains("EDITED: only rename the log field")),
         "the landed fix must put its 'Fix applied' line on the restart log: {qa:?}"
     );
 }

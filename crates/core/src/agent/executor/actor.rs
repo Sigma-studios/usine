@@ -668,10 +668,7 @@ fn finalize_question(
     };
     // Any state other than `Answering` means a cancel/supersede raced the
     // run's completion — skip quietly, the card already moved on.
-    if !matches!(
-        store.get_card(card_id)?.state,
-        CardState::Answering { .. }
-    ) {
+    if !matches!(store.get_card(card_id)?.state, CardState::Answering { .. }) {
         return Ok(());
     }
     let question = store

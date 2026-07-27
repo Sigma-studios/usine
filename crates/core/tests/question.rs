@@ -307,9 +307,7 @@ async fn a_question_from_validation_failed_returns_to_that_exact_state() {
         question: "is the failure environmental?".into(),
     });
     wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::CardUpdated(c)
-            if matches!(c.state, CardState::Answering { .. }) =>
-        {
+        ExecutorEventKind::CardUpdated(c) if matches!(c.state, CardState::Answering { .. }) => {
             Some(())
         }
         _ => None,

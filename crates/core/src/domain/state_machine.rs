@@ -1183,7 +1183,11 @@ mod tests {
                 }
                 other => panic!("expected Failed, got {other:?}"),
             }
-            assert_eq!(failed.column(), s.column(), "column stable through the fault");
+            assert_eq!(
+                failed.column(),
+                s.column(),
+                "column stable through the fault"
+            );
             let retried = transition(&failed, Transition::Retry).unwrap();
             assert_eq!(retried, wrapped, "Retry restores the question run");
             let answered = transition(&retried, Transition::QuestionAnswered).unwrap();

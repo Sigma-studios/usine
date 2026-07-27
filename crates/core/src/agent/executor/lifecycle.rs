@@ -766,7 +766,9 @@ impl Executor {
         let Some(mut handoff) = self.store.get_handoff(card_id)? else {
             return Ok(());
         };
-        handoff.answers.resize(handoff.questions.len(), String::new());
+        handoff
+            .answers
+            .resize(handoff.questions.len(), String::new());
         let mut changed = false;
         for (idx, answer) in answers {
             let answer = answer.trim();
@@ -850,7 +852,9 @@ impl Executor {
                 return Ok(());
             };
             let extra = question_extra(stage, plan.as_deref(), &question);
-            return self.launch(card, RunMode::Question, Some(extra), None).await;
+            return self
+                .launch(card, RunMode::Question, Some(extra), None)
+                .await;
         }
         let mode = match &card.state {
             CardState::Designing(_) => RunMode::Plan,

@@ -442,8 +442,7 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
     // selects it (click again to unselect); one "Send answer" button submits
     // the selection and/or the typed text.
     let mut selected = use_signal(|| None::<String>);
-    let can_send =
-        selected.read().is_some() || !answer.read().trim().is_empty();
+    let can_send = selected.read().is_some() || !answer.read().trim().is_empty();
 
     rsx! {
         div { class: "section",
