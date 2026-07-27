@@ -911,12 +911,10 @@ impl Executor {
             // retry can restate it. Without it the resumed agent finds finished
             // work, changes nothing, and the no-commit guard fails the run
             // again: an unwinnable retry loop.
-            RunMode::ApplyFixes => Some(
-                match self.store.get_fix_extra(card_id).unwrap_or(None) {
-                    Some(task) => format!("{task}\n\n{}", resume_extra(None)),
-                    None => resume_extra(None),
-                },
-            ),
+            RunMode::ApplyFixes => Some(match self.store.get_fix_extra(card_id).unwrap_or(None) {
+                Some(task) => format!("{task}\n\n{}", resume_extra(None)),
+                None => resume_extra(None),
+            }),
             RunMode::Review => {
                 let project = self.store.get_project(card.project_id)?;
                 let guide = crate::agent::review::find_review_prompt(&project.path);
