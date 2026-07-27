@@ -2,6 +2,7 @@
 //! action (agent runs and direct CRUD alike) goes to the executor via the
 //! `AppState` command helpers — the UI never touches the store itself.
 
+mod adoptdialog;
 mod board;
 mod card;
 mod cardmenu;
@@ -17,6 +18,7 @@ mod sidebar;
 mod usagebar;
 mod widgets;
 
+pub use adoptdialog::AdoptDialogHost;
 pub use board::BoardArea;
 pub use cardmenu::CardMenuHost;
 pub use confirm::ConfirmHost;

@@ -12,11 +12,11 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
-    spawn_executor, AppSettings, Card, CardState, DesignSub, DiffState, ExecutorCommand,
-    ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle, Forge, GhForge, GitOps,
-    Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, Provider, ProviderFactory, RealFactory,
-    RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory, SimForge, SimGit, Store,
-    UsageSnapshot,
+    spawn_executor, AdoptProbe, AppSettings, Card, CardState, DesignSub, DiffState, DirtyAction,
+    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle, Forge,
+    GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, Provider,
+    ProviderFactory, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory,
+    SimForge, SimGit, Store, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -66,6 +66,13 @@ pub struct AppState {
     pub transcripts: Signal<HashMap<Uuid, Vec<(i64, String)>>>,
     /// Per-project reviewer candidates (GitHub logins), fetched lazily on demand.
     pub reviewers: Signal<HashMap<Uuid, Vec<String>>>,
+    /// Per-project adoptable branches (local + remote, minus base/usine/card
+    /// refs), fetched when the adopt dialog opens. In-memory only.
+    pub adopt_sources: Signal<HashMap<Uuid, Vec<String>>>,
+    /// The latest adopt-probe result per project. The dialog matches the
+    /// probe's `source_ref` against its current pick, so a stale response for a
+    /// previously picked branch is ignored. In-memory only.
+    pub adopt_probes: Signal<HashMap<Uuid, AdoptProbe>>,
     /// Per-project PR-review tasks (other contributors' PRs), seeded at startup
     /// and kept in sync via `ReviewTasksUpdated`/`ReviewTaskUpdated` events.
     pub review_tasks: Signal<HashMap<Uuid, Vec<ReviewTask>>>,
@@ -207,6 +214,8 @@ impl AppState {
             selected_review: Signal::new(None),
             transcripts: Signal::new(HashMap::new()),
             reviewers: Signal::new(HashMap::new()),
+            adopt_sources: Signal::new(HashMap::new()),
+            adopt_probes: Signal::new(HashMap::new()),
             review_tasks: Signal::new(review_tasks),
             skip_plans: Signal::new(skip_plans),
             auto_reviews: Signal::new(auto_reviews),
@@ -361,6 +370,14 @@ impl AppState {
                 let mut reviewers = self.reviewers;
                 reviewers.write().insert(project_id, logins);
             }
+            ExecutorEventKind::AdoptSources { project_id, refs } => {
+                let mut sources = self.adopt_sources;
+                sources.write().insert(project_id, refs);
+            }
+            ExecutorEventKind::AdoptProbe { project_id, probe } => {
+                let mut probes = self.adopt_probes;
+                probes.write().insert(project_id, probe);
+            }
             ExecutorEventKind::ReviewTasksUpdated { project_id, tasks } => {
                 let mut rt = self.review_tasks;
                 rt.write().insert(project_id, tasks);
@@ -471,6 +488,41 @@ impl AppState {
     /// result arrives asynchronously as a `Reviewers` event.
     pub fn fetch_reviewers(&self, project_id: Uuid) {
         self.send(ExecutorCommand::ListReviewers { project_id });
+    }
+
+    /// Ask the executor for a project's adoptable branches (the adopt dialog's
+    /// picker). The result arrives as an `AdoptSources` event.
+    pub fn fetch_adopt_sources(&self, project_id: Uuid) {
+        self.send(ExecutorCommand::ListAdoptSources { project_id });
+    }
+
+    /// Probe one candidate branch for the adopt dialog (commits ahead, dirty
+    /// checkout, open PR). The result arrives as an `AdoptProbe` event.
+    pub fn probe_adopt_source(&self, project_id: Uuid, source_ref: String) {
+        self.send(ExecutorCommand::ProbeAdoptSource {
+            project_id,
+            source_ref,
+        });
+    }
+
+    /// Adopt a branch into a new card that starts in the self-review pipeline.
+    pub fn adopt_branch(
+        &self,
+        project_id: Uuid,
+        source_ref: String,
+        title: String,
+        description: String,
+        retire_original: bool,
+        dirty_action: DirtyAction,
+    ) {
+        self.send(ExecutorCommand::AdoptBranch {
+            project_id,
+            source_ref,
+            title,
+            description,
+            retire_original,
+            dirty_action,
+        });
     }
 
     /// Refresh the usage bar's rate-limit data now (its refresh button) rather

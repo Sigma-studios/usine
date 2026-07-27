@@ -341,6 +341,15 @@ select option { background: var(--panel-2); color: var(--text); }
 }
 .field textarea { resize: vertical; min-height: 60px; }
 
+/* Adopt-branch dialog: a small form inside the standard modal shell. */
+.adopt-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.adopt-form .hint { text-align: left; padding: 0; }
+.adopt-choice {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; color: var(--muted); cursor: pointer;
+}
+.adopt-choice input { flex: 0 0 auto; }
+
 /* Auto-growing textarea: a hidden mirror (::after, fed by data-replicated-value)
    sizes the grid cell to the content; the textarea overlays it at the same size. */
 .grow-wrap { display: grid; width: 100%; }

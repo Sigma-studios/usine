@@ -43,6 +43,7 @@ use crate::infra::git::{canonicalize_branch_case, sanitize_branch_name, GitOps, 
 use crate::infra::persistence::Store;
 
 mod actor;
+mod adopt;
 mod diff;
 mod lifecycle;
 mod pr;
@@ -416,6 +417,31 @@ impl Executor {
                 self.convert_to_implementation(card_id).await
             }
             ExecutorCommand::ListReviewers { project_id } => self.list_reviewers(project_id).await,
+            ExecutorCommand::ListAdoptSources { project_id } => {
+                self.list_adopt_sources(project_id).await
+            }
+            ExecutorCommand::ProbeAdoptSource {
+                project_id,
+                source_ref,
+            } => self.probe_adopt_source(project_id, source_ref).await,
+            ExecutorCommand::AdoptBranch {
+                project_id,
+                source_ref,
+                title,
+                description,
+                retire_original,
+                dirty_action,
+            } => {
+                self.adopt_branch(
+                    project_id,
+                    source_ref,
+                    title,
+                    description,
+                    retire_original,
+                    dirty_action,
+                )
+                .await
+            }
             ExecutorCommand::RefreshUsage => {
                 self.refresh_usage().await;
                 Ok(())

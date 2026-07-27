@@ -13,8 +13,8 @@ use crate::agent::handoff::Handoff;
 use crate::agent::usage::UsageSnapshot;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
-    Card, DraftComment, FixVerdict, PreviewStatus, PreviewUrl, Project, ReviewEvent, ReviewTask,
-    Usage,
+    Card, DraftComment, FixVerdict, PrInfo, PreviewStatus, PreviewUrl, Project, ReviewEvent,
+    ReviewTask, Usage,
 };
 
 /// Severity for a user-facing toast.
@@ -63,6 +63,43 @@ pub enum RunControl {
     Interrupt,
     /// Tear the run down entirely.
     Cancel,
+}
+
+/// What [`ExecutorCommand::AdoptBranch`] should do about uncommitted changes
+/// sitting in a checkout of the adopted branch. "Cancel" never reaches the
+/// executor — it's just the dialog's cancel button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyAction {
+    /// Snapshot the checkout's uncommitted changes (tracked edits + untracked
+    /// files) and commit them in the card's worktree. The user's checkout is
+    /// copied from, never touched — it stays dirty.
+    Include,
+    /// Adopt only the committed work; the checkout keeps its dirty state.
+    Ignore,
+}
+
+/// What [`ExecutorCommand::ProbeAdoptSource`] found out about a candidate
+/// branch, driving the adopt dialog's warnings and prefills. Every field is
+/// best-effort except `refusal`: a set refusal means adoption would be
+/// rejected, and the dialog blocks submission up front.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdoptProbe {
+    /// The ref this probe describes, echoed back so the dialog can drop a
+    /// stale response after the user picked another branch.
+    pub source_ref: String,
+    /// Why this ref can't be adopted (doesn't resolve, is the base, belongs to
+    /// a card…), or `None` when it can.
+    pub refusal: Option<String>,
+    /// Commits on the branch since its merge base with the project base.
+    pub commits_ahead: usize,
+    /// Those commits' subjects, newest first — the description prefill.
+    pub subjects: Vec<String>,
+    /// The working tree that has the branch checked out with uncommitted
+    /// changes, when one does — triggers the include/ignore choice.
+    pub dirty_checkout: Option<PathBuf>,
+    /// An open PR already on this branch, if the forge knows of one. Adoption
+    /// stays allowed; the dialog warns that a second PR would be opened.
+    pub open_pr: Option<PrInfo>,
 }
 
 /// Which app to launch for [`ExecutorCommand::OpenWorktree`].
@@ -135,6 +172,32 @@ pub enum ExecutorCommand {
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
+
+    // --- branch adoption (turning an existing branch into a card) ---------
+    /// List a project's branches that could be adopted into a card (local +
+    /// `origin/*`, minus the base, usine-owned refs, and branches already
+    /// belonging to cards). Result: an `AdoptSources` event.
+    ListAdoptSources { project_id: Uuid },
+    /// Inspect one candidate branch for the adopt dialog: commits ahead of the
+    /// base (with subjects, for the description prefill), a dirty checkout, an
+    /// open PR. Result: an `AdoptProbe` event.
+    ProbeAdoptSource {
+        project_id: Uuid,
+        source_ref: String,
+    },
+    /// Adopt `source_ref` into a new card: cut the card's own `usine/` branch
+    /// at its tip, optionally fold in the checkout's uncommitted changes
+    /// (`dirty_action`), optionally delete the original local branch, and drop
+    /// the card straight into the self-review pipeline. `description` is
+    /// mandatory — it's the task statement every downstream agent run reads.
+    AdoptBranch {
+        project_id: Uuid,
+        source_ref: String,
+        title: String,
+        description: String,
+        retire_original: bool,
+        dirty_action: DirtyAction,
+    },
 
     // --- PR review workflow (reviewing other contributors' PRs) ----------
     /// Poll a project for open PRs (by its configured contributors) that the user
@@ -359,8 +422,12 @@ impl ExecutorCommand {
             | ExecutorCommand::OpenReviewWorktree { review_id, .. }
             | ExecutorCommand::StartReviewPreview { review_id }
             | ExecutorCommand::StopReviewPreview { review_id } => *review_id,
-            // Project-scoped / global — no single entity.
+            // Project-scoped / global — no single entity. `AdoptBranch`
+            // creates its card mid-handler and claims it there.
             ExecutorCommand::ListReviewers { .. }
+            | ExecutorCommand::ListAdoptSources { .. }
+            | ExecutorCommand::ProbeAdoptSource { .. }
+            | ExecutorCommand::AdoptBranch { .. }
             | ExecutorCommand::AddProject { .. }
             | ExecutorCommand::SaveProject { .. }
             | ExecutorCommand::DeleteProject { .. }
@@ -488,6 +555,13 @@ pub enum ExecutorEventKind {
         project_id: Uuid,
         logins: Vec<String>,
     },
+    /// A project's adoptable branches (project-scoped; the adopt dialog's
+    /// picker replaces its list).
+    AdoptSources { project_id: Uuid, refs: Vec<String> },
+    /// What probing one adopt candidate found (project-scoped; the dialog
+    /// matches `probe.source_ref` against its current pick to drop stale
+    /// responses).
+    AdoptProbe { project_id: Uuid, probe: AdoptProbe },
     /// A project's full set of PR-review tasks (after a scan or a removal). The UI
     /// replaces its per-project list.
     ReviewTasksUpdated {
@@ -600,6 +674,18 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id: Uuid::nil(),
             kind: ExecutorEventKind::Reviewers { project_id, logins },
+        }
+    }
+    pub fn adopt_sources(project_id: Uuid, refs: Vec<String>) -> Self {
+        ExecutorEvent {
+            card_id: Uuid::nil(),
+            kind: ExecutorEventKind::AdoptSources { project_id, refs },
+        }
+    }
+    pub fn adopt_probe(project_id: Uuid, probe: AdoptProbe) -> Self {
+        ExecutorEvent {
+            card_id: Uuid::nil(),
+            kind: ExecutorEventKind::AdoptProbe { project_id, probe },
         }
     }
     pub fn review_tasks_updated(project_id: Uuid, tasks: Vec<ReviewTask>) -> Self {
