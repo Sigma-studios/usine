@@ -86,6 +86,20 @@ pub(super) async fn run_actor(
                 continue;
             }
             cancel_run(&runs, card_id, run_id);
+            // Drop the runs-map entry now rather than at the end-of-loop
+            // cleanup below: until it's gone, `Executor::answer`'s live-run
+            // check would route the user's answer into this one-shot provider,
+            // which ignores it — losing the answer.
+            {
+                let mut map = lock(&runs);
+                if map
+                    .get(&card_id)
+                    .map(|(rid, _)| *rid == run_id)
+                    .unwrap_or(false)
+                {
+                    map.remove(&card_id);
+                }
+            }
             break;
         }
 
@@ -620,10 +634,10 @@ fn finalize_triage(
 }
 
 /// Finalize a read-only Agent Chat question run: record cost, persist + emit
-/// the prose answer, and apply the agent-done transition that lands the card
-/// back where the question was asked from. Never touches git — a question run
-/// changes no files by contract, so the no-commit guard in `finalize_run` must
-/// not see it — and never touches the hand-off or the fixes recap.
+/// the prose answer, and unwrap `Answering` back to the state the question was
+/// asked from. Never touches git — a question run changes no files by
+/// contract, so the no-commit guard in `finalize_run` must not see it — and
+/// never touches the hand-off or the fixes recap.
 fn finalize_question(
     store: &Store,
     evt_tx: &UnboundedSender<ExecutorEvent>,
@@ -636,24 +650,14 @@ fn finalize_question(
         } => (result, cost_usd),
         _ => return Ok(()),
     };
-    // Route back by the card's *current* running state (see `ask_question` for
-    // the entry edges). Any other state means a cancel/supersede race — skip.
-    let transition = match store.get_card(card_id)?.state {
-        // A plan-stage question: restore the stashed plan verbatim so the card
-        // returns to AwaitingApproval exactly as it left it. Without a stored
-        // plan (a delete raced us), demote rather than restore an empty plan.
-        CardState::Designing(DesignSub::Running) => match store.get_plan(card_id)? {
-            Some(plan) => Transition::AgentPlanReady { plan },
-            None => Transition::AgentError {
-                message: "the plan under discussion went missing — retry to re-plan".into(),
-            },
-        },
-        CardState::Implementing(RunSub::Running) => Transition::AgentImplementDone,
-        CardState::PrReview(PrReviewSub::ApplyingChange | PrReviewSub::ApplyingFixes) => {
-            Transition::AgentFixesDone
-        }
-        _ => return Ok(()),
-    };
+    // Any state other than `Answering` means a cancel/supersede raced the
+    // run's completion — skip quietly, the card already moved on.
+    if !matches!(
+        store.get_card(card_id)?.state,
+        CardState::Answering { .. }
+    ) {
+        return Ok(());
+    }
     let question = store
         .get_question(card_id)
         .unwrap_or(None)
@@ -675,7 +679,7 @@ fn finalize_question(
         question,
         answer.clone(),
     ));
-    apply_transition(store, evt_tx, card_id, transition)?;
+    apply_transition(store, evt_tx, card_id, Transition::QuestionAnswered)?;
     if !answer.is_empty() {
         transcript(store, evt_tx, card_id, format!("✔ {answer}"));
     }
@@ -777,9 +781,9 @@ pub(super) fn handle_event(
             // Remember the provider session so a later Resume can --resume it —
             // but only for the modes a retry actually resumes (see `relaunch`).
             // The read-only side runs (question/review/triage) must not claim
-            // `last_session`: a died Question run leaves the card in a *write*
-            // running state, and its Retry would otherwise resume the read-only
-            // Q&A conversation as a write run.
+            // `last_session`: they are stateless single turns that a retry
+            // re-runs fresh, and a stale claim here would leak their read-only
+            // conversation into a later write run's --resume.
             if matches!(
                 mode,
                 RunMode::Plan | RunMode::Implement | RunMode::ApplyFixes

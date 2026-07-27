@@ -91,9 +91,13 @@ impl Executor {
             self.apply(card_id, Transition::SkipToPr)?;
             return self.run_validation(card_id).await;
         }
-        // Keep the note so a later "back to start" folds it into the prompt.
+        // Keep the note so a later "back to start" folds it into the prompt —
+        // and the checked findings, so the log carries what was actually fixed.
         if !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
+        }
+        for v in &selected {
+            self.record_qa(card_id, fixed_comment_qa(v));
         }
         let extra = fix_prompt(&selected, &note);
         // Isolate before the running-state transition, so a failure (e.g. a dirty

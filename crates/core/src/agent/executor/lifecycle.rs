@@ -691,6 +691,44 @@ impl Executor {
         });
     }
 
+    /// Record the user's answers to the hand-off's open questions: each
+    /// non-empty pair goes on the restart log (so later revise/fix/reset runs
+    /// see the decision via the qa fold) and onto the stored hand-off (so the
+    /// panel shows the question answered). Launches nothing.
+    pub(super) fn record_handoff_answers(
+        &self,
+        card_id: Uuid,
+        answers: Vec<(String, String)>,
+    ) -> Result<()> {
+        let Some(mut handoff) = self.store.get_handoff(card_id)? else {
+            return Ok(());
+        };
+        handoff.answers.resize(handoff.questions.len(), String::new());
+        let mut changed = false;
+        for (question, answer) in answers {
+            let answer = answer.trim();
+            if answer.is_empty() {
+                continue;
+            }
+            let Some(idx) = handoff.questions.iter().position(|q| *q == question) else {
+                continue;
+            };
+            handoff.answers[idx] = answer.to_string();
+            changed = true;
+            self.record_qa(
+                card_id,
+                format!("Handoff question: {question}\nAnswer: {answer}"),
+            );
+        }
+        if changed {
+            self.store.set_handoff(card_id, &handoff)?;
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
+        }
+        Ok(())
+    }
+
     pub(super) async fn retry(&self, card_id: Uuid) -> Result<()> {
         let card = self.apply(card_id, Transition::Retry)?;
         // Both real CLIs can resume the actual conversation via the session /
@@ -716,6 +754,27 @@ impl Executor {
             CardState::AwaitingReview(ReviewSub::Validating { .. })
         ) {
             return self.run_validation(card_id).await;
+        }
+        // An interrupted question run: the payload (question + the state it was
+        // asked from) lives in `Answering`, so rebuild the exact prompt
+        // `ask_question` built and re-run it fresh — read-only single turn, no
+        // resume, same policy as the other read-only phases below.
+        if let CardState::Answering { previous, question } = card.state.clone() {
+            if matches!(
+                *previous,
+                CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+            ) {
+                // Mirror `ask_question`: the agent must look at the PR's
+                // actual branch, re-established here in case it went missing.
+                self.ensure_branch_worktree(card_id).await?;
+                card = self.store.get_card(card_id)?;
+            }
+            let stored_plan = self.store.get_plan(card_id).unwrap_or(None);
+            let Some((stage, plan)) = question_context(&previous, stored_plan) else {
+                return Ok(());
+            };
+            let extra = question_extra(stage, plan.as_deref(), &question);
+            return self.launch(card, RunMode::Question, Some(extra), None).await;
         }
         let mode = match &card.state {
             CardState::Designing(_) => RunMode::Plan,
@@ -743,7 +802,11 @@ impl Executor {
         }
         let resume = if matches!(
             mode,
-            RunMode::Plan | RunMode::Review | RunMode::Triage | RunMode::Investigate
+            RunMode::Plan
+                | RunMode::Review
+                | RunMode::Triage
+                | RunMode::Investigate
+                | RunMode::Question
         ) {
             None
         } else {
@@ -773,9 +836,8 @@ impl Executor {
                 let comments = self.store.get_pending_comments(card_id).unwrap_or_default();
                 Some(triage_prompt(&comments))
             }
-            // Unreachable: relaunch derives the mode from the card's state,
-            // which never maps to Question — a died question run is retried as
-            // its state's normal mode instead (the user re-asks if needed).
+            // Unreachable: an interrupted question (`Answering`) is handled by
+            // the early return above, which rebuilds its extra itself.
             RunMode::Question => None,
         };
         self.launch(card, mode, extra, resume).await

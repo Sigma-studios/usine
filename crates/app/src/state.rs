@@ -862,6 +862,7 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
                     .into(),
                 "Open a card's diff — highlighting should appear, not plain text".into(),
             ],
+            answers: Vec::new(),
         },
     )?;
 

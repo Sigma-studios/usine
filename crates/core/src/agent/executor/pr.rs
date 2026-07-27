@@ -234,16 +234,27 @@ impl Executor {
                 if v.reply.trim().is_empty() {
                     continue;
                 }
-                if let Err(e) = self
+                match self
                     .forge
                     .reply_to_comment(&project.path, pr, v.comment.id, &v.reply)
                     .await
                 {
-                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                    // Keep the decision on the restart log: a later reset run
+                    // must know the comment was declined, not overlooked.
+                    Ok(()) => self.record_qa(
                         card_id,
-                        Severity::Warning,
-                        format!("couldn't reply to a comment: {e}"),
-                    ));
+                        format!(
+                            "Declined review comment with reply: {}",
+                            one_line_capped(&v.reply, 200)
+                        ),
+                    ),
+                    Err(e) => {
+                        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                            card_id,
+                            Severity::Warning,
+                            format!("couldn't reply to a comment: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -271,9 +282,13 @@ impl Executor {
             return Ok(());
         }
         // Keep the note so a later "back to start" folds it into the prompt,
-        // just like a post-PR change request.
+        // just like a post-PR change request — and the checked comments, so
+        // the log carries what was actually fixed, one bounded line each.
         if !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
+        }
+        for v in &checked {
+            self.record_qa(card_id, fixed_comment_qa(v));
         }
         // Remember which comments this run addresses so their GitHub review
         // threads can be marked resolved once the fix lands (see `finalize_run`,
@@ -385,57 +400,36 @@ impl Executor {
     }
 
     /// Ask the agent a question about the card's current work without sending
-    /// it back for changes. Reuses the existing "send back" transitions to
-    /// enter a running state (so the state machine needs no new edges) and runs
-    /// a strictly read-only [`RunMode::Question`] turn; `finalize_question`
-    /// (see `actor.rs`) lands the card back where it started and records the
-    /// prose answer. Self-contained like `revise` — no session resume.
+    /// it back for changes. Wraps the parked state in `CardState::Answering`
+    /// and runs a strictly read-only [`RunMode::Question`] turn;
+    /// `finalize_question` (see `actor.rs`) unwraps the card back where it
+    /// started and records the prose answer. Self-contained like `revise` — no
+    /// session resume.
     pub(super) async fn ask_question(&self, card_id: Uuid, question: String) -> Result<()> {
         let question = question.trim().to_string();
         let card = self.store.get_card(card_id)?;
-        let plan = self.store.get_plan(card_id).unwrap_or(None);
-        let (transition, stage, plan) = match &card.state {
-            // Plan approval: the plan text lives only in the state and
-            // `RejectPlan` discards it, so stash the RAW plan (questions block
-            // included) for `finalize_question` to restore verbatim. Benign:
-            // a later approve re-saves the parsed clean plan.
-            CardState::Designing(DesignSub::AwaitingApproval { plan }) => {
-                self.store.save_plan(card_id, plan)?;
-                (
-                    Transition::RejectPlan,
-                    "The proposed plan below is under review; nothing is implemented yet.",
-                    Some(plan.clone()),
-                )
-            }
-            CardState::AwaitingReview(
-                ReviewSub::ReadyForReview
-                | ReviewSub::ReadyForPr
-                | ReviewSub::ValidationFailed { .. },
-            ) => (
-                Transition::RequestChanges,
-                "The implementation is complete and committed in this worktree, under review \
-                 before a pull request is opened.",
-                plan,
-            ),
-            CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge => {
-                // The question runs read-only, but make sure the branch is
-                // checked out here so the agent looks at the PR's actual code
-                // (mirrors `request_post_pr_change`).
-                self.ensure_branch_worktree(card_id).await?;
-                (
-                    Transition::RequestPostPrChange,
-                    "This card's pull request is open; its branch is checked out in this worktree.",
-                    plan,
-                )
-            }
-            _ => {
-                return Err(CoreError::IllegalTransition(
-                    "questions can only be asked while the work is parked for your review".into(),
-                ))
-            }
+        let stored_plan = self.store.get_plan(card_id).unwrap_or(None);
+        let Some((stage, plan)) = question_context(&card.state, stored_plan) else {
+            return Err(CoreError::IllegalTransition(
+                "questions can only be asked while the work is parked for your review".into(),
+            ));
         };
+        if matches!(
+            card.state,
+            CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+        ) {
+            // The question runs read-only, but make sure the branch is
+            // checked out here so the agent looks at the PR's actual code
+            // (mirrors `request_post_pr_change`).
+            self.ensure_branch_worktree(card_id).await?;
+        }
         let extra = question_extra(stage, plan.as_deref(), &question);
-        let card = self.apply(card_id, transition)?;
+        let card = self.apply(
+            card_id,
+            Transition::AskQuestion {
+                question: question.clone(),
+            },
+        )?;
         // Only now that the run is really happening, stash the question on the
         // answer record: `finalize_question` reads it back to render the
         // exchange and to log the answered Q&A pair on the restart log. A bare

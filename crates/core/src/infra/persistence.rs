@@ -883,6 +883,12 @@ impl Store {
         self.mutate_review(card_id, |r| r.handoff = json)
     }
 
+    pub fn get_handoff(&self, card_id: Uuid) -> Result<Option<Handoff>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardReviewRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.and_then(|r| serde_json::from_str::<Handoff>(&r.handoff).ok()))
+    }
+
     /// All cards' hand-offs, keyed by card id (loaded once at startup).
     pub fn all_handoffs(&self) -> Result<HashMap<Uuid, Handoff>> {
         let r = self.db.r_transaction()?;

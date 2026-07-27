@@ -409,6 +409,9 @@ impl Executor {
             ExecutorCommand::AskQuestion { card_id, question } => {
                 self.ask_question(card_id, question).await
             }
+            ExecutorCommand::RecordHandoffAnswers { card_id, answers } => {
+                self.record_handoff_answers(card_id, answers)
+            }
             ExecutorCommand::FollowUpInvestigation { card_id, feedback } => {
                 self.follow_up_investigation(card_id, feedback).await
             }
@@ -990,6 +993,59 @@ fn revise_extra(plan: Option<&str>, feedback: &str) -> String {
     );
     s.push_str(feedback);
     s
+}
+
+/// One bounded line for a qa_log entry: collapse whitespace/newlines and cap
+/// the length, so folding the log into a later prompt can't balloon it.
+fn one_line_capped(s: &str, max: usize) -> String {
+    let mut out = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > max {
+        out = out.chars().take(max).collect();
+        out.push('…');
+    }
+    out
+}
+
+/// The restart-log line for a review comment the user checked for fixing —
+/// shared by the PR-comment and self-review fix paths.
+fn fixed_comment_qa(v: &FixVerdict) -> String {
+    let line = v.comment.line.map(|l| format!(":{l}")).unwrap_or_default();
+    format!(
+        "Fix applied per review comment: {}{} — {}",
+        v.comment.path,
+        line,
+        one_line_capped(&v.comment.body, 200)
+    )
+}
+
+/// Derive the stage sentence and plan for a question run from the state the
+/// question was (or is being) asked from — the `previous` inside `Answering`.
+/// `stored_plan` is the card's persisted plan; at plan approval the plan lives
+/// in the state itself and wins. `None` means the state is not a legal question
+/// entry point. Shared by `ask_question` and `relaunch` so a retried question
+/// rebuilds the exact same prompt.
+fn question_context(
+    state: &CardState,
+    stored_plan: Option<String>,
+) -> Option<(&'static str, Option<String>)> {
+    match state {
+        CardState::Designing(DesignSub::AwaitingApproval { plan }) => Some((
+            "The proposed plan below is under review; nothing is implemented yet.",
+            Some(plan.clone()),
+        )),
+        CardState::AwaitingReview(
+            ReviewSub::ReadyForReview | ReviewSub::ReadyForPr | ReviewSub::ValidationFailed { .. },
+        ) => Some((
+            "The implementation is complete and committed in this worktree, under review \
+             before a pull request is opened.",
+            stored_plan,
+        )),
+        CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge => Some((
+            "This card's pull request is open; its branch is checked out in this worktree.",
+            stored_plan,
+        )),
+        _ => None,
+    }
 }
 
 /// Extra prompt for an Agent Chat question: where the work currently sits, the
@@ -1813,9 +1869,10 @@ mod tests {
         );
     }
 
-    /// A read-only Question run must not claim `last_session`: it rides a write
-    /// state, so a died run's Retry would `--resume` the Q&A conversation as a
-    /// write run. The resumable modes still record theirs.
+    /// A read-only Question run must not claim `last_session`: a retried
+    /// question re-runs fresh (see `relaunch`), and a stale claim would leak
+    /// the Q&A conversation into a later write run's `--resume`. The resumable
+    /// modes still record theirs.
     #[test]
     fn a_question_run_started_never_claims_last_session() {
         let (store, card) = designing_card();

@@ -11,6 +11,7 @@ use crate::state::AppState;
 pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
     let state = use_context::<AppState>();
     let (clean_plan, questions) = usine_core::parse_plan(&plan);
+    let block_malformed = usine_core::plan_block_malformed(&plan);
     let has_questions = !questions.is_empty();
     let n = questions.len();
     // Draft answers live in `AppState` keyed by card + the plan they answer:
@@ -40,6 +41,19 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
     // every question answered, the plan can be sent back even with no free-form
     // text — the answers alone are the feedback.
     let all_answered = answers.iter().all(|a| !a.trim().is_empty());
+    // Own the chat textarea so the submit button can say what the send will
+    // actually do: answers alone, answers + feedback, or a plain change request.
+    let chat_text = use_signal(String::new);
+    let chat_blank = chat_text.read().trim().is_empty();
+    let request_label = if has_questions && all_answered {
+        if chat_blank {
+            "Send answers"
+        } else {
+            "Send answers & feedback"
+        }
+    } else {
+        "Request changes"
+    };
     let chat_hint = if has_questions {
         "Answer the questions above and/or type below, then request changes to send the plan \
          back — or ask the agent a question about its plan without re-planning."
@@ -52,6 +66,11 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
         div { class: "section",
             h3 { "Proposed plan" }
             div { class: "plan-box", "{clean_plan}" }
+            if block_malformed {
+                div { class: "hint",
+                    "The agent attached a malformed questions block; it was ignored."
+                }
+            }
         }
 
         if has_questions {
@@ -117,6 +136,8 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
             card_id,
             hint: chat_hint,
             request_enabled_when_blank: has_questions && all_answered,
+            request_label: request_label.to_string(),
+            text: chat_text,
             on_request: move |text: String| {
                 let cur: Vec<String> = drafts
                     .read()
