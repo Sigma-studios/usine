@@ -159,7 +159,7 @@ async fn a_note_alone_launches_a_fix_run() {
 
 #[tokio::test]
 async fn an_edited_finding_reaches_the_fix_prompt_as_edited() {
-    let (handle, mut rx, _store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+    let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
 
     // The user rewords the first finding before applying it — the fix run must
     // receive their wording, not the agent's.
@@ -198,6 +198,17 @@ async fn an_edited_finding_reaches_the_fix_prompt_as_edited() {
     assert!(
         !fixes.contains(&original),
         "and not the agent's original wording:\n{fixes}"
+    );
+
+    // The "Fix applied" restart-log line is recorded only once the fix run
+    // lands its commit (stashed at launch; see `apply_self_fixes`) — and it
+    // carries the user's wording, since the edited verdicts went wholesale.
+    let qa = store.get_card(card_id).unwrap().qa_log;
+    assert!(
+        qa.iter()
+            .any(|l| l.starts_with("Fix applied per review comment:")
+                && l.contains("EDITED: only rename the log field")),
+        "the landed fix must put its 'Fix applied' line on the restart log: {qa:?}"
     );
 }
 

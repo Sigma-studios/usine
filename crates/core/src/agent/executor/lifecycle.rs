@@ -530,15 +530,74 @@ impl Executor {
         self.launch(card, mode, Some(extra), resume).await
     }
 
-    pub(super) fn cancel(&self, card_id: Uuid) -> Result<()> {
-        if let Some((_, control)) = lock(&self.runs).get(&card_id) {
+    pub(super) async fn cancel(&self, card_id: Uuid) -> Result<()> {
+        let prior = self.store.get_card(card_id)?.state;
+        let run_id = lock(&self.runs).get(&card_id).map(|(rid, control)| {
             let _ = control.unbounded_send(RunControl::Cancel);
-        }
+            *rid
+        });
         // Tolerate the race where the run finished (and transitioned) a beat
         // before the cancel landed: there's simply nothing to cancel.
         match self.apply(card_id, Transition::Cancel) {
-            Ok(_) | Err(CoreError::IllegalTransition(_)) => Ok(()),
-            Err(e) => Err(e),
+            Ok(_) => {}
+            Err(CoreError::IllegalTransition(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        // A cancelled fix/change run dies mid-write, leaving half-applied edits
+        // uncommitted in the worktree. Discard them: the next fix run's
+        // `commit_all` (a `git add -A`) would otherwise sweep them into its own
+        // commit — and, on an open PR, push them.
+        if matches!(
+            prior,
+            CardState::AwaitingReview(
+                ReviewSub::ApplyingFixes | ReviewSub::FixingValidation { .. }
+            ) | CardState::PrReview(PrReviewSub::ApplyingFixes | PrReviewSub::ApplyingChange)
+        ) {
+            self.discard_cancelled_run_edits(card_id, run_id).await;
+        }
+        Ok(())
+    }
+
+    /// After cancelling a write run, wait for its child to actually die (the
+    /// runs-map slot clears when the actor ends), then discard whatever
+    /// uncommitted edits it left in the card's isolated worktree. Backs off if
+    /// the slot is still held after the grace period or a newer run has claimed
+    /// it — never reset a tree a live run may be writing to. Also drops the
+    /// stashed "Fix applied" log lines: the cancelled run fixed nothing.
+    async fn discard_cancelled_run_edits(&self, card_id: Uuid, cancelled: Option<Uuid>) {
+        let _ = self.store.take_pending_fix_qa(card_id);
+        if cancelled.is_some() {
+            for _ in 0..100 {
+                if lock(&self.runs)
+                    .get(&card_id)
+                    .map(|(rid, _)| Some(*rid) != cancelled)
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if lock(&self.runs).contains_key(&card_id) {
+                return;
+            }
+        }
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        let Ok(project) = self.store.get_project(card.project_id) else {
+            return;
+        };
+        // Only ever reset the card's ISOLATED worktree — never the main
+        // working copy (same guard as `finalize_run`'s commit).
+        let Some(dir) = card.worktree_path.filter(|d| *d != project.path) else {
+            return;
+        };
+        if let Err(e) = self.git.discard_changes(&dir).await {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                format!("couldn't discard the cancelled run's edits: {e}"),
+            ));
         }
     }
 
@@ -578,9 +637,11 @@ impl Executor {
             .evt_tx
             .unbounded_send(ExecutorEvent::answer_updated(card_id, "", ""));
         // Same for a discarded investigation's stashed round context, and for a
-        // discarded fix run's stashed task.
+        // discarded fix run's stashed task and not-yet-earned "Fix applied"
+        // log lines.
         let _ = self.store.set_investigation_extra(card_id, None);
         let _ = self.store.set_fix_extra(card_id, None);
+        let _ = self.store.take_pending_fix_qa(card_id);
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx
@@ -706,6 +767,50 @@ impl Executor {
         });
     }
 
+    /// Record the user's answers to the hand-off's open questions: each
+    /// non-empty (index, answer) pair goes on the restart log (so later
+    /// revise/fix/reset runs see the decision via the qa fold) and onto the
+    /// stored hand-off (so the panel shows the question answered). Answers are
+    /// keyed by question index — matching on text would collapse two
+    /// identically worded questions onto the first. Launches nothing.
+    pub(super) fn record_handoff_answers(
+        &self,
+        card_id: Uuid,
+        answers: Vec<(usize, String)>,
+    ) -> Result<()> {
+        let Some(mut handoff) = self.store.get_handoff(card_id)? else {
+            return Ok(());
+        };
+        handoff
+            .answers
+            .resize(handoff.questions.len(), String::new());
+        let mut changed = false;
+        for (idx, answer) in answers {
+            let answer = answer.trim();
+            if answer.is_empty() {
+                continue;
+            }
+            // An out-of-range index means the stored hand-off changed under the
+            // panel (a new implement run replaced it) — drop the stale answer.
+            let Some(question) = handoff.questions.get(idx).cloned() else {
+                continue;
+            };
+            handoff.answers[idx] = answer.to_string();
+            changed = true;
+            self.record_qa(
+                card_id,
+                format!("Handoff question: {question}\nAnswer: {answer}"),
+            );
+        }
+        if changed {
+            self.store.set_handoff(card_id, &handoff)?;
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
+        }
+        Ok(())
+    }
+
     pub(super) async fn retry(&self, card_id: Uuid) -> Result<()> {
         let card = self.apply(card_id, Transition::Retry)?;
         // Both real CLIs can resume the actual conversation via the session /
@@ -731,6 +836,40 @@ impl Executor {
             CardState::AwaitingReview(ReviewSub::Validating { .. })
         ) {
             return self.run_validation(card_id).await;
+        }
+        // An interrupted question run: the payload (question + the state it was
+        // asked from) lives in `Answering`, so rebuild the exact prompt
+        // `ask_question` built and re-run it fresh — read-only single turn, no
+        // resume, same policy as the other read-only phases below.
+        if let CardState::Answering { previous, question } = card.state.clone() {
+            if matches!(
+                *previous,
+                CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+            ) {
+                // Mirror `ask_question`: the agent must look at the PR's
+                // actual branch, re-established here in case it went missing.
+                self.ensure_branch_worktree(card_id).await?;
+                card = self.store.get_card(card_id)?;
+            }
+            let stored_plan = self.store.get_plan(card_id).unwrap_or(None);
+            let Some((stage, plan)) = question_context(&previous, stored_plan) else {
+                // No prompt can be rebuilt from this `previous` (it should
+                // always be a legal question entry point — see `ask_question`).
+                // Restore it rather than leaving the card parked in a running
+                // `Answering` with no run behind it and no way out but Cancel.
+                self.apply(card_id, Transition::QuestionAnswered)?;
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Warning,
+                    "Couldn't re-run the interrupted question; the card was restored to where \
+                     it was asked from.",
+                ));
+                return Ok(());
+            };
+            let extra = question_extra(stage, plan.as_deref(), &question);
+            return self
+                .launch(card, RunMode::Question, Some(extra), None)
+                .await;
         }
         let mode = match &card.state {
             CardState::Designing(_) => RunMode::Plan,
@@ -758,7 +897,11 @@ impl Executor {
         }
         let resume = if matches!(
             mode,
-            RunMode::Plan | RunMode::Review | RunMode::Triage | RunMode::Investigate
+            RunMode::Plan
+                | RunMode::Review
+                | RunMode::Triage
+                | RunMode::Investigate
+                | RunMode::Question
         ) {
             None
         } else {
@@ -797,9 +940,8 @@ impl Executor {
                 let comments = self.store.get_pending_comments(card_id).unwrap_or_default();
                 Some(triage_prompt(&comments))
             }
-            // Unreachable: relaunch derives the mode from the card's state,
-            // which never maps to Question — a died question run is retried as
-            // its state's normal mode instead (the user re-asks if needed).
+            // Unreachable: an interrupted question (`Answering`) is handled by
+            // the early return above, which rebuilds its extra itself.
             RunMode::Question => None,
         };
         self.launch(card, mode, extra, resume).await

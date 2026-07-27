@@ -80,9 +80,11 @@ fn CardDetail() -> Element {
             } else {
                 card.title.clone()
             };
-            // Committed work to diff: the same window the card menu's entry uses.
+            // Committed work to diff: the same window the card menu's entry
+            // uses — through a fault or an in-flight question, since the
+            // worktree is still there.
             let can_diff = matches!(
-                card.state,
+                card.state.effective(),
                 CardState::AwaitingReview(_) | CardState::PrReview(_) | CardState::ReadyToMerge
             );
 
@@ -191,6 +193,43 @@ fn CardPanel(card: Card) -> Element {
                     div { class: "hint", "No description." }
                 } else {
                     div { class: "plan-box", "{card.description}" }
+                }
+            }
+        }
+
+        // The main running phases used to render nothing actionable here; give
+        // them a status line and a way out. Cancel drops the run's progress and
+        // returns the card to the starting block, hence the confirm.
+        if let Some(phase) = match &card.state {
+            CardState::Designing(DesignSub::Running) => Some("designing"),
+            CardState::Investigating(usine_core::RunSub::Running) => Some("investigating"),
+            CardState::Implementing(usine_core::RunSub::Running) => Some("implementing"),
+            _ => None,
+        } {
+            div { class: "section",
+                div { class: "hint", "The agent is {phase}…" }
+                button {
+                    class: "btn subtle",
+                    onclick: move |_| request_confirm(ConfirmRequest {
+                        title: "Stop the run?".into(),
+                        message: "Stop the agent's current run? Its progress is discarded and the card returns to the starting block.".into(),
+                        confirm_label: "Stop".into(),
+                        danger: true,
+                        action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
+                    }),
+                    "Stop"
+                }
+            }
+        }
+
+        if let CardState::Answering { question, .. } = &card.state {
+            div { class: "section",
+                h3 { "Answering" }
+                div { class: "hint", "The agent is answering: {question}" }
+                button {
+                    class: "btn subtle",
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
                 }
             }
         }
@@ -399,6 +438,11 @@ fn CardPanel(card: Card) -> Element {
 fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> Element {
     let state = use_context::<AppState>();
     let mut answer = use_signal(String::new);
+    // Draft-then-submit, like the plan questions: clicking an option only
+    // selects it (click again to unselect); one "Send answer" button submits
+    // the selection and/or the typed text.
+    let mut selected = use_signal(|| None::<String>);
+    let can_send = selected.read().is_some() || !answer.read().trim().is_empty();
 
     rsx! {
         div { class: "section",
@@ -407,33 +451,53 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                 div { "{question}" }
                 div { class: "option-row",
                     for opt in options.iter() {
-                        button {
-                            key: "{opt}",
-                            class: "btn",
-                            onclick: {
-                                let opt = opt.clone();
-                                move |_| state.send(ExecutorCommand::Answer { card_id, text: opt.clone() })
-                            },
-                            "{opt}"
+                        {
+                            let opt = opt.clone();
+                            let is_sel = selected.read().as_deref() == Some(opt.as_str());
+                            let cls = if is_sel { "btn primary" } else { "btn" };
+                            rsx! {
+                                button {
+                                    key: "{opt}",
+                                    class: "{cls}",
+                                    onclick: move |_| {
+                                        let cur = selected.read().clone();
+                                        selected.set(if cur.as_deref() == Some(opt.as_str()) {
+                                            None
+                                        } else {
+                                            Some(opt.clone())
+                                        });
+                                    },
+                                    "{opt}"
+                                }
+                            }
                         }
                     }
                 }
                 div { class: "row",
                     input {
-                        placeholder: "Or type an answer…",
+                        placeholder: if options.is_empty() { "Type an answer…" } else { "Or type an answer…" },
                         value: "{answer}",
                         oninput: move |e| answer.set(e.value()),
                     }
                     button {
                         class: "btn primary",
+                        disabled: !can_send,
                         onclick: move |_| {
-                            let text = answer.read().trim().to_string();
-                            if !text.is_empty() {
-                                state.send(ExecutorCommand::Answer { card_id, text });
+                            let mut parts: Vec<String> = Vec::new();
+                            if let Some(opt) = selected.read().clone() {
+                                parts.push(opt);
+                            }
+                            let typed = answer.read().trim().to_string();
+                            if !typed.is_empty() {
+                                parts.push(typed);
+                            }
+                            if !parts.is_empty() {
+                                state.send(ExecutorCommand::Answer { card_id, text: parts.join("\n\n") });
+                                selected.set(None);
                                 answer.set(String::new());
                             }
                         },
-                        "Send"
+                        "Send answer"
                     }
                 }
             }
@@ -476,5 +540,6 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::ReadyToMerge => "ready",
         CardState::Done => "done",
         CardState::Failed { .. } => "failed",
+        CardState::Answering { .. } => "answering",
     }
 }

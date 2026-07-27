@@ -1,7 +1,9 @@
 //! End-to-end smoke of the Agent Chat "Ask questions" flow over the simulated
-//! backends: a question rides the existing send-back transitions, runs a
+//! backends: a question wraps the parked state in `Answering`, runs a
 //! read-only turn, and lands the card back exactly where it was asked from —
-//! never tripping the no-commit guard, never touching the fixes recap.
+//! never tripping the no-commit guard, never touching the fixes recap, and
+//! surviving a crash mid-question as a retryable question (not the parked
+//! phase re-run as a write).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,8 +13,8 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, DesignSub, ExecutorCommand, ExecutorConfig,
-    ExecutorEvent, ExecutorEventKind, ExecutorHandle, PrReviewSub, Project, ProjectConfig,
-    ReviewSub, RunSub, SimFactory, SimForge, SimGit, Store,
+    ExecutorEvent, ExecutorEventKind, ExecutorHandle, Project, ProjectConfig, ReviewSub,
+    SimFactory, SimForge, SimGit, Store,
 };
 use uuid::Uuid;
 
@@ -79,13 +81,20 @@ async fn a_question_from_awaiting_review_round_trips_with_an_answer() {
         card_id,
         question: "  why did you adapt at the boundary?  ".into(),
     });
-    // The card passes through Implementing while the agent answers.
+    // The card wraps into `Answering` while the agent answers, carrying the
+    // asked-from state.
     wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::CardUpdated(c)
-            if matches!(c.state, CardState::Implementing(RunSub::Running)) =>
-        {
-            Some(())
-        }
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            CardState::Answering { previous, .. }
+                if matches!(
+                    **previous,
+                    CardState::AwaitingReview(ReviewSub::ReadyForReview)
+                ) =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
         _ => None,
     })
     .await;
@@ -176,8 +185,9 @@ async fn a_plan_stage_question_restores_the_identical_plan() {
         card_id,
         question: "does step 2 cover the migration?".into(),
     });
-    // While answering, the card shows as designing again; then it returns to
-    // AwaitingApproval carrying the untouched plan text (questions block and all).
+    // While answering, the card rides `Answering` (plan intact inside); then it
+    // returns to AwaitingApproval carrying the untouched plan text (questions
+    // block and all).
     let restored = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
             CardState::Designing(DesignSub::AwaitingApproval { plan }) => Some(plan.clone()),
@@ -221,11 +231,14 @@ async fn a_ready_to_merge_question_returns_without_touching_the_recap() {
         question: "is the migration reversible?".into(),
     });
     wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::CardUpdated(c)
-            if matches!(c.state, CardState::PrReview(PrReviewSub::ApplyingFixes)) =>
-        {
-            Some(())
-        }
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            CardState::Answering { previous, .. }
+                if matches!(**previous, CardState::ReadyToMerge) =>
+            {
+                Some(())
+            }
+            _ => None,
+        },
         _ => None,
     })
     .await;
@@ -267,4 +280,171 @@ async fn a_question_from_an_illegal_state_leaves_no_trace() {
 
     assert!(store.get_card(card_id).unwrap().qa_log.is_empty());
     assert_eq!(store.get_question(card_id).unwrap(), None);
+}
+
+/// The position-loss regression the `Answering` state fixes: a question asked
+/// from a pre-PR gate position other than `ReadyForReview` must return to that
+/// exact position — before, it came back via `AgentImplementDone` and dropped
+/// to `ReadyForReview`, losing the gate position and the validation output.
+#[tokio::test]
+async fn a_question_from_validation_failed_returns_to_that_exact_state() {
+    let store = Store::open_in_memory().unwrap();
+    let card_id = seed_card(&store, "/tmp/question-valfail");
+    let parked = CardState::AwaitingReview(ReviewSub::ValidationFailed {
+        attempt: 3,
+        output: "test task_x failed".into(),
+    });
+    store
+        .mutate_card(card_id, |c| {
+            c.state = parked.clone();
+            Ok(())
+        })
+        .unwrap();
+    let (handle, mut rx) = spawn_with(&store);
+
+    handle.send(ExecutorCommand::AskQuestion {
+        card_id,
+        question: "is the failure environmental?".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if matches!(c.state, CardState::Answering { .. }) => {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            s if *s == parked => Some(()),
+            CardState::AwaitingReview(ReviewSub::ReadyForReview) => {
+                panic!("the question dropped the card back to ReadyForReview")
+            }
+            CardState::Failed { message, .. } => panic!("question failed: {message}"),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    assert!(store.get_answer(card_id).unwrap().is_some());
+}
+
+/// A question run that dies mid-flight faults as `Failed { previous:
+/// Answering }`, and Retry re-runs the *question* — landing back at the parked
+/// state — rather than resuming the borrowed phase as a write run.
+#[tokio::test]
+async fn an_interrupted_question_retries_as_a_question() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use usine_core::{
+        AgentProvider, CoreError, Provider, ProviderFactory, Result, RunConfig, RunHandle, RunMode,
+    };
+
+    /// Fails the next `start` when armed (a run that can't launch at all);
+    /// records every launched run's `(mode, full prompt)`.
+    struct FlakyProvider {
+        inner: Arc<dyn AgentProvider>,
+        fail_next: Arc<AtomicBool>,
+        runs: Arc<Mutex<Vec<(RunMode, String)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentProvider for FlakyProvider {
+        fn provider(&self) -> Provider {
+            self.inner.provider()
+        }
+        fn interactive(&self) -> bool {
+            self.inner.interactive()
+        }
+        async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(CoreError::other("simulated launch failure"));
+            }
+            self.runs
+                .lock()
+                .unwrap()
+                .push((cfg.mode, cfg.full_prompt()));
+            self.inner.start(cfg).await
+        }
+    }
+    struct FlakyFactory {
+        fail_next: Arc<AtomicBool>,
+        runs: Arc<Mutex<Vec<(RunMode, String)>>>,
+    }
+    impl ProviderFactory for FlakyFactory {
+        fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
+            Arc::new(FlakyProvider {
+                inner: SimFactory.make(provider),
+                fail_next: self.fail_next.clone(),
+                runs: self.runs.clone(),
+            })
+        }
+    }
+
+    let store = Store::open_in_memory().unwrap();
+    let card_id = seed_card(&store, "/tmp/question-interrupted");
+    store
+        .mutate_card(card_id, |c| {
+            c.state = CardState::AwaitingReview(ReviewSub::ReadyForReview);
+            Ok(())
+        })
+        .unwrap();
+    let fail_next = Arc::new(AtomicBool::new(true));
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(FlakyFactory {
+            fail_next: fail_next.clone(),
+            runs: runs.clone(),
+        }),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+
+    // The question's run dies at launch → Failed wrapping Answering.
+    handle.send(ExecutorCommand::AskQuestion {
+        card_id,
+        question: "why did you adapt at the boundary?".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            CardState::Failed { previous, .. } => {
+                assert!(
+                    matches!(**previous, CardState::Answering { .. }),
+                    "the fault must wrap the question run, got {previous:?}"
+                );
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    // The failing AskQuestion still holds the card's exclusive claim when the
+    // Failed echo arrives; wait for the release so Retry isn't dropped.
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardBusy { busy: false } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Retry re-runs the question (read-only, question in the prompt) and lands
+    // the card back where it was asked from.
+    handle.send(ExecutorCommand::Retry { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            CardState::AwaitingReview(ReviewSub::ReadyForReview) => Some(()),
+            CardState::Implementing(_) => panic!("retry must not resume as a write run"),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    let runs = runs.lock().unwrap();
+    assert_eq!(runs.len(), 1, "only the retried launch reached a provider");
+    let (mode, prompt) = &runs[0];
+    assert_eq!(*mode, RunMode::Question);
+    assert!(
+        prompt.contains("why did you adapt at the boundary?"),
+        "the retried question rides in the rebuilt prompt"
+    );
+    assert!(store.get_answer(card_id).unwrap().is_some());
 }

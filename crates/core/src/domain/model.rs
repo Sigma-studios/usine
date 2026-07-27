@@ -463,6 +463,13 @@ pub enum CardState {
         previous: Box<CardState>,
         message: String,
     },
+    /// A read-only question run (the user asked the agent something while the
+    /// work was parked). Carries the state to return to once answered, like
+    /// `Failed`, so a crash/retry re-runs the question — not the parked phase.
+    Answering {
+        previous: Box<CardState>,
+        question: String,
+    },
 }
 
 impl CardState {
@@ -494,6 +501,7 @@ impl CardState {
             CardState::ReadyToMerge => Column::ReadyToMerge,
             CardState::Done => Column::Done,
             CardState::Failed { previous, .. } => previous.column(),
+            CardState::Answering { previous, .. } => previous.column(),
         }
     }
 
@@ -506,6 +514,7 @@ impl CardState {
     pub fn effective(&self) -> &CardState {
         match self {
             CardState::Failed { previous, .. } => previous.effective(),
+            CardState::Answering { previous, .. } => previous.effective(),
             other => other,
         }
     }
@@ -554,6 +563,7 @@ impl CardState {
         matches!(
             self,
             CardState::Designing(DesignSub::Intervention(_))
+                | CardState::Investigating(RunSub::Intervention(_))
                 | CardState::Implementing(RunSub::Intervention(_))
                 | CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
                 | CardState::Failed { .. }
@@ -580,6 +590,7 @@ impl CardState {
                 | CardState::PrReview(PrReviewSub::FetchingComments)
                 | CardState::PrReview(PrReviewSub::ApplyingFixes)
                 | CardState::PrReview(PrReviewSub::ApplyingChange)
+                | CardState::Answering { .. }
         )
     }
 
@@ -604,7 +615,7 @@ impl CardState {
                 if crate::agent::plan::parse_plan(plan).1.is_empty() {
                     "plan ready"
                 } else {
-                    "needs answers"
+                    "questions to answer"
                 }
             }
             CardState::Investigating(RunSub::Running) => "investigating…",
@@ -628,6 +639,7 @@ impl CardState {
             CardState::ReadyToMerge => "ready to merge",
             CardState::Done => "done",
             CardState::Failed { .. } => "failed",
+            CardState::Answering { .. } => "answering…",
         }
     }
 }
@@ -1396,6 +1408,7 @@ mod tests {
         // Faulted, exhausted validation, and agent questions → red tier.
         let urgent = [
             CardState::Designing(DesignSub::Intervention(intervention())),
+            CardState::Investigating(RunSub::Intervention(intervention())),
             CardState::Implementing(RunSub::Intervention(intervention())),
             CardState::AwaitingReview(ReviewSub::ValidationFailed {
                 attempt: 3,
@@ -1481,6 +1494,50 @@ mod tests {
 
         // The new variants round-trip through the store's JSON codec shape.
         for s in [running, parked, concluded] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn answering_state_membership_columns_and_serde() {
+        // A question run wraps the state it was asked from; membership and
+        // column delegate to it, like `Failed`.
+        let entries = [
+            (
+                CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() }),
+                Column::Designing,
+            ),
+            (
+                CardState::AwaitingReview(ReviewSub::ReadyForReview),
+                Column::AwaitingReview,
+            ),
+            (
+                CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                    attempt: 3,
+                    output: "boom".into(),
+                }),
+                Column::SelfReview,
+            ),
+            (CardState::PrReview(PrReviewSub::Idle), Column::PrReview),
+            (CardState::ReadyToMerge, Column::ReadyToMerge),
+        ];
+        for (previous, column) in entries {
+            let s = CardState::Answering {
+                previous: Box::new(previous.clone()),
+                question: "why this approach?".into(),
+            };
+            // It's a running state — no attention tier badges while it runs —
+            // and `effective` looks through it so diff/preview stay reachable.
+            assert!(s.is_running(), "{s:?} should be running");
+            assert!(!s.needs_attention(), "{s:?} should not need attention");
+            assert!(!s.needs_intervention() && !s.needs_urgent_attention());
+            assert!(s.intervention().is_none());
+            assert_eq!(s.column(), column);
+            assert_eq!(*s.effective(), previous);
+            assert_eq!(s.status_label(), "answering…");
+
+            // Round-trips through the store's JSON codec shape.
             let json = serde_json::to_string(&s).unwrap();
             assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
         }

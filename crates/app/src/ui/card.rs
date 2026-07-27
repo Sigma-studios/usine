@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
-use usine_core::{Card, CardState, DesignSub, ExecutorCommand, PrReviewSub, PreviewStatus};
+use usine_core::{
+    Card, CardKind, CardState, DesignSub, ExecutorCommand, PrReviewSub, PreviewStatus, ReviewSub,
+};
 use uuid::Uuid;
 
 use super::icons::{IconExternal, IconPlay, IconStop};
@@ -53,7 +55,22 @@ pub fn CardView(card: Card) -> Element {
         CardState::Designing(DesignSub::AwaitingApproval { plan })
             if usine_core::parse_plan(plan).1.is_empty()
     );
-    let awaiting_review = matches!(st, CardState::AwaitingReview(_));
+    // Only the parked review sub-states get a board button, labelled for what
+    // opening the panel actually offers there; the running ones just spin.
+    let review_action = match st {
+        CardState::AwaitingReview(ReviewSub::ReadyForReview) => Some("Review"),
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. }) => Some("Select fixes"),
+        CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => Some("Fix validation"),
+        CardState::AwaitingReview(ReviewSub::ReadyForPr) => Some("Create PR"),
+        _ => None,
+    };
+    // Validation gave up — urgent tier (`needs_urgent_attention`), so the badge
+    // must read broken, not routine.
+    let validation_failed = matches!(
+        st,
+        CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
+    );
+    let is_investigation = card.config.kind == CardKind::Investigation;
     // An investigation finished: its conclusion is the deliverable — the primary
     // action is to read it (in the detail panel, where follow-up/convert live).
     let concluded = matches!(st, CardState::Concluded { .. });
@@ -138,6 +155,14 @@ pub fn CardView(card: Card) -> Element {
     };
     let menu_title = title.clone();
     let is_done = matches!(st, CardState::Done);
+    // Non-done cards keep the open-project fallback (useful even with no
+    // worktree yet); a done card whose worktree was reaped has nothing to open.
+    let can_open = !is_done
+        || card
+            .worktree_path
+            .as_ref()
+            .map(|p| p.exists())
+            .unwrap_or(false);
 
     rsx! {
         div {
@@ -171,6 +196,7 @@ pub fn CardView(card: Card) -> Element {
                                     can_reset: !can_start,
                                     can_done: !is_done,
                                     can_diff,
+                                    can_open,
                                 },
                                 target_id: id,
                                 title: menu_title.clone(),
@@ -198,8 +224,15 @@ pub fn CardView(card: Card) -> Element {
                 if running || busy {
                     span { class: "spinner" }
                 }
+                if is_investigation {
+                    span { class: "badge kind", "Investigation" }
+                }
                 if needs_answer {
                     span { class: "badge intervention", "needs answer" }
+                } else if validation_failed {
+                    span { class: "badge intervention", "{status}" }
+                } else if concluded {
+                    span { class: "badge concluded", "{status}" }
                 } else {
                     span { class: "badge status", "{status}" }
                 }
@@ -260,11 +293,11 @@ pub fn CardView(card: Card) -> Element {
                         "Review"
                     }
                 }
-                if awaiting_review {
+                if let Some(label) = review_action {
                     button {
                         class: "btn primary",
                         onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                        "Review"
+                        "{label}"
                     }
                 }
                 if concluded {

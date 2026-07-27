@@ -12,15 +12,18 @@ use crate::state::AppState;
 /// Props: `hint` explains what "request changes" means at this stage;
 /// `on_request` dispatches the panel-specific change command with the typed
 /// text. `request_enabled_when_blank` lets the plan panel submit answered
-/// questions with no free-form text (its request folds both). A caller that
-/// renders the section from several alternating parked states can pass its own
-/// `text` signal so a typed-but-unsent draft survives the moves between them.
+/// questions with no free-form text (its request folds both), and
+/// `request_label` lets it retitle the button to what the send actually does
+/// (e.g. "Send answers"). A caller that renders the section from several
+/// alternating parked states can pass its own `text` signal so a
+/// typed-but-unsent draft survives the moves between them.
 #[component]
 pub(super) fn AgentChatSection(
     card_id: Uuid,
     hint: String,
     on_request: EventHandler<String>,
     #[props(default = false)] request_enabled_when_blank: bool,
+    request_label: Option<String>,
     text: Option<Signal<String>>,
 ) -> Element {
     let state = use_context::<AppState>();
@@ -28,6 +31,7 @@ pub(super) fn AgentChatSection(
     let mut text = text.unwrap_or(own_text);
     let exchange = state.answers.read().get(&card_id).cloned();
     let blank = text.read().trim().is_empty();
+    let request_label = request_label.unwrap_or_else(|| "Request changes".to_string());
 
     rsx! {
         div { class: "section",
@@ -59,7 +63,7 @@ pub(super) fn AgentChatSection(
                             text.set(String::new());
                         }
                     },
-                    "Request changes"
+                    "{request_label}"
                 }
                 button {
                     class: "btn",
