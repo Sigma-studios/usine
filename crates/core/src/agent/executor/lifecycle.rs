@@ -564,8 +564,10 @@ impl Executor {
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::answer_updated(card_id, "", ""));
-        // Same for a discarded investigation's stashed round context.
+        // Same for a discarded investigation's stashed round context, and for a
+        // discarded fix run's stashed task.
         let _ = self.store.set_investigation_extra(card_id, None);
+        let _ = self.store.set_fix_extra(card_id, None);
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx
@@ -760,7 +762,18 @@ impl Executor {
                 let plan = self.store.get_plan(card_id).unwrap_or(None);
                 Some(resume_extra(plan.as_deref()))
             }
-            RunMode::ApplyFixes => Some(resume_extra(None)),
+            // A fix run's task lives entirely in its launch extra (the conflict
+            // prompt, the picked review comments, a requested change, the
+            // failing-checks logs) — restore the copy stashed at launch so the
+            // retry can restate it. Without it the resumed agent finds finished
+            // work, changes nothing, and the no-commit guard fails the run
+            // again: an unwinnable retry loop.
+            RunMode::ApplyFixes => Some(
+                match self.store.get_fix_extra(card_id).unwrap_or(None) {
+                    Some(task) => format!("{task}\n\n{}", resume_extra(None)),
+                    None => resume_extra(None),
+                },
+            ),
             RunMode::Review => {
                 let project = self.store.get_project(card.project_id)?;
                 let guide = crate::agent::review::find_review_prompt(&project.path);

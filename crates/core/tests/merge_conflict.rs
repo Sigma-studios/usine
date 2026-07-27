@@ -11,17 +11,18 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, Card, CardConfig, CardState, CoreError, DraftComment, ExecutorCommand,
-    ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome, MergeStatus,
-    PrInfo, PrSummary, Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewSummary,
-    Severity, SimFactory, SimForge, SimGit, Store,
+    spawn_executor, AgentProvider, Card, CardConfig, CardState, CoreError, DraftComment,
+    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome,
+    MergeStatus, PrInfo, PrSummary, Project, ProjectConfig, Provider, ProviderFactory, RealGit,
+    ReviewComment, ReviewEvent, ReviewSummary, RunConfig, RunHandle, RunMode, Severity, SimFactory,
+    SimForge, SimGit, Store,
 };
 
 /// A forge whose merge always fails, reporting `status` when asked why.
@@ -361,6 +362,128 @@ async fn a_conflict_that_resolved_itself_costs_no_agent_run() {
         store.get_card(card.id).unwrap().state,
         CardState::ReadyToMerge
     ));
+}
+
+/// Every prompt handed to a provider, tagged with the run mode that asked for it.
+type Prompts = Arc<Mutex<Vec<(RunMode, String)>>>;
+
+/// Wraps the simulator, recording each run's full prompt before delegating —
+/// and refusing the first start outright (a CLI that failed to spawn), which
+/// is what parks a card at `Failed` with its stashed task intact.
+struct FlakyProvider {
+    inner: Arc<dyn AgentProvider>,
+    prompts: Prompts,
+    failed_once: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl AgentProvider for FlakyProvider {
+    fn provider(&self) -> Provider {
+        self.inner.provider()
+    }
+    fn interactive(&self) -> bool {
+        self.inner.interactive()
+    }
+    async fn start(&self, cfg: RunConfig) -> usine_core::Result<RunHandle> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((cfg.mode, cfg.full_prompt()));
+        {
+            let mut failed = self.failed_once.lock().unwrap();
+            if !*failed {
+                *failed = true;
+                return Err(CoreError::other("agent CLI failed to start"));
+            }
+        }
+        self.inner.start(cfg).await
+    }
+}
+
+struct FlakyFactory {
+    prompts: Prompts,
+    failed_once: Arc<Mutex<bool>>,
+}
+
+impl ProviderFactory for FlakyFactory {
+    fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
+        Arc::new(FlakyProvider {
+            inner: SimFactory.make(provider),
+            prompts: self.prompts.clone(),
+            failed_once: self.failed_once.clone(),
+        })
+    }
+}
+
+/// A faulted conflict-resolution run must not forget its task on Retry. The
+/// task lives entirely in the launch extra (the conflict brief); `relaunch`
+/// rebuilds the prompt from scratch, so without the stashed copy the retried
+/// agent resumes into finished work with nothing asking it to conclude the
+/// merge — it changes no files, the no-commit guard fails the run, and every
+/// further Retry loops the same way.
+#[tokio::test]
+async fn a_retried_conflict_fix_still_knows_about_the_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-conflict"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let mut card = ready_to_merge_card(&store, project.id);
+    card.worktree_path = Some(tmp.path().to_path_buf());
+    store.upsert_card(&card).unwrap();
+
+    let prompts: Prompts = Arc::new(Mutex::new(Vec::new()));
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(FlakyFactory {
+            prompts: prompts.clone(),
+            failed_once: Arc::new(Mutex::new(false)),
+        }),
+        forge: Arc::new(RefusingForge {
+            status: MergeStatus::Conflicting,
+        }),
+        git: Arc::new(ConflictingGit),
+    });
+
+    // The first resolution run's provider dies at start: the card is demoted to
+    // `Failed`, recoverable — with the conflict brief stashed at launch.
+    handle.send(ExecutorCommand::ResolveConflicts { card_id: card.id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id && c.state.is_failed() => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        store
+            .get_fix_extra(card.id)
+            .unwrap()
+            .is_some_and(|e| e.contains("src/lib.rs")),
+        "the conflict brief must be stashed at launch for a later retry"
+    );
+
+    handle.send(ExecutorCommand::Retry { card_id: card.id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id && !c.state.is_running() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let fix_prompts: Vec<String> = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .collect();
+    assert_eq!(fix_prompts.len(), 2, "the retry launched a second fix run");
+    assert!(
+        fix_prompts[1].contains("cannot be merged") && fix_prompts[1].contains("src/lib.rs"),
+        "the retried fix run must restate the conflict task:\n{}",
+        fix_prompts[1]
+    );
 }
 
 // --- real git: a conflicted merge is an outcome, a broken one is an error ----

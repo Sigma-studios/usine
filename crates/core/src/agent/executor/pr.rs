@@ -287,8 +287,11 @@ impl Executor {
         // Done before the running-state transition so a failure (e.g. a dirty main
         // repo) leaves the card in the recoverable fix picker.
         self.ensure_branch_worktree(card_id).await?;
-        let card = self.apply(card_id, Transition::SelectFixes)?;
         let extra = fix_prompt(&checked, &note);
+        // Stash the task before entering the running state, so a retry of a
+        // faulted run can restate it (see `relaunch`).
+        self.store.set_fix_extra(card_id, Some(&extra))?;
+        let card = self.apply(card_id, Transition::SelectFixes)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
     }
@@ -601,6 +604,9 @@ impl Executor {
         // Isolate the fix before entering the running state (a failure here leaves
         // the card recoverable in its current state — ReadyToMerge or the PR gate).
         self.ensure_branch_worktree(card_id).await?;
+        // Stash the task before entering the running state, so a retry of a
+        // faulted run can restate it (see `relaunch`).
+        self.store.set_fix_extra(card_id, Some(&extra))?;
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
@@ -840,6 +846,10 @@ impl Executor {
             ),
         );
         let extra = conflict_prompt(&base, &files);
+        // Stash the task before entering the running state, so a retry of a
+        // faulted run can restate it (see `relaunch`). Without this, a retried
+        // conflict run has no idea a merge is in progress.
+        self.store.set_fix_extra(card_id, Some(&extra))?;
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
@@ -935,6 +945,9 @@ impl Executor {
             ),
         );
         let extra = checks_fix_prompt(pr_number, &failed, &logs);
+        // Stash the task before entering the running state, so a retry of a
+        // faulted run can restate it (see `relaunch`).
+        self.store.set_fix_extra(card_id, Some(&extra))?;
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
