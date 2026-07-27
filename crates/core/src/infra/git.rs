@@ -345,6 +345,12 @@ pub trait GitOps: Send + Sync {
     /// if there was nothing to commit (a clean tree) — the caller uses this to
     /// tell "the run produced work" from "the run changed nothing".
     async fn commit_all(&self, dir: &Path, message: &str) -> Result<bool>;
+    /// Whether `dir`'s HEAD carries any commit beyond its merge base with
+    /// `base`. Backends that don't model history report `false`; callers must
+    /// read that as "no information", never as proof the branch is empty.
+    async fn branch_has_commits(&self, _dir: &Path, _base: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// Discard every uncommitted change in `dir` — tracked edits (`git reset
     /// --hard`) and untracked files (`git clean -fd`) — returning the tree to
     /// HEAD. Backends that don't model working-tree state treat it as a no-op.
@@ -540,6 +546,10 @@ impl GitOps for RealGit {
             "git commit failed: {}",
             stderr.trim()
         )))
+    }
+
+    async fn branch_has_commits(&self, dir: &Path, base: &str) -> Result<bool> {
+        Ok(!log_subjects(dir, base, "HEAD")?.is_empty())
     }
 
     async fn discard_changes(&self, dir: &Path) -> Result<()> {

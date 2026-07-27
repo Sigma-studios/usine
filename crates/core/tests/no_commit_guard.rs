@@ -10,6 +10,11 @@
 //!
 //! The guard demotes such a run to `Failed` (a running state's escape hatch) so
 //! the user sees it needs attention and can Retry, instead of a silent dead-end.
+//!
+//! The exception is a retried implement run whose earlier attempt already
+//! committed: it finds the work finished and (as `resume_extra` instructs)
+//! changes nothing. Demoting it would re-arm the same retry forever, so when
+//! the branch already carries commits beyond the base the run advances instead.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,13 +30,20 @@ use usine_core::{
 };
 
 /// Git that behaves like the simulator, except a commit never lands — the tree
-/// is always clean, so `commit_all` reports "nothing committed".
-struct NoCommitGit;
+/// is always clean, so `commit_all` reports "nothing committed". `prior_work`
+/// is what `branch_has_commits` reports: whether an earlier attempt already
+/// put this card's commits on the branch.
+struct NoCommitGit {
+    prior_work: bool,
+}
 
 #[async_trait]
 impl GitOps for NoCommitGit {
     async fn commit_all(&self, _: &Path, _: &str) -> Result<bool> {
         Ok(false)
+    }
+    async fn branch_has_commits(&self, _: &Path, _: &str) -> Result<bool> {
+        Ok(self.prior_work)
     }
     // Everything else defers to the simulator's always-succeeds behavior.
     async fn create_worktree(&self, r: &Path, b: &str, p: &Path, base: &str) -> Result<()> {
@@ -102,7 +114,7 @@ async fn an_implement_run_that_commits_nothing_is_failed_not_advanced() {
         store: store.clone(),
         providers: Arc::new(SimFactory),
         forge: Arc::new(SimForge),
-        git: Arc::new(NoCommitGit),
+        git: Arc::new(NoCommitGit { prior_work: false }),
     });
 
     handle.send(ExecutorCommand::Start { card_id });
@@ -134,4 +146,43 @@ async fn an_implement_run_that_commits_nothing_is_failed_not_advanced() {
         ),
         other => panic!("card should be Failed, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_retried_run_whose_branch_already_has_the_work_advances() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-no-commit-guard-prior"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+    store.set_skip_plan(card_id, true).unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(NoCommitGit { prior_work: true }),
+    });
+
+    handle.send(ExecutorCommand::Start { card_id });
+
+    // The run commits nothing, but the branch already carries an earlier
+    // attempt's commits — the card reaches the review gate instead of looping
+    // through Failed → Retry → Failed on the same finished work.
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => match &c.state {
+            CardState::AwaitingReview(_) => Some(()),
+            CardState::Failed { message, .. } if message.contains("without changing any files") => {
+                panic!("a run with prior work on the branch was demoted by the guard")
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
 }
