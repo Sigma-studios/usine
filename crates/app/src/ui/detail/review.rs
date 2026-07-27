@@ -150,7 +150,7 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                 div { class: "section",
                     h3 { "Review" }
                     div { class: "hint",
-                        "Check out the PR in a worktree and have an agent draft review comments. You approve each one before anything is posted."
+                        "Check out the PR in a worktree and have an agent draft review comments — you approve each one before anything is posted. Already read the PR yourself? Approve it directly, no agent pass needed."
                     }
                     div { class: "field",
                         label { "Steer this review (optional)" }
@@ -165,6 +165,12 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                             class: "btn primary",
                             onclick: move |_| state.start_review(id, guidance.read().clone()),
                             "Review this PR"
+                        }
+                        button {
+                            class: "btn",
+                            title: "Approve on GitHub without running the review agent",
+                            onclick: move |_| crate::ui::confirm_approve_review(state, id, task.pr_number),
+                            "Approve"
                         }
                         button {
                             class: "btn",
