@@ -32,11 +32,23 @@ pub fn Board() -> Element {
                 ColumnView {
                     key: "{col:?}",
                     column: col,
-                    cards: cards.iter().filter(|c| c.column() == col).cloned().collect::<Vec<_>>(),
+                    cards: column_cards(&cards, col),
                 }
             }
         }
     }
+}
+
+/// One column's cards in display order. The working columns keep the list's
+/// creation order (oldest first); Done shows the most recently touched card on
+/// top, since the transition into Done stamps `updated_at` — i.e. "recently
+/// finished first" instead of a pile sorted by age.
+fn column_cards(cards: &[Card], col: Column) -> Vec<Card> {
+    let mut out: Vec<Card> = cards.iter().filter(|c| c.column() == col).cloned().collect();
+    if col == Column::Done {
+        out.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+    }
+    out
 }
 
 #[component]

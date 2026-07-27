@@ -818,7 +818,8 @@ impl AppState {
 
     pub fn visible_cards(&self) -> Vec<Card> {
         let view = *self.selected_view.read();
-        self.cards
+        let mut out: Vec<Card> = self
+            .cards
             .read()
             .iter()
             .filter(|c| match view {
@@ -826,7 +827,12 @@ impl AppState {
                 SelectedView::Project(id) => c.project_id == id,
             })
             .cloned()
-            .collect()
+            .collect();
+        // Creation order, oldest first. Without this the board follows the
+        // store's primary-key scan (UUID-string order), which reshuffles every
+        // column across restarts.
+        out.sort_by_key(|c| c.created_at);
+        out
     }
 
     pub fn project_name(&self, id: Uuid) -> String {
