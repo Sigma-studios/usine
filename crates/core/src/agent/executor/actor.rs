@@ -425,6 +425,12 @@ async fn finalize_run(
         Transition::SelfFixesDone | Transition::ValidationFixDone
     );
     let is_implement_done = matches!(transition, Transition::AgentImplementDone);
+    // The fix run committed its task — drop the stashed copy so a later,
+    // unrelated retry can't resurrect it (best-effort; a stale stash is
+    // overwritten at the next fix launch anyway).
+    if !is_implement_done {
+        let _ = store.set_fix_extra(card_id, None);
+    }
     apply_transition(store, evt_tx, card_id, transition)?;
     // The card just parked (`ReadyForReview`, `ReadyToMerge`, or PR-review
     // idle): light-stop the preview this run brought up. The validation routes

@@ -196,6 +196,22 @@ struct CardInvestigationRecord {
     extra: String,
 }
 
+/// The task-specific extra of the last launched fix run (the conflict prompt,
+/// the picked review comments, a requested change, the failing-checks logs).
+/// Kept so a retry of a faulted fix run can restate the task: `relaunch`
+/// rebuilds the prompt from scratch, and without this the resumed agent finds
+/// finished work, changes nothing, and the no-commit guard fails the run again
+/// — an unwinnable retry loop. Its own record so adding it doesn't change the
+/// `Card` record layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 13, version = 1, with = Json)]
+#[native_db]
+struct CardFixExtraRecord {
+    #[primary_key]
+    card_id: String,
+    extra: String,
+}
+
 /// A pull request the user is reviewing (someone else's PR). Its own top-level
 /// record — distinct from `CardRecord` — because a foreign PR has no owned
 /// branch/worktree/card. `project_id` is lifted for the per-project filter.
@@ -271,6 +287,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<CardInvestigationRecord>()
         .expect("define CardInvestigationRecord");
+    models
+        .define::<CardFixExtraRecord>()
+        .expect("define CardFixExtraRecord");
     models
         .define::<ReviewTaskRecord>()
         .expect("define ReviewTaskRecord");
@@ -713,6 +732,37 @@ impl Store {
     pub fn get_investigation_extra(&self, card_id: Uuid) -> Result<Option<String>> {
         let r = self.db.r_transaction()?;
         let rec: Option<CardInvestigationRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.extra))
+    }
+
+    // --- fix-run context ------------------------------------------------
+
+    /// Stash (or, with `None`, clear) the task-specific extra of a fix run so a
+    /// retry re-launches with the same task (see the record's doc).
+    pub fn set_fix_extra(&self, card_id: Uuid, extra: Option<&str>) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardFixExtraRecord> = rw.get().primary(card_id.to_string())?;
+        match (old, extra) {
+            (old, Some(extra)) => {
+                let rec = CardFixExtraRecord {
+                    card_id: card_id.to_string(),
+                    extra: extra.to_string(),
+                };
+                match old {
+                    Some(old) => rw.update(old, rec)?,
+                    None => rw.insert(rec)?,
+                }
+            }
+            (Some(old), None) => rw.remove(old).map(|_| ())?,
+            (None, None) => {}
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    pub fn get_fix_extra(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardFixExtraRecord> = r.get().primary(card_id.to_string())?;
         Ok(rec.map(|r| r.extra))
     }
 
