@@ -440,22 +440,6 @@ impl Executor {
     pub(super) async fn ensure_worktree(&self, card_id: Uuid) -> Result<Card> {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
-        let branch = format!("usine/{}", slug(&card.title, card.id));
-        let worktree = worktree_path(&project.path, card.id);
-        // Pre-clean any stale worktree/dir and lingering same-named branch from a
-        // discarded attempt (e.g. a `back_to_start` whose worktree resisted
-        // removal). The branch name is derived deterministically from the card, so
-        // without this the `git worktree add -b <branch> <path>` below would fail
-        // with "branch already exists" / "path already exists" and wedge the card
-        // in the starting block. The branch is freshly cut from base here, so
-        // nothing of value is discarded.
-        if worktree.exists() {
-            let _ = self
-                .remove_worktree_retrying(&project.path, &worktree)
-                .await;
-            let _ = std::fs::remove_dir_all(&worktree);
-        }
-        let _ = self.git.delete_branch(&project.path, &branch).await;
         // Refresh origin so the cut point is the *current* remote base, not
         // wherever it sat at the last pull. Non-fatal: offline, the last-fetched
         // remote-tracking ref (or the local branch) still lets work start.
@@ -466,15 +450,44 @@ impl Executor {
             &project.path,
             project.config.effective_base_branch(),
         );
-        self.git
-            .create_worktree(&project.path, &branch, &worktree, &base)
-            .await?;
+        let (branch, worktree) = self.cut_card_worktree(&project, &card, &base).await?;
         self.store.mutate_card(card_id, |c| {
             c.branch = Some(branch.clone());
             c.worktree_path = Some(worktree.clone());
             c.updated_at = now_millis();
             Ok(())
         })
+    }
+
+    /// Cut the card's own `usine/` branch at `cut_point` in a fresh worktree —
+    /// the shared middle of [`Self::ensure_worktree`] and branch adoption.
+    /// Persists nothing; the caller decides what lands on the card.
+    pub(super) async fn cut_card_worktree(
+        &self,
+        project: &Project,
+        card: &Card,
+        cut_point: &str,
+    ) -> Result<(String, PathBuf)> {
+        let branch = format!("usine/{}", slug(&card.title, card.id));
+        let worktree = worktree_path(&project.path, card.id);
+        // Pre-clean any stale worktree/dir and lingering same-named branch from a
+        // discarded attempt (e.g. a `back_to_start` whose worktree resisted
+        // removal). The branch name is derived deterministically from the card, so
+        // without this the `git worktree add -b <branch> <path>` below would fail
+        // with "branch already exists" / "path already exists" and wedge the card
+        // in the starting block. The branch is freshly cut from `cut_point` here,
+        // so nothing of value is discarded.
+        if worktree.exists() {
+            let _ = self
+                .remove_worktree_retrying(&project.path, &worktree)
+                .await;
+            let _ = std::fs::remove_dir_all(&worktree);
+        }
+        let _ = self.git.delete_branch(&project.path, &branch).await;
+        self.git
+            .create_worktree(&project.path, &branch, &worktree, cut_point)
+            .await?;
+        Ok((branch, worktree))
     }
 
     /// Answer a pending intervention. An interactive run (the simulator) gets the
@@ -768,12 +781,10 @@ impl Executor {
             // retry can restate it. Without it the resumed agent finds finished
             // work, changes nothing, and the no-commit guard fails the run
             // again: an unwinnable retry loop.
-            RunMode::ApplyFixes => Some(
-                match self.store.get_fix_extra(card_id).unwrap_or(None) {
-                    Some(task) => format!("{task}\n\n{}", resume_extra(None)),
-                    None => resume_extra(None),
-                },
-            ),
+            RunMode::ApplyFixes => Some(match self.store.get_fix_extra(card_id).unwrap_or(None) {
+                Some(task) => format!("{task}\n\n{}", resume_extra(None)),
+                None => resume_extra(None),
+            }),
             RunMode::Review => {
                 let project = self.store.get_project(card.project_id)?;
                 let guide = crate::agent::review::find_review_prompt(&project.path);
