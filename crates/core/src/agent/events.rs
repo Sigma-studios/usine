@@ -155,10 +155,19 @@ pub enum ExecutorCommand {
     ReviseImplementation { card_id: Uuid, feedback: String },
     /// Ask the agent a question about its work without sending it back for
     /// changes: a strictly read-only turn from any Agent Chat panel (plan
-    /// approval, awaiting review, PR idle, ready-to-merge). The card rides the
-    /// matching "send back" transition while answering and returns to where it
-    /// started; the answer arrives via `AnswerUpdated`.
+    /// approval, awaiting review, PR idle, ready-to-merge). The card wraps
+    /// into `CardState::Answering` while answering and returns to the exact
+    /// state it was asked from; the answer arrives via `AnswerUpdated`.
     AskQuestion { card_id: Uuid, question: String },
+    /// Record the user's answers to the hand-off's open questions: each
+    /// non-empty (question index, answer) pair lands on the card's restart log
+    /// (so later runs see the decision) and on the stored hand-off (so the
+    /// panel shows it answered). Matched by INDEX, not question text, so two
+    /// identically worded questions stay distinct. No run is launched.
+    RecordHandoffAnswers {
+        card_id: Uuid,
+        answers: Vec<(usize, String)>,
+    },
     /// From `Concluded`: dig deeper — re-run the investigation with the prior
     /// conclusion, the earlier rounds, and this follow-up as context (the
     /// investigation twin of `RejectPlan`'s re-plan loop).
@@ -379,6 +388,7 @@ impl ExecutorCommand {
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
             | ExecutorCommand::AskQuestion { card_id, .. }
+            | ExecutorCommand::RecordHandoffAnswers { card_id, .. }
             | ExecutorCommand::FollowUpInvestigation { card_id, .. }
             | ExecutorCommand::ConvertToImplementation { card_id }
             | ExecutorCommand::Merge { card_id, .. }
@@ -511,6 +521,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }
+                | ExecutorCommand::RecordHandoffAnswers { .. }
         )
     }
 }

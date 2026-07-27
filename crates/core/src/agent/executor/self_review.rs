@@ -92,9 +92,15 @@ impl Executor {
             return self.run_validation(card_id).await;
         }
         // Keep the note so a later "back to start" folds it into the prompt.
+        // The checked findings are only STASHED: their "Fix applied" lines go
+        // on the log when the run lands its commit (see `finalize_run`) — a
+        // cancelled or faulted run must not leave a durable claim it fixed
+        // anything.
         if !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
         }
+        let fix_qa: Vec<String> = selected.iter().map(fixed_comment_qa).collect();
+        self.store.set_pending_fix_qa(card_id, &fix_qa)?;
         let extra = fix_prompt(&selected, &note);
         // Isolate before the running-state transition, so a failure (e.g. a dirty
         // main repo) leaves the card recoverable in the fix picker.

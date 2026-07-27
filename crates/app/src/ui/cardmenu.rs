@@ -28,6 +28,10 @@ pub(crate) enum MenuKind {
         can_done: bool,
         /// "Show diff" shows once the card has committed work to diff.
         can_diff: bool,
+        /// "Open in terminal/editor" only when there's somewhere to open: any
+        /// non-done card (the open falls back to the project), or a done card
+        /// whose worktree still exists on disk.
+        can_open: bool,
     },
     Review {
         pr_number: u64,
@@ -79,13 +83,14 @@ pub fn CardMenuHost() -> Element {
                 style: "{pos}",
                 onclick: move |e| e.stop_propagation(),
                 match req.kind.clone() {
-                    MenuKind::Card { can_reset, can_done, can_diff } => rsx! {
+                    MenuKind::Card { can_reset, can_done, can_diff, can_open } => rsx! {
                         CardMenuItems {
                             card_id: id,
                             title: req.title.clone(),
                             can_reset,
                             can_done,
                             can_diff,
+                            can_open,
                         }
                     },
                     MenuKind::Review { pr_number, has_checkout } => rsx! {
@@ -104,6 +109,7 @@ fn CardMenuItems(
     can_reset: bool,
     can_done: bool,
     can_diff: bool,
+    can_open: bool,
 ) -> Element {
     let state = use_context::<AppState>();
     let id = card_id;
@@ -123,21 +129,23 @@ fn CardMenuItems(
                 "Show diff"
             }
         }
-        button {
-            class: "menu-item",
-            onclick: move |_| {
-                dismiss();
-                state.send(ExecutorCommand::OpenWorktree { card_id: id, target: OpenTarget::Terminal });
-            },
-            "Open in terminal"
-        }
-        button {
-            class: "menu-item",
-            onclick: move |_| {
-                dismiss();
-                state.send(ExecutorCommand::OpenWorktree { card_id: id, target: OpenTarget::Editor });
-            },
-            "Open in editor"
+        if can_open {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    state.send(ExecutorCommand::OpenWorktree { card_id: id, target: OpenTarget::Terminal });
+                },
+                "Open in terminal"
+            }
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    state.send(ExecutorCommand::OpenWorktree { card_id: id, target: OpenTarget::Editor });
+                },
+                "Open in editor"
+            }
         }
         if can_reset {
             button {

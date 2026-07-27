@@ -48,30 +48,43 @@ pub struct PlanQuestion {
     pub options: Vec<String>,
 }
 
-/// Split a plan into (prose with the questions block removed, parsed questions).
-/// If there's no valid block, returns the plan unchanged with no questions.
-pub fn parse_plan(plan: &str) -> (String, Vec<PlanQuestion>) {
-    const TAG: &str = "```usine-questions";
+const TAG: &str = "```usine-questions";
 
-    let Some(start) = plan.find(TAG) else {
-        return (plan.to_string(), Vec::new());
-    };
+/// Locate a complete fenced questions block: (block start, end past the
+/// closing fence, the JSON between them).
+fn find_block(plan: &str) -> Option<(usize, usize, &str)> {
+    let start = plan.find(TAG)?;
     let after_tag = &plan[start + TAG.len()..];
-    let Some(close_rel) = after_tag.find("```") else {
+    let close_rel = after_tag.find("```")?;
+    let block_end = start + TAG.len() + close_rel + 3; // include the closing ```
+    Some((start, block_end, after_tag[..close_rel].trim()))
+}
+
+/// Split a plan into (prose with the questions block removed, parsed questions).
+/// With no complete block, returns the plan unchanged and no questions. A
+/// complete block is always stripped — even when its JSON is malformed (no
+/// questions then; see [`plan_block_malformed`]), so the garbage never badges
+/// the plan as questioned nor leaks into the implement prompt.
+pub fn parse_plan(plan: &str) -> (String, Vec<PlanQuestion>) {
+    let Some((start, block_end, json)) = find_block(plan) else {
         return (plan.to_string(), Vec::new());
     };
-
-    let json = after_tag[..close_rel].trim();
     let questions: Vec<PlanQuestion> = serde_json::from_str(json).unwrap_or_default();
-    if questions.is_empty() {
-        return (plan.to_string(), Vec::new());
-    }
-
-    let block_end = start + TAG.len() + close_rel + 3; // include the closing ```
     let mut cleaned = String::new();
     cleaned.push_str(&plan[..start]);
     cleaned.push_str(&plan[block_end..]);
     (cleaned.trim().to_string(), questions)
+}
+
+/// True when the plan carries a questions block whose JSON doesn't parse — the
+/// agent tried to ask something but garbled it. [`parse_plan`] strips the block
+/// silently; the plan panel uses this to tell the user something was dropped.
+/// A valid-but-empty `[]` is not malformed.
+pub fn plan_block_malformed(plan: &str) -> bool {
+    match find_block(plan) {
+        Some((_, _, json)) => serde_json::from_str::<Vec<PlanQuestion>>(json).is_err(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -109,10 +122,29 @@ mod tests {
     }
 
     #[test]
-    fn malformed_block_is_ignored() {
+    fn malformed_block_is_stripped_and_flagged() {
         let plan = "Plan.\n```usine-questions\nnot json\n```";
         let (clean, qs) = parse_plan(plan);
-        assert_eq!(clean, plan);
+        // The garbage block must not survive into the badge logic or the
+        // implement prompt — stripped, with no questions.
+        assert_eq!(clean, "Plan.");
         assert!(qs.is_empty());
+        assert!(plan_block_malformed(plan));
+    }
+
+    #[test]
+    fn valid_or_absent_blocks_are_not_malformed() {
+        // A valid empty array strips silently: nothing was lost.
+        let plan = "Plan.\n```usine-questions\n[]\n```";
+        let (clean, qs) = parse_plan(plan);
+        assert_eq!(clean, "Plan.");
+        assert!(qs.is_empty());
+        assert!(!plan_block_malformed(plan));
+
+        assert!(!plan_block_malformed("just a plan"));
+        // An unterminated fence isn't a complete block — left untouched.
+        let dangling = "Plan.\n```usine-questions\nnot json";
+        assert_eq!(parse_plan(dangling).0, dangling);
+        assert!(!plan_block_malformed(dangling));
     }
 }

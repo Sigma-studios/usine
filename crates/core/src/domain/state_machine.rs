@@ -64,6 +64,12 @@ pub enum Transition {
     /// User-triggered: mark the card finished from wherever it is, without going
     /// through the PR/merge flow.
     MarkDone,
+    /// Ask the agent a read-only question while the work is parked. Wraps the
+    /// current state in `Answering` so the question run has a state of its own
+    /// (a crash/retry re-runs the question, not the parked phase).
+    AskQuestion {
+        question: String,
+    },
     // --- agent-driven ---
     AgentNeedsInput(Intervention),
     AgentPlanReady {
@@ -105,6 +111,9 @@ pub enum Transition {
     AgentError {
         message: String,
     },
+    /// The question run finished (its answer recorded elsewhere); unwrap
+    /// `Answering` back to the state the question was asked from.
+    QuestionAnswered,
 }
 
 /// Compute the next state, or [`CoreError::IllegalTransition`] if the move is
@@ -318,6 +327,31 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         // some thread still awaits an answer (`Card::unanswered_count`).
         (S::ReadyToMerge, T::FetchComments) => S::PrReview(PrReviewSub::FetchingComments),
         (S::ReadyToMerge, T::Merge) => S::Done,
+
+        // Questions: from any parked hand-off state the user can ask the agent
+        // a read-only question. The current state is wrapped, not replaced, so
+        // the answer (or a cancel, or a crash + retry) restores it exactly.
+        (s, T::AskQuestion { question })
+            if matches!(
+                s,
+                S::Designing(DesignSub::AwaitingApproval { .. })
+                    | S::AwaitingReview(
+                        ReviewSub::ReadyForReview
+                            | ReviewSub::ReadyForPr
+                            | ReviewSub::ValidationFailed { .. }
+                    )
+                    | S::PrReview(PrReviewSub::Idle)
+                    | S::ReadyToMerge
+            ) =>
+        {
+            S::Answering {
+                previous: Box::new(s.clone()),
+                question,
+            }
+        }
+        (S::Answering { previous, .. }, T::QuestionAnswered) => (**previous).clone(),
+        // Cancelling a question restores the exact state it was asked from.
+        (S::Answering { previous, .. }, T::Cancel) => (**previous).clone(),
 
         // Any active run can fault.
         (s, T::AgentError { message }) if s.is_running() => S::Failed {
@@ -1051,5 +1085,113 @@ mod tests {
             s,
             CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
         ));
+    }
+
+    /// The parked hand-off states a question can be asked from.
+    fn question_entry_states() -> Vec<CardState> {
+        vec![
+            CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() }),
+            CardState::AwaitingReview(ReviewSub::ReadyForReview),
+            CardState::AwaitingReview(ReviewSub::ReadyForPr),
+            CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                attempt: 3,
+                output: "boom".into(),
+            }),
+            CardState::PrReview(PrReviewSub::Idle),
+            CardState::ReadyToMerge,
+        ]
+    }
+
+    fn ask(s: &CardState) -> Result<CardState> {
+        transition(
+            s,
+            Transition::AskQuestion {
+                question: "why this approach?".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn ask_question_wraps_exactly_the_parked_handoff_states() {
+        for s in question_entry_states() {
+            let wrapped = ask(&s).unwrap();
+            match &wrapped {
+                CardState::Answering { previous, question } => {
+                    assert_eq!(**previous, s, "the asked-from state rides inside");
+                    assert_eq!(question, "why this approach?");
+                }
+                other => panic!("expected Answering, got {other:?}"),
+            }
+            // Wrapping, not replacing: the card stays in its column.
+            assert_eq!(wrapped.column(), s.column());
+        }
+
+        // Illegal everywhere else: unstarted, running, mid-question, terminal.
+        for s in [
+            CardState::StartingBlock,
+            CardState::Designing(DesignSub::Running),
+            CardState::Investigating(RunSub::Running),
+            CardState::Implementing(RunSub::Running),
+            CardState::Implementing(RunSub::Intervention(intervention())),
+            CardState::AwaitingReview(ReviewSub::Reviewing),
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts: vec![] }),
+            CardState::AwaitingReview(ReviewSub::Validating { attempt: 1 }),
+            CardState::PrReview(PrReviewSub::FetchingComments),
+            CardState::Concluded {
+                conclusion: "c".into(),
+            },
+            CardState::Answering {
+                previous: Box::new(CardState::ReadyToMerge),
+                question: "q".into(),
+            },
+            CardState::Done,
+        ] {
+            assert!(ask(&s).is_err(), "{s:?} must not accept AskQuestion");
+        }
+    }
+
+    #[test]
+    fn question_answered_and_cancel_restore_the_asked_from_state() {
+        for s in question_entry_states() {
+            let wrapped = ask(&s).unwrap();
+            let answered = transition(&wrapped, Transition::QuestionAnswered).unwrap();
+            assert_eq!(answered, s, "answering must restore the exact state");
+            let cancelled = transition(&wrapped, Transition::Cancel).unwrap();
+            assert_eq!(cancelled, s, "cancelling must restore the exact state");
+        }
+        // QuestionAnswered means nothing outside a question run.
+        assert!(transition(&CardState::ReadyToMerge, Transition::QuestionAnswered).is_err());
+    }
+
+    #[test]
+    fn a_faulted_question_retries_as_a_question() {
+        // The crash/Retry path that motivated the state: the fault wraps
+        // Answering (not the borrowed phase), and Retry re-enters Answering —
+        // never a write run against the parked work.
+        for s in question_entry_states() {
+            let wrapped = ask(&s).unwrap();
+            let failed = transition(
+                &wrapped,
+                Transition::AgentError {
+                    message: "boom".into(),
+                },
+            )
+            .unwrap();
+            match &failed {
+                CardState::Failed { previous, .. } => {
+                    assert_eq!(**previous, wrapped, "the fault wraps Answering")
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            assert_eq!(
+                failed.column(),
+                s.column(),
+                "column stable through the fault"
+            );
+            let retried = transition(&failed, Transition::Retry).unwrap();
+            assert_eq!(retried, wrapped, "Retry restores the question run");
+            let answered = transition(&retried, Transition::QuestionAnswered).unwrap();
+            assert_eq!(answered, s);
+        }
     }
 }

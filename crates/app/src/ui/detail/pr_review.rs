@@ -108,14 +108,38 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                 },
             }
         }
+        // Cancelling any of the three running PR-review phases returns the
+        // card to the idle PR gate; a cancelled write run's half-applied edits
+        // are discarded by the executor so they can't ride the next fix commit.
         if is_fetching {
-            div { class: "section", div { class: "hint", "Triaging review comments…" } }
+            div { class: "section",
+                div { class: "hint", "Triaging review comments…" }
+                button {
+                    class: "btn",
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
+                }
+            }
         }
         if is_applying {
-            div { class: "section", div { class: "hint", "Applying fixes & replying to comments…" } }
+            div { class: "section",
+                div { class: "hint", "Applying fixes & replying to comments…" }
+                button {
+                    class: "btn",
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
+                }
+            }
         }
         if is_applying_change {
-            div { class: "section", div { class: "hint", "Applying your requested change…" } }
+            div { class: "section",
+                div { class: "hint", "Applying your requested change…" }
+                button {
+                    class: "btn",
+                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                    "Cancel"
+                }
+            }
         }
     }
 }

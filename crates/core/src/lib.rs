@@ -24,7 +24,9 @@ pub use agent::events::{
 pub use agent::executor::{spawn as spawn_executor, ExecutorConfig, ExecutorHandle};
 pub use agent::handoff::{parse_handoff, Handoff, HANDOFF_INSTRUCTION};
 pub use agent::investigate::{investigate_instruction, INVESTIGATE_INSTRUCTION};
-pub use agent::plan::{parse_plan, plan_instruction, PlanQuestion, PLAN_QUESTIONS_INSTRUCTION};
+pub use agent::plan::{
+    parse_plan, plan_block_malformed, plan_instruction, PlanQuestion, PLAN_QUESTIONS_INSTRUCTION,
+};
 pub use agent::provider::claude::ClaudeProvider;
 pub use agent::provider::codex::CodexProvider;
 pub use agent::provider::sim::SimFactory;
