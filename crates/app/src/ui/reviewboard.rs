@@ -261,6 +261,15 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                         "Review"
                     }
                     button {
+                        class: "btn",
+                        title: "Approve this PR without running the review agent",
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            super::confirm_approve_review(state, id, pr_number);
+                        },
+                        "Approve"
+                    }
+                    button {
                         class: "btn subtle",
                         title: "Dismiss this PR from the review board",
                         onclick: move |e| {

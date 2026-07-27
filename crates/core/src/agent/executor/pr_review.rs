@@ -409,7 +409,13 @@ impl Executor {
         let project = self.store.get_project(task.project_id)?;
         let selected: Vec<DraftComment> = drafts.into_iter().filter(|d| d.selected).collect();
         let n_selected = selected.len();
-        let diff = self.anchoring_diff(&task, &project).await;
+        // A draft-less publish — a direct approve from `ToReview` — has nothing
+        // to anchor, and its PR may never have been fetched at all.
+        let diff = if selected.is_empty() {
+            None
+        } else {
+            self.anchoring_diff(&task, &project).await
+        };
         let (inline, body) = fold_unanchorable(diff.as_ref(), selected, &body);
         let folded = n_selected - inline.len();
         self.forge

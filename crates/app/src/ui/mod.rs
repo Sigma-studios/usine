@@ -106,6 +106,29 @@ fn confirm_publish_review(
     });
 }
 
+/// Approve a PR outright, skipping the review agent — for the PRs the user has
+/// already read and judged fine on their own. Same outward-facing gate as
+/// publishing a drafted review: it's the same POST, just with no comments and
+/// no summary.
+pub(crate) fn confirm_approve_review(state: AppState, review_id: Uuid, pr_number: u64) {
+    confirm_then_send(
+        state,
+        "Approve pull request",
+        format!(
+            "Approve PR #{pr_number} without running a review agent? The approval posts \
+             on the contributor's pull request under your account and can't be undone \
+             from here."
+        ),
+        "Approve",
+        ExecutorCommand::PublishReview {
+            review_id,
+            drafts: Vec::new(),
+            event: ReviewEvent::Approve,
+            body: String::new(),
+        },
+    );
+}
+
 /// Tear down both validation surfaces once a review has been submitted: drop the
 /// edit buffer and close the diff viewer if it's the one that was open on it.
 pub(crate) fn finish_review_validation() {
