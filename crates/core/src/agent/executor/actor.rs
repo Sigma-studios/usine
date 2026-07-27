@@ -285,9 +285,9 @@ async fn finalize_run(
     // rather than advancing an empty branch that looks done. `None` means we
     // couldn't even attempt a commit (no branch, or the worktree was missing so
     // the contamination guard refused) — also "nothing landed".
+    let project = store.get_project(card.project_id)?;
     let committed = if let Some(branch) = card.branch.clone() {
-        let main_repo = store.get_project(card.project_id)?.path;
-        match card.worktree_path.clone().filter(|d| *d != main_repo) {
+        match card.worktree_path.clone().filter(|d| *d != project.path) {
             Some(dir) => {
                 // Prefer the agent's own message (authored in the repo's style).
                 // Fall back to a Conventional-Commits-style default keyed to the
@@ -358,22 +358,55 @@ async fn finalize_run(
     // This is the common "the agent answered in prose without ever editing files"
     // case: `git add -A` finds nothing to stage, `git commit` reports nothing to
     // commit, and without this the card would sail through review to "ready for PR".
+    //
+    // A clean tree is not proof of that for an IMPLEMENT run, though: a retried
+    // run whose earlier attempt already committed the work finds it finished and
+    // — exactly as `resume_extra` instructs — verifies and stops without editing.
+    // Demoting that run re-arms the same retry with the same context: an
+    // unwinnable loop (the fix-run sibling of the one `relaunch` solves by
+    // restoring the fix extra). The branch already carrying commits beyond the
+    // base is what separates the two cases, so only a truly empty branch demotes.
+    // Scoped to implement runs: a fix run's branch is never empty, so this test
+    // would blind the guard there entirely.
     if !committed {
-        let message = "The run finished without changing any files, so nothing was committed to \
-                       the branch. Retry to run it again."
-            .to_string();
-        apply_transition(
-            store,
-            evt_tx,
-            card_id,
-            Transition::AgentError {
-                message: message.clone(),
-            },
-        )?;
-        let _ = evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Warning, message));
-        // The card parked at `Failed` — light-stop the preview this run brought up.
-        reap_idle_preview_direct(executor, card_id);
-        return Ok(());
+        let prior_work = matches!(transition, Transition::AgentImplementDone)
+            && card.branch.is_some()
+            && match card.worktree_path.clone().filter(|d| *d != project.path) {
+                Some(dir) => {
+                    let base = crate::infra::git::remote_tracking_base(
+                        &project.path,
+                        project.config.effective_base_branch(),
+                    );
+                    git.branch_has_commits(&dir, &base).await.unwrap_or(false)
+                }
+                None => false,
+            };
+        if prior_work {
+            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Info,
+                "The run changed no files, but the branch already carries this card's work \
+                 from an earlier attempt — advancing it to review."
+                    .to_string(),
+            ));
+        } else {
+            let message = "The run finished without changing any files, so nothing was \
+                           committed to the branch. Retry to run it again."
+                .to_string();
+            apply_transition(
+                store,
+                evt_tx,
+                card_id,
+                Transition::AgentError {
+                    message: message.clone(),
+                },
+            )?;
+            let _ =
+                evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Warning, message));
+            // The card parked at `Failed` — light-stop the preview this run brought up.
+            reap_idle_preview_direct(executor, card_id);
+            return Ok(());
+        }
     }
 
     // A fix run's commit is real, so the stashed "Fix applied per review
