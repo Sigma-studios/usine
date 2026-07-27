@@ -273,7 +273,6 @@ fn storing_an_empty_hand_off_clears_the_previous_one() {
         summary: "Built it.".into(),
         questions: vec![],
         tests: vec!["Click the button".into()],
-        answers: vec![],
     };
     store.set_handoff(card.id, &handoff).unwrap();
     assert_eq!(store.all_handoffs().unwrap().get(&card.id), Some(&handoff));
