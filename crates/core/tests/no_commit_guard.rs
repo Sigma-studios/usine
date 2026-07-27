@@ -15,6 +15,11 @@
 //! committed: it finds the work finished and (as `resume_extra` instructs)
 //! changes nothing. Demoting it would re-arm the same retry forever, so when
 //! the branch already carries commits beyond the base the run advances instead.
+//!
+//! Fix runs never demote at all: their branch is never empty (the empty-PR
+//! disaster the guard prevents can't happen) and every fix transition lands at
+//! a gate that re-checks the result, so a no-op fix run advances with a warning
+//! — dropping the stashed "Fix applied" QA lines so no false claim survives.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,8 +30,8 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, ExecutorCommand, ExecutorConfig, ExecutorEvent,
-    ExecutorEventKind, GitOps, MergeOutcome, Project, ProjectConfig, Result, SimFactory, SimForge,
-    SimGit, Store,
+    ExecutorEventKind, GitOps, MergeOutcome, Project, ProjectConfig, Result, ReviewSub, SimFactory,
+    SimForge, SimGit, Store,
 };
 
 /// Git that behaves like the simulator, except a commit never lands — the tree
@@ -185,4 +190,75 @@ async fn a_retried_run_whose_branch_already_has_the_work_advances() {
         _ => None,
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_no_op_fix_run_advances_without_claiming_fixes() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-no-commit-guard-fix"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+    store.set_skip_plan(card_id, true).unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(NoCommitGit { prior_work: true }),
+    });
+
+    // Implement (advances via the prior-work rescue), then the self-review pass
+    // lands the card at the fix picker.
+    handle.send(ExecutorCommand::Start { card_id });
+    let verdicts = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => match &c.state {
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {
+                Some(verdicts.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    // Pick a finding; the fix run commits nothing. The card must still reach
+    // ReadyForPr — its branch has the work and the diff there is the re-check —
+    // instead of looping through Failed → Retry → Failed.
+    let verdicts: Vec<_> = verdicts
+        .into_iter()
+        .map(|mut v| {
+            v.selected = true;
+            v
+        })
+        .collect();
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: String::new(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => match &c.state {
+            CardState::AwaitingReview(ReviewSub::ReadyForPr) => Some(()),
+            CardState::Failed { message, .. } if message.contains("without changing any files") => {
+                panic!("a no-op fix run was demoted by the guard")
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    // The stashed "Fix applied" lines were dropped, not logged: the run changed
+    // nothing, so a durable claim that it fixed anything would be false.
+    let qa = store.get_card(card_id).unwrap().qa_log;
+    assert!(
+        !qa.iter().any(|l| l.contains("Fix applied")),
+        "a no-op fix run must not claim it applied fixes: {qa:?}"
+    );
 }
