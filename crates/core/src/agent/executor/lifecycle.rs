@@ -767,50 +767,6 @@ impl Executor {
         });
     }
 
-    /// Record the user's answers to the hand-off's open questions: each
-    /// non-empty (index, answer) pair goes on the restart log (so later
-    /// revise/fix/reset runs see the decision via the qa fold) and onto the
-    /// stored hand-off (so the panel shows the question answered). Answers are
-    /// keyed by question index — matching on text would collapse two
-    /// identically worded questions onto the first. Launches nothing.
-    pub(super) fn record_handoff_answers(
-        &self,
-        card_id: Uuid,
-        answers: Vec<(usize, String)>,
-    ) -> Result<()> {
-        let Some(mut handoff) = self.store.get_handoff(card_id)? else {
-            return Ok(());
-        };
-        handoff
-            .answers
-            .resize(handoff.questions.len(), String::new());
-        let mut changed = false;
-        for (idx, answer) in answers {
-            let answer = answer.trim();
-            if answer.is_empty() {
-                continue;
-            }
-            // An out-of-range index means the stored hand-off changed under the
-            // panel (a new implement run replaced it) — drop the stale answer.
-            let Some(question) = handoff.questions.get(idx).cloned() else {
-                continue;
-            };
-            handoff.answers[idx] = answer.to_string();
-            changed = true;
-            self.record_qa(
-                card_id,
-                format!("Handoff question: {question}\nAnswer: {answer}"),
-            );
-        }
-        if changed {
-            self.store.set_handoff(card_id, &handoff)?;
-            let _ = self
-                .evt_tx
-                .unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
-        }
-        Ok(())
-    }
-
     pub(super) async fn retry(&self, card_id: Uuid) -> Result<()> {
         let card = self.apply(card_id, Transition::Retry)?;
         // Both real CLIs can resume the actual conversation via the session /

@@ -410,9 +410,6 @@ impl Executor {
             ExecutorCommand::AskQuestion { card_id, question } => {
                 self.ask_question(card_id, question).await
             }
-            ExecutorCommand::RecordHandoffAnswers { card_id, answers } => {
-                self.record_handoff_answers(card_id, answers)
-            }
             ExecutorCommand::FollowUpInvestigation { card_id, feedback } => {
                 self.follow_up_investigation(card_id, feedback).await
             }

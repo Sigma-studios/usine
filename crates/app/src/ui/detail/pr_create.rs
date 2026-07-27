@@ -6,7 +6,6 @@
 
 use dioxus::prelude::*;
 use usine_core::{Card, CardState, ExecutorCommand, Handoff, ReviewSub, MAX_VALIDATION_ATTEMPTS};
-use uuid::Uuid;
 
 use crate::state::AppState;
 
@@ -101,7 +100,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
     rsx! {
         if let Some(handoff) = handoff {
-            HandoffPanel { card_id: id, handoff }
+            HandoffPanel { handoff }
         }
 
         if has_branch {
@@ -387,24 +386,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
 /// The implement run's note to whoever reviews it: how the work went, what it
 /// wasn't sure about, and what's worth exercising by hand before the PR. Each
-/// part is omitted when the agent had nothing to say for it. Open questions
-/// take an answer: recording it puts the decision on the restart log (so later
-/// runs see it) and pins it here.
+/// part is omitted when the agent had nothing to say for it. Purely
+/// informative — to weigh in on an open question, use the Agent Chat.
 #[component]
-fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
-    let state = use_context::<AppState>();
-    let n = handoff.questions.len();
-    // One draft slot per still-unanswered question, keyed by index.
-    let mut drafts = use_signal(|| vec![String::new(); n]);
-    let recorded = |i: usize| {
-        handoff
-            .answers
-            .get(i)
-            .map(|a| a.as_str())
-            .filter(|a| !a.trim().is_empty())
-    };
-    let any_draft = drafts.read().iter().any(|d| !d.trim().is_empty());
-
+fn HandoffPanel(handoff: Handoff) -> Element {
     rsx! {
         div { class: "section",
             h3 { "How it went" }
@@ -413,40 +398,9 @@ fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
             }
             if !handoff.questions.is_empty() {
                 div { class: "hint", "Open questions" }
-                for (i, q) in handoff.questions.iter().enumerate() {
-                    div { key: "{i}", class: "question",
-                        div { class: "qtext", "{q}" }
-                        if let Some(answer) = recorded(i) {
-                            div { class: "hint", "Answered: {answer}" }
-                        } else {
-                            input {
-                                placeholder: "Your answer…",
-                                value: "{drafts.read()[i]}",
-                                oninput: move |e| drafts.write()[i] = e.value(),
-                            }
-                        }
-                    }
-                }
-                if handoff.answers.iter().filter(|a| !a.trim().is_empty()).count() < n {
-                    button {
-                        class: "btn",
-                        disabled: !any_draft,
-                        onclick: move |_| {
-                            // Keyed by question index, so identically worded
-                            // questions record their own answers.
-                            let answers: Vec<(usize, String)> = drafts
-                                .read()
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, a)| !a.trim().is_empty())
-                                .map(|(i, a)| (i, a.clone()))
-                                .collect();
-                            if !answers.is_empty() {
-                                state.send(ExecutorCommand::RecordHandoffAnswers { card_id, answers });
-                                drafts.set(vec![String::new(); n]);
-                            }
-                        },
-                        "Record answers"
+                ul { class: "handoff-list",
+                    for (i, q) in handoff.questions.iter().enumerate() {
+                        li { key: "{i}", "{q}" }
                     }
                 }
             }

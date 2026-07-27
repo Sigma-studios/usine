@@ -53,11 +53,6 @@ pub struct Handoff {
     /// Things worth testing by hand, most important first.
     #[serde(default)]
     pub tests: Vec<String>,
-    /// The user's recorded answers, index-aligned with `questions` (empty
-    /// string = not answered yet). Never emitted by the agent — filled in by
-    /// `RecordHandoffAnswers` after the fact, hence the lenient default.
-    #[serde(default)]
-    pub answers: Vec<String>,
 }
 
 impl Handoff {
@@ -77,7 +72,6 @@ pub fn parse_handoff(text: &str) -> Option<Handoff> {
         summary: raw.summary.trim().to_string(),
         questions: trimmed(raw.questions),
         tests: trimmed(raw.tests),
-        answers: Vec::new(),
     };
     (!handoff.is_empty()).then_some(handoff)
 }
