@@ -12,8 +12,8 @@ use futures::StreamExt;
 use state::AppState;
 use toast::ToastHost;
 use ui::{
-    BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost, ProjectSettingsModal,
-    SearchHost, SettingsModal, Sidebar, UsageBar,
+    AdoptDialogHost, BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost,
+    ProjectSettingsModal, SearchHost, SettingsModal, Sidebar, UsageBar,
 };
 
 const CSS: &str = include_str!("style.css");
@@ -312,6 +312,7 @@ fn App() -> Element {
         SearchHost {}
         CardMenuHost {}
         ConfirmHost {}
+        AdoptDialogHost {}
         DiffDialogHost {}
         SettingsModal {}
         ProjectSettingsModal {}

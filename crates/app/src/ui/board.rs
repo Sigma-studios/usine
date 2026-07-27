@@ -85,5 +85,14 @@ fn AddCardButton() -> Element {
             onclick: move |_| state.create_card(target, String::new(), String::new()),
             "+ Add card"
         }
+        button {
+            class: "add-card",
+            onclick: move |_| {
+                // Fetch first so the picker fills as the modal appears.
+                state.fetch_adopt_sources(target);
+                super::adoptdialog::open_adopt_dialog(target);
+            },
+            "⤵ Adopt branch…"
+        }
     }
 }

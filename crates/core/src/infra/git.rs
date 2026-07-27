@@ -213,6 +213,48 @@ pub fn fetch_args(remote: &str) -> Vec<String> {
     vec!["fetch".into(), remote.into()]
 }
 
+/// Every local branch plus every `origin/*` remote-tracking branch, shorthand.
+/// Feeds the adopt-branch picker; `origin/HEAD` (a symref, not a branch) rides
+/// along and is filtered by the caller.
+pub fn list_all_branches_args() -> Vec<String> {
+    vec![
+        "for-each-ref".into(),
+        "--format=%(refname:short)".into(),
+        "refs/heads/".into(),
+        "refs/remotes/origin/".into(),
+    ]
+}
+
+/// The working tree's uncommitted changes to TRACKED files as an applicable
+/// patch (`--binary` so images and the like survive). Untracked files are not
+/// in the diff — see [`untracked_files_args`].
+pub fn uncommitted_patch_args() -> Vec<String> {
+    vec!["diff".into(), "HEAD".into(), "--binary".into()]
+}
+
+/// Apply a patch file produced by [`uncommitted_patch_args`] onto the working
+/// tree. `--whitespace=nowarn`: adopted changes are applied verbatim, not
+/// reviewed for hygiene.
+pub fn apply_patch_args(patch_file: &str) -> Vec<String> {
+    vec![
+        "apply".into(),
+        "--whitespace=nowarn".into(),
+        patch_file.into(),
+    ]
+}
+
+/// The working tree's untracked (and not ignored) files, NUL-separated. `-z`
+/// so paths come out raw — without it, `core.quotePath` C-quotes any non-ASCII
+/// filename and the quoted string no longer names a real file.
+pub fn untracked_files_args() -> Vec<String> {
+    vec![
+        "ls-files".into(),
+        "--others".into(),
+        "--exclude-standard".into(),
+        "-z".into(),
+    ]
+}
+
 /// Merge `gitref` into the checked-out branch. `--no-edit` keeps git from
 /// opening an editor for the merge commit message.
 pub fn merge_args(gitref: &str) -> Vec<String> {
@@ -267,6 +309,27 @@ pub trait GitOps: Send + Sync {
     /// model refs (the simulator, test doubles) report none; callers must read
     /// an empty list as "no information", never as "the repo has no branches".
     async fn local_branches(&self, _dir: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Every local branch plus every `origin/*` remote-tracking branch. Same
+    /// "empty means no information" contract as [`Self::local_branches`].
+    async fn list_all_branches(&self, _dir: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// The working tree's uncommitted changes to tracked files, as a `--binary`
+    /// patch (empty when clean). Raw bytes, not a `String` — a text diff of a
+    /// non-UTF-8 file must survive the round-trip byte-for-byte or `git apply`
+    /// rejects it. Backends that don't model a working tree report an empty
+    /// patch.
+    async fn uncommitted_patch(&self, _dir: &Path) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    /// Apply a patch from [`Self::uncommitted_patch`] onto `dir`'s working tree.
+    async fn apply_patch(&self, _dir: &Path, _patch: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    /// The working tree's untracked (not ignored) files, repo-relative.
+    async fn untracked_files(&self, _dir: &Path) -> Result<Vec<PathBuf>> {
         Ok(Vec::new())
     }
     /// Force-delete a local branch. The branch must not be checked out anywhere
@@ -362,6 +425,40 @@ impl GitOps for RealGit {
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(str::to_string)
+            .collect())
+    }
+
+    async fn list_all_branches(&self, dir: &Path) -> Result<Vec<String>> {
+        Ok(run_git(dir, &list_all_branches_args())
+            .await?
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn uncommitted_patch(&self, dir: &Path) -> Result<Vec<u8>> {
+        run_git_bytes(dir, &uncommitted_patch_args()).await
+    }
+
+    async fn apply_patch(&self, dir: &Path, patch: &[u8]) -> Result<()> {
+        // `run_git` has no stdin plumbing, so the patch goes through a temp
+        // file — outside the worktree, so `git add -A` can never sweep the
+        // patch file itself onto the branch.
+        let file = std::env::temp_dir().join(format!("usine-{}.patch", uuid::Uuid::new_v4()));
+        std::fs::write(&file, patch)?;
+        let out = run_git(dir, &apply_patch_args(&file.to_string_lossy())).await;
+        let _ = std::fs::remove_file(&file);
+        out.map(|_| ())
+    }
+
+    async fn untracked_files(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let out = run_git_bytes(dir, &untracked_files_args()).await?;
+        Ok(out
+            .split(|b| *b == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(path_from_bytes)
             .collect())
     }
 
@@ -494,6 +591,13 @@ impl GitOps for SimGit {
 }
 
 async fn run_git(cwd: &Path, args: &[String]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&run_git_bytes(cwd, args).await?).to_string())
+}
+
+/// Like [`run_git`], but hands back stdout untouched — for output that must
+/// stay byte-exact (patches, `-z` path listings), where a lossy UTF-8 pass
+/// would corrupt non-UTF-8 content.
+async fn run_git_bytes(cwd: &Path, args: &[String]) -> Result<Vec<u8>> {
     let out = timeout(
         GIT_TIMEOUT,
         Command::new("git").current_dir(cwd).args(args).output(),
@@ -513,7 +617,21 @@ async fn run_git(cwd: &Path, args: &[String]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(out.stdout)
+}
+
+/// A repo-relative path from git's raw (`-z`) output bytes. On Unix, paths are
+/// bytes and convert losslessly; elsewhere fall back to lossy UTF-8.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).to_string())
+    }
 }
 
 // --- read-only inspection (git2) -------------------------------------------
@@ -582,6 +700,70 @@ pub fn merge_base(repo: &Path, base: &str, head: &str) -> Result<String> {
     let base_oid = resolve_oid(&r, base)?;
     let head_oid = resolve_oid(&r, head)?;
     Ok(r.merge_base(base_oid, head_oid)?.to_string())
+}
+
+/// The subjects of the commits on `head` since its merge base with `base`,
+/// newest first. Empty when `head` sits on (or behind) `base` — the signal the
+/// adopt flow uses to refuse an empty adoption. Both names tolerate bare branch
+/// names that only exist as `origin/<name>` (see [`resolve_oid`]).
+pub fn log_subjects(repo: &Path, base: &str, head: &str) -> Result<Vec<String>> {
+    let r = git2::Repository::open(repo)?;
+    let base_oid = resolve_oid(&r, base)?;
+    let head_oid = resolve_oid(&r, head)?;
+    let fork = r.merge_base(base_oid, head_oid)?;
+    let mut walk = r.revwalk()?;
+    walk.push(head_oid)?;
+    walk.hide(fork)?;
+    let mut subjects = Vec::new();
+    for oid in walk {
+        let commit = r.find_commit(oid?)?;
+        subjects.push(
+            commit
+                .summary()
+                .ok()
+                .flatten()
+                .unwrap_or("(no message)")
+                .to_string(),
+        );
+    }
+    Ok(subjects)
+}
+
+/// The working tree that has local `branch` checked out — the main checkout or
+/// any linked worktree — or `None` when nothing does (or the branch is
+/// remote-only). Pairs with [`is_dirty`] for the adopt flow's dirty probe, and
+/// tells retire-original that deleting would fail.
+pub fn checkout_of_branch(repo: &Path, branch: &str) -> Option<PathBuf> {
+    let r = git2::Repository::open(repo).ok()?;
+    let refname = format!("refs/heads/{branch}");
+    let head_is_branch = |repo: &git2::Repository| {
+        repo.head()
+            .ok()
+            .and_then(|h| h.name().ok().map(|n| n == refname))
+            .unwrap_or(false)
+    };
+    if head_is_branch(&r) {
+        return r.workdir().map(Path::to_path_buf);
+    }
+    for name in r.worktrees().ok()?.iter().flatten().flatten() {
+        let Ok(wt) = r.find_worktree(name) else {
+            continue;
+        };
+        if let Ok(wr) = git2::Repository::open(wt.path()) {
+            if head_is_branch(&wr) {
+                return Some(wt.path().to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+/// Whether `name` resolves to a commit in the repo (tolerating bare branch
+/// names that only exist as `origin/<name>`).
+pub fn commitish_exists(repo: &Path, name: &str) -> bool {
+    git2::Repository::open(repo)
+        .ok()
+        .is_some_and(|r| resolve_oid(&r, name).is_ok())
 }
 
 /// Whether the working tree has uncommitted changes — matching exactly what
@@ -831,6 +1013,46 @@ mod tests {
         assert_eq!(args[0], "fetch");
         assert_eq!(args[1], "origin");
         assert_eq!(args[2], "+pull/42/head:usine-review/42");
+    }
+
+    /// The picker's listing must cover remote-tracking branches too — a branch
+    /// pushed from another machine has no local ref to adopt from.
+    #[test]
+    fn list_all_branches_covers_local_and_origin() {
+        assert_eq!(
+            list_all_branches_args(),
+            vec![
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/",
+                "refs/remotes/origin/"
+            ]
+        );
+    }
+
+    /// `--binary` so an adopted image/asset change survives the patch round-trip.
+    #[test]
+    fn uncommitted_patch_is_binary_safe() {
+        assert_eq!(uncommitted_patch_args(), vec!["diff", "HEAD", "--binary"]);
+    }
+
+    #[test]
+    fn apply_patch_is_well_formed() {
+        assert_eq!(
+            apply_patch_args("/tmp/x.patch"),
+            vec!["apply", "--whitespace=nowarn", "/tmp/x.patch"]
+        );
+    }
+
+    /// `--exclude-standard` keeps ignored files (build output, node_modules)
+    /// out of an adopted dirty snapshot; `-z` keeps non-ASCII paths from being
+    /// C-quoted by `core.quotePath`.
+    #[test]
+    fn untracked_files_respects_ignores() {
+        assert_eq!(
+            untracked_files_args(),
+            vec!["ls-files", "--others", "--exclude-standard", "-z"]
+        );
     }
 
     #[test]

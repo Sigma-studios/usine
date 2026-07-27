@@ -232,6 +232,18 @@ pub fn pr_view_args(head: &str) -> Vec<String> {
     ]
 }
 
+/// The open PR (if any) whose head is `head` — the adopt dialog's "this branch
+/// already has a PR" warning. `--json` fields cover a displayable [`PrInfo`].
+pub fn pr_for_head_args(head: &str) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        head.into(),
+        "--json".into(),
+        "number,url,title,state".into(),
+    ]
+}
+
 /// Open PRs authored by any of `authors` that the current user hasn't yet
 /// reviewed. `author:` qualifiers OR together; `-reviewed-by:@me` is how "PRs I
 /// haven't reviewed" is expressed; drafts are excluded. Scoped to the current
@@ -644,6 +656,14 @@ pub trait Forge: Send + Sync {
     async fn failed_run_log(&self, _repo: &Path, _run_id: u64) -> Result<String> {
         Ok(String::new())
     }
+
+    /// The open PR whose head branch is `head`, if one exists. Best-effort
+    /// dialog context (the adopt probe's "open PR" warning): "no PR" and "can't
+    /// tell" both come back `None`, so forges that don't model it — the sim,
+    /// test doubles — need no override.
+    async fn pr_for_head(&self, _repo: &Path, _head: &str) -> Result<Option<PrInfo>> {
+        Ok(None)
+    }
 }
 
 /// Real GitHub forge via the `gh` CLI.
@@ -921,6 +941,39 @@ impl Forge for GhForge {
 
     async fn failed_run_log(&self, repo: &Path, run_id: u64) -> Result<String> {
         run_gh(repo, &run_log_args(run_id)).await
+    }
+
+    async fn pr_for_head(&self, repo: &Path, head: &str) -> Result<Option<PrInfo>> {
+        // `gh pr view <branch>` exits non-zero when the branch has no PR — the
+        // common case here, folded into `None` along with genuine failures
+        // (offline, unauthed): the caller only wants a best-effort warning.
+        let Ok(json) = run_gh(repo, &pr_for_head_args(head)).await else {
+            return Ok(None);
+        };
+        let v: Value = serde_json::from_str(&json)?;
+        let number = v.get("number").and_then(Value::as_u64).unwrap_or(0);
+        if number == 0 {
+            return Ok(None);
+        }
+        let text = |key: &str| {
+            v.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        // A closed/merged PR is history, not a conflict worth warning about.
+        let state = text("state");
+        if !state.eq_ignore_ascii_case("open") {
+            return Ok(None);
+        }
+        Ok(Some(PrInfo {
+            number,
+            url: text("url"),
+            title: text("title"),
+            state: state.to_lowercase(),
+            reviewer: None,
+            reviewer_recorded: false,
+        }))
     }
 }
 
