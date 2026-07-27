@@ -98,6 +98,9 @@ pub fn CardView(card: Card) -> Element {
     // Surface the PR from the board itself — until now only the detail panel
     // showed it, while the review board already prefixes its cards with #N.
     let pr_link = card.pr.as_ref().map(|p| (p.number, p.url.clone()));
+    // Who approved the PR, for the badge tooltip. Empty = no approval landed,
+    // no badge.
+    let approved_by = card.approved_by().join(", ");
     // The worktree holds committed, reviewable work from just-implemented through
     // PR review until merge. "Show diff" lives in the card actions menu; the
     // preview controls sit inline on the card and need a run command configured.
@@ -259,6 +262,15 @@ pub fn CardView(card: Card) -> Element {
                         class: "badge {card.checks.css_class()}",
                         title: "{card.checks.label()}",
                         "{card.checks.glyph()} CI"
+                    }
+                }
+                // A standing approval on the PR — the fact that carries a card
+                // to the merge gate, so it's worth seeing from the board.
+                if card.pr.is_some() && !approved_by.is_empty() {
+                    span {
+                        class: "badge approved",
+                        title: "Approved by {approved_by}",
+                        "✓ approved"
                     }
                 }
             }

@@ -162,6 +162,9 @@ fn CardPanel(card: Card) -> Element {
     // The PR's CI state as of the last poll/refresh; the executor re-reads it
     // authoritatively when a merge is actually requested.
     let checks = card.checks;
+    // Who approved the PR (same poll keeps it fresh) — restated at the merge
+    // gate so the approval that made the card mergeable stays visible.
+    let approved_by = card.approved_by().join(", ");
     let recap = state.review_recaps.read().get(&id).cloned();
     let fail_msg = if let CardState::Failed { message, .. } = &card.state {
         Some(message.clone())
@@ -304,12 +307,21 @@ fn CardPanel(card: Card) -> Element {
                         "Mark ready for review"
                     }
                 } else {
-                    if checks.is_reportable() {
+                    if !approved_by.is_empty() || checks.is_reportable() {
                         div { class: "card-meta",
-                            span {
-                                class: "badge {checks.css_class()}",
-                                title: "{checks.label()}",
-                                "{checks.glyph()} CI"
+                            if !approved_by.is_empty() {
+                                span {
+                                    class: "badge approved",
+                                    title: "An approving review has been submitted on the PR",
+                                    "✓ Approved by {approved_by}"
+                                }
+                            }
+                            if checks.is_reportable() {
+                                span {
+                                    class: "badge {checks.css_class()}",
+                                    title: "{checks.label()}",
+                                    "{checks.glyph()} CI"
+                                }
                             }
                         }
                     }

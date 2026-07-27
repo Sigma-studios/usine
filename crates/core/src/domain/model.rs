@@ -1290,6 +1290,20 @@ impl Card {
             && !self.reviews.iter().any(ReviewSummary::requests_changes)
     }
 
+    /// The reviewers whose latest review approves this card's PR.
+    /// `latestReviews` keeps one verdict per reviewer, so this is the set of
+    /// standing approvals — what the board badge and the merge panel restate,
+    /// so the approval that carried the card to the merge gate stays visible
+    /// there. Empty when none has landed (including the no-reviewer route to
+    /// `ReadyToMerge`).
+    pub fn approved_by(&self) -> Vec<&str> {
+        self.reviews
+            .iter()
+            .filter(|r| r.is_approved())
+            .map(|r| r.author.as_str())
+            .collect()
+    }
+
     /// Whether a PR with no reviewer to wait on can go straight to the merge
     /// gate. A project without a configured reviewer opens PRs nobody is asked
     /// to review: no approval will ever land, so [`Self::approval_clears_merge`]
