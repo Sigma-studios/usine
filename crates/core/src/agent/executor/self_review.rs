@@ -99,6 +99,9 @@ impl Executor {
         // Isolate before the running-state transition, so a failure (e.g. a dirty
         // main repo) leaves the card recoverable in the fix picker.
         self.ensure_branch_worktree(card_id).await?;
+        // Stash the task before entering the running state, so a retry of a
+        // faulted run can restate it (see `relaunch`).
+        self.store.set_fix_extra(card_id, Some(&extra))?;
         let card = self.apply(card_id, Transition::ApplySelfFixes)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
