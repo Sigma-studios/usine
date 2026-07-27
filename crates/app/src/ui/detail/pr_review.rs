@@ -109,7 +109,8 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
             }
         }
         // Cancelling any of the three running PR-review phases returns the
-        // card to the idle PR gate.
+        // card to the idle PR gate; a cancelled write run's half-applied edits
+        // are discarded by the executor so they can't ride the next fix commit.
         if is_fetching {
             div { class: "section",
                 div { class: "hint", "Triaging review comments…" }

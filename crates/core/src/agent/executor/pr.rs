@@ -282,14 +282,15 @@ impl Executor {
             return Ok(());
         }
         // Keep the note so a later "back to start" folds it into the prompt,
-        // just like a post-PR change request — and the checked comments, so
-        // the log carries what was actually fixed, one bounded line each.
+        // just like a post-PR change request. The checked comments are only
+        // STASHED here: their "Fix applied" lines go on the log when the run
+        // lands its commit (see `finalize_run`), not at launch — a cancelled
+        // or faulted run must not leave a durable claim that it fixed anything.
         if !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
         }
-        for v in &checked {
-            self.record_qa(card_id, fixed_comment_qa(v));
-        }
+        let fix_qa: Vec<String> = checked.iter().map(fixed_comment_qa).collect();
+        self.store.set_pending_fix_qa(card_id, &fix_qa)?;
         // Remember which comments this run addresses so their GitHub review
         // threads can be marked resolved once the fix lands (see `finalize_run`,
         // which emits `ResolveFixedComments` on completion). A note-only run has

@@ -376,6 +376,22 @@ async fn finalize_run(
         return Ok(());
     }
 
+    // A fix run's commit is real, so the stashed "Fix applied per review
+    // comment" lines are now true — put them on the restart log. Stashed (not
+    // recorded) at launch by `apply_fixes` / `apply_self_fixes`, so a run that
+    // never lands leaves no false claim behind; a faulted run keeps its stash
+    // for a retry. Keyed off the transition so an implement run can't sweep up
+    // a stale stash.
+    if !matches!(transition, Transition::AgentImplementDone) {
+        let fix_qa = store.take_pending_fix_qa(card_id).unwrap_or_default();
+        if !fix_qa.is_empty() {
+            let _ = store.mutate_card(card_id, |c| {
+                c.qa_log.extend(fix_qa.iter().cloned());
+                Ok(())
+            });
+        }
+    }
+
     // For display, drop the machine-facing blocks the agent appended.
     let summary = crate::agent::handoff::strip_handoff_block(
         &crate::agent::commit::strip_commit_block(&result_text),

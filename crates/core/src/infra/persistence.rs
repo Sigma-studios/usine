@@ -174,6 +174,12 @@ struct CardReviewRecord {
     /// keeps older records loadable.
     #[serde(default)]
     handoff: String,
+    /// Restart-log lines describing the fixes a launched fix run set out to
+    /// apply, stashed until the run lands a commit — recording them up front
+    /// would leave a durable "fix applied" claim behind a run that was
+    /// cancelled or died. `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pending_qa: Vec<String>,
 }
 
 /// The extra context of the current investigation round: the follow-up prompt
@@ -936,6 +942,27 @@ impl Store {
             self.mutate_review(card_id, |r| r.pending_resolve = Vec::new())?;
         }
         Ok(ids)
+    }
+
+    /// Stash the restart-log lines a fix run will earn *if it lands* ("Fix
+    /// applied per review comment: …"), so they go on the log only once the
+    /// run's commit is real (see [`Self::take_pending_fix_qa`]). Overwrites the
+    /// previous stash — each fix run states its own set.
+    pub fn set_pending_fix_qa(&self, card_id: Uuid, entries: &[String]) -> Result<()> {
+        self.mutate_review(card_id, |r| r.pending_qa = entries.to_vec())
+    }
+
+    /// Read and clear the stashed fix-run log lines. Cleared on read so they
+    /// land on the log exactly once; a run that never commits leaves them for
+    /// its retry (a cancel clears them explicitly).
+    pub fn take_pending_fix_qa(&self, card_id: Uuid) -> Result<Vec<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardReviewRecord> = r.get().primary(card_id.to_string())?;
+        let entries = rec.map(|r| r.pending_qa).unwrap_or_default();
+        if !entries.is_empty() {
+            self.mutate_review(card_id, |r| r.pending_qa = Vec::new())?;
+        }
+        Ok(entries)
     }
 
     // --- review tasks (foreign PRs under review) ------------------------

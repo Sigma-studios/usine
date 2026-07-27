@@ -282,6 +282,12 @@ pub trait GitOps: Send + Sync {
     /// if there was nothing to commit (a clean tree) — the caller uses this to
     /// tell "the run produced work" from "the run changed nothing".
     async fn commit_all(&self, dir: &Path, message: &str) -> Result<bool>;
+    /// Discard every uncommitted change in `dir` — tracked edits (`git reset
+    /// --hard`) and untracked files (`git clean -fd`) — returning the tree to
+    /// HEAD. Backends that don't model working-tree state treat it as a no-op.
+    async fn discard_changes(&self, _dir: &Path) -> Result<()> {
+        Ok(())
+    }
     /// Push `branch` to `origin`, setting upstream.
     async fn push(&self, dir: &Path, branch: &str) -> Result<()>;
 }
@@ -437,6 +443,13 @@ impl GitOps for RealGit {
             "git commit failed: {}",
             stderr.trim()
         )))
+    }
+
+    async fn discard_changes(&self, dir: &Path) -> Result<()> {
+        run_git(dir, &["reset".into(), "--hard".into()]).await?;
+        run_git(dir, &["clean".into(), "-fd".into()])
+            .await
+            .map(|_| ())
     }
 
     async fn push(&self, dir: &Path, branch: &str) -> Result<()> {

@@ -123,12 +123,13 @@ pub enum ExecutorCommand {
     /// state it was asked from; the answer arrives via `AnswerUpdated`.
     AskQuestion { card_id: Uuid, question: String },
     /// Record the user's answers to the hand-off's open questions: each
-    /// non-empty (question, answer) pair lands on the card's restart log (so
-    /// later runs see the decision) and on the stored hand-off (so the panel
-    /// shows it answered). No run is launched.
+    /// non-empty (question index, answer) pair lands on the card's restart log
+    /// (so later runs see the decision) and on the stored hand-off (so the
+    /// panel shows it answered). Matched by INDEX, not question text, so two
+    /// identically worded questions stay distinct. No run is launched.
     RecordHandoffAnswers {
         card_id: Uuid,
-        answers: Vec<(String, String)>,
+        answers: Vec<(usize, String)>,
     },
     /// From `Concluded`: dig deeper — re-run the investigation with the prior
     /// conclusion, the earlier rounds, and this follow-up as context (the

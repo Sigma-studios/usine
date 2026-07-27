@@ -404,7 +404,6 @@ fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
             .filter(|a| !a.trim().is_empty())
     };
     let any_draft = drafts.read().iter().any(|d| !d.trim().is_empty());
-    let questions = handoff.questions.clone();
 
     rsx! {
         div { class: "section",
@@ -433,11 +432,14 @@ fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
                         class: "btn",
                         disabled: !any_draft,
                         onclick: move |_| {
-                            let answers: Vec<(String, String)> = questions
+                            // Keyed by question index, so identically worded
+                            // questions record their own answers.
+                            let answers: Vec<(usize, String)> = drafts
+                                .read()
                                 .iter()
-                                .cloned()
-                                .zip(drafts.read().iter().cloned())
+                                .enumerate()
                                 .filter(|(_, a)| !a.trim().is_empty())
+                                .map(|(i, a)| (i, a.clone()))
                                 .collect();
                             if !answers.is_empty() {
                                 state.send(ExecutorCommand::RecordHandoffAnswers { card_id, answers });
