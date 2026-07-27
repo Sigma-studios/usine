@@ -15,7 +15,9 @@
 use std::collections::HashSet;
 
 use crate::agent::events::{AdoptProbe, DirtyAction};
-use crate::infra::git::{checkout_of_branch, commitish_exists, is_dirty, log_subjects};
+use crate::infra::git::{
+    checkout_of_branch, commitish_exists, is_dirty, log_subjects, remote_tracking_base,
+};
 
 use super::*;
 
@@ -49,8 +51,18 @@ impl Executor {
         let mut dirty_checkout = None;
         let mut open_pr = None;
         if refusal.is_none() {
-            let base = project.config.effective_base_branch();
-            subjects = log_subjects(&project.path, base, &source_ref).unwrap_or_default();
+            // Fetch so the remote-tracking base the count runs against is
+            // current — the probe must predict what adoption will compute.
+            // Non-fatal: offline, the tracking ref is merely stale.
+            if let Err(e) = self.git.fetch(&project.path, "origin").await {
+                tracing::warn!("probe {source_ref}: fetching origin failed: {e}");
+            }
+            // `origin/<base>` when it exists, never the user's local base: the
+            // local one can sit far behind the remote, and counting against it
+            // inflates commits-ahead with everything merged since their last
+            // pull — the same rule the card's diff uses (see `diff.rs`).
+            let base = remote_tracking_base(&project.path, project.config.effective_base_branch());
+            subjects = log_subjects(&project.path, &base, &source_ref).unwrap_or_default();
             let local = local_name(&source_ref);
             if let Some(path) = checkout_of_branch(&project.path, local) {
                 if is_dirty(&path).await.unwrap_or(false) {
@@ -108,7 +120,11 @@ impl Executor {
                  review and fix agents read as the statement of intent",
             ));
         }
-        let base = project.config.effective_base_branch();
+        // Diffed against `origin/<base>` (freshly fetched above) when it
+        // exists, matching the probe and the card's own diff: a stale local
+        // base would let a branch fully merged into the remote base pass the
+        // empty-adoption guard below.
+        let base = remote_tracking_base(&project.path, project.config.effective_base_branch());
         let local = local_name(&source_ref).to_string();
         let local_exists = self
             .git
@@ -132,7 +148,7 @@ impl Executor {
         // Refuse an empty adoption: with nothing beyond the base and nothing
         // dirty to fold in, the card's diff — what self-review reviews and the
         // PR ships — would be empty.
-        let subjects = log_subjects(&project.path, base, &cut_point).unwrap_or_default();
+        let subjects = log_subjects(&project.path, &base, &cut_point).unwrap_or_default();
         if subjects.is_empty() && !include_dirty {
             return Err(CoreError::other(format!(
                 "`{source_ref}` has no commits beyond `{base}` and no uncommitted changes \
@@ -202,23 +218,34 @@ impl Executor {
             }
         }
 
-        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
-            card.id,
-            Severity::Success,
-            format!("Adopted `{source_ref}` — self-review running"),
-        ));
         // Start the self-review under the card's exclusive claim, exactly like
         // the post-implement auto-start (`start_self_review_direct`): this
         // project-scoped command never claimed the (brand-new) card, and the
         // claim guards the launch window against a concurrent user command.
+        // The success toast waits until the launch outcome is known, so it
+        // never claims "running" for a card that ends up parked or failed.
+        let adopted = |detail: &str| {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card.id,
+                Severity::Success,
+                format!("Adopted `{source_ref}`{detail}"),
+            ));
+        };
         let Some(_guard) = claim(&self.in_flight, &self.evt_tx, card.id) else {
+            adopted("");
             return Ok(());
         };
         match self.self_review(card.id).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                adopted(" — self-review running");
+                Ok(())
+            }
             // A user command got there first — their choice stands; the card
             // rests at `ReadyForReview` with the manual buttons.
-            Err(CoreError::IllegalTransition(_)) => Ok(()),
+            Err(CoreError::IllegalTransition(_)) => {
+                adopted("");
+                Ok(())
+            }
             // A failed launch already demoted the card to Failed (retryable);
             // surface the error without undoing the adoption — the work is on
             // the card's branch now.
@@ -226,7 +253,7 @@ impl Executor {
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                     card.id,
                     Severity::Error,
-                    e.to_string(),
+                    format!("Adopted `{source_ref}`, but self-review failed to start: {e}"),
                 ));
                 Ok(())
             }
@@ -243,15 +270,29 @@ impl Executor {
         source_ref: &str,
     ) -> Result<()> {
         let patch = self.git.uncommitted_patch(checkout).await?;
-        if !patch.trim().is_empty() {
+        if !patch.iter().all(u8::is_ascii_whitespace) {
             self.git.apply_patch(worktree, &patch).await?;
         }
         for rel in self.git.untracked_files(checkout).await? {
+            let src = checkout.join(&rel);
             let dest = worktree.join(&rel);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(checkout.join(&rel), &dest)?;
+            // Recreate a symlink as a symlink: `fs::copy` follows links, which
+            // would materialize the target as a file (or fail on a dangling
+            // link) instead of carrying the link itself onto the card branch.
+            if std::fs::symlink_metadata(&src)?.file_type().is_symlink() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dest)?;
+                #[cfg(not(unix))]
+                return Err(CoreError::other(format!(
+                    "cannot include symlink `{}` on this platform",
+                    rel.display()
+                )));
+            } else {
+                std::fs::copy(&src, &dest)?;
+            }
         }
         self.git
             .commit_all(

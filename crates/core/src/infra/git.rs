@@ -243,12 +243,15 @@ pub fn apply_patch_args(patch_file: &str) -> Vec<String> {
     ]
 }
 
-/// The working tree's untracked (and not ignored) files, one path per line.
+/// The working tree's untracked (and not ignored) files, NUL-separated. `-z`
+/// so paths come out raw — without it, `core.quotePath` C-quotes any non-ASCII
+/// filename and the quoted string no longer names a real file.
 pub fn untracked_files_args() -> Vec<String> {
     vec![
         "ls-files".into(),
         "--others".into(),
         "--exclude-standard".into(),
+        "-z".into(),
     ]
 }
 
@@ -314,17 +317,19 @@ pub trait GitOps: Send + Sync {
         Ok(Vec::new())
     }
     /// The working tree's uncommitted changes to tracked files, as a `--binary`
-    /// patch (empty when clean). Backends that don't model a working tree
-    /// report an empty patch.
-    async fn uncommitted_patch(&self, _dir: &Path) -> Result<String> {
-        Ok(String::new())
+    /// patch (empty when clean). Raw bytes, not a `String` — a text diff of a
+    /// non-UTF-8 file must survive the round-trip byte-for-byte or `git apply`
+    /// rejects it. Backends that don't model a working tree report an empty
+    /// patch.
+    async fn uncommitted_patch(&self, _dir: &Path) -> Result<Vec<u8>> {
+        Ok(Vec::new())
     }
     /// Apply a patch from [`Self::uncommitted_patch`] onto `dir`'s working tree.
-    async fn apply_patch(&self, _dir: &Path, _patch: &str) -> Result<()> {
+    async fn apply_patch(&self, _dir: &Path, _patch: &[u8]) -> Result<()> {
         Ok(())
     }
     /// The working tree's untracked (not ignored) files, repo-relative.
-    async fn untracked_files(&self, _dir: &Path) -> Result<Vec<String>> {
+    async fn untracked_files(&self, _dir: &Path) -> Result<Vec<PathBuf>> {
         Ok(Vec::new())
     }
     /// Force-delete a local branch. The branch must not be checked out anywhere
@@ -433,11 +438,11 @@ impl GitOps for RealGit {
             .collect())
     }
 
-    async fn uncommitted_patch(&self, dir: &Path) -> Result<String> {
-        run_git(dir, &uncommitted_patch_args()).await
+    async fn uncommitted_patch(&self, dir: &Path) -> Result<Vec<u8>> {
+        run_git_bytes(dir, &uncommitted_patch_args()).await
     }
 
-    async fn apply_patch(&self, dir: &Path, patch: &str) -> Result<()> {
+    async fn apply_patch(&self, dir: &Path, patch: &[u8]) -> Result<()> {
         // `run_git` has no stdin plumbing, so the patch goes through a temp
         // file — outside the worktree, so `git add -A` can never sweep the
         // patch file itself onto the branch.
@@ -448,13 +453,12 @@ impl GitOps for RealGit {
         out.map(|_| ())
     }
 
-    async fn untracked_files(&self, dir: &Path) -> Result<Vec<String>> {
-        Ok(run_git(dir, &untracked_files_args())
-            .await?
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
+    async fn untracked_files(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        let out = run_git_bytes(dir, &untracked_files_args()).await?;
+        Ok(out
+            .split(|b| *b == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(path_from_bytes)
             .collect())
     }
 
@@ -587,6 +591,13 @@ impl GitOps for SimGit {
 }
 
 async fn run_git(cwd: &Path, args: &[String]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&run_git_bytes(cwd, args).await?).to_string())
+}
+
+/// Like [`run_git`], but hands back stdout untouched — for output that must
+/// stay byte-exact (patches, `-z` path listings), where a lossy UTF-8 pass
+/// would corrupt non-UTF-8 content.
+async fn run_git_bytes(cwd: &Path, args: &[String]) -> Result<Vec<u8>> {
     let out = timeout(
         GIT_TIMEOUT,
         Command::new("git").current_dir(cwd).args(args).output(),
@@ -606,7 +617,21 @@ async fn run_git(cwd: &Path, args: &[String]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(out.stdout)
+}
+
+/// A repo-relative path from git's raw (`-z`) output bytes. On Unix, paths are
+/// bytes and convert losslessly; elsewhere fall back to lossy UTF-8.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).to_string())
+    }
 }
 
 // --- read-only inspection (git2) -------------------------------------------
@@ -1020,12 +1045,13 @@ mod tests {
     }
 
     /// `--exclude-standard` keeps ignored files (build output, node_modules)
-    /// out of an adopted dirty snapshot.
+    /// out of an adopted dirty snapshot; `-z` keeps non-ASCII paths from being
+    /// C-quoted by `core.quotePath`.
     #[test]
     fn untracked_files_respects_ignores() {
         assert_eq!(
             untracked_files_args(),
-            vec!["ls-files", "--others", "--exclude-standard"]
+            vec!["ls-files", "--others", "--exclude-standard", "-z"]
         );
     }
 

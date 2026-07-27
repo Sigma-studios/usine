@@ -305,6 +305,109 @@ async fn dirty_include_copies_and_leaves_the_checkout_untouched() {
     assert!(!feature_log.contains("Adopt uncommitted changes"));
 }
 
+/// The empty-adoption guard counts against `origin/<base>`, not the user's
+/// (possibly stale) local base: a branch fully merged into the remote base has
+/// nothing left to adopt, even when the local base hasn't been pulled and
+/// still shows it as ahead.
+#[tokio::test]
+async fn a_branch_merged_into_the_remote_base_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repo_with_feature(tmp.path());
+    // `feature` becomes origin's `dev` tip — merged remotely — while the local
+    // `dev` stays a commit behind, as after someone else pressed the merge
+    // button and the user never pulled.
+    let origin = tmp.path().join("origin.git");
+    git(
+        tmp.path(),
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "feature:dev", "feature"]);
+    let (store, project_id, handle, mut rx) = executor_for(&repo);
+
+    handle.send(adopt_cmd(project_id, "feature", DirtyAction::Ignore));
+
+    let msg = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Error,
+            message,
+        } => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        msg.contains("nothing to adopt"),
+        "a remotely merged branch must be refused, got: {msg}"
+    );
+    assert!(store.list_cards().unwrap().is_empty(), "no card created");
+}
+
+/// The dirty snapshot survives the awkward cases byte-for-byte: an accented
+/// untracked filename (C-quoted by `core.quotePath` unless listed with `-z`),
+/// non-UTF-8 file content in the tracked patch, and untracked symlinks —
+/// valid ones stay symlinks (never materialized copies), dangling ones don't
+/// abort the adoption.
+#[tokio::test]
+async fn dirty_include_survives_symlinks_and_non_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repo_with_feature(tmp.path());
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "feature"],
+    );
+    // Tracked non-UTF-8 (Latin-1) content, edited in the checkout.
+    std::fs::write(wt.join("latin1.txt"), b"caf\xe9\n").unwrap();
+    git(&wt, &["add", "latin1.txt"]);
+    git(&wt, &["commit", "-qm", "latin1 file"]);
+    std::fs::write(wt.join("latin1.txt"), b"caf\xe9 edited\n").unwrap();
+    // Untracked accented filename, valid symlink, dangling symlink.
+    std::fs::write(wt.join("café.txt"), "accent").unwrap();
+    std::os::unix::fs::symlink("feat.txt", wt.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("missing.txt", wt.join("dangling.txt")).unwrap();
+    let (_store, project_id, handle, mut rx) = executor_for(&repo);
+
+    handle.send(adopt_cmd(project_id, "feature", DirtyAction::Include));
+
+    let card = wait_for_state(&mut rx, |c| {
+        matches!(
+            c.state,
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+        )
+    })
+    .await;
+    let card_wt = card.worktree_path.clone().unwrap();
+    assert_eq!(
+        std::fs::read(card_wt.join("latin1.txt")).unwrap(),
+        b"caf\xe9 edited\n",
+        "non-UTF-8 patch content must survive byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read_to_string(card_wt.join("café.txt")).unwrap(),
+        "accent"
+    );
+    let link = card_wt.join("link.txt");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a valid symlink stays a symlink"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        PathBuf::from("feat.txt")
+    );
+    assert_eq!(
+        std::fs::read_link(card_wt.join("dangling.txt")).unwrap(),
+        PathBuf::from("missing.txt"),
+        "a dangling symlink is carried over, not an abort"
+    );
+}
+
 /// Retiring deletes a branch nothing has checked out, and the adopted commits
 /// stay reachable through the card's own branch.
 #[tokio::test]
