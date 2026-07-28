@@ -317,6 +317,20 @@ impl AppState {
                 for id in removed {
                     crate::ui::drafts::forget_owner(id);
                 }
+                // The project's review tasks go too, drafts included.
+                let mut rt = self.review_tasks;
+                if let Some(tasks) = rt.write().remove(&project_id) {
+                    for t in tasks {
+                        crate::ui::drafts::forget_owner(t.id);
+                    }
+                }
+                // Copy the id out first (same borrow rule as below).
+                let selected_review = *self.selected_review.read();
+                if let Some(rid) = selected_review {
+                    if self.review_task(rid).is_none() {
+                        self.select_review(None);
+                    }
+                }
                 // Fall back to the global view if we were viewing this project.
                 if matches!(*self.selected_view.read(), SelectedView::Project(pid) if pid == project_id)
                 {
@@ -384,6 +398,21 @@ impl AppState {
             }
             ExecutorEventKind::ReviewTasksUpdated { project_id, tasks } => {
                 let mut rt = self.review_tasks;
+                // Tasks a rescan or dismissal dropped take their drafts
+                // (e.g. "review.guidance") with them.
+                let dropped: Vec<Uuid> = rt
+                    .read()
+                    .get(&project_id)
+                    .map(|old| {
+                        old.iter()
+                            .filter(|t| !tasks.iter().any(|n| n.id == t.id))
+                            .map(|t| t.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for id in dropped {
+                    crate::ui::drafts::forget_owner(id);
+                }
                 rt.write().insert(project_id, tasks);
                 // A rescan or a dismissal can drop the task the panel is showing.
                 // Copy the id out first: an `if let` scrutinee keeps the read

@@ -184,7 +184,14 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     button {
                         class: "btn",
                         title: if has_note { "Opens the PR without applying anything — your note is discarded" } else { "Apply nothing and open the PR" },
-                        onclick: move |_| state.send(ExecutorCommand::SkipToPr { card_id }),
+                        onclick: move |_| {
+                            state.send(ExecutorCommand::SkipToPr { card_id });
+                            // The button promises the note is discarded; forget
+                            // the store entry too in case the panel unmounts
+                            // before the mirror effect sees the reset.
+                            note.set(String::new());
+                            drafts::forget(card_id, "fixes.note");
+                        },
                         "Skip to PR"
                     }
                 }
