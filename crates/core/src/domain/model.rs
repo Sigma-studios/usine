@@ -1244,19 +1244,52 @@ impl Card {
     }
 
     /// Whether this card should light the dock badge. Delegates to
-    /// [`CardState::needs_attention`], except a PR parked in `PrReview(Idle)`
-    /// only counts once a review has actually landed — either the assigned
-    /// reviewer left comments ([`Self::reviewer_comment_count`]) or a submitted
-    /// review carries an actionable verdict ([`ReviewSummary::is_actionable`]).
-    /// The latter is what catches an approval or change request that came in
-    /// with no inline comments, which the count alone would miss. The background
-    /// poll keeps both fresh, so a freshly opened PR awaiting review still
-    /// doesn't nag on its own.
+    /// [`CardState::needs_attention`], with the two corrections the state alone
+    /// can't make because they turn on what the PR poll found.
+    ///
+    /// A PR parked in `PrReview(Idle)` only counts once a review has actually
+    /// landed — either the assigned reviewer left comments
+    /// ([`Self::reviewer_comment_count`]) or a submitted review carries an
+    /// actionable verdict ([`ReviewSummary::is_actionable`]). The latter is what
+    /// catches an approval or change request that came in with no inline
+    /// comments, which the count alone would miss. The background poll keeps both
+    /// fresh, so a freshly opened PR awaiting review still doesn't nag on its own.
+    ///
+    /// And a card at the merge gate stops counting while its build is in flight —
+    /// see [`Self::merge_gate_waits_on_ci`].
     pub fn needs_attention(&self) -> bool {
+        if self.merge_gate_waits_on_ci() {
+            return false;
+        }
         self.state.needs_attention()
             || (matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
                 && (self.reviewer_comment_count > 0
                     || self.reviews.iter().any(ReviewSummary::is_actionable)))
+    }
+
+    /// True when `ReadyToMerge` is waiting on CI rather than on the user: the
+    /// build is still running and no review thread is outstanding.
+    ///
+    /// The merge gate offers nothing but "refresh" and the explicit "merge
+    /// anyway" override in that window — the executor refuses a plain merge while
+    /// checks are pending — so badging it nags for an action the user can't
+    /// usefully take. Same reasoning that keeps `PrReview(Idle)` out of
+    /// [`CardState::needs_attention`]. The poll refreshes checks on
+    /// `ReadyToMerge` cards, so the badge returns on its own once the build goes
+    /// green or red.
+    ///
+    /// Deliberately narrow on both sides. Only `Pending` suppresses:
+    /// [`CheckStatus::None`] — no checks configured, or nothing polled yet —
+    /// badges as before, and since a failed `pr_checks` leaves the last-known
+    /// status on the card, a broken `gh` can't silence a mergeable card. And an
+    /// unanswered review thread keeps the badge lit regardless, because that one
+    /// *is* actionable while CI runs (the gate's "reevaluate comments" offer) and
+    /// it's exactly the late comment the poll covers `ReadyToMerge` cards to
+    /// catch.
+    fn merge_gate_waits_on_ci(&self) -> bool {
+        matches!(self.state, CardState::ReadyToMerge)
+            && self.checks == CheckStatus::Pending
+            && self.unanswered_count == 0
     }
 
     /// The urgent slice of [`Self::needs_attention`]. Pure delegation to
@@ -1593,6 +1626,36 @@ mod tests {
         card.reviews.clear();
         card.reviewer_comment_count = 2;
         assert!(card.needs_attention());
+    }
+
+    #[test]
+    fn merge_gate_does_not_badge_while_checks_are_running() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::ReadyToMerge;
+
+        // Nothing polled yet — the state alone badges, as it always has.
+        assert_eq!(card.checks, CheckStatus::None);
+        assert!(card.needs_attention());
+
+        // Build in flight: waiting on CI, not on the user.
+        card.checks = CheckStatus::Pending;
+        assert!(!card.needs_attention());
+
+        // Every settled outcome badges again — green means merge, red means fix.
+        for status in [CheckStatus::Passing, CheckStatus::Failing] {
+            card.checks = status;
+            assert!(card.needs_attention(), "{status:?} should badge");
+        }
+
+        // A thread left unanswered is actionable while the build runs, so it
+        // outranks the suppression.
+        card.checks = CheckStatus::Pending;
+        card.unanswered_count = 1;
+        assert!(card.needs_attention());
+
+        // Suppressed or not, the merge gate is never the urgent tier.
+        card.unanswered_count = 0;
+        assert!(!card.needs_urgent_attention());
     }
 
     #[test]
