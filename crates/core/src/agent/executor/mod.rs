@@ -748,9 +748,7 @@ fn next_pasted_number(existing: &[PathBuf]) -> u32 {
     existing
         .iter()
         .filter_map(|p| {
-            let name = p.file_name()?.to_str()?;
-            // Stored names are `<8 hex>-<original>`.
-            let (_, original) = name.split_once('-')?;
+            let original = crate::infra::paths::attachment_label(p);
             if original == "pasted.png" {
                 return Some(0);
             }

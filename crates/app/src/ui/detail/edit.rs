@@ -119,12 +119,11 @@ pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
                     for path in atts {
                         {
                             let key = path.to_string_lossy().into_owned();
-                            // Stored names are `<8 hex>-<original>`; show the original part.
                             let name = path
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_default();
-                            let label = name.split_once('-').map(|x| x.1).unwrap_or(&name).to_string();
+                            let label = usine_core::infra::paths::attachment_label(&path);
                             let to_remove = path.clone();
                             let is_image = image_mime(&path).is_some();
                             let to_preview = path.clone();
@@ -188,11 +187,7 @@ fn image_mime(path: &std::path::Path) -> Option<&'static str> {
 /// the card "preview" concept). Same dismiss/focus behaviour as `ConfirmHost`.
 #[component]
 fn AttachmentPreview(path: PathBuf, on_close: EventHandler<()>) -> Element {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let label = name.split_once('-').map(|x| x.1).unwrap_or(&name).to_string();
+    let label = usine_core::infra::paths::attachment_label(&path);
     // Attachments live outside any served root, so inline the bytes as a data
     // URL (the same trick as `LOGO_URI`). None = the file could not be read.
     let src = use_memo(use_reactive!(|path| {
@@ -229,7 +224,7 @@ fn AttachmentPreview(path: PathBuf, on_close: EventHandler<()>) -> Element {
                     if let Some(src) = src() {
                         img { src: "{src}", alt: "{label}" }
                     } else {
-                        div { class: "hint", "Could not read {name}." }
+                        div { class: "hint", "Could not read {label}." }
                     }
                 }
             }
