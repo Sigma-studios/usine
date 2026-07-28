@@ -27,6 +27,17 @@ use super::{AgentProvider, RunConfig, RunHandle, RunMode};
 
 /// Build argv for `codex exec`, excluding the prompt (appended by `start`). The
 /// working directory is set on the command, so no `-C` is needed.
+///
+/// Always ends with `--` so everything the caller appends is read as a
+/// positional. That terminator is load-bearing twice over:
+///
+/// * `-i/--image` is declared `<FILE>...` — *greedy* multi-value — so an
+///   unterminated `-i <path>` swallows the prompt (and, on resume, the session
+///   id) as further image paths. codex then finds no prompt positional, falls
+///   back to stdin, and dies with "Reading prompt from stdin... No prompt
+///   provided via stdin." Verified on codex 0.144.6 and 0.145.0.
+/// * A prompt starting with `-` (a description opening on a markdown bullet)
+///   would otherwise be parsed as a flag: "error: unexpected argument '- '".
 pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     // Image attachments ride as `-i` flags: unlike Claude (whose Read tool is
     // vision-capable), Codex can only see images attached to the message. Also
@@ -62,6 +73,7 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
             format!("model_reasoning_effort={}", effort.codex_value()),
         ];
         args.extend(image_args);
+        args.push("--".into());
         args.push(session.clone());
         return args;
     }
@@ -107,6 +119,7 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     }
 
     args.extend(image_args);
+    args.push("--".into());
     args
 }
 
@@ -365,6 +378,7 @@ mod tests {
                 "gpt-5-codex",
                 "-c",
                 "model_reasoning_effort=medium",
+                "--",
                 "thread-123"
             ]
         );
@@ -384,12 +398,41 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-i", "/att/mock.PNG"]));
         assert!(args.windows(2).any(|w| w == ["-i", "/att/shot.jpeg"]));
         assert!(!args.iter().any(|a| a == "/att/notes.txt"));
+        // ...and the `--` closing the greedy image list is the LAST arg, so the
+        // prompt `start` appends lands as a positional instead of being eaten as
+        // one more image path (which left codex prompt-less on stdin).
+        assert_eq!(args.last().map(String::as_str), Some("--"));
 
-        // On resume the images still attach, before the trailing session id.
+        // On resume the images still attach, before the terminator and the
+        // trailing session id — which `-i` would otherwise swallow too.
         c.resume_session = Some("t-1".into());
         let args = build_args(&c);
         assert!(args.windows(2).any(|w| w == ["-i", "/att/mock.PNG"]));
         assert_eq!(args.last().map(String::as_str), Some("t-1"));
+        assert_eq!(args[args.len() - 2], "--");
+    }
+
+    /// Every mode must end its argv with `--`: the prompt is appended by
+    /// `start`, and only a terminator guarantees codex reads it as the prompt
+    /// positional rather than as a flag or as trailing `-i` fodder.
+    #[test]
+    fn every_mode_terminates_options_before_the_prompt() {
+        for mode in [
+            RunMode::Plan,
+            RunMode::Implement,
+            RunMode::ApplyFixes,
+            RunMode::Review,
+            RunMode::Triage,
+            RunMode::Question,
+            RunMode::Investigate,
+        ] {
+            let args = build_args(&cfg(mode, Effort::Medium));
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("--"),
+                "{mode:?} must end with the option terminator"
+            );
+        }
     }
 
     #[test]

@@ -85,6 +85,12 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
         }
     }
 
+    // Terminate option parsing so the prompt `start` appends is always read as a
+    // positional. Without it a prompt starting with `-` — a description opening
+    // on a markdown bullet — is taken for a flag ("error: unknown option '- fix
+    // the thing'") and the run dies before it begins. Also belt-and-braces for
+    // the variadic-option hazard the ordering above already guards against.
+    args.push("--".into());
     args
 }
 
@@ -389,6 +395,32 @@ mod tests {
             let mf = args.iter().position(|a| a == mode_flag).unwrap();
             assert!(di < mf, "disallowedTools must come before {mode_flag}");
         }
+    }
+
+    /// The prompt is appended by `start`, so argv must end with `--`: a
+    /// description opening on a markdown bullet would otherwise be parsed as a
+    /// flag and the run would die at "unknown option '- ...'".
+    #[test]
+    fn every_mode_terminates_options_before_the_prompt() {
+        for mode in [
+            RunMode::Plan,
+            RunMode::Implement,
+            RunMode::ApplyFixes,
+            RunMode::Review,
+            RunMode::Triage,
+            RunMode::Question,
+            RunMode::Investigate,
+        ] {
+            let args = build_args(&cfg(mode));
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("--"),
+                "{mode:?} must end with the option terminator"
+            );
+        }
+        let mut c = cfg(RunMode::Implement);
+        c.resume_session = Some("sess-123".into());
+        assert_eq!(build_args(&c).last().map(String::as_str), Some("--"));
     }
 
     /// Drive a `PlanGate` over the raw lines of a run, returning the forwarded
