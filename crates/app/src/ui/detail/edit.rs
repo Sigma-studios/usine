@@ -1,6 +1,9 @@
 //! Starting-block editing panels: task title/description, image attachments,
 //! and the run configuration form.
 
+use std::path::PathBuf;
+
+use base64::Engine as _;
 use dioxus::prelude::*;
 use usine_core::{Card, CardConfig, CardKind, ExecutorCommand, Provider};
 use uuid::Uuid;
@@ -103,6 +106,8 @@ pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
         return rsx! {};
     }
     let atts = state.card_attachments(card_id);
+    // Image chip clicked → preview it in a modal; None when the dialog is closed.
+    let mut preview = use_signal(|| None::<PathBuf>);
 
     rsx! {
         div { class: "section",
@@ -121,9 +126,20 @@ pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
                                 .unwrap_or_default();
                             let label = name.split_once('-').map(|x| x.1).unwrap_or(&name).to_string();
                             let to_remove = path.clone();
+                            let is_image = image_mime(&path).is_some();
+                            let to_preview = path.clone();
                             rsx! {
                                 span { key: "{key}", class: "chip",
-                                    span { class: "chip-label", title: "{name}", "{label}" }
+                                    if is_image {
+                                        span {
+                                            class: "chip-label clickable",
+                                            title: "{name}",
+                                            onclick: move |_| preview.set(Some(to_preview.clone())),
+                                            "{label}"
+                                        }
+                                    } else {
+                                        span { class: "chip-label", title: "{name}", "{label}" }
+                                    }
                                     button {
                                         class: "chip-remove",
                                         title: "Remove",
@@ -136,6 +152,9 @@ pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
                     }
                 }
             }
+            if let Some(path) = preview() {
+                AttachmentPreview { path, on_close: move |_| preview.set(None) }
+            }
             button {
                 class: "btn",
                 onclick: move |_| {
@@ -147,6 +166,72 @@ pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
                     });
                 },
                 "Attach file"
+            }
+        }
+    }
+}
+
+/// The mime type for an attachment path, if its extension is a web-renderable
+/// image — only those chips open the preview dialog.
+fn image_mime(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Simple modal previewing an image attachment (named to avoid colliding with
+/// the card "preview" concept). Same dismiss/focus behaviour as `ConfirmHost`.
+#[component]
+fn AttachmentPreview(path: PathBuf, on_close: EventHandler<()>) -> Element {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = name.split_once('-').map(|x| x.1).unwrap_or(&name).to_string();
+    // Attachments live outside any served root, so inline the bytes as a data
+    // URL (the same trick as `LOGO_URI`). None = the file could not be read.
+    let src = use_memo(use_reactive!(|path| {
+        let mime = image_mime(&path)?;
+        let bytes = std::fs::read(&path).ok()?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Some(format!("data:{mime};base64,{b64}"))
+    }));
+
+    rsx! {
+        div { class: "modal-overlay", onclick: move |_| on_close.call(()),
+            div {
+                class: "modal image-preview",
+                "role": "dialog",
+                "aria-modal": "true",
+                tabindex: "-1",
+                // Don't dismiss when clicking inside the dialog.
+                onclick: move |e| e.stop_propagation(),
+                // Escape closes the dialog (matches the overlay-click behaviour).
+                onkeydown: move |e: KeyboardEvent| {
+                    if e.key() == Key::Escape {
+                        e.prevent_default();
+                        on_close.call(());
+                    }
+                },
+                // Focus the dialog on open so Escape works and focus is trapped here.
+                onmounted: move |e: MountedEvent| {
+                    spawn(async move {
+                        let _ = e.data().set_focus(true).await;
+                    });
+                },
+                h3 { class: "modal-title", "{label}" }
+                div { class: "modal-body",
+                    if let Some(src) = src() {
+                        img { src: "{src}", alt: "{label}" }
+                    } else {
+                        div { class: "hint", "Could not read {name}." }
+                    }
+                }
             }
         }
     }
