@@ -9,6 +9,11 @@
 //! It's seeded from the task's `AwaitingValidation` payload the first time that
 //! review is rendered and dropped when the review changes or is published, so
 //! one review's edits can never leak into the next.
+//!
+//! This is the same origin-keyed pattern as `drafts::use_draft_of`, kept
+//! separate because two surfaces edit it through module-level setters rather
+//! than one component's signal; folding it onto the draft store is possible
+//! but low value.
 
 use dioxus::prelude::*;
 use usine_core::{DraftComment, ReviewEvent};

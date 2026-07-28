@@ -6,6 +6,7 @@ use usine_core::ExecutorCommand;
 use uuid::Uuid;
 
 use crate::state::AppState;
+use crate::ui::drafts;
 
 #[component]
 pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
@@ -14,45 +15,24 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
     let block_malformed = usine_core::plan_block_malformed(&plan);
     let has_questions = !questions.is_empty();
     let n = questions.len();
-    // Draft answers live in `AppState` keyed by card + the plan they answer:
-    // asking a chat question unmounts this panel while the read-only turn runs,
-    // so a component-local signal would lose partially typed answers. A draft
-    // stored for a different plan (a replan landed) is ignored here and
-    // replaced on the next edit.
-    let mut drafts = state.plan_drafts;
-    let answers: Vec<String> = match drafts.read().get(&card_id) {
-        Some((p, a)) if *p == plan && a.len() == n => a.clone(),
-        _ => vec![String::new(); n],
-    };
-    let plan_for_edit = plan.clone();
-    let set_draft = move |idx: usize, value: String| {
-        let mut map = drafts.write();
-        let entry = map
-            .entry(card_id)
-            .or_insert_with(|| (plan_for_edit.clone(), vec![String::new(); n]));
-        if entry.0 != plan_for_edit || entry.1.len() != n {
-            *entry = (plan_for_edit.clone(), vec![String::new(); n]);
-        }
-        entry.1[idx] = value;
-    };
-    let plan_for_submit = plan.clone();
+    // Draft answers, keyed on the plan they answer: asking a chat question
+    // unmounts this panel while the read-only turn runs, so a component-local
+    // signal would lose partially typed answers — while a replan landing
+    // reseeds instead of restoring answers to questions it no longer asks.
+    let mut answers =
+        drafts::use_draft_of(card_id, "plan.answers", &plan, || vec![String::new(); n]);
     let questions_for_submit = questions.clone();
     // A question is "answered" once it has a picked option or typed text. With
     // every question answered, the plan can be sent back even with no free-form
     // text — the answers alone are the feedback.
-    let all_answered = answers.iter().all(|a| !a.trim().is_empty());
-    // Own the chat textarea so the submit button can say what the send will
-    // actually do: answers alone, answers + feedback, or a plain change request.
-    let chat_text = use_signal(String::new);
-    let chat_blank = chat_text.read().trim().is_empty();
-    let request_label = if has_questions && all_answered {
-        if chat_blank {
-            "Send answers"
-        } else {
-            "Send answers & feedback"
-        }
+    let all_answered = answers.read().iter().all(|a| !a.trim().is_empty());
+    // The submit button says what the send will actually do: answers alone,
+    // answers + feedback (when the chat box holds text), or a plain change
+    // request — the chat section applies the nonblank label itself.
+    let (request_label, request_label_nonblank) = if has_questions && all_answered {
+        ("Send answers", Some("Send answers & feedback"))
     } else {
-        "Request changes"
+        ("Request changes", None)
     };
     let chat_hint = if has_questions {
         "Answer the questions above and/or type below, then request changes to send the plan \
@@ -78,8 +58,7 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                 h3 { "Questions" }
                 for (idx, q) in questions.iter().enumerate() {
                     {
-                        let cur = answers.get(idx).cloned().unwrap_or_default();
-                        let mut set_for_input = set_draft.clone();
+                        let cur = answers.read().get(idx).cloned().unwrap_or_default();
                         rsx! {
                             div { key: "{idx}", class: "question",
                                 div { class: "qtext", "{q.question}" }
@@ -88,12 +67,11 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                                         {
                                             let opt = opt.clone();
                                             let cls = if cur == opt { "btn primary" } else { "btn" };
-                                            let mut set_for_option = set_draft.clone();
                                             rsx! {
                                                 button {
                                                     key: "{opt}",
                                                     class: "{cls}",
-                                                    onclick: move |_| set_for_option(idx, opt.clone()),
+                                                    onclick: move |_| answers.write()[idx] = opt.clone(),
                                                     "{opt}"
                                                 }
                                             }
@@ -103,7 +81,7 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                                 input {
                                     placeholder: "Or type your own answer…",
                                     value: "{cur}",
-                                    oninput: move |e| set_for_input(idx, e.value()),
+                                    oninput: move |e| answers.write()[idx] = e.value(),
                                 }
                             }
                         }
@@ -137,14 +115,11 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
             hint: chat_hint,
             request_enabled_when_blank: has_questions && all_answered,
             request_label: request_label.to_string(),
-            text: chat_text,
+            request_label_nonblank: request_label_nonblank.map(str::to_string),
             on_request: move |text: String| {
-                let cur: Vec<String> = drafts
-                    .read()
-                    .get(&card_id)
-                    .filter(|(p, _)| *p == plan_for_submit)
-                    .map(|(_, a)| a.clone())
-                    .unwrap_or_default();
+                // No origin re-filter needed: the hook guarantees these answers
+                // belong to the plan being sent back.
+                let cur: Vec<String> = answers.read().clone();
                 let any_answered = cur.iter().any(|a| !a.trim().is_empty());
                 // Fold answered questions and free-form notes into one
                 // feedback blob so neither input is lost on send-back.
@@ -160,7 +135,7 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                     state.send(ExecutorCommand::RejectPlan { card_id, feedback: combined });
                     // The answers were consumed by this send-back; the replan's
                     // questions will be different.
-                    drafts.write().remove(&card_id);
+                    drafts::forget(card_id, "plan.answers");
                 }
             },
         }

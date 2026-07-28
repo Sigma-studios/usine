@@ -10,15 +10,17 @@ use uuid::Uuid;
 
 use super::review::fallback_rows;
 use crate::state::AppState;
+use crate::ui::drafts;
 
 #[component]
 pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review: bool) -> Element {
     let state = use_context::<AppState>();
     // The user's working copy of the verdicts: checkbox state and edited text
-    // live here, and the apply command sends it wholesale. The panel remounts
-    // on every state change (keyed in `detail/mod.rs`), so no reseeding needed.
-    let mut edits = use_signal(|| verdicts.clone());
-    let mut note = use_signal(String::new);
+    // live here, and the apply command sends it wholesale. A draft keyed on the
+    // verdicts themselves, so edits survive deselects but a re-run analysis
+    // reseeds instead of restoring edits to findings it no longer shows.
+    let mut edits = drafts::use_draft_of(card_id, "fixes.verdicts", &verdicts, || verdicts.clone());
+    let mut note = drafts::use_draft(card_id, "fixes.note", String::new);
     let heading = if self_review {
         "Self-review findings"
     } else {
@@ -158,6 +160,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                         } else {
                             state.send(ExecutorCommand::ApplyFixes { card_id, verdicts, note: text });
                         }
+                        // The drafts were consumed by the send; a later
+                        // re-analysis can legitimately produce identical
+                        // verdicts, so the origin rule alone wouldn't clear.
+                        drafts::forget(card_id, "fixes.verdicts");
+                        note.set(String::new());
                     },
                     "{apply_label}"
                 }

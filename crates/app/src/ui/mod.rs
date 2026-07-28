@@ -9,6 +9,7 @@ mod cardmenu;
 mod confirm;
 mod detail;
 mod diffdialog;
+pub(crate) mod drafts;
 mod icons;
 mod reviewboard;
 mod reviewdraft;

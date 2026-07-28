@@ -92,11 +92,6 @@ pub struct AppState {
     /// answer — seeded at startup and updated via `AnswerUpdated` (an empty
     /// answer removes the entry).
     pub answers: Signal<HashMap<Uuid, (String, String)>>,
-    /// Per-card draft answers to a proposed plan's structured questions, keyed
-    /// alongside the plan text they answer. Held here (not in the plan panel)
-    /// because asking a chat question unmounts the panel mid-edit — a
-    /// component-local signal would come back blank. In-memory only.
-    pub plan_drafts: Signal<HashMap<Uuid, (String, Vec<String>)>>,
     /// Per-card implementation hand-off — the recap, open questions, and testing
     /// checklist the implement run left for its reviewer. Seeded at startup and
     /// updated via `HandoffUpdated`.
@@ -222,7 +217,6 @@ impl AppState {
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
             answers: Signal::new(answers),
-            plan_drafts: Signal::new(HashMap::new()),
             handoffs: Signal::new(handoffs),
             previews: Signal::new(HashMap::new()),
             diffs: Signal::new(HashMap::new()),
@@ -292,8 +286,7 @@ impl AppState {
                 attachments.write().remove(&id);
                 let mut answers = self.answers;
                 answers.write().remove(&id);
-                let mut plan_drafts = self.plan_drafts;
-                plan_drafts.write().remove(&id);
+                crate::ui::drafts::forget_owner(id);
                 if *self.selected_card.read() == Some(id) {
                     let mut selected = self.selected_card;
                     selected.set(None);
@@ -312,7 +305,18 @@ impl AppState {
                 let mut projects = self.projects;
                 projects.write().retain(|p| p.id != project_id);
                 let mut cards = self.cards;
+                // The removed cards' drafts go with them — collect their ids
+                // before the retain drops them.
+                let removed: Vec<Uuid> = cards
+                    .read()
+                    .iter()
+                    .filter(|c| c.project_id == project_id)
+                    .map(|c| c.id)
+                    .collect();
                 cards.write().retain(|c| c.project_id != project_id);
+                for id in removed {
+                    crate::ui::drafts::forget_owner(id);
+                }
                 // Fall back to the global view if we were viewing this project.
                 if matches!(*self.selected_view.read(), SelectedView::Project(pid) if pid == project_id)
                 {
