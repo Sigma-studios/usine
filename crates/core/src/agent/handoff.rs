@@ -6,7 +6,8 @@
 //! that could have gone the other way, or left part of the task undone.
 //!
 //! So the run is asked to append a fenced ` ```usine-handoff ` JSON block: a
-//! short recap, any open questions, and the things worth testing by hand.
+//! recap of the work done, any open questions, and the things worth testing by
+//! hand.
 //! [`parse_handoff`] pulls it out; the executor stores it on the card and the
 //! detail panel renders it beside the self-review and PR buttons. Same
 //! prompt-and-parse shape as [`crate::agent::commit`] and [`crate::agent::review`],
@@ -23,10 +24,12 @@ const TAG: &str = "usine-handoff";
 pub const HANDOFF_INSTRUCTION: &str = "\
 When you have finished making changes, hand the work off to the human who will review it. Emit a \
 fenced code block tagged `usine-handoff` containing a JSON object shaped like \
-{\"summary\": \"<how it went>\", \"questions\": [\"<open question>\"], \"tests\": [\"<what to check>\"]}.\n\
-- `summary`: two to five sentences for someone who did not watch you work — what you built, the \
-approach you took, and anything you had to work around, decide, or deliberately leave out. If part \
-of the task is unfinished, or you are unsure a change is right, say so plainly.\n\
+{\"summary\": \"<what was done>\", \"questions\": [\"<open question>\"], \"tests\": [\"<what to check>\"]}.\n\
+- `summary`: a short recap of all the work done, for someone who did not watch you work — one \
+short line per change, newline-separated, covering everything meaningful in the diff (features, \
+refactors, tests, docs, config). Note in place anything you had to work around or deliberately \
+leave out; if part of the task is unfinished, or you are unsure a change is right, say so plainly \
+on its own line.\n\
 - `questions`: what you genuinely want the author to weigh in on — a judgement call that could \
 reasonably have gone the other way, an ambiguity in the task, an assumption you had to invent. Use \
 an empty array if you have none; do NOT manufacture questions to fill it.\n\
@@ -36,15 +39,14 @@ cover: the risky paths, the edge cases you touched, the flows a regression would
 scenario you already verified yourself in the running app with `[verified]` — it still deserves a \
 human eye, but the reviewer should know it has been exercised once. Use an \
 empty array if the change has no observable behaviour.\n\
-Be honest and specific — this is the note a careful engineer leaves a colleague, not a sales pitch. \
-Do not restate the commit message.";
+Be honest and specific — this is the note a careful engineer leaves a colleague, not a sales pitch.";
 
 /// An implement run's hand-off to its reviewer. Every field is optional: an agent
 /// with nothing to ask emits `questions: []`, and a change with no observable
 /// behaviour emits `tests: []`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
-    /// A few sentences on how the implementation went.
+    /// A short recap of the work done, one line per change.
     #[serde(default)]
     pub summary: String,
     /// Decisions or ambiguities the agent wants the user to weigh in on.

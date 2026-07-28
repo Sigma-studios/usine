@@ -137,10 +137,9 @@ async fn simulate(
             // The hand-off block feeds the awaiting-review panel's recap.
             emit!(AgentEvent::Done {
                 result: "Implemented the change.\n\n```usine-handoff\n{\
-                    \"summary\":\"Added the new module and wired it into the app. Kept the existing \
-                    call sites untouched by adapting at the boundary, which was simpler than \
-                    threading the new type through. The docs are updated; the changelog entry is \
-                    not, since the release notes are generated.\",\
+                    \"summary\":\"Added the new module and wired it into the app.\\nAdapted at the \
+                    boundary so the existing call sites stay untouched.\\nUpdated the docs; left \
+                    the changelog alone since the release notes are generated.\",\
                     \"questions\":[\"The flag defaults to on — should it ship behind an opt-in instead?\"],\
                     \"tests\":[\"Create a card and start it — the new module should log its setup once\",\
                     \"Restart with an existing database — old records should still load\"]\
