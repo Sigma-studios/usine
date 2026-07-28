@@ -5339,6 +5339,8 @@ dependencies = [
  "objc2-foundation",
  "resvg",
  "rfd",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

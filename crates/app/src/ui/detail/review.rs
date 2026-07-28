@@ -100,9 +100,10 @@ fn ReviewPanel(task: ReviewTask) -> Element {
     let id = task.id;
     // Steering for the run this panel can start, seeded from what the last one
     // used so a retry starts from the same instruction instead of a blank box.
-    // The panel remounts on every status change (see `ReviewDetail`), which is
-    // what reseeds this rather than carrying a stale draft across a run.
-    let mut guidance = use_signal(|| task.guidance.clone());
+    // A draft, so a half-typed instruction survives deselects and the panel's
+    // remount-on-status-change; starting the run forgets it explicitly.
+    let mut guidance =
+        crate::ui::drafts::use_draft(id, "review.guidance", || task.guidance.clone());
     // Once the run is under way the box is gone, but the instruction still
     // explains why the drafts read the way they do — so it's shown back.
     let steering = task.guidance.trim().to_string();
@@ -163,7 +164,13 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     div { class: "row",
                         button {
                             class: "btn primary",
-                            onclick: move |_| state.start_review(id, guidance.read().clone()),
+                            onclick: move |_| {
+                                state.start_review(id, guidance.read().clone());
+                                // Consumed by the run (it becomes `task.guidance`,
+                                // the next mount's seed). The seed rule can't
+                                // clear this one: its seed is nonempty.
+                                crate::ui::drafts::forget(id, "review.guidance");
+                            },
                             "Review this PR"
                         }
                         button {
@@ -219,7 +226,10 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     div { class: "row",
                         button {
                             class: "btn",
-                            onclick: move |_| state.start_review(id, guidance.read().clone()),
+                            onclick: move |_| {
+                                state.start_review(id, guidance.read().clone());
+                                crate::ui::drafts::forget(id, "review.guidance");
+                            },
                             "Retry"
                         }
                         button {

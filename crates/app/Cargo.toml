@@ -16,6 +16,8 @@ dioxus = { version = "0.7.9", features = ["desktop"] }
 futures.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rfd = "0.17.2"
+serde = "1.0.228"
+serde_json = "1.0.150"
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

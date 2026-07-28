@@ -7,11 +7,12 @@ use usine_core::ExecutorCommand;
 use uuid::Uuid;
 
 use crate::state::AppState;
+use crate::ui::drafts;
 
 #[component]
 pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
     let state = use_context::<AppState>();
-    let mut follow_up = use_signal(String::new);
+    let mut follow_up = drafts::use_draft(card_id, "investigate.followup", String::new);
 
     rsx! {
         div { class: "section",

@@ -92,11 +92,6 @@ pub struct AppState {
     /// answer — seeded at startup and updated via `AnswerUpdated` (an empty
     /// answer removes the entry).
     pub answers: Signal<HashMap<Uuid, (String, String)>>,
-    /// Per-card draft answers to a proposed plan's structured questions, keyed
-    /// alongside the plan text they answer. Held here (not in the plan panel)
-    /// because asking a chat question unmounts the panel mid-edit — a
-    /// component-local signal would come back blank. In-memory only.
-    pub plan_drafts: Signal<HashMap<Uuid, (String, Vec<String>)>>,
     /// Per-card implementation hand-off — the recap, open questions, and testing
     /// checklist the implement run left for its reviewer. Seeded at startup and
     /// updated via `HandoffUpdated`.
@@ -222,7 +217,6 @@ impl AppState {
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
             answers: Signal::new(answers),
-            plan_drafts: Signal::new(HashMap::new()),
             handoffs: Signal::new(handoffs),
             previews: Signal::new(HashMap::new()),
             diffs: Signal::new(HashMap::new()),
@@ -292,8 +286,7 @@ impl AppState {
                 attachments.write().remove(&id);
                 let mut answers = self.answers;
                 answers.write().remove(&id);
-                let mut plan_drafts = self.plan_drafts;
-                plan_drafts.write().remove(&id);
+                crate::ui::drafts::forget_owner(id);
                 if *self.selected_card.read() == Some(id) {
                     let mut selected = self.selected_card;
                     selected.set(None);
@@ -312,7 +305,32 @@ impl AppState {
                 let mut projects = self.projects;
                 projects.write().retain(|p| p.id != project_id);
                 let mut cards = self.cards;
+                // The removed cards' drafts go with them — collect their ids
+                // before the retain drops them.
+                let removed: Vec<Uuid> = cards
+                    .read()
+                    .iter()
+                    .filter(|c| c.project_id == project_id)
+                    .map(|c| c.id)
+                    .collect();
                 cards.write().retain(|c| c.project_id != project_id);
+                for id in removed {
+                    crate::ui::drafts::forget_owner(id);
+                }
+                // The project's review tasks go too, drafts included.
+                let mut rt = self.review_tasks;
+                if let Some(tasks) = rt.write().remove(&project_id) {
+                    for t in tasks {
+                        crate::ui::drafts::forget_owner(t.id);
+                    }
+                }
+                // Copy the id out first (same borrow rule as below).
+                let selected_review = *self.selected_review.read();
+                if let Some(rid) = selected_review {
+                    if self.review_task(rid).is_none() {
+                        self.select_review(None);
+                    }
+                }
                 // Fall back to the global view if we were viewing this project.
                 if matches!(*self.selected_view.read(), SelectedView::Project(pid) if pid == project_id)
                 {
@@ -380,6 +398,21 @@ impl AppState {
             }
             ExecutorEventKind::ReviewTasksUpdated { project_id, tasks } => {
                 let mut rt = self.review_tasks;
+                // Tasks a rescan or dismissal dropped take their drafts
+                // (e.g. "review.guidance") with them.
+                let dropped: Vec<Uuid> = rt
+                    .read()
+                    .get(&project_id)
+                    .map(|old| {
+                        old.iter()
+                            .filter(|t| !tasks.iter().any(|n| n.id == t.id))
+                            .map(|t| t.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for id in dropped {
+                    crate::ui::drafts::forget_owner(id);
+                }
                 rt.write().insert(project_id, tasks);
                 // A rescan or a dismissal can drop the task the panel is showing.
                 // Copy the id out first: an `if let` scrutinee keeps the read
