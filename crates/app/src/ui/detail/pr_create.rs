@@ -384,15 +384,15 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
     }
 }
 
-/// The implement run's note to whoever reviews it: how the work went, what it
-/// wasn't sure about, and what's worth exercising by hand before the PR. Each
-/// part is omitted when the agent had nothing to say for it. Purely
+/// The implement run's note to whoever reviews it: a recap of the work done,
+/// what it wasn't sure about, and what's worth exercising by hand before the
+/// PR. Each part is omitted when the agent had nothing to say for it. Purely
 /// informative — to weigh in on an open question, use the Agent Chat.
 #[component]
 fn HandoffPanel(handoff: Handoff) -> Element {
     rsx! {
         div { class: "section",
-            h3 { "How it went" }
+            h3 { "What was done" }
             if !handoff.summary.is_empty() {
                 div { class: "plan-box", "{handoff.summary}" }
             }
