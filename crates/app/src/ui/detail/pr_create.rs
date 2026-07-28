@@ -8,15 +8,19 @@ use dioxus::prelude::*;
 use usine_core::{Card, CardState, ExecutorCommand, Handoff, ReviewSub, MAX_VALIDATION_ATTEMPTS};
 
 use crate::state::AppState;
+use crate::ui::drafts;
 
 #[component]
 pub(super) fn PrCreateForm(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
     let project_id = card.project_id;
-    let mut title = use_signal(|| card.title.clone());
+    // The form fields are drafts: typed-but-unsent text survives deselects and
+    // the card moving between the parked states. The seeded ones (title,
+    // reviewer) stay live-fresh until actually touched, per the seed rule.
+    let mut title = drafts::use_draft(id, "pr.title", || card.title.clone());
     // Start the PR description blank rather than echoing the original task prompt.
-    let mut body = use_signal(String::new);
+    let mut body = drafts::use_draft(id, "pr.body", String::new);
     let project = state
         .projects
         .read()
@@ -27,15 +31,11 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .as_ref()
         .and_then(|p| p.config.reviewer.clone())
         .unwrap_or_default();
-    let mut reviewer = use_signal(|| default_reviewer);
-    // Draft text for the Agent Chat sections, owned here (and handed to each
-    // `AgentChatSection`) so typed-but-unsent text survives the card moving
-    // between the parked states.
-    let draft = use_signal(String::new);
+    let mut reviewer = drafts::use_draft(id, "pr.reviewer", || default_reviewer);
     let branch = card.branch.clone().unwrap_or_default();
     // The PR branch name is required and starts blank: the user must deliberately
     // choose one rather than shipping the auto-generated `usine/…` name.
-    let mut branch_name = use_signal(String::new);
+    let mut branch_name = drafts::use_draft(id, "pr.branch", String::new);
     // Sanitise for display and for the command, but keep the raw text in the
     // signal — rewriting the field on every keystroke would fight the user (a
     // trailing `.` gets trimmed, so `feat.x` becomes untypeable).
@@ -140,7 +140,6 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
             super::AgentChatSection {
                 card_id: id,
-                text: draft,
                 hint: "Not happy with the implementation, or curious why it went a certain way? \
                        Request changes to send it back to the agent's worktree, or ask a question \
                        without sending it back.",
@@ -168,7 +167,6 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         if is_selecting_fixes {
             super::AgentChatSection {
                 card_id: id,
-                text: draft,
                 hint: "Not happy with the implementation, or curious why it went a certain way? \
                        Request changes to send it back to the agent's worktree, or ask a question \
                        without sending it back.",
@@ -237,7 +235,6 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // The parked failure can also bounce the work back wholesale.
             super::AgentChatSection {
                 card_id: id,
-                text: draft,
                 hint: "Request changes to send the work back to the agent's worktree, or ask a \
                        question about it without sending it back.",
                 on_request: move |fb: String| {
@@ -372,7 +369,6 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,
-                text: draft,
                 hint: "Spotted something before opening the PR, or want to double-check a \
                        decision? Request changes to send it back to the agent's worktree, or ask \
                        a question without sending it back.",

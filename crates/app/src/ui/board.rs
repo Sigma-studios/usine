@@ -44,7 +44,11 @@ pub fn Board() -> Element {
 /// top, since the transition into Done stamps `updated_at` — i.e. "recently
 /// finished first" instead of a pile sorted by age.
 fn column_cards(cards: &[Card], col: Column) -> Vec<Card> {
-    let mut out: Vec<Card> = cards.iter().filter(|c| c.column() == col).cloned().collect();
+    let mut out: Vec<Card> = cards
+        .iter()
+        .filter(|c| c.column() == col)
+        .cloned()
+        .collect();
     if col == Column::Done {
         out.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
     }

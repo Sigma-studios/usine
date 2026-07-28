@@ -449,11 +449,20 @@ fn CardPanel(card: Card) -> Element {
 #[component]
 fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> Element {
     let state = use_context::<AppState>();
-    let mut answer = use_signal(String::new);
+    // Both fields are drafts keyed by the question they answer: the half-typed
+    // answer survives deselects, but a *different* intervention arriving later
+    // reseeds instead of restoring an answer meant for the previous question.
+    let mut answer =
+        crate::ui::drafts::use_draft_of(card_id, "intervention.answer", &question, String::new);
     // Draft-then-submit, like the plan questions: clicking an option only
     // selects it (click again to unselect); one "Send answer" button submits
     // the selection and/or the typed text.
-    let mut selected = use_signal(|| None::<String>);
+    let mut selected = crate::ui::drafts::use_draft_of(
+        card_id,
+        "intervention.option",
+        &question,
+        || None::<String>,
+    );
     let can_send = selected.read().is_some() || !answer.read().trim().is_empty();
 
     rsx! {
