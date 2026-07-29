@@ -645,8 +645,8 @@ impl Executor {
                 Ok(())
             }
             ExecutorCommand::AttachImageBytes { card_id, data } => {
-                let dest = copy_attachment_bytes(card_id, &data)?;
                 let mut paths = self.store.get_attachments(card_id).unwrap_or_default();
+                let dest = copy_attachment_bytes(card_id, &data, &paths)?;
                 paths.push(dest);
                 self.store.set_attachments(card_id, &paths)?;
                 let _ = self
@@ -728,13 +728,41 @@ fn copy_attachment(card_id: Uuid, src: &Path) -> Result<PathBuf> {
 }
 
 /// Write pasted image bytes (already PNG-encoded by the UI) into the card's
-/// managed attachments dir and return the destination path.
-fn copy_attachment_bytes(card_id: Uuid, data: &[u8]) -> Result<PathBuf> {
+/// managed attachments dir and return the destination path. Pasted screenshots
+/// are numbered (`pasted-1.png`, `pasted-2.png`, …) so their chips stay
+/// distinguishable.
+fn copy_attachment_bytes(card_id: Uuid, data: &[u8], existing: &[PathBuf]) -> Result<PathBuf> {
     let dir = crate::infra::paths::attachments_dir(card_id);
     std::fs::create_dir_all(&dir)?;
-    let dest = dir.join(format!("{}-pasted.png", &Uuid::new_v4().to_string()[..8]));
+    let n = next_pasted_number(existing);
+    let dest = dir.join(format!(
+        "{}-pasted-{n}.png",
+        &Uuid::new_v4().to_string()[..8]
+    ));
     std::fs::write(&dest, data)?;
     Ok(dest)
+}
+
+/// Next free number for a pasted screenshot, from the card's existing
+/// attachments. Max-based rather than count-based so a removed screenshot's
+/// number is never reissued. Legacy un-numbered `pasted.png` counts as 0;
+/// non-pasted attachments are ignored.
+fn next_pasted_number(existing: &[PathBuf]) -> u32 {
+    existing
+        .iter()
+        .filter_map(|p| {
+            let original = crate::infra::paths::attachment_label(p);
+            if original == "pasted.png" {
+                return Some(0);
+            }
+            original
+                .strip_prefix("pasted-")?
+                .strip_suffix(".png")?
+                .parse::<u32>()
+                .ok()
+        })
+        .max()
+        .map_or(1, |m| m + 1)
 }
 
 /// Fold the captured clarifying Q&A and change requests into a task description
@@ -1352,6 +1380,35 @@ mod tests {
     use super::actor::{finalize_investigation, handle_event};
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn next_pasted_number_starts_at_one() {
+        assert_eq!(next_pasted_number(&[]), 1);
+    }
+
+    #[test]
+    fn next_pasted_number_legacy_unnumbered_counts_as_zero() {
+        let existing = [PathBuf::from("/att/ab12cd34-pasted.png")];
+        assert_eq!(next_pasted_number(&existing), 1);
+    }
+
+    #[test]
+    fn next_pasted_number_skips_gaps_never_reissues() {
+        let existing = [
+            PathBuf::from("/att/ab12cd34-pasted-1.png"),
+            PathBuf::from("/att/ef56ab78-pasted-3.png"),
+        ];
+        assert_eq!(next_pasted_number(&existing), 4);
+    }
+
+    #[test]
+    fn next_pasted_number_ignores_non_pasted_names() {
+        let existing = [
+            PathBuf::from("/att/ab12cd34-screenshot.png"),
+            PathBuf::from("/att/ef56ab78-notes-2.txt"),
+        ];
+        assert_eq!(next_pasted_number(&existing), 1);
+    }
 
     #[test]
     fn slug_is_branch_safe() {

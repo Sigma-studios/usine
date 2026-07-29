@@ -307,6 +307,8 @@ select option { background: var(--panel-2); color: var(--text); }
   border-radius: 6px; padding: 3px 6px 3px 8px; font-size: 12px;
 }
 .chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.chip-label.clickable { cursor: pointer; }
+.chip-label.clickable:hover { text-decoration: underline; }
 .chip-remove {
   background: none; border: none; color: var(--muted); cursor: pointer;
   font-size: 14px; line-height: 1; padding: 0 2px;
@@ -491,6 +493,13 @@ select option { background: var(--panel-2); color: var(--text); }
   box-shadow: 0 20px 60px var(--shadow);
 }
 .modal-title { font-size: 15px; margin-bottom: 10px; }
+
+/* Attachment image preview: size the modal to the image, capped to the viewport. */
+.modal.image-preview { width: auto; max-width: calc(100vw - 80px); }
+.modal.image-preview img {
+  display: block; max-width: 100%; max-height: calc(85vh - 80px); border-radius: 6px;
+}
+.modal.image-preview .modal-body { margin-bottom: 0; }
 
 /* The large framed modal (header + fill body) used by the diff dialog. */
 .modal.modal-large {

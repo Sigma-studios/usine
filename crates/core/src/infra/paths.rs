@@ -51,6 +51,21 @@ pub fn attachments_dir(card_id: Uuid) -> PathBuf {
     data_dir().join("attachments").join(card_id.to_string())
 }
 
+/// The user-facing name of a stored attachment. Files land in
+/// [`attachments_dir`] as `<8 hex>-<original>` (the prefix keeps names unique);
+/// this strips the prefix back off. Falls back to the full file name for
+/// anything that doesn't follow the convention.
+pub fn attachment_label(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.split_once('-') {
+        Some((_, original)) => original.to_string(),
+        None => name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
