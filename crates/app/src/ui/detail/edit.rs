@@ -2,7 +2,7 @@
 //! and the run configuration form.
 
 use dioxus::prelude::*;
-use usine_core::{Card, CardConfig, CardKind, ExecutorCommand, Provider};
+use usine_core::{Card, CardConfig, CardKind, ExecutorCommand};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -91,17 +91,16 @@ fn clipboard_image_png() -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Image attachments (Claude-only)
+// Image attachments
 // ---------------------------------------------------------------------------
 
+/// Both providers can see attached images: Claude reads them with its
+/// vision-capable Read tool, Codex receives them as `codex exec -i` flags. Non-
+/// image files ride as prompt-listed paths either way (Codex's `-i` filter only
+/// covers png/jpg/jpeg/gif/webp), which both CLIs read with their shell tools.
 #[component]
-pub(super) fn Attachments(card_id: Uuid, provider: Provider) -> Element {
+pub(super) fn Attachments(card_id: Uuid) -> Element {
     let state = use_context::<AppState>();
-    // Claude reads attached images via its (vision-capable) Read tool; Codex has
-    // no equivalent path today, so the section only shows for Claude cards.
-    if provider != Provider::Claude {
-        return rsx! {};
-    }
     let atts = state.card_attachments(card_id);
 
     rsx! {
