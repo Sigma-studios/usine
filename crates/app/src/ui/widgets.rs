@@ -8,12 +8,17 @@ use usine_core::{supported_efforts, Effort, ModelSpec, Provider};
 pub(crate) fn models_for(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &["opus", "sonnet", "haiku", "fable"],
-        // The pre-5.3 Codex lineup shuts down 2026-07-23; this is the surviving
-        // set (minus the Pro-only `gpt-5.3-codex-spark`). Working-on-ChatGPT-auth
-        // models first (verified live Jul 2026): gpt-5.5 and gpt-5.4-mini are
-        // accepted; gpt-5.3-codex and gpt-5.4 are rejected on ChatGPT accounts
-        // but kept selectable in case that gate changes per plan.
-        Provider::Codex => &["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.4"],
+        // Models available through Codex with ChatGPT authentication, newest
+        // first. Older entries remain selectable for plan-dependent access.
+        Provider::Codex => &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+        ],
     }
 }
 
@@ -37,6 +42,7 @@ pub(crate) fn parse_effort(s: &str) -> Effort {
         "high" => Effort::High,
         "xhigh" => Effort::XHigh,
         "max" => Effort::Max,
+        "ultra" => Effort::Ultra,
         _ => Effort::Medium,
     }
 }
@@ -141,5 +147,23 @@ pub(crate) fn OptionalModelEffortPicker(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_picker_lists_the_gpt_5_6_family() {
+        let models = models_for(Provider::Codex);
+        assert!(models.contains(&"gpt-5.6-sol"));
+        assert!(models.contains(&"gpt-5.6-terra"));
+        assert!(models.contains(&"gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn ultra_effort_is_parsed() {
+        assert_eq!(parse_effort("ultra"), Effort::Ultra);
     }
 }
