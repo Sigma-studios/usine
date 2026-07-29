@@ -175,6 +175,7 @@ pub enum Effort {
     High,
     XHigh,
     Max,
+    Ultra,
 }
 
 impl Effort {
@@ -185,29 +186,25 @@ impl Effort {
             Effort::High => "high",
             Effort::XHigh => "xhigh",
             Effort::Max => "max",
+            Effort::Ultra => "ultra",
         }
     }
     /// Value for `claude --effort <e>` (Claude supports the full set).
     pub fn claude_flag(self) -> &'static str {
         self.label()
     }
-    /// Value for `codex -c model_reasoning_effort=<e>`. Codex tops out at `xhigh`
-    /// (supported by `gpt-5.1-codex-max`); the Claude-only `max` tier clamps to it.
+    /// Value for `codex -c model_reasoning_effort=<e>`.
     pub fn codex_value(self) -> &'static str {
-        match self {
-            Effort::Low => "low",
-            Effort::Medium => "medium",
-            Effort::High => "high",
-            Effort::XHigh | Effort::Max => "xhigh",
-        }
+        self.label()
     }
-    pub fn all() -> [Effort; 5] {
+    pub fn all() -> [Effort; 6] {
         [
             Effort::Low,
             Effort::Medium,
             Effort::High,
             Effort::XHigh,
             Effort::Max,
+            Effort::Ultra,
         ]
     }
 
@@ -234,9 +231,9 @@ impl Effort {
 ///
 /// * **Claude** — the `opus` (4.8), `sonnet` (5), and `fable` (5) aliases take the
 ///   full range; Haiku 4.5 has no effort tiers, so it gets a single neutral entry.
-/// * **Codex** — the current generation (`gpt-5.3-codex`, `gpt-5.4`(`-mini`),
-///   `gpt-5.5`) reaches `xhigh`, as did the retiring `gpt-5.1-codex-max`; legacy
-///   or unknown ids stay at `high`, and none exposes a tier matching our `max`.
+/// * **Codex** — GPT-5.6 Sol and Terra reach `ultra`, while Luna reaches `max`.
+///   GPT-5.3 through GPT-5.5 reach `xhigh`, as did the retiring
+///   `gpt-5.1-codex-max`; legacy or unknown ids stay at `high`.
 ///
 /// Verified against the Claude Code model-config docs and OpenAI's Codex model
 /// docs (Jul 2026 — the pre-5.3 Codex lineup shuts down 2026-07-23). Claude Code
@@ -251,6 +248,8 @@ pub fn supported_efforts(provider: Provider, model: &str) -> &'static [Effort] {
             _ => &[Low, Medium, High, XHigh, Max],
         },
         Provider::Codex => match model {
+            "gpt-5.6-sol" | "gpt-5.6-terra" => &[Low, Medium, High, XHigh, Max, Ultra],
+            "gpt-5.6-luna" => &[Low, Medium, High, XHigh, Max],
             "gpt-5.3-codex" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" | "gpt-5.1-codex-max" => {
                 &[Low, Medium, High, XHigh]
             }

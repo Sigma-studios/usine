@@ -485,10 +485,24 @@ mod tests {
             effort_arg(&build_args(&mk("gpt-5.3-codex", Effort::XHigh))),
             "xhigh"
         );
-        // ...and `max` (no Codex analogue) clamps to that ceiling.
+        // ...and `max` clamps to that ceiling.
         assert_eq!(
             effort_arg(&build_args(&mk("gpt-5.3-codex", Effort::Max))),
             "xhigh"
+        );
+        // GPT-5.6 Sol and Terra add `max` and `ultra`.
+        assert_eq!(
+            effort_arg(&build_args(&mk("gpt-5.6-sol", Effort::Ultra))),
+            "ultra"
+        );
+        assert_eq!(
+            effort_arg(&build_args(&mk("gpt-5.6-terra", Effort::Max))),
+            "max"
+        );
+        // Luna tops out at `max`.
+        assert_eq!(
+            effort_arg(&build_args(&mk("gpt-5.6-luna", Effort::Ultra))),
+            "max"
         );
         // Legacy / unknown model ids stay clamped to `high`.
         assert_eq!(
