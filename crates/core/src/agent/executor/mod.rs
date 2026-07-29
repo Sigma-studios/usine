@@ -735,7 +735,10 @@ fn copy_attachment_bytes(card_id: Uuid, data: &[u8], existing: &[PathBuf]) -> Re
     let dir = crate::infra::paths::attachments_dir(card_id);
     std::fs::create_dir_all(&dir)?;
     let n = next_pasted_number(existing);
-    let dest = dir.join(format!("{}-pasted-{n}.png", &Uuid::new_v4().to_string()[..8]));
+    let dest = dir.join(format!(
+        "{}-pasted-{n}.png",
+        &Uuid::new_v4().to_string()[..8]
+    ));
     std::fs::write(&dest, data)?;
     Ok(dest)
 }
