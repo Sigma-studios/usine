@@ -187,7 +187,7 @@ fn CardPanel(card: Card) -> Element {
     rsx! {
         if is_start {
             EditableTask { card: card.clone() }
-            Attachments { card_id: id, provider: card.config.provider }
+            Attachments { card_id: id }
             ConfigForm { card: card.clone() }
         } else {
             div { class: "section",
