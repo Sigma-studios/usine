@@ -7,10 +7,12 @@
 //! clickable URLs. Nothing touches the user's main checkout.
 //!
 //! A preview auto-started for a write run lives only as long as the automated
-//! pipeline: when the card parks, the finalizers light-stop it
-//! ([`Executor::reap_idle_preview`]) — process tree killed, teardown script
-//! skipped — so idle cards don't accumulate running apps while a restart
-//! stays warm.
+//! pipeline: when the card parks, the finalizers stop it
+//! ([`Executor::reap_idle_preview`]) — process tree killed *and* teardown
+//! script run — so idle cards accumulate neither running apps nor the
+//! containers and volumes their setup spun up. A restart is still fast: what
+//! makes it fast (dependencies, build output, build caches) lives in the
+//! worktree, which teardown leaves alone.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -168,8 +170,8 @@ impl Executor {
     /// Bring a card's preview up alongside a write run, so the agent can test its
     /// work against the running app (see [`crate::agent::testing`]). The app lives
     /// for the automated pipeline and is reaped when the card parks
-    /// ([`Self::reap_idle_preview`]) — the light kill keeps the worktree's infra
-    /// up, so a manual restart from the card is fast. Quietly a no-op
+    /// ([`Self::reap_idle_preview`]), which takes the worktree's isolated infra
+    /// down with it; the setup script rebuilds it on the next start. Quietly a no-op
     /// when there is nothing to do: a preview already up (or setting up) is
     /// reused, and a project with no run script — or a card with no worktree —
     /// simply has no app to run (the agent's prompt omits the testing instruction
@@ -513,11 +515,29 @@ impl Executor {
         }
     }
 
-    /// Light-stop a card's preview once its automated pipeline parks: kill the
-    /// app's process tree but skip the teardown script, so per-worktree infra
-    /// (DB, containers) stays up and a restart — manual or the next run's
-    /// `EnsurePreview` — is warm and fast. Best-effort and infallible; called
-    /// from every finalizer that leaves the card in a parked state.
+    /// Stop a card's preview once its automated pipeline parks: kill the app's
+    /// process tree *and* run the teardown script, so the worktree's isolated
+    /// infra (DB container + volume) goes with it. Best-effort and infallible;
+    /// called from every finalizer that leaves the card in a parked state.
+    ///
+    /// This used to skip the teardown to keep the infra "warm" for a fast
+    /// restart, but that warmth is a fiction: a setup script owns bringing the
+    /// infra up, and the conventional one recreates it from scratch every run
+    /// (`docker compose down -v` then `up`, because a surviving volume would
+    /// make its non-idempotent seeders fail on already-seeded data). So the
+    /// container we kept alive was never read — the next start destroyed it
+    /// first. What actually stays warm is everything the teardown does *not*
+    /// touch: installed dependencies, build output and build caches, all of
+    /// which live in the worktree's filesystem.
+    ///
+    /// Parking is also the overwhelmingly common way a card stops, so tearing
+    /// down here is what bounds the infra's lifetime to a single run. The
+    /// delete/merge paths reach it too, but a card that simply parks on the
+    /// board would otherwise hold a database container indefinitely — and if
+    /// its worktree is later removed without going through those paths, the
+    /// teardown script goes with it and the stack is orphaned for good (see
+    /// [`crate::agent::startup::reconcile_orphaned_worktree_stacks`], the
+    /// backstop for the crash/force-quit window this cannot close).
     ///
     /// Race-safe by construction: bail when the card has no preview slot (no
     /// spurious `Stopped` for cards that never previewed), when the card is
@@ -549,6 +569,16 @@ impl Executor {
         }
         if let Some(wt) = card.worktree_path.as_deref() {
             clear_preview_info(wt);
+        }
+        // Awaited, not detached: a detached `down -v` could still be running
+        // when a restart's setup script issues its own `down -v` + `up`, and
+        // the two would race over the same container. Parking is not
+        // latency-critical the way starting a run is — the command channel that
+        // keeps a slow *setup* off the card's critical path exists for the
+        // opposite direction.
+        if let Ok(project) = self.store.get_project(card.project_id) {
+            self.teardown_preview(card_id, &project.config, card.worktree_path.as_deref())
+                .await;
         }
         self.progress(
             card_id,

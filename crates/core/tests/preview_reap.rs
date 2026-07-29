@@ -1,7 +1,7 @@
 //! Auto-stop of the in-worktree preview when the automated pipeline parks,
 //! driven through the real executor: a write run brings the app up
-//! (`EnsurePreview`), and the finalizers light-stop it — process tree killed,
-//! teardown script skipped — once the card settles in a parked state.
+//! (`EnsurePreview`), and the finalizers stop it — process tree killed and
+//! teardown script run — once the card settles in a parked state.
 //!
 //! The preview is a real `sh` process in a real temp worktree — only the
 //! agents, git, and the forge are simulated.
@@ -126,7 +126,7 @@ async fn implement_done_park_reaps_the_preview() {
 }
 
 #[tokio::test]
-async fn validation_pass_reaps_light_without_teardown() {
+async fn validation_pass_reap_tears_down_the_worktree_infra() {
     let wt = tempfile::tempdir().unwrap();
     let (store, card_id) = seed(
         ProjectConfig {
@@ -157,10 +157,16 @@ async fn validation_pass_reaps_light_without_teardown() {
         "card should be parked at ReadyForPr, got {:?}",
         card.state
     );
-    // The light kill skips the teardown script — the worktree's infra stays up.
+    // The reap runs the teardown script, so the worktree's isolated infra (in a
+    // real project: the DB container and its volume) goes down with the app.
+    // Parking is the common way a card stops, so skipping it here was what let
+    // containers outlive their cards indefinitely.
+    //
+    // No polling needed: the reap awaits the teardown *before* emitting
+    // `Stopped`, so observing that status already means the script has run.
     assert!(
-        !wt.path().join("torn-down").exists(),
-        "the teardown script must not run on a parked-card reap"
+        wt.path().join("torn-down").exists(),
+        "the teardown script should run when a parked card's preview is reaped"
     );
 }
 

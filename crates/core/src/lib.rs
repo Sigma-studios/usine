@@ -39,7 +39,7 @@ pub use agent::review::{
 };
 pub use agent::startup::{
     binary_on_path, reconcile_interrupted_reviews, reconcile_interrupted_runs,
-    seed_default_provider, sync_base_branches,
+    reconcile_orphaned_worktree_stacks, seed_default_provider, sync_base_branches,
 };
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{

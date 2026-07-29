@@ -327,9 +327,9 @@ impl Executor {
         // Bring the worktree's app up alongside every write run (setup script,
         // then `run_script`, executor-owned like any preview) so the agent can
         // verify its work in the running app. It lives for the automated
-        // pipeline: the finalizers light-stop it when the card parks
-        // (`reap_idle_preview`), leaving the worktree's infra warm for a fast
-        // manual restart. Routed through the command channel — this
+        // pipeline: the finalizers stop it when the card parks
+        // (`reap_idle_preview`), tearing the worktree's isolated infra down with
+        // it so a parked card holds no containers. Routed through the command channel — this
         // launch usually runs inside an exclusive command, and a slow setup
         // (deps, docker) must not hold the card busy or delay the agent.
         if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
