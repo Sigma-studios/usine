@@ -165,6 +165,13 @@ impl AppState {
             let _ = usine_core::sync_base_branches(&store);
             let _ = usine_core::reconcile_interrupted_runs(&store, INTERRUPTED_MSG);
             let _ = usine_core::reconcile_interrupted_reviews(&store, INTERRUPTED_MSG);
+            // Detached, unlike the reconciliations above: this one shells out to
+            // Docker once per stranded stack, so a slow — or wedged — daemon
+            // would otherwise hold the board off the screen for as long as it
+            // takes. Nothing on screen depends on the result, and the stacks it
+            // reclaims have already been stranded for however long, so finishing
+            // a few seconds after launch is soon enough.
+            std::thread::spawn(usine_core::reconcile_orphaned_worktree_stacks);
         }
 
         // Rewrite stored records into canonical form so ones written before newer
