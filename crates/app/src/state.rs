@@ -911,7 +911,10 @@ fn open_store() -> Store {
         Err(e) => {
             push_toast(
                 Severity::Error,
-                format!("could not open database ({e}); using a temporary in-memory store"),
+                format!(
+                    "could not open database ({e}). Maybe another instance is already running; \
+                     using a temporary in-memory store"
+                ),
             );
             Store::open_in_memory().expect("in-memory store")
         }
