@@ -427,6 +427,22 @@ fn CardPanel(card: Card) -> Element {
             }
         }
 
+        if let CardState::MergedWithoutReview { merged } = &card.state {
+            div { class: "section",
+                h3 { if *merged { "Merged without review" } else { "PR closed" } }
+                if let Some(p) = card.pr.clone() {
+                    PrLink { number: p.number, url: p.url }
+                }
+                div { class: "hint",
+                    if *merged {
+                        "This PR was merged on GitHub before its review finished here. The work is on the base branch; the worktree was cleaned up, the branch was left alone. Use the card menu to mark it done or send it back to start."
+                    } else {
+                        "This PR was closed on GitHub without merging. The branch was left alone in case the work is still wanted. Use the card menu to mark the card done or send it back to start."
+                    }
+                }
+            }
+        }
+
         if let Some(msg) = fail_display.clone() {
             div { class: "section",
                 div { class: "question", "{msg}" }
@@ -559,6 +575,8 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::PrReview(PrReviewSub::ApplyingFixes) => "pr-apply",
         CardState::PrReview(PrReviewSub::ApplyingChange) => "pr-change",
         CardState::ReadyToMerge => "ready",
+        CardState::MergedWithoutReview { merged: true } => "ext-merged",
+        CardState::MergedWithoutReview { merged: false } => "ext-closed",
         CardState::Done => "done",
         CardState::Failed { .. } => "failed",
         CardState::Answering { .. } => "answering",

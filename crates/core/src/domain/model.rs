@@ -289,6 +289,9 @@ pub enum Column {
     SelfReview,
     PrReview,
     ReadyToMerge,
+    /// The PR left GitHub without the in-app review finishing: merged directly,
+    /// or closed without merging (see [`CardState::MergedWithoutReview`]).
+    MergedWithoutReview,
     #[serde(alias = "Merged")]
     Done,
 }
@@ -303,11 +306,12 @@ impl Column {
             Column::SelfReview => "Self-review",
             Column::PrReview => "PR review",
             Column::ReadyToMerge => "Ready to merge",
+            Column::MergedWithoutReview => "Merged w/o review",
             Column::Done => "Done",
         }
     }
     /// Columns shown on the board, in order.
-    pub fn board() -> [Column; 8] {
+    pub fn board() -> [Column; 9] {
         [
             Column::StartingBlock,
             Column::Designing,
@@ -316,6 +320,7 @@ impl Column {
             Column::SelfReview,
             Column::PrReview,
             Column::ReadyToMerge,
+            Column::MergedWithoutReview,
             Column::Done,
         ]
     }
@@ -330,6 +335,9 @@ pub enum ReviewColumn {
     Reviewing,
     AwaitingValidation,
     Reviewed,
+    /// The PR left GitHub before the review finished: merged directly, or
+    /// closed without merging (see [`ReviewStatus::MergedWithoutReview`]).
+    MergedWithoutReview,
 }
 
 impl ReviewColumn {
@@ -339,15 +347,17 @@ impl ReviewColumn {
             ReviewColumn::Reviewing => "Reviewing",
             ReviewColumn::AwaitingValidation => "Awaiting validation",
             ReviewColumn::Reviewed => "Reviewed",
+            ReviewColumn::MergedWithoutReview => "Merged w/o review",
         }
     }
     /// Columns shown on the review board, in order.
-    pub fn board() -> [ReviewColumn; 4] {
+    pub fn board() -> [ReviewColumn; 5] {
         [
             ReviewColumn::ToReview,
             ReviewColumn::Reviewing,
             ReviewColumn::AwaitingValidation,
             ReviewColumn::Reviewed,
+            ReviewColumn::MergedWithoutReview,
         ]
     }
 }
@@ -453,6 +463,15 @@ pub enum CardState {
     AwaitingReview(ReviewSub),
     PrReview(PrReviewSub),
     ReadyToMerge,
+    /// The PR left GitHub without this card's review flow finishing: `merged:
+    /// true` means it was merged directly on GitHub while review comments were
+    /// still pending; `merged: false` means it was closed without merging.
+    /// Parked for the user to acknowledge — exits are the usual card-menu
+    /// `ResetToStart` / `MarkDone`. Set by the reconciliation in the PR poll
+    /// and the panel's ↻ (see `poll_pr_comments` / `list_reviews`).
+    MergedWithoutReview {
+        merged: bool,
+    },
     /// Terminal: the card is finished — reached by merging its PR or by the user
     /// marking it done. (Serialized as `Done`; older records used `Merged`.)
     #[serde(alias = "Merged")]
@@ -498,6 +517,7 @@ impl CardState {
             ) => Column::SelfReview,
             CardState::PrReview(_) => Column::PrReview,
             CardState::ReadyToMerge => Column::ReadyToMerge,
+            CardState::MergedWithoutReview { .. } => Column::MergedWithoutReview,
             CardState::Done => Column::Done,
             CardState::Failed { previous, .. } => previous.column(),
             CardState::Answering { previous, .. } => previous.column(),
@@ -550,6 +570,7 @@ impl CardState {
                         | ReviewSub::ValidationFailed { .. }
                 ) | CardState::Concluded { .. }
                     | CardState::ReadyToMerge
+                    | CardState::MergedWithoutReview { .. }
                     | CardState::Failed { .. }
             )
     }
@@ -636,6 +657,8 @@ impl CardState {
             CardState::PrReview(PrReviewSub::ApplyingFixes) => "applying fixes…",
             CardState::PrReview(PrReviewSub::ApplyingChange) => "applying change…",
             CardState::ReadyToMerge => "ready to merge",
+            CardState::MergedWithoutReview { merged: true } => "merged w/o review",
+            CardState::MergedWithoutReview { merged: false } => "PR closed",
             CardState::Done => "done",
             CardState::Failed { .. } => "failed",
             CardState::Answering { .. } => "answering…",
@@ -955,6 +978,15 @@ pub enum ReviewStatus {
     },
     /// The review was submitted to GitHub.
     Reviewed,
+    /// The PR left GitHub before the review finished: `merged: true` means it
+    /// was merged without waiting for this review; `merged: false` means it was
+    /// closed without merging. Kept on the board (rather than pruned) precisely
+    /// because "merged without review" is worth seeing; dismiss clears it. Set
+    /// by the scan's reconciliation, which also flips it back to `ToReview` if
+    /// the PR is reopened.
+    MergedWithoutReview {
+        merged: bool,
+    },
     /// A run faulted. Carries the state to return to on retry.
     Failed {
         previous: Box<ReviewStatus>,
@@ -969,6 +1001,7 @@ impl ReviewStatus {
             ReviewStatus::Reviewing => ReviewColumn::Reviewing,
             ReviewStatus::AwaitingValidation { .. } => ReviewColumn::AwaitingValidation,
             ReviewStatus::Reviewed => ReviewColumn::Reviewed,
+            ReviewStatus::MergedWithoutReview { .. } => ReviewColumn::MergedWithoutReview,
             ReviewStatus::Failed { previous, .. } => previous.column(),
         }
     }
@@ -989,6 +1022,7 @@ impl ReviewStatus {
             self,
             ReviewStatus::ToReview
                 | ReviewStatus::AwaitingValidation { .. }
+                | ReviewStatus::MergedWithoutReview { .. }
                 | ReviewStatus::Failed { .. }
         )
     }
@@ -999,6 +1033,8 @@ impl ReviewStatus {
             ReviewStatus::Reviewing => "reviewing…",
             ReviewStatus::AwaitingValidation { .. } => "validate",
             ReviewStatus::Reviewed => "reviewed",
+            ReviewStatus::MergedWithoutReview { merged: true } => "merged w/o review",
+            ReviewStatus::MergedWithoutReview { merged: false } => "PR closed",
             ReviewStatus::Failed { .. } => "failed",
         }
     }
@@ -1845,6 +1881,61 @@ mod tests {
                 "{s:?} → Self-review"
             );
         }
+    }
+
+    #[test]
+    fn merged_without_review_membership_columns_and_serde() {
+        for (state, label) in [
+            (
+                CardState::MergedWithoutReview { merged: true },
+                "merged w/o review",
+            ),
+            (
+                CardState::MergedWithoutReview { merged: false },
+                "PR closed",
+            ),
+        ] {
+            // A parked hand-off: badges like `ReadyToMerge`, but never the
+            // urgent tier and never an intervention.
+            assert!(state.needs_attention(), "{state:?}");
+            assert!(!state.needs_urgent_attention() && !state.needs_intervention());
+            assert!(!state.is_running());
+            assert_eq!(state.column(), Column::MergedWithoutReview);
+            assert_eq!(state.status_label(), label);
+            // Round-trips through the store's JSON codec shape.
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), state);
+        }
+        // The column sits between the merge gate and Done on the board.
+        let board = Column::board();
+        let i = board
+            .iter()
+            .position(|c| *c == Column::MergedWithoutReview)
+            .unwrap();
+        assert_eq!(board[i - 1], Column::ReadyToMerge);
+        assert_eq!(board[i + 1], Column::Done);
+
+        for (status, label) in [
+            (
+                ReviewStatus::MergedWithoutReview { merged: true },
+                "merged w/o review",
+            ),
+            (
+                ReviewStatus::MergedWithoutReview { merged: false },
+                "PR closed",
+            ),
+        ] {
+            assert!(status.needs_attention(), "{status:?}");
+            assert!(!status.is_running() && !status.is_failed());
+            assert_eq!(status.column(), ReviewColumn::MergedWithoutReview);
+            assert_eq!(status.status_label(), label);
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(serde_json::from_str::<ReviewStatus>(&json).unwrap(), status);
+        }
+        assert_eq!(
+            *ReviewColumn::board().last().unwrap(),
+            ReviewColumn::MergedWithoutReview
+        );
     }
 
     #[test]
