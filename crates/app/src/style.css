@@ -650,14 +650,18 @@ select option { background: var(--panel-2); color: var(--text); }
 
 .toast-host {
   position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 1000;
-  max-width: 360px;
+  max-width: 360px; max-height: calc(100vh - 32px); overflow-y: auto;
 }
 .toast {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex: none;
   background: var(--panel-2); border: 1px solid var(--border); border-left-width: 4px;
   border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 20px var(--shadow-soft);
 }
-.toast .toast-msg { flex: 1; font-size: 13px; }
+.toast .toast-msg {
+  flex: 1; font-size: 13px;
+  min-width: 0; overflow-wrap: anywhere;
+  max-height: 40vh; overflow-y: auto;
+}
 .toast .toast-close { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 16px; }
 .toast.info { border-left-color: var(--accent); }
 .toast.success { border-left-color: var(--green); }
