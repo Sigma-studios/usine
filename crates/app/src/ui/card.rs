@@ -70,6 +70,10 @@ pub fn CardView(card: Card) -> Element {
         st,
         CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
     );
+    // A PR closed without merging is closer to "something went wrong" than a
+    // routine hand-off, so its badge borrows the intervention styling; the
+    // merged-without-review variant keeps the neutral status badge.
+    let externally_closed = matches!(st, CardState::MergedWithoutReview { merged: false });
     let is_investigation = card.config.kind == CardKind::Investigation;
     // An investigation finished: its conclusion is the deliverable — the primary
     // action is to read it (in the detail panel, where follow-up/convert live).
@@ -232,6 +236,8 @@ pub fn CardView(card: Card) -> Element {
                 }
                 if needs_answer {
                     span { class: "badge intervention", "needs answer" }
+                } else if externally_closed {
+                    span { class: "badge intervention", "{status}" }
                 } else if validation_failed {
                     span { class: "badge intervention", "{status}" }
                 } else if concluded {

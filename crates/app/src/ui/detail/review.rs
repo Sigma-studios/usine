@@ -212,6 +212,24 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     div { class: "hint", "This review was submitted to GitHub." }
                 }
             },
+            ReviewStatus::MergedWithoutReview { merged } => rsx! {
+                div { class: "section",
+                    h3 { "Review" }
+                    div { class: "hint",
+                        if *merged {
+                            "This PR was merged on GitHub before the review finished — nothing left to review. Dismiss it once acknowledged; if the PR is reopened, it returns to the queue on the next refresh."
+                        } else {
+                            "This PR was closed on GitHub without merging — nothing left to review. Dismiss it once acknowledged; if the PR is reopened, it returns to the queue on the next refresh."
+                        }
+                    }
+                    button {
+                        class: "btn subtle",
+                        title: "Dismiss this PR from the review board",
+                        onclick: move |_| crate::ui::confirm_dismiss_review(id, task.pr_number),
+                        "Dismiss"
+                    }
+                }
+            },
             ReviewStatus::Failed { message, .. } => rsx! {
                 div { class: "section",
                     div { class: "question", "Review failed: {message}" }
@@ -433,6 +451,8 @@ fn status_discriminant(s: &ReviewStatus) -> &'static str {
         ReviewStatus::Reviewing => "reviewing",
         ReviewStatus::AwaitingValidation { .. } => "validate",
         ReviewStatus::Reviewed => "reviewed",
+        ReviewStatus::MergedWithoutReview { merged: true } => "ext-merged",
+        ReviewStatus::MergedWithoutReview { merged: false } => "ext-closed",
         ReviewStatus::Failed { .. } => "failed",
     }
 }

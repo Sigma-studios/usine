@@ -125,10 +125,13 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
     let can_start = matches!(st, ReviewStatus::ToReview);
     let can_validate = matches!(st, ReviewStatus::AwaitingValidation { .. });
     let published = matches!(st, ReviewStatus::Reviewed);
+    // The PR left GitHub (merged or closed) before the review finished — the
+    // only thing left to do is acknowledge it.
+    let retired = matches!(st, ReviewStatus::MergedWithoutReview { .. });
 
-    // A published review's checkout is torn down, so there's nothing left to run
-    // or open; everything before that has (or can get) one on demand.
-    let has_checkout = !published;
+    // A published or retired task's checkout is torn down, so there's nothing
+    // left to run or open; everything before that has (or can get) one on demand.
+    let has_checkout = !published && !retired;
     let run_configured = state
         .projects
         .read()
@@ -293,6 +296,17 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                 }
                 if published {
                     span { class: "reviewed-tag", "✓ published" }
+                }
+                if retired {
+                    button {
+                        class: "btn subtle",
+                        title: "Dismiss this PR from the review board",
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            super::confirm_dismiss_review(id, pr_number);
+                        },
+                        "Dismiss"
+                    }
                 }
                 if failed {
                     button {

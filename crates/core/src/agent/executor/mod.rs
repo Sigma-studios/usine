@@ -38,7 +38,7 @@ use crate::domain::model::{
 };
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::{CoreError, Result};
-use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, MergeStatus};
+use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState, MergeStatus};
 use crate::infra::git::{canonicalize_branch_case, sanitize_branch_name, GitOps, MergeOutcome};
 use crate::infra::persistence::Store;
 
