@@ -2,6 +2,7 @@
 //! PR, fetching + applying reviewer comments, marking ready, and merging.
 
 use super::*;
+use crate::infra::git::is_dirty;
 
 impl Executor {
     pub(super) async fn create_pr(
@@ -728,7 +729,8 @@ impl Executor {
 
         // Past this point the PR is merged: report cleanup problems, never raise
         // them.
-        let (worktree_gone, mut left_behind) = self.cleanup_terminal_pr_worktree(card_id).await;
+        let (worktree_gone, mut left_behind) =
+            self.cleanup_terminal_pr_worktree(card_id, false).await;
         if delete_branch {
             if let Some(branch) = &card.branch {
                 // Deleting the local branch can only work once nothing has it
@@ -771,9 +773,17 @@ impl Executor {
     /// deletion itself is deliberately NOT here: the reconciliation paths never
     /// delete branches. Best-effort throughout — returns whether the worktree
     /// is gone, plus what was left behind for the caller's warning.
+    ///
+    /// `keep_if_dirty` is for the background reconcile: the card menu offers
+    /// opening the worktree in a terminal/editor while parked at the PR gates,
+    /// so a poll tick noticing the PR went terminal on GitHub must not
+    /// force-remove uncommitted edits the user may have in there. A dirty tree
+    /// is then kept in place (path and all) and reported instead of destroyed.
+    /// The user-initiated merge passes `false` — they asked for the teardown.
     pub(super) async fn cleanup_terminal_pr_worktree(
         &self,
         card_id: Uuid,
+        keep_if_dirty: bool,
     ) -> (bool, Vec<String>) {
         let _ = self.stop_preview(card_id).await;
         let Ok(card) = self.store.get_card(card_id) else {
@@ -785,7 +795,13 @@ impl Executor {
         let mut left_behind = Vec::new();
         let mut worktree_gone = true;
         if let Some(worktree) = &card.worktree_path {
-            if let Err(e) = self.remove_worktree_retrying(&project.path, worktree).await {
+            // An unreadable tree (already removed by hand, permissions) answers
+            // "not dirty" and falls through to the removal attempt, which
+            // reports its own failure.
+            if keep_if_dirty && is_dirty(worktree).await.unwrap_or(false) {
+                worktree_gone = false;
+                left_behind.push("worktree (kept — it has uncommitted changes)".to_string());
+            } else if let Err(e) = self.remove_worktree_retrying(&project.path, worktree).await {
                 worktree_gone = false;
                 left_behind.push(format!("worktree ({e})"));
             }
@@ -871,7 +887,7 @@ impl Executor {
                     )
                 };
                 self.apply(card_id, transition)?;
-                let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id).await;
+                let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id, true).await;
                 self.toast_reconciled(card_id, message, left_behind);
                 Ok(true)
             }
@@ -884,7 +900,7 @@ impl Executor {
                 }
                 sync_pr_state("closed")?;
                 self.apply(card_id, Transition::PrClosedExternally)?;
-                let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id).await;
+                let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id, true).await;
                 self.toast_reconciled(
                     card_id,
                     format!("PR #{} was closed on GitHub without merging", pr.number),

@@ -226,12 +226,7 @@ impl Executor {
             // and stay put either way.
             let open: HashSet<u64> = prs.iter().map(|p| p.number).collect();
             for task in &existing {
-                if open.contains(&task.pr_number)
-                    || matches!(
-                        task.status,
-                        ReviewStatus::Reviewed | ReviewStatus::MergedWithoutReview { .. }
-                    )
-                {
+                if open.contains(&task.pr_number) || task.status.is_settled() {
                     continue;
                 }
                 match self
@@ -769,7 +764,11 @@ fn handle_review_event(
 }
 
 /// Mark a review task `Failed` (retryable), wrapping its current status as
-/// `previous`. Idempotent if the task is already failed.
+/// `previous`. Idempotent if the task is already failed, and a no-op on a
+/// settled task: a straggler `Error` from the cancelled run (or its idle-
+/// timeout synthetic error) landing just after `retire_review_task` must not
+/// wrap `MergedWithoutReview`/`Reviewed` into `Failed` and pull a dead PR back
+/// onto a retryable column.
 fn fail_review_task(
     store: &Store,
     evt_tx: &UnboundedSender<ExecutorEvent>,
@@ -777,7 +776,7 @@ fn fail_review_task(
     message: String,
 ) -> Result<()> {
     let updated = store.mutate_review_task(review_id, |t| {
-        if !t.status.is_failed() {
+        if !t.status.is_failed() && !t.status.is_settled() {
             let prev = std::mem::replace(&mut t.status, ReviewStatus::ToReview);
             t.status = ReviewStatus::Failed {
                 previous: Box::new(prev),

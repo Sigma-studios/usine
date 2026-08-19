@@ -1015,6 +1015,17 @@ impl ReviewStatus {
         matches!(self, ReviewStatus::Failed { .. })
     }
 
+    /// True once the PR's fate no longer depends on a run: the review was
+    /// submitted, or the PR left GitHub. Nothing may move a settled task to
+    /// `Failed` — only the scan's reconciliation changes it (reopen heals
+    /// `MergedWithoutReview` back to `ToReview`).
+    pub fn is_settled(&self) -> bool {
+        matches!(
+            self,
+            ReviewStatus::Reviewed | ReviewStatus::MergedWithoutReview { .. }
+        )
+    }
+
     /// True when the user must act: a PR waiting to be reviewed, drafts waiting
     /// to be validated, or a faulted run. Feeds the sidebar / dock badge counts.
     pub fn needs_attention(&self) -> bool {
