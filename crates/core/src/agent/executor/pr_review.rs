@@ -70,7 +70,7 @@ impl Executor {
                 continue;
             };
             let reviewer = reviewer.as_deref();
-            let (comments, reviews, unanswered, checks) =
+            let (comments, reviews, unanswered, checks, live) =
                 match self.fetch_review_status(&project.path, pr_number).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -78,6 +78,19 @@ impl Executor {
                         continue;
                     }
                 };
+            // A PR merged or closed on GitHub retires the card before the count
+            // refresh and the auto-advance below — a merged PR must not ride
+            // `Idle → ReadyToMerge` on the tick that should retire it. Moving
+            // is idempotent: the card leaves the polled states, so the next
+            // tick skips it entirely. Best-effort, like the rest of the loop.
+            match self.reconcile_pr_live_state(card.id, live).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("PR-comment poll: reconcile for #{pr_number} failed: {e}");
+                    continue;
+                }
+            }
             let (by_reviewer, total) = comment_counts(&comments, reviewer);
             // A failed thread listing keeps the previous count (see fetch_review_status);
             // a failed checks read likewise keeps the previous status.
@@ -162,7 +175,14 @@ impl Executor {
                 // it's deliberately untouched: a scan must never resurrect a
                 // reviewed PR or interrupt one mid-review.
                 if let Some(tracked) = existing.iter().find(|t| t.pr_number == pr.number) {
-                    let changed = tracked.pr_title != pr.title
+                    // A task retired as merged/closed whose PR shows up open
+                    // again was reopened on GitHub — heal it back to the queue.
+                    let reopened = matches!(
+                        tracked.status,
+                        ReviewStatus::MergedWithoutReview { .. }
+                    );
+                    let changed = reopened
+                        || tracked.pr_title != pr.title
                         || tracked.body != pr.body
                         || tracked.checks != pr.checks
                         || tracked.mergeable != pr.mergeable
@@ -174,8 +194,12 @@ impl Executor {
                             t.checks = pr.checks;
                             t.mergeable = pr.mergeable;
                             t.base_ref = base.clone();
-                            // Not a user-facing edit — same reasoning as the
-                            // comment poll, don't bump `updated_at`.
+                            if reopened {
+                                t.status = ReviewStatus::ToReview;
+                                t.updated_at = now_millis();
+                            }
+                            // Otherwise not a user-facing edit — same reasoning
+                            // as the comment poll, don't bump `updated_at`.
                             Ok(())
                         })?;
                     }
@@ -195,11 +219,69 @@ impl Executor {
                 task.mergeable = pr.mergeable;
                 self.store.upsert_review_task(&task)?;
             }
+            // Reconcile tracked tasks whose PR left the open listing. Absence
+            // alone does NOT mean the PR closed — the search also excludes
+            // drafts and `-reviewed-by:@me` — so each one is confirmed
+            // individually before anything moves. `Reviewed` tasks are history
+            // and stay put either way.
+            let open: HashSet<u64> = prs.iter().map(|p| p.number).collect();
+            for task in &existing {
+                if open.contains(&task.pr_number) || task.status.is_settled() {
+                    continue;
+                }
+                match self
+                    .forge
+                    .pr_live_state(&project.path, task.pr_number)
+                    .await
+                {
+                    Ok(Some(LivePrState::Merged)) => self.retire_review_task(task, true).await?,
+                    Ok(Some(LivePrState::Closed)) => self.retire_review_task(task, false).await?,
+                    // Still open (just filtered out of the search), or the
+                    // forge can't tell — leave the task exactly where it is.
+                    Ok(_) => {}
+                    // A failed read must never tear anything down.
+                    Err(e) => tracing::warn!(
+                        "review scan: live state of #{} failed: {e}",
+                        task.pr_number
+                    ),
+                }
+            }
         }
         let tasks = self.store.list_review_tasks_for_project(project_id)?;
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::review_tasks_updated(project_id, tasks));
+        Ok(())
+    }
+
+    /// Move a review task whose PR terminated on GitHub to the "merged without
+    /// review" column: cancel any live run, reap the preview and the worktree
+    /// (same ordering as `dismiss_review` — the preview's processes must die
+    /// before the directory goes), but KEEP the record and skip the permanent
+    /// dismissed list, so the column shows what happened and a reopened PR can
+    /// heal back to `ToReview` on a later scan. Any `AwaitingValidation` drafts
+    /// are discarded with the status — the PR can no longer be affected.
+    async fn retire_review_task(&self, task: &ReviewTask, merged: bool) -> Result<()> {
+        if let Some((_, control)) = lock(&self.review_runs).get(&task.id) {
+            let _ = control.unbounded_send(RunControl::Cancel);
+        }
+        if let (Some(wt), Ok(project)) = (
+            task.worktree_path.clone(),
+            self.store.get_project(task.project_id),
+        ) {
+            let _ = self.stop_review_preview(task.id).await;
+            let _ = self.git.remove_worktree(&project.path, &wt).await;
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+        let updated = self.store.mutate_review_task(task.id, |t| {
+            t.status = ReviewStatus::MergedWithoutReview { merged };
+            t.worktree_path = None;
+            t.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::review_task_updated(updated));
         Ok(())
     }
 
@@ -682,7 +764,11 @@ fn handle_review_event(
 }
 
 /// Mark a review task `Failed` (retryable), wrapping its current status as
-/// `previous`. Idempotent if the task is already failed.
+/// `previous`. Idempotent if the task is already failed, and a no-op on a
+/// settled task: a straggler `Error` from the cancelled run (or its idle-
+/// timeout synthetic error) landing just after `retire_review_task` must not
+/// wrap `MergedWithoutReview`/`Reviewed` into `Failed` and pull a dead PR back
+/// onto a retryable column.
 fn fail_review_task(
     store: &Store,
     evt_tx: &UnboundedSender<ExecutorEvent>,
@@ -690,7 +776,7 @@ fn fail_review_task(
     message: String,
 ) -> Result<()> {
     let updated = store.mutate_review_task(review_id, |t| {
-        if !t.status.is_failed() {
+        if !t.status.is_failed() && !t.status.is_settled() {
             let prev = std::mem::replace(&mut t.status, ReviewStatus::ToReview);
             t.status = ReviewStatus::Failed {
                 previous: Box::new(prev),

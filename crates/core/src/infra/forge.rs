@@ -49,6 +49,16 @@ pub struct PrSummary {
     pub mergeable: Mergeable,
 }
 
+/// A PR's live lifecycle state on the forge, as opposed to the snapshot taken
+/// at creation. What the reconciliation passes read to notice a PR that was
+/// merged or closed on GitHub directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePrState {
+    Open { draft: bool },
+    Merged,
+    Closed,
+}
+
 /// One failing check from a PR's `statusCheckRollup` — enough to name it in a
 /// dialog and (via `url`, when it points at a GitHub Actions run) fetch its
 /// failed-step log for the fixing agent.
@@ -152,6 +162,34 @@ pub fn pr_state_args(pr_number: u64) -> Vec<String> {
         "--jq".into(),
         ".state".into(),
     ]
+}
+
+/// Read a PR's live lifecycle state plus its draft flag, so the reconciliation
+/// passes can tell an open PR from one merged or closed on GitHub directly.
+pub fn pr_live_state_args(pr_number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        pr_number.to_string(),
+        "--json".into(),
+        "state,isDraft".into(),
+    ]
+}
+
+/// Map `gh pr view --json state,isDraft` onto [`LivePrState`]. Anything other
+/// than the three known states is `None` — an unrecognized answer must not be
+/// read as "closed" and tear local state down.
+pub fn parse_live_pr_state(json: &str) -> Option<LivePrState> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let state = v.get("state").and_then(Value::as_str)?;
+    match state.to_ascii_uppercase().as_str() {
+        "OPEN" => Some(LivePrState::Open {
+            draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        "MERGED" => Some(LivePrState::Merged),
+        "CLOSED" => Some(LivePrState::Closed),
+        _ => None,
+    }
 }
 
 /// Read whether the PR still merges cleanly onto its base. Asked *after* a merge
@@ -657,6 +695,15 @@ pub trait Forge: Send + Sync {
         Ok(String::new())
     }
 
+    /// The PR's live lifecycle state on the forge. `Ok(None)` means "can't
+    /// tell" and is the default, so forges that don't model it (the sim, test
+    /// doubles) leave every card and task untouched. A transport failure is an
+    /// `Err`, never `Closed` — a network hiccup must not move or tear down
+    /// anything.
+    async fn pr_live_state(&self, _repo: &Path, _pr_number: u64) -> Result<Option<LivePrState>> {
+        Ok(None)
+    }
+
     /// The open PR whose head branch is `head`, if one exists. Best-effort
     /// dialog context (the adopt probe's "open PR" warning): "no PR" and "can't
     /// tell" both come back `None`, so forges that don't model it — the sim,
@@ -941,6 +988,11 @@ impl Forge for GhForge {
 
     async fn failed_run_log(&self, repo: &Path, run_id: u64) -> Result<String> {
         run_gh(repo, &run_log_args(run_id)).await
+    }
+
+    async fn pr_live_state(&self, repo: &Path, pr_number: u64) -> Result<Option<LivePrState>> {
+        let json = run_gh(repo, &pr_live_state_args(pr_number)).await?;
+        Ok(parse_live_pr_state(&json))
     }
 
     async fn pr_for_head(&self, repo: &Path, head: &str) -> Result<Option<PrInfo>> {
@@ -1517,6 +1569,38 @@ mod tests {
         assert_eq!(&args[0..3], &["pr", "view", "7"]);
         assert!(args.windows(2).any(|w| w == ["--json", "state"]));
         assert!(args.windows(2).any(|w| w == ["--jq", ".state"]));
+    }
+
+    #[test]
+    fn pr_live_state_reads_state_and_draft_together() {
+        let args = pr_live_state_args(7);
+        assert_eq!(&args[0..3], &["pr", "view", "7"]);
+        assert!(args.windows(2).any(|w| w == ["--json", "state,isDraft"]));
+    }
+
+    /// Only the three known lifecycle states are committed to — anything else
+    /// (including unparseable output) is `None`, never read as "closed".
+    #[test]
+    fn live_pr_state_parses_only_the_known_states() {
+        assert_eq!(
+            parse_live_pr_state(r#"{"state":"OPEN","isDraft":false}"#),
+            Some(LivePrState::Open { draft: false })
+        );
+        assert_eq!(
+            parse_live_pr_state(r#"{"state":"OPEN","isDraft":true}"#),
+            Some(LivePrState::Open { draft: true })
+        );
+        assert_eq!(
+            parse_live_pr_state(r#"{"state":"MERGED","isDraft":false}"#),
+            Some(LivePrState::Merged)
+        );
+        assert_eq!(
+            parse_live_pr_state(r#"{"state":"CLOSED","isDraft":false}"#),
+            Some(LivePrState::Closed)
+        );
+        assert_eq!(parse_live_pr_state(r#"{"state":"WEIRD"}"#), None);
+        assert_eq!(parse_live_pr_state("not json"), None);
+        assert_eq!(parse_live_pr_state("{}"), None);
     }
 
     #[test]

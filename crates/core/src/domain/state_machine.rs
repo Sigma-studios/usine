@@ -108,6 +108,12 @@ pub enum Transition {
     /// [`Card::no_reviewer_clears_merge`](crate::domain::model::Card::no_reviewer_clears_merge),
     /// which own the "is it really clear?" rules.
     ReviewApproved,
+    /// The reconciliation found the card's PR merged on GitHub directly while
+    /// its review hadn't finished (from `ReadyToMerge` — review passed — the
+    /// existing `Merge` edge to `Done` is used instead).
+    PrMergedExternally,
+    /// The reconciliation found the card's PR closed on GitHub without merging.
+    PrClosedExternally,
     AgentError {
         message: String,
     },
@@ -327,6 +333,19 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         // some thread still awaits an answer (`Card::unanswered_count`).
         (S::ReadyToMerge, T::FetchComments) => S::PrReview(PrReviewSub::FetchingComments),
         (S::ReadyToMerge, T::Merge) => S::Done,
+
+        // The PR left GitHub out from under the card. Merged while comments
+        // were still pending → "merged without review"; a `ReadyToMerge` card
+        // merged externally goes to `Done` via the `Merge` edge above instead —
+        // its review completed. Closed without merging parks either gate on the
+        // same column, flagged as closed. Only legal from the two parked PR
+        // gates: a mid-triage or mid-fix card is left for the run to finish.
+        (S::PrReview(PrReviewSub::Idle), T::PrMergedExternally) => {
+            S::MergedWithoutReview { merged: true }
+        }
+        (S::PrReview(PrReviewSub::Idle) | S::ReadyToMerge, T::PrClosedExternally) => {
+            S::MergedWithoutReview { merged: false }
+        }
 
         // Questions: from any parked hand-off state the user can ask the agent
         // a read-only question. The current state is wrapped, not replaced, so
@@ -1029,6 +1048,49 @@ mod tests {
                 "{s:?} should reject ReviewApproved"
             );
         }
+    }
+
+    #[test]
+    fn external_pr_termination_parks_on_merged_without_review() {
+        // A PR merged on GitHub while comments were still pending: the review
+        // never finished, so the card parks on the new column, flagged merged.
+        let idle = CardState::PrReview(PrReviewSub::Idle);
+        let s = transition(&idle, Transition::PrMergedExternally).unwrap();
+        assert_eq!(s, CardState::MergedWithoutReview { merged: true });
+
+        // Closed without merging parks the same column from either gate,
+        // flagged closed.
+        for gate in [CardState::PrReview(PrReviewSub::Idle), CardState::ReadyToMerge] {
+            let s = transition(&gate, Transition::PrClosedExternally).unwrap();
+            assert_eq!(s, CardState::MergedWithoutReview { merged: false });
+        }
+
+        // A `ReadyToMerge` card merged externally completed its review — the
+        // caller uses the existing `Merge` edge to `Done`, and the external
+        // edge is deliberately illegal there so nothing can misroute it.
+        assert!(transition(&CardState::ReadyToMerge, Transition::PrMergedExternally).is_err());
+
+        // Mid-triage and terminal states must not be yanked by a poll tick.
+        for s in [
+            CardState::PrReview(PrReviewSub::FetchingComments),
+            CardState::PrReview(PrReviewSub::ApplyingFixes),
+            CardState::PrReview(PrReviewSub::ApplyingChange),
+            CardState::Done,
+        ] {
+            assert!(transition(&s, Transition::PrMergedExternally).is_err(), "{s:?}");
+            assert!(transition(&s, Transition::PrClosedExternally).is_err(), "{s:?}");
+        }
+
+        // The park's exits come from the catch-all edges.
+        let parked = CardState::MergedWithoutReview { merged: true };
+        assert_eq!(
+            transition(&parked, Transition::ResetToStart).unwrap(),
+            CardState::StartingBlock
+        );
+        assert_eq!(
+            transition(&parked, Transition::MarkDone).unwrap(),
+            CardState::Done
+        );
     }
 
     #[test]

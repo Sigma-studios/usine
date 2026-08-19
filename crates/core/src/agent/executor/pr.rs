@@ -2,6 +2,7 @@
 //! PR, fetching + applying reviewer comments, marking ready, and merging.
 
 use super::*;
+use crate::infra::git::is_dirty;
 
 impl Executor {
     pub(super) async fn create_pr(
@@ -462,7 +463,9 @@ impl Executor {
     /// [`comment_counts`]. The unanswered count is `None` when the thread
     /// listing failed — it rides on GraphQL, unlike the other two — so callers
     /// keep the card's previous value rather than guessing; the CI check status
-    /// follows the same convention when its fetch failed.
+    /// follows the same convention when its fetch failed. The PR's live
+    /// lifecycle state rides along under the same convention (`None` = can't
+    /// tell), feeding [`Self::reconcile_pr_live_state`].
     pub(super) async fn fetch_review_status(
         &self,
         repo: &Path,
@@ -472,6 +475,7 @@ impl Executor {
         Vec<ReviewSummary>,
         Option<usize>,
         Option<CheckStatus>,
+        Option<LivePrState>,
     )> {
         let comments = self.forge.fetch_comments(repo, pr_number).await?;
         let reviews = self.forge.list_submitted_reviews(repo, pr_number).await?;
@@ -491,7 +495,16 @@ impl Executor {
                 None
             }
         };
-        Ok((comments, reviews, unanswered, checks))
+        let live = match self.forge.pr_live_state(repo, pr_number).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "review-status refresh: couldn't read live state of #{pr_number}: {e}"
+                );
+                None
+            }
+        };
+        Ok((comments, reviews, unanswered, checks, live))
     }
 
     /// Refresh the submitted reviews *and* the comment counts on the card's PR.
@@ -511,8 +524,13 @@ impl Executor {
         let reviewer = pr
             .effective_reviewer(project.config.reviewer.as_deref())
             .map(str::to_string);
-        let (comments, reviews, unanswered, checks) =
+        let (comments, reviews, unanswered, checks, live) =
             self.fetch_review_status(&project.path, pr.number).await?;
+        // A PR merged or closed on GitHub retires the card before any count
+        // mutation or auto-advance — nothing below applies to a gone PR.
+        if self.reconcile_pr_live_state(card_id, live).await? {
+            return Ok(());
+        }
         let (by_reviewer, total) = comment_counts(&comments, reviewer.as_deref());
         // A failed thread listing keeps the previous count (see fetch_review_status);
         // a failed checks read likewise keeps the previous status.
@@ -710,31 +728,9 @@ impl Executor {
         self.apply(card_id, Transition::Merge)?;
 
         // Past this point the PR is merged: report cleanup problems, never raise
-        // them. A preview left running in this worktree keeps writing into it
-        // (vite's dep cache, the backend's `dist`), which races `git worktree
-        // remove` and leaves it behind as "Directory not empty" — so reap the
-        // preview (and tear down its isolated infra) before touching the worktree.
-        // The worktree must go next: it holds the branch.
-        let _ = self.stop_preview(card_id).await;
-        let mut left_behind = Vec::new();
-        let mut worktree_gone = true;
-        if let Some(worktree) = &card.worktree_path {
-            if let Err(e) = self.remove_worktree_retrying(&project.path, worktree).await {
-                worktree_gone = false;
-                left_behind.push(format!("worktree ({e})"));
-            }
-        }
-        // Drop the path only once the worktree is actually gone, so a card that
-        // still has one on disk keeps pointing at it.
-        if worktree_gone && card.worktree_path.is_some() {
-            if let Ok(updated) = self.store.mutate_card(card_id, |c| {
-                c.worktree_path = None;
-                c.updated_at = now_millis();
-                Ok(())
-            }) {
-                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
-            }
-        }
+        // them.
+        let (worktree_gone, mut left_behind) =
+            self.cleanup_terminal_pr_worktree(card_id, false).await;
         if delete_branch {
             if let Some(branch) = &card.branch {
                 // Deleting the local branch can only work once nothing has it
@@ -765,6 +761,169 @@ impl Executor {
             ));
         }
         Ok(())
+    }
+
+    /// Local cleanup once a card's PR is terminal on the forge (merged there by
+    /// us or by anyone, or closed): stop the preview, remove the worktree, and
+    /// clear the card's `worktree_path` once it is actually gone. The ordering
+    /// is load-bearing — a preview left running keeps writing into the worktree
+    /// (vite's dep cache, the backend's `dist`), which races `git worktree
+    /// remove` and leaves it behind as "Directory not empty"; and the worktree
+    /// must go before any branch deletion, since it holds the branch. Branch
+    /// deletion itself is deliberately NOT here: the reconciliation paths never
+    /// delete branches. Best-effort throughout — returns whether the worktree
+    /// is gone, plus what was left behind for the caller's warning.
+    ///
+    /// `keep_if_dirty` is for the background reconcile: the card menu offers
+    /// opening the worktree in a terminal/editor while parked at the PR gates,
+    /// so a poll tick noticing the PR went terminal on GitHub must not
+    /// force-remove uncommitted edits the user may have in there. A dirty tree
+    /// is then kept in place (path and all) and reported instead of destroyed.
+    /// The user-initiated merge passes `false` — they asked for the teardown.
+    pub(super) async fn cleanup_terminal_pr_worktree(
+        &self,
+        card_id: Uuid,
+        keep_if_dirty: bool,
+    ) -> (bool, Vec<String>) {
+        let _ = self.stop_preview(card_id).await;
+        let Ok(card) = self.store.get_card(card_id) else {
+            return (false, Vec::new());
+        };
+        let Ok(project) = self.store.get_project(card.project_id) else {
+            return (false, Vec::new());
+        };
+        let mut left_behind = Vec::new();
+        let mut worktree_gone = true;
+        if let Some(worktree) = &card.worktree_path {
+            // An unreadable tree (already removed by hand, permissions) answers
+            // "not dirty" and falls through to the removal attempt, which
+            // reports its own failure.
+            if keep_if_dirty && is_dirty(worktree).await.unwrap_or(false) {
+                worktree_gone = false;
+                left_behind.push("worktree (kept — it has uncommitted changes)".to_string());
+            } else if let Err(e) = self.remove_worktree_retrying(&project.path, worktree).await {
+                worktree_gone = false;
+                left_behind.push(format!("worktree ({e})"));
+            }
+        }
+        // Drop the path only once the worktree is actually gone, so a card that
+        // still has one on disk keeps pointing at it.
+        if worktree_gone && card.worktree_path.is_some() {
+            if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+                c.worktree_path = None;
+                c.updated_at = now_millis();
+                Ok(())
+            }) {
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+            }
+        }
+        (worktree_gone, left_behind)
+    }
+
+    /// Reconcile a card's local PR state with what the forge reported live.
+    /// Returns `true` when the card moved to a terminal column (the caller must
+    /// stop processing it — its counts and auto-advances no longer apply).
+    ///
+    /// Runs *before* the count refresh and the `approval_clears_merge`
+    /// auto-advance on every poll tick and manual ↻, so a merged PR can't ride
+    /// `Idle → ReadyToMerge` on the same tick it should be retiring on.
+    /// Only the two parked PR gates are reconciled; any other state (mid-triage,
+    /// mid-fix) is left for its run to finish — the next tick catches it.
+    /// `None` (the forge can't tell, or the read failed upstream) changes
+    /// nothing: absence of an answer is never treated as "closed".
+    pub(super) async fn reconcile_pr_live_state(
+        &self,
+        card_id: Uuid,
+        live: Option<LivePrState>,
+    ) -> Result<bool> {
+        let Some(live) = live else {
+            return Ok(false);
+        };
+        let card = self.store.get_card(card_id)?;
+        let Some(pr) = card.pr.clone() else {
+            return Ok(false);
+        };
+        let sync_pr_state = |target: &str| -> Result<()> {
+            if pr.state != target {
+                let updated = self.store.mutate_card(card_id, |c| {
+                    if let Some(p) = &mut c.pr {
+                        p.state = target.to_string();
+                    }
+                    Ok(())
+                })?;
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+            }
+            Ok(())
+        };
+        match live {
+            // Bonus fix: a draft marked ready (or flipped back) on GitHub keeps
+            // the card's badge honest without moving anything.
+            LivePrState::Open { draft } => {
+                sync_pr_state(if draft { "draft" } else { "open" })?;
+                Ok(false)
+            }
+            LivePrState::Merged => {
+                if !matches!(
+                    card.state,
+                    CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+                ) {
+                    return Ok(false);
+                }
+                sync_pr_state("merged")?;
+                let (message, transition) = if matches!(card.state, CardState::ReadyToMerge) {
+                    // Review passed — the external merge finishes the card the
+                    // same way our own merge would.
+                    (
+                        format!("PR #{} was merged on GitHub — marked done", pr.number),
+                        Transition::Merge,
+                    )
+                } else {
+                    (
+                        format!(
+                            "PR #{} was merged on GitHub before its review finished",
+                            pr.number
+                        ),
+                        Transition::PrMergedExternally,
+                    )
+                };
+                self.apply(card_id, transition)?;
+                let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id, true).await;
+                self.toast_reconciled(card_id, message, left_behind);
+                Ok(true)
+            }
+            LivePrState::Closed => {
+                if !matches!(
+                    card.state,
+                    CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+                ) {
+                    return Ok(false);
+                }
+                sync_pr_state("closed")?;
+                self.apply(card_id, Transition::PrClosedExternally)?;
+                let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id, true).await;
+                self.toast_reconciled(
+                    card_id,
+                    format!("PR #{} was closed on GitHub without merging", pr.number),
+                    left_behind,
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    /// The reconciliation's outcome toast, with any cleanup leftovers appended
+    /// as a second warning (mirroring `merge`'s reporting).
+    fn toast_reconciled(&self, card_id: Uuid, message: String, left_behind: Vec<String>) {
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::toast(card_id, Severity::Info, message));
+        if !left_behind.is_empty() {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                format!("Couldn't clean up: {}", left_behind.join("; ")),
+            ));
+        }
     }
 
     /// Whether the PR was refused because it conflicts with its base.
