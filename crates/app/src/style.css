@@ -649,15 +649,25 @@ select option { background: var(--panel-2); color: var(--text); }
 .card-search-close:hover { color: var(--text); }
 
 .toast-host {
-  position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 1000;
-  max-width: 360px;
+  position: fixed; right: -10px; bottom: -10px; display: flex; flex-direction: column; gap: 8px; z-index: 1000;
+  /* The scroll container clips painting at its padding box, so pad it by the
+     toast shadow's reach (0 6px 20px → 26px) and pull the offsets back so the
+     toasts still sit 16px from the viewport corner. pointer-events is off so
+     the always-present padded host doesn't eat clicks; toasts re-enable it. */
+  padding: 26px;
+  max-width: 412px; max-height: calc(100vh + 20px); overflow-y: auto;
+  pointer-events: none;
 }
 .toast {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex: none; pointer-events: auto;
   background: var(--panel-2); border: 1px solid var(--border); border-left-width: 4px;
   border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 20px var(--shadow-soft);
 }
-.toast .toast-msg { flex: 1; font-size: 13px; }
+.toast .toast-msg {
+  flex: 1; font-size: 13px;
+  min-width: 0; overflow-wrap: anywhere;
+  max-height: 40vh; overflow-y: auto;
+}
 .toast .toast-close { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 16px; }
 .toast.info { border-left-color: var(--accent); }
 .toast.success { border-left-color: var(--green); }
