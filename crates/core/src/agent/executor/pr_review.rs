@@ -177,10 +177,8 @@ impl Executor {
                 if let Some(tracked) = existing.iter().find(|t| t.pr_number == pr.number) {
                     // A task retired as merged/closed whose PR shows up open
                     // again was reopened on GitHub — heal it back to the queue.
-                    let reopened = matches!(
-                        tracked.status,
-                        ReviewStatus::MergedWithoutReview { .. }
-                    );
+                    let reopened =
+                        matches!(tracked.status, ReviewStatus::MergedWithoutReview { .. });
                     let changed = reopened
                         || tracked.pr_title != pr.title
                         || tracked.body != pr.body
@@ -240,10 +238,9 @@ impl Executor {
                     // forge can't tell — leave the task exactly where it is.
                     Ok(_) => {}
                     // A failed read must never tear anything down.
-                    Err(e) => tracing::warn!(
-                        "review scan: live state of #{} failed: {e}",
-                        task.pr_number
-                    ),
+                    Err(e) => {
+                        tracing::warn!("review scan: live state of #{} failed: {e}", task.pr_number)
+                    }
                 }
             }
         }

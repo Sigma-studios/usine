@@ -1060,7 +1060,10 @@ mod tests {
 
         // Closed without merging parks the same column from either gate,
         // flagged closed.
-        for gate in [CardState::PrReview(PrReviewSub::Idle), CardState::ReadyToMerge] {
+        for gate in [
+            CardState::PrReview(PrReviewSub::Idle),
+            CardState::ReadyToMerge,
+        ] {
             let s = transition(&gate, Transition::PrClosedExternally).unwrap();
             assert_eq!(s, CardState::MergedWithoutReview { merged: false });
         }
@@ -1077,8 +1080,14 @@ mod tests {
             CardState::PrReview(PrReviewSub::ApplyingChange),
             CardState::Done,
         ] {
-            assert!(transition(&s, Transition::PrMergedExternally).is_err(), "{s:?}");
-            assert!(transition(&s, Transition::PrClosedExternally).is_err(), "{s:?}");
+            assert!(
+                transition(&s, Transition::PrMergedExternally).is_err(),
+                "{s:?}"
+            );
+            assert!(
+                transition(&s, Transition::PrClosedExternally).is_err(),
+                "{s:?}"
+            );
         }
 
         // The park's exits come from the catch-all edges.
