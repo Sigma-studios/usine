@@ -151,10 +151,7 @@ fn pr_card(store: &Store, project_id: uuid::Uuid, state: CardState, pr_state: &s
 }
 
 /// Spawn the executor over a store — the poll's first tick fires immediately.
-fn polling(
-    store: Store,
-    forge: Arc<LiveForge>,
-) -> UnboundedReceiver<ExecutorEvent> {
+fn polling(store: Store, forge: Arc<LiveForge>) -> UnboundedReceiver<ExecutorEvent> {
     let (_handle, rx) = spawn_executor(ExecutorConfig {
         store,
         providers: Arc::new(SimFactory),
@@ -368,7 +365,10 @@ async fn a_vanished_pr_confirmed_merged_moves_to_the_column() {
     wait_for(&mut rx, |e| scan_done(e, project.id)).await;
 
     let task = store.get_review_task(task.id).unwrap();
-    assert_eq!(task.status, ReviewStatus::MergedWithoutReview { merged: true });
+    assert_eq!(
+        task.status,
+        ReviewStatus::MergedWithoutReview { merged: true }
+    );
     assert!(
         !store
             .dismissed_reviews(project.id)
