@@ -984,9 +984,7 @@ pub enum ReviewStatus {
     /// because "merged without review" is worth seeing; dismiss clears it. Set
     /// by the scan's reconciliation, which also flips it back to `ToReview` if
     /// the PR is reopened.
-    MergedWithoutReview {
-        merged: bool,
-    },
+    MergedWithoutReview { merged: bool },
     /// A run faulted. Carries the state to return to on retry.
     Failed {
         previous: Box<ReviewStatus>,
