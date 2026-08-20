@@ -1,5 +1,6 @@
-//! Starting-block editing panels: task title/description, image attachments,
-//! and the run configuration form.
+//! Starting-block editing panels: task description, image attachments, and
+//! the run configuration form. The title is edited in the panel header
+//! (`EditableTitle` in the parent module), which works in every card state.
 
 use std::path::PathBuf;
 
@@ -17,23 +18,16 @@ use crate::ui::widgets::{
 pub(super) fn EditableTask(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
-    // Local copies of both fields, saved on blur. The title's mirror exists so
-    // the unmount commit below can see unblurred text; the description's also
-    // drives the auto-grow wrapper (`data-replicated-value`).
-    let mut title = use_signal(|| card.title.clone());
+    // Local copy of the description, saved on blur; it also drives the
+    // auto-grow wrapper (`data-replicated-value`).
     let mut desc = use_signal(|| card.description.clone());
     // Deselecting (or a state change) unmounts this panel before blur can fire,
     // which would silently drop whatever was typed — commit on unmount too.
     // Comparing against the mount-time value keeps an untouched field from
     // overwriting an edit that arrived from elsewhere; a blur-then-unmount
     // double save is idempotent.
-    let original_title = card.title.clone();
     let original_desc = card.description.clone();
     use_drop(move || {
-        let t = title.peek().clone();
-        if t != original_title {
-            state.update_card(id, |c| c.title = t);
-        }
         let d = desc.peek().clone();
         if d != original_desc {
             state.update_card(id, |c| c.description = d);
@@ -43,16 +37,6 @@ pub(super) fn EditableTask(card: Card) -> Element {
     rsx! {
         div { class: "section",
             h3 { "Task" }
-            div { class: "field",
-                label { r#for: "task-title", "Title" }
-                input {
-                    id: "task-title",
-                    value: "{title}",
-                    placeholder: "Card title…",
-                    oninput: move |e| title.set(e.value()),
-                    onchange: move |e| state.update_card(id, |c| c.title = e.value()),
-                }
-            }
             div { class: "field",
                 label { r#for: "task-desc", "Description" }
                 div { class: "grow-wrap", "data-replicated-value": "{desc}",

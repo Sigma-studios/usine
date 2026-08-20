@@ -75,11 +75,6 @@ fn CardDetail() -> Element {
             } else {
                 "detail-body"
             };
-            let title = if card.title.trim().is_empty() {
-                "Untitled card".to_string()
-            } else {
-                card.title.clone()
-            };
             // Committed work to diff: the same window the card menu's entry
             // uses — through a fault or an in-flight question, since the
             // worktree is still there.
@@ -92,7 +87,14 @@ fn CardDetail() -> Element {
                 div { class: "detail",
                     div { class: "detail-header",
                         div { class: "detail-title-row",
-                            h2 { "{title}" }
+                            // Keyed per card (single-item `for`, same trick as
+                            // CardPanel below) so selecting another card remounts
+                            // the input and resets its buffer signal. Keyed by id
+                            // only — a state transition or poll echo must not wipe
+                            // an in-progress rename.
+                            for t in [card.title.clone()] {
+                                EditableTitle { key: "{id}", card_id: id, title: t }
+                            }
                             if can_diff {
                                 button {
                                     class: "card-icon-btn",
@@ -138,6 +140,42 @@ fn CardDetail() -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The panel-header title, editable in every card state. Follows
+/// `EditableTask`'s commit pattern: a local mirror saved on blur/Enter
+/// (`onchange`), plus an unmount commit so deselecting mid-edit — which tears
+/// the panel down before blur can fire — doesn't drop the typed text.
+/// Comparing against the mount-time value keeps an untouched input from
+/// overwriting an edit that arrived from elsewhere; a blur-then-unmount double
+/// save is idempotent.
+#[component]
+fn EditableTitle(card_id: Uuid, title: String) -> Element {
+    let state = use_context::<AppState>();
+    let mut buf = use_signal(|| title.clone());
+    let original = title.clone();
+    let revert = title.clone();
+    use_drop(move || {
+        let t = buf.peek().clone();
+        if t != original {
+            state.update_card(card_id, |c| c.title = t);
+        }
+    });
+    rsx! {
+        input {
+            class: "detail-title-input",
+            value: "{buf}",
+            placeholder: "Untitled card",
+            "aria-label": "Card title",
+            oninput: move |e| buf.set(e.value()),
+            onchange: move |e| state.update_card(card_id, |c| c.title = e.value()),
+            onkeydown: move |e: KeyboardEvent| {
+                if e.key() == Key::Escape {
+                    buf.set(revert.clone());
+                }
+            },
         }
     }
 }
