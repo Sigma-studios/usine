@@ -325,13 +325,22 @@ impl Executor {
 
     /// Fetch the PR head into a worktree and launch the review agent there.
     pub(super) async fn begin_review_run(&self, review_id: Uuid) -> Result<()> {
+        // The concurrency gate, before the (expensive) worktree prep: either
+        // take a slot now or park in the queue — the task stays `Reviewing` and
+        // the pump re-enters this function when a slot frees. The run id
+        // doubles as the slot's admission generation (see `gate.rs`).
+        let run_id = Uuid::new_v4();
+        let Some(slot) = self.try_admit(review_id, run_id) else {
+            self.enqueue_run(super::gate::QueuedRun::Review { review_id });
+            return Ok(());
+        };
         // A review run always starts from a clean checkout: a retry must not
         // inherit whatever a previous attempt (or a preview's setup script) left
         // behind in the worktree.
         let wt = self.prepare_review_worktree(review_id, true).await?;
         let task = self.store.get_review_task(review_id)?;
         let project = self.store.get_project(task.project_id)?;
-        self.launch_review(&task, &project, wt).await
+        self.launch_review(&task, &project, wt, run_id, slot).await
     }
 
     /// Materialize the PR's checkout, returning its path.
@@ -408,6 +417,8 @@ impl Executor {
         task: &ReviewTask,
         project: &Project,
         wt: PathBuf,
+        run_id: Uuid,
+        slot: super::gate::SlotGuard,
     ) -> Result<()> {
         let project_guide = crate::agent::review::find_review_prompt(&project.path);
         let base = if task.base_ref.is_empty() {
@@ -453,7 +464,6 @@ impl Executor {
         let provider = self.providers.make(project.config.default_provider);
         let interactive = provider.interactive();
         let handle = provider.start(cfg).await?;
-        let run_id = Uuid::new_v4();
         lock(&self.review_runs).insert(task.id, (run_id, handle.control));
         tokio::spawn(run_review_actor(
             task.id,
@@ -463,6 +473,7 @@ impl Executor {
             self.evt_tx.clone(),
             self.review_runs.clone(),
             interactive,
+            slot,
         ));
         Ok(())
     }
@@ -577,6 +588,7 @@ impl Executor {
     /// record, and refresh the project's list. The PR number is recorded as
     /// permanently dismissed so the poll never re-adds it.
     pub(super) async fn dismiss_review(&self, review_id: Uuid) -> Result<()> {
+        self.purge_queued(review_id);
         if let Some((_, control)) = lock(&self.review_runs).get(&review_id) {
             let _ = control.unbounded_send(RunControl::Cancel);
         }
@@ -622,6 +634,7 @@ impl Executor {
 /// Pump a read-only PR-review run: stream progress to the review transcript and,
 /// on completion, parse the drafted comments and park the task for validation.
 /// Errors mark the task `Failed` (retryable). Keyed by review id, not card id.
+#[allow(clippy::too_many_arguments)]
 async fn run_review_actor(
     review_id: Uuid,
     run_id: Uuid,
@@ -630,6 +643,9 @@ async fn run_review_actor(
     evt_tx: UnboundedSender<ExecutorEvent>,
     review_runs: RunMap,
     interactive: bool,
+    // The run's concurrency slot; dropping it when the actor ends releases the
+    // slot and pumps the run queue.
+    _slot: super::gate::SlotGuard,
 ) {
     loop {
         let evt = if interactive {

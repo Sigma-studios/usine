@@ -86,9 +86,18 @@ impl Executor {
             .clone()
             .ok_or_else(|| CoreError::other("card has no worktree to validate in"))?;
 
+        // The concurrency gate: either take a slot now or park in the queue —
+        // the card stays `Validating` and the pump re-enters this function
+        // (through its already-mid-gate arm) when a slot frees. The run id
+        // doubles as the slot's admission generation (see `gate.rs`).
+        let run_id = Uuid::new_v4();
+        let Some(slot) = self.try_admit(card_id, run_id) else {
+            self.enqueue_run(super::gate::QueuedRun::Validation { card_id });
+            return Ok(());
+        };
+
         // Register the check as the card's active run: cancel, teardown, and
         // the supersede guard all work through this slot.
-        let run_id = Uuid::new_v4();
         let (ctl_tx, ctl_rx) = mpsc::unbounded::<RunControl>();
         lock(&self.runs).insert(card_id, (run_id, ctl_tx));
 
@@ -111,6 +120,7 @@ impl Executor {
             cmd,
             worktree,
             ctl_rx,
+            slot,
         ));
         Ok(())
     }
@@ -276,6 +286,11 @@ async fn validation_actor(
     cmd: String,
     worktree: PathBuf,
     mut ctl_rx: UnboundedReceiver<RunControl>,
+    // The check's concurrency slot; dropping it when the actor ends releases
+    // the slot and pumps the run queue. The fix run a failing exit launches
+    // re-admits under its own generation, so whichever of the two lands first
+    // the card ends up holding exactly one slot (see `gate.rs`).
+    _slot: super::gate::SlotGuard,
 ) {
     let cleanup = |validations: &ValidationMap, runs: &RunMap| {
         lock(validations).remove(&card_id);

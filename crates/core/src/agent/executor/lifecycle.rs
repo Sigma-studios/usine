@@ -142,6 +142,28 @@ impl Executor {
         extra: Option<String>,
         resume_session: Option<String>,
     ) -> Result<()> {
+        // The concurrency gate, before any setup work: a capped launch either
+        // takes a slot now or parks in the queue untouched — the card just
+        // stays in the running state its command already put it in, and the
+        // pump re-enters this function when a slot frees. The run id doubles
+        // as the slot's admission generation (see `gate.rs`).
+        let run_id = Uuid::new_v4();
+        let slot = if mode.is_capped() {
+            match self.try_admit(card.id, run_id) {
+                Some(guard) => Some(guard),
+                None => {
+                    self.enqueue_run(super::gate::QueuedRun::Card {
+                        card_id: card.id,
+                        mode,
+                        extra,
+                        resume_session,
+                    });
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         let project = self.store.get_project(card.project_id)?;
         let spec = match mode {
             // Investigations run on the plan spec — the "thinking" phase's model.
@@ -293,7 +315,6 @@ impl Executor {
                 return Err(e);
             }
         };
-        let run_id = Uuid::new_v4();
         lock(&self.runs).insert(card.id, (run_id, handle.control));
         // Any run that can change the work supersedes the last Agent Chat
         // exchange — drop it so the panel doesn't come back showing an answer
@@ -323,6 +344,7 @@ impl Executor {
             interactive,
             self.cmd_tx.clone(),
             self.self_ref.clone(),
+            slot,
         ));
         // Bring the worktree's app up alongside every write run (setup script,
         // then `run_script`, executor-owned like any preview) so the agent can
@@ -531,6 +553,10 @@ impl Executor {
     }
 
     pub(super) async fn cancel(&self, card_id: Uuid) -> Result<()> {
+        // A queued launch has no runs-map entry to cancel — drop it from the
+        // queue first, or the pump would later start a run for the card this
+        // cancel is about to park.
+        self.purge_queued(card_id);
         let prior = self.store.get_card(card_id)?.state;
         let run_id = lock(&self.runs).get(&card_id).map(|(rid, control)| {
             let _ = control.unbounded_send(RunControl::Cancel);
@@ -681,6 +707,7 @@ impl Executor {
     /// artifacts: cancel any active agent run and reap any running preview (and its
     /// isolated infra). Shared by `back_to_start`, `mark_done`, and card deletion.
     pub(super) async fn teardown_card_runtime(&self, card_id: Uuid) {
+        self.purge_queued(card_id);
         if let Some((_, control)) = lock(&self.runs).get(&card_id) {
             let _ = control.unbounded_send(RunControl::Cancel);
         }

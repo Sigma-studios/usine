@@ -250,6 +250,8 @@ select option { background: var(--panel-2); color: var(--text); }
 .badge.cost { background: var(--badge-cost-bg); color: var(--badge-cost-fg); }
 .badge.intervention { background: var(--amber); color: var(--intervention-fg); font-weight: 600; }
 .badge.status { background: var(--panel-2); color: var(--muted); }
+/* A run parked in the run queue, waiting for a free concurrency slot. */
+.badge.queued { background: transparent; border: 1px dashed var(--border); color: var(--muted); font-variant-numeric: tabular-nums; }
 /* The card's kind ("Investigation"): an outline chip, not a status. */
 .badge.kind { background: transparent; border: 1px solid var(--border); color: var(--muted); }
 /* A finished investigation's conclusion — a deliverable to read, not a diff. */
