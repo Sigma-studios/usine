@@ -150,6 +150,74 @@ async fn a_second_card_queues_at_the_cap_and_dequeues_when_a_slot_frees() {
 }
 
 #[tokio::test]
+async fn the_queue_drains_in_fifo_order() {
+    let store = store_with_cap(1);
+    let project_id = seed_project(&store, "/tmp/run-queue-fifo");
+    let a = seed_card(&store, project_id, "a");
+    let b = seed_card(&store, project_id, "b");
+    let c = seed_card(&store, project_id, "c");
+    let (handle, mut rx) = spawn_with(&store);
+
+    park_holding_slot(&handle, &mut rx, a).await;
+    handle.send(ExecutorCommand::Start { card_id: b });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::RunQueueChanged { entries } if entries == &[QueuedTarget::Card(b)] => {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    handle.send(ExecutorCommand::Start { card_id: c });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::RunQueueChanged { entries }
+            if entries == &[QueuedTarget::Card(b), QueuedTarget::Card(c)] =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // The freed slot goes to b — first in line — and c keeps its place at the
+    // head of the queue (the pump claims the slot at pop time, so nothing can
+    // bounce a dequeued entry back behind a later arrival).
+    handle.send(ExecutorCommand::Answer {
+        card_id: a,
+        text: "Simplicity".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(card)
+            if card.id == b
+                && matches!(card.state, CardState::Designing(DesignSub::Intervention(_))) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert!(matches!(
+        store.get_card(c).unwrap().state,
+        CardState::Designing(DesignSub::Running)
+    ));
+
+    // And the next freed slot goes to c.
+    handle.send(ExecutorCommand::Answer {
+        card_id: b,
+        text: "Simplicity".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(card)
+            if card.id == c
+                && matches!(card.state, CardState::Designing(DesignSub::Intervention(_))) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn cancelling_a_queued_card_purges_it_and_it_never_launches() {
     let store = store_with_cap(1);
     let project_id = seed_project(&store, "/tmp/run-queue-cancel");

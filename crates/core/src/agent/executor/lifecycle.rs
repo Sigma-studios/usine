@@ -142,27 +142,47 @@ impl Executor {
         extra: Option<String>,
         resume_session: Option<String>,
     ) -> Result<()> {
+        self.launch_admitted(card, mode, extra, resume_session, None)
+            .await
+    }
+
+    /// `launch` behind the concurrency gate. `admitted` is the queue pump's
+    /// pre-claimed slot (run id + guard, claimed at pop time so a dequeued
+    /// entry can't lose a re-admit race and forfeit its FIFO position); every
+    /// other caller passes `None` and admits here.
+    pub(super) async fn launch_admitted(
+        &self,
+        card: Card,
+        mode: RunMode,
+        extra: Option<String>,
+        resume_session: Option<String>,
+        admitted: Option<(Uuid, super::gate::SlotGuard)>,
+    ) -> Result<()> {
         // The concurrency gate, before any setup work: a capped launch either
         // takes a slot now or parks in the queue untouched — the card just
         // stays in the running state its command already put it in, and the
         // pump re-enters this function when a slot frees. The run id doubles
         // as the slot's admission generation (see `gate.rs`).
-        let run_id = Uuid::new_v4();
-        let slot = if mode.is_capped() {
-            match self.try_admit(card.id, run_id) {
-                Some(guard) => Some(guard),
-                None => {
-                    self.enqueue_run(super::gate::QueuedRun::Card {
+        let (run_id, slot) = match admitted {
+            Some((run_id, guard)) => (run_id, Some(guard)),
+            None => {
+                let run_id = Uuid::new_v4();
+                let slot = if mode.is_capped() {
+                    let entry = super::gate::QueuedRun::Card {
                         card_id: card.id,
                         mode,
-                        extra,
-                        resume_session,
-                    });
-                    return Ok(());
-                }
+                        extra: extra.clone(),
+                        resume_session: resume_session.clone(),
+                    };
+                    match self.admit_or_enqueue(run_id, entry) {
+                        Some(guard) => Some(guard),
+                        None => return Ok(()),
+                    }
+                } else {
+                    None
+                };
+                (run_id, slot)
             }
-        } else {
-            None
         };
         let project = self.store.get_project(card.project_id)?;
         let spec = match mode {

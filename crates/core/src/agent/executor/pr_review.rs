@@ -325,14 +325,31 @@ impl Executor {
 
     /// Fetch the PR head into a worktree and launch the review agent there.
     pub(super) async fn begin_review_run(&self, review_id: Uuid) -> Result<()> {
+        self.begin_review_run_admitted(review_id, None).await
+    }
+
+    /// `begin_review_run` behind the concurrency gate. `admitted` is the queue
+    /// pump's pre-claimed slot (see `launch_admitted`); every other caller
+    /// passes `None` and admits here.
+    pub(super) async fn begin_review_run_admitted(
+        &self,
+        review_id: Uuid,
+        admitted: Option<(Uuid, super::gate::SlotGuard)>,
+    ) -> Result<()> {
         // The concurrency gate, before the (expensive) worktree prep: either
         // take a slot now or park in the queue — the task stays `Reviewing` and
         // the pump re-enters this function when a slot frees. The run id
         // doubles as the slot's admission generation (see `gate.rs`).
-        let run_id = Uuid::new_v4();
-        let Some(slot) = self.try_admit(review_id, run_id) else {
-            self.enqueue_run(super::gate::QueuedRun::Review { review_id });
-            return Ok(());
+        let (run_id, slot) = match admitted {
+            Some((run_id, guard)) => (run_id, guard),
+            None => {
+                let run_id = Uuid::new_v4();
+                let entry = super::gate::QueuedRun::Review { review_id };
+                match self.admit_or_enqueue(run_id, entry) {
+                    Some(guard) => (run_id, guard),
+                    None => return Ok(()),
+                }
+            }
         };
         // A review run always starts from a clean checkout: a retry must not
         // inherit whatever a previous attempt (or a preview's setup script) left

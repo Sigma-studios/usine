@@ -49,6 +49,18 @@ impl Executor {
     /// validate command or the card isn't at the gate, so the internal eager
     /// dispatches and a user's stale click are both harmless.
     pub(super) async fn run_validation(&self, card_id: Uuid) -> Result<()> {
+        self.run_validation_admitted(card_id, None).await
+    }
+
+    /// `run_validation` behind the concurrency gate. `admitted` is the queue
+    /// pump's pre-claimed slot (see `launch_admitted`); every other caller
+    /// passes `None` and admits here. Early back-offs drop the guard, which
+    /// releases the slot.
+    pub(super) async fn run_validation_admitted(
+        &self,
+        card_id: Uuid,
+        admitted: Option<(Uuid, super::gate::SlotGuard)>,
+    ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
         let Some(cmd) = validate_command(&project.config) else {
@@ -90,10 +102,16 @@ impl Executor {
         // the card stays `Validating` and the pump re-enters this function
         // (through its already-mid-gate arm) when a slot frees. The run id
         // doubles as the slot's admission generation (see `gate.rs`).
-        let run_id = Uuid::new_v4();
-        let Some(slot) = self.try_admit(card_id, run_id) else {
-            self.enqueue_run(super::gate::QueuedRun::Validation { card_id });
-            return Ok(());
+        let (run_id, slot) = match admitted {
+            Some((run_id, guard)) => (run_id, guard),
+            None => {
+                let run_id = Uuid::new_v4();
+                let entry = super::gate::QueuedRun::Validation { card_id };
+                match self.admit_or_enqueue(run_id, entry) {
+                    Some(guard) => (run_id, guard),
+                    None => return Ok(()),
+                }
+            }
         };
 
         // Register the check as the card's active run: cancel, teardown, and
