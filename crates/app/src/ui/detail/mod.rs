@@ -148,18 +148,18 @@ fn CardDetail() -> Element {
 /// `EditableTask`'s commit pattern: a local mirror saved on blur/Enter
 /// (`onchange`), plus an unmount commit so deselecting mid-edit — which tears
 /// the panel down before blur can fire — doesn't drop the typed text.
-/// Comparing against the mount-time value keeps an untouched input from
-/// overwriting an edit that arrived from elsewhere; a blur-then-unmount double
-/// save is idempotent.
+/// Comparing against the last value this input committed (seeded with the
+/// mount-time title) keeps an untouched input from overwriting an edit that
+/// arrived from elsewhere, while still saving a rename back to a previously
+/// committed value; a blur-then-unmount double save is idempotent.
 #[component]
 fn EditableTitle(card_id: Uuid, title: String) -> Element {
     let state = use_context::<AppState>();
     let mut buf = use_signal(|| title.clone());
-    let original = title.clone();
-    let revert = title.clone();
+    let mut committed = use_signal(|| title.clone());
     use_drop(move || {
         let t = buf.peek().clone();
-        if t != original {
+        if t != *committed.peek() {
             state.update_card(card_id, |c| c.title = t);
         }
     });
@@ -170,10 +170,14 @@ fn EditableTitle(card_id: Uuid, title: String) -> Element {
             placeholder: "Untitled card",
             "aria-label": "Card title",
             oninput: move |e| buf.set(e.value()),
-            onchange: move |e| state.update_card(card_id, |c| c.title = e.value()),
+            onchange: move |e| {
+                let t = e.value();
+                committed.set(t.clone());
+                state.update_card(card_id, |c| c.title = t);
+            },
             onkeydown: move |e: KeyboardEvent| {
                 if e.key() == Key::Escape {
-                    buf.set(revert.clone());
+                    buf.set(committed.peek().clone());
                 }
             },
         }

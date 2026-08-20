@@ -323,6 +323,11 @@ select option { background: var(--panel-2); color: var(--text); }
 .detail-header { padding: 16px; border-bottom: 1px solid var(--border); }
 /* Title, then its diff button; the close button is pinned to the far right. */
 .detail-title-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+/* ReviewDetail still renders its (read-only) PR title as an h2 here. */
+.detail-header h2 {
+  font-size: 16px; flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* Looks like the old h2 until hovered/focused, then reveals its input chrome. */
 .detail-title-input {
   flex: 1 1 auto; min-width: 0;
