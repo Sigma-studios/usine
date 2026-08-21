@@ -19,8 +19,8 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, CoreError, DiffState, ExecutorCommand, ExecutorConfig, ExecutorEvent,
-    ExecutorEventKind, GitOps, MergeOutcome, Project, ProjectConfig, Result, ReviewTask, SimFactory,
-    SimForge, SimGit, Store,
+    ExecutorEventKind, GitOps, MergeOutcome, Project, ProjectConfig, Result, ReviewTask,
+    SimFactory, SimForge, SimGit, Store,
 };
 
 /// Run `git <args>` in `dir`, asserting success.
@@ -139,7 +139,12 @@ fn repo_with_fetched_pr(tmp: &Path) -> PathBuf {
     identify(&repo);
     git(
         &repo,
-        &["fetch", "-q", "origin", "+refs/heads/feat/seasons:usine-review/552"],
+        &[
+            "fetch",
+            "-q",
+            "origin",
+            "+refs/heads/feat/seasons:usine-review/552",
+        ],
     );
     repo
 }
@@ -180,7 +185,11 @@ async fn a_refused_fetch_falls_back_to_the_local_branch() {
         _ => None,
     })
     .await;
-    let names: Vec<_> = data.files.iter().filter_map(|f| f.new_path.clone()).collect();
+    let names: Vec<_> = data
+        .files
+        .iter()
+        .filter_map(|f| f.new_path.clone())
+        .collect();
     assert_eq!(names, vec!["labels.ts".to_string()]);
 }
 
