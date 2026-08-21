@@ -26,7 +26,7 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::agent::events::{
-    AgentEvent, ExecutorCommand, ExecutorEvent, OpenTarget, RunControl, Severity,
+    AgentEvent, ExecutorCommand, ExecutorEvent, OpenTarget, QueuedTarget, RunControl, Severity,
 };
 use crate::agent::handoff::Handoff;
 use crate::agent::provider::{ProviderFactory, RunConfig, RunMode};
@@ -45,6 +45,7 @@ use crate::infra::persistence::Store;
 mod actor;
 mod adopt;
 mod diff;
+mod gate;
 mod lifecycle;
 mod pr;
 mod pr_review;
@@ -137,6 +138,7 @@ pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<Execu
                     in_flight: Arc::new(Mutex::new(HashSet::new())),
                     previews: previews_for_exec,
                     validations: validations_for_exec,
+                    gate: Mutex::new(gate::RunGate::new()),
                     self_ref: self_ref.clone(),
                 });
                 // Background poll: every few minutes, discover new PRs to review
@@ -306,6 +308,9 @@ struct Executor {
     /// Running validation checks' process-group pids, keyed by card id (see
     /// [`ValidationMap`]).
     validations: ValidationMap,
+    /// The global concurrency gate: active slot owners + the FIFO queue of
+    /// launches waiting for one (see [`gate::RunGate`]).
+    gate: Mutex<gate::RunGate>,
     /// Back-reference for actor tasks that must call the executor directly:
     /// a command re-dispatched from an actor can race the in-flight claim of
     /// the very handler that spawned it and be silently dropped, stranding the
@@ -592,6 +597,7 @@ impl Executor {
                     }
                     if let Ok(tasks) = self.store.list_review_tasks_for_project(project_id) {
                         for task in &tasks {
+                            self.purge_queued(task.id);
                             if let Some((_, control)) = lock(&self.review_runs).get(&task.id) {
                                 let _ = control.unbounded_send(RunControl::Cancel);
                             }
@@ -618,6 +624,9 @@ impl Executor {
                 let _ = self
                     .evt_tx
                     .unbounded_send(ExecutorEvent::settings_updated(*settings));
+                // A raised (or lifted) concurrency cap frees slots — drain the
+                // run queue into them right away.
+                self.spawn_pump();
                 Ok(())
             }
             ExecutorCommand::SetSkipPlan { card_id, skip } => {

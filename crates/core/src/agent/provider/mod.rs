@@ -43,6 +43,18 @@ pub enum RunMode {
     Investigate,
 }
 
+impl RunMode {
+    /// Whether a run in this mode counts against (and queues behind) the global
+    /// concurrency cap (`AppSettings::max_concurrent_runs`). The long-running
+    /// autonomous modes do; `Question` (Agent Chat) and `Triage` (PR-comment
+    /// triage) are exempt — both are short, read-only, spawn only the bare CLI
+    /// (no preview/worktree build/validation), and are user-blocking, so parking
+    /// them behind implement runs would make the app feel broken.
+    pub fn is_capped(&self) -> bool {
+        !matches!(self, RunMode::Question | RunMode::Triage)
+    }
+}
+
 /// Everything a provider needs to launch one run.
 #[derive(Debug, Clone)]
 pub struct RunConfig {

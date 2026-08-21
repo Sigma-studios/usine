@@ -17,6 +17,10 @@ pub(super) async fn run_actor(
     interactive: bool,
     cmd_tx: UnboundedSender<ExecutorCommand>,
     executor: Weak<Executor>,
+    // The run's concurrency slot (None for exempt modes). Held for the actor's
+    // whole life; dropping it — however the run ends, including the mid-loop
+    // NeedsInput teardown below — releases the slot and pumps the run queue.
+    _slot: Option<gate::SlotGuard>,
 ) {
     loop {
         // One-shot runs get an idle watchdog: a hung child that never emits a
