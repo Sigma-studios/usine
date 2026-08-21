@@ -464,6 +464,17 @@ async fn a_retried_conflict_fix_still_knows_about_the_merge() {
         "the conflict brief must be stashed at launch for a later retry"
     );
 
+    // The failing launch emits `Failed` while still holding the card's
+    // exclusive claim (it has teardown left to await); the dispatcher silently
+    // drops any exclusive command sent in that window. The UI can't hit it —
+    // the busy flag disables Retry until the claim releases — so wait for the
+    // release the same way before retrying.
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardBusy { busy: false } if e.card_id == card.id => Some(()),
+        _ => None,
+    })
+    .await;
+
     handle.send(ExecutorCommand::Retry { card_id: card.id });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id && !c.state.is_running() => Some(()),

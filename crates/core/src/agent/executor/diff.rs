@@ -46,8 +46,15 @@ impl Executor {
     /// `ToReview` has never been checked out. We fetch the PR head into its
     /// stable local branch first (idempotent, and the same branch the review run
     /// later checks out), so the diff can be read before deciding to spend a
-    /// review pass on the PR at all. Nothing is checked out — the walk reads the
-    /// object DB directly.
+    /// review pass on the PR at all — the walk reads the object DB directly.
+    ///
+    /// The fetch is best-effort: from review start until publish/dismiss the
+    /// local branch is checked out in the review worktree, and git refuses to
+    /// fetch into a checked-out branch (same constraint `anchoring_diff`
+    /// documents). Falling back to the branch as-is is honest there — the
+    /// drafted comments were written against that checkout — at the cost of not
+    /// reflecting a push made after the review started. It also makes the diff
+    /// readable offline once the PR has been fetched once.
     ///
     /// *Both* sides have to be fetched, and the base has to resolve remote-first
     /// (see [`remote_tracking_base`]): the fork point is only where the forge
@@ -64,16 +71,19 @@ impl Executor {
 
         // Refresh the branch even when it exists: the author may have pushed
         // since the last fetch, and a stale diff is worse than a slow one.
-        if let Err(e) = self
+        // Non-fatal: while the branch is checked out in the review worktree the
+        // fetch is refused, but the branch is right there to diff — only if the
+        // diff itself then fails is this surfaced as the root cause.
+        let fetch_err = self
             .git
             .fetch_pr(&project.path, task.pr_number, &branch)
             .await
-        {
-            self.emit_diff(
-                review_id,
-                DiffState::Failed(format!("couldn't fetch PR #{}: {e}", task.pr_number)),
+            .err();
+        if let Some(e) = &fetch_err {
+            tracing::warn!(
+                "review diff: fetching PR #{} failed, diffing the local branch as-is: {e}",
+                task.pr_number
             );
-            return Ok(());
         }
 
         // Refresh the base's remote-tracking ref too. Non-fatal: a fetch can fail
@@ -97,6 +107,13 @@ impl Executor {
         let state = match computed {
             Ok(data) if data.files.is_empty() => DiffState::Empty,
             Ok(data) => DiffState::Ready(data),
+            // A failed walk after a failed fetch means the branch never made it
+            // locally — the fetch error is the root cause worth showing.
+            Err(_) if fetch_err.is_some() => DiffState::Failed(format!(
+                "couldn't fetch PR #{}: {}",
+                task.pr_number,
+                fetch_err.unwrap()
+            )),
             Err(e) => DiffState::Failed(e.to_string()),
         };
         self.emit_diff(review_id, state);
