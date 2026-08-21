@@ -187,6 +187,48 @@ impl Executor {
             }
         };
 
+        // Review *bodies* ride along as synthetic items: refetch the submitted
+        // reviews (still pre-transition) so a body that just landed is triaged
+        // with the comments. Best-effort — a hiccup falls back to what the card
+        // already knows rather than blocking the triage of inline comments.
+        let reviews = match self
+            .forge
+            .list_submitted_reviews(&project.path, pr_number)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("comment triage: couldn't refresh reviews for #{pr_number}: {e}");
+                card.reviews.clone()
+            }
+        };
+        let card = if reviews != card.reviews {
+            let updated = self.store.mutate_card(card_id, |c| {
+                c.reviews = reviews;
+                Ok(())
+            })?;
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::updated(updated.clone()));
+            updated
+        } else {
+            card
+        };
+        let mut items = items;
+        // Synthetic ids count down from u64::MAX so they can't collide with
+        // real GitHub comment ids; `review_body_of` carries the body's
+        // identity so applying the picker can record it handled.
+        for (k, r) in card.pending_review_bodies().into_iter().enumerate() {
+            items.push(ReviewComment {
+                id: u64::MAX - k as u64,
+                author: r.author.clone(),
+                path: String::new(),
+                line: None,
+                body: r.body.clone(),
+                review_body_of: Some(r.body_key()),
+            });
+        }
+
         self.apply(card_id, Transition::FetchComments)?;
         if items.is_empty() {
             self.apply(card_id, Transition::CommentsFetched { verdicts: vec![] })?;
@@ -225,14 +267,35 @@ impl Executor {
                 "can only apply fixes while selecting fixes".into(),
             ));
         }
+        // Disposing of the picker is what handles the review *bodies* in it —
+        // fixed or declined, the user has read them. Record their keys now so
+        // they stop counting as pending feedback (a triage run cancelled
+        // before this point leaves them pending, by design).
+        let body_keys: Vec<String> = verdicts
+            .iter()
+            .filter_map(|v| v.comment.review_body_of.clone())
+            .collect();
+        if !body_keys.is_empty() {
+            let updated = self.store.mutate_card(card_id, |c| {
+                for k in body_keys {
+                    if !c.triaged_review_bodies.contains(&k) {
+                        c.triaged_review_bodies.push(k);
+                    }
+                }
+                Ok(())
+            })?;
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        }
         let (checked, ignored): (Vec<FixVerdict>, Vec<FixVerdict>) =
             verdicts.into_iter().partition(|v| v.selected);
 
         // Reply to the ignored comments with the agent's short explanation
         // (best-effort — a failed reply shouldn't block applying the fixes).
+        // A review-body item never gets one: GitHub has no reply endpoint for
+        // a review body (its synthetic id isn't a real comment id).
         if let Some(pr) = pr_number {
             for v in &ignored {
-                if v.reply.trim().is_empty() {
+                if v.comment.review_body_of.is_some() || v.reply.trim().is_empty() {
                     continue;
                 }
                 match self
@@ -295,8 +358,13 @@ impl Executor {
         // Remember which comments this run addresses so their GitHub review
         // threads can be marked resolved once the fix lands (see `finalize_run`,
         // which emits `ResolveFixedComments` on completion). A note-only run has
-        // no comments to resolve.
-        let fixed_ids: Vec<u64> = checked.iter().map(|v| v.comment.id).collect();
+        // no comments to resolve, and a review-body item has no thread — its
+        // synthetic id must not reach the resolve call.
+        let fixed_ids: Vec<u64> = checked
+            .iter()
+            .filter(|v| v.comment.review_body_of.is_none())
+            .map(|v| v.comment.id)
+            .collect();
         self.store.set_pending_resolve(card_id, &fixed_ids)?;
 
         // Run the fix in an ISOLATED worktree on the card's branch — never in the
@@ -566,6 +634,34 @@ impl Executor {
             self.apply(card_id, Transition::ReviewApproved)?;
             self.progress(card_id, "✔ no reviewer assigned — ready to merge");
         }
+        Ok(())
+    }
+
+    /// Mark every pending review *body* on the card handled — the panel's
+    /// "Mark as read", for a body-only review (e.g. a bot's pass report) the
+    /// user has read and doesn't need an agent run for. Purely local: nothing
+    /// is posted to the forge. The next poll tick (or ↻) re-runs the
+    /// auto-advance predicates, which no longer see the bodies as pending.
+    pub(super) fn mark_review_bodies_read(&self, card_id: Uuid) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let keys: Vec<String> = card
+            .pending_review_bodies()
+            .into_iter()
+            .map(|r| r.body_key())
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let updated = self.store.mutate_card(card_id, |c| {
+            for k in keys {
+                if !c.triaged_review_bodies.contains(&k) {
+                    c.triaged_review_bodies.push(k);
+                }
+            }
+            c.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
         Ok(())
     }
 

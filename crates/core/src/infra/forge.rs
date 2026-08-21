@@ -246,6 +246,44 @@ pub fn submitted_reviews_args(pr_number: u64) -> Vec<String> {
     ]
 }
 
+/// Parse `gh pr view --json latestReviews` output into review summaries.
+/// The `body` and `submittedAt` fields ride along with the verdict: a
+/// body-only review (a bot report, or a human Comment review with no inline
+/// comments) carries its entire content in `body`, and with no usable review
+/// id in this payload, `author` + `submittedAt` is what identifies it (see
+/// [`ReviewSummary::body_key`]).
+pub fn parse_latest_reviews(value: &Value) -> Vec<ReviewSummary> {
+    let arr = value
+        .get("latestReviews")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    arr.iter()
+        .map(|r| ReviewSummary {
+            author: r
+                .pointer("/author/login")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            state: r
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            body: r
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            submitted_at: r
+                .get("submittedAt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+        .collect()
+}
+
 /// Post a reply on a specific PR review comment (`comment_id`).
 pub fn reply_args(pr_number: u64, comment_id: u64, body: &str) -> Vec<String> {
     vec![
@@ -787,6 +825,7 @@ impl Forge for GhForge {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                review_body_of: None,
             })
             .collect())
     }
@@ -877,26 +916,7 @@ impl Forge for GhForge {
     ) -> Result<Vec<ReviewSummary>> {
         let json = run_gh(repo, &submitted_reviews_args(pr_number)).await?;
         let value: Value = serde_json::from_str(&json)?;
-        let arr = value
-            .get("latestReviews")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(arr
-            .iter()
-            .map(|r| ReviewSummary {
-                author: r
-                    .pointer("/author/login")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                state: r
-                    .get("state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            })
-            .collect())
+        Ok(parse_latest_reviews(&value))
     }
 
     async fn reply_to_comment(
@@ -1063,6 +1083,7 @@ impl Forge for SimForge {
                 path: "src/lib.rs".into(),
                 line: Some(12),
                 body: "Consider extracting this into a helper function.".into(),
+                review_body_of: None,
             },
             ReviewComment {
                 id: 2,
@@ -1070,6 +1091,7 @@ impl Forge for SimForge {
                 path: "src/main.rs".into(),
                 line: Some(48),
                 body: "Nit: typo in this comment.".into(),
+                review_body_of: None,
             },
             ReviewComment {
                 id: 3,
@@ -1077,6 +1099,7 @@ impl Forge for SimForge {
                 path: "src/db.rs".into(),
                 line: Some(5),
                 body: "This `unwrap()` could panic on malformed input.".into(),
+                review_body_of: None,
             },
         ])
     }
@@ -1132,13 +1155,17 @@ impl Forge for SimForge {
         _pr_number: u64,
     ) -> Result<Vec<ReviewSummary>> {
         Ok(vec![
-            ReviewSummary {
-                author: "octocat".into(),
-                state: "CHANGES_REQUESTED".into(),
-            },
+            ReviewSummary::new("octocat", "CHANGES_REQUESTED"),
+            // A body-only review — the bot-report shape: no inline comments,
+            // the whole report in the summary text.
             ReviewSummary {
                 author: "gemini-code-assist".into(),
                 state: "COMMENTED".into(),
+                body: "## Review summary\n\nThe change looks reasonable overall. \
+                       One concern: the retry loop has no backoff, which could \
+                       hammer the endpoint under sustained failure."
+                    .into(),
+                submitted_at: "2026-01-01T00:00:00Z".into(),
             },
         ])
     }
@@ -1639,6 +1666,31 @@ mod tests {
         let args = submitted_reviews_args(7);
         assert_eq!(&args[0..3], &["pr", "view", "7"]);
         assert!(args.windows(2).any(|w| w == ["--json", "latestReviews"]));
+    }
+
+    #[test]
+    fn latest_reviews_parse_carries_body_and_submitted_at() {
+        // The shape `gh pr view --json latestReviews` actually returns — the
+        // review id comes back empty, which is why the body's identity is
+        // author + submittedAt.
+        let json: Value = serde_json::from_str(
+            r#"{"latestReviews":[
+                {"author":{"login":"Argus"},"state":"COMMENTED",
+                 "body":"pass · high confidence","submittedAt":"2026-08-21T13:58:00Z","id":""},
+                {"author":{"login":"octocat"},"state":"APPROVED","body":""}
+            ]}"#,
+        )
+        .unwrap();
+        let reviews = parse_latest_reviews(&json);
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].author, "Argus");
+        assert_eq!(reviews[0].state, "COMMENTED");
+        assert_eq!(reviews[0].body, "pass · high confidence");
+        assert_eq!(reviews[0].submitted_at, "2026-08-21T13:58:00Z");
+        assert_eq!(reviews[0].body_key(), "argus@2026-08-21T13:58:00Z");
+        // Missing fields degrade to empty, not a parse failure.
+        assert_eq!(reviews[1].body, "");
+        assert_eq!(reviews[1].submitted_at, "");
     }
 
     #[test]

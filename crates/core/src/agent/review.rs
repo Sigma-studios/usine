@@ -41,7 +41,10 @@ per comment, shaped like {\"id\": 123, \"severity\": \"high\", \"worth_fixing\":
 assessment of how serious the comment's underlying issue is — one of \"critical\", \"high\", \
 \"medium\", or \"low\" — independent of whether it's worth fixing. `opinion` is shown to the user \
 as your recommendation; `reply` is the message posted on the comment when the user chooses NOT to \
-fix it — a polite, one- or two-sentence explanation. Include exactly one item per comment id listed.";
+fix it — a polite, one- or two-sentence explanation. An item located at \"PR review summary\" is \
+not an inline comment but the body of a submitted review (often a full report): judge whether the \
+concerns it raises are worth acting on; no reply can be posted on it. Include exactly one item per \
+comment id listed.";
 
 /// Built-in review guidance used when the project has no `review.md`.
 pub const DEFAULT_REVIEW_PROMPT: &str = "\
@@ -186,6 +189,7 @@ pub fn parse_self_review(text: &str) -> Vec<FixVerdict> {
                 path: r.path,
                 line: r.line,
                 body: r.issue,
+                review_body_of: None,
             },
             selected: r.worth_fixing,
             worth_fixing: r.worth_fixing,
@@ -198,7 +202,9 @@ pub fn parse_self_review(text: &str) -> Vec<FixVerdict> {
 
 /// PR triage: join each verdict to its comment by id. A comment the agent didn't
 /// return a verdict for defaults to worth-fixing/selected so it's never silently
-/// dropped from the user's picker.
+/// dropped from the user's picker. A review-*body* item keeps its reply blank
+/// whatever the agent drafted — GitHub has no endpoint to reply to a review
+/// body, so the picker must not promise one.
 pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
     let raw = parse_raw(text);
     comments
@@ -210,7 +216,11 @@ pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
                 worth_fixing: r.worth_fixing,
                 severity: normalize_severity(&r.severity),
                 rationale: r.opinion.clone(),
-                reply: r.reply.clone(),
+                reply: if c.review_body_of.is_some() {
+                    String::new()
+                } else {
+                    r.reply.clone()
+                },
             },
             None => FixVerdict {
                 comment: c.clone(),
@@ -360,6 +370,7 @@ mod tests {
                 path: "a.rs".into(),
                 line: Some(1),
                 body: "c1".into(),
+                review_body_of: None,
             },
             ReviewComment {
                 id: 2,
@@ -367,6 +378,7 @@ mod tests {
                 path: "b.rs".into(),
                 line: None,
                 body: "c2".into(),
+                review_body_of: None,
             },
         ];
         // Only a verdict for id 1; id 2 must be backfilled as worth-fixing.
@@ -379,6 +391,28 @@ mod tests {
             v[1].worth_fixing,
             "missing verdict backfills to worth-fixing"
         );
+    }
+
+    #[test]
+    fn triage_blanks_the_reply_on_a_review_body_item() {
+        // GitHub has no endpoint to reply to a review body, so whatever the
+        // agent drafted must not reach the picker as a promised reply.
+        let comments = vec![ReviewComment {
+            id: u64::MAX,
+            author: "argus".into(),
+            path: String::new(),
+            line: None,
+            body: "## Report\n\nno concerns".into(),
+            review_body_of: Some("argus@2026-08-21T13:58:00Z".into()),
+        }];
+        let text = format!(
+            "```usine-review\n[{{\"id\":{},\"worth_fixing\":false,\"opinion\":\"a pass report\",\"reply\":\"thanks!\"}}]\n```",
+            u64::MAX
+        );
+        let v = parse_triage(&text, &comments);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rationale, "a pass report");
+        assert_eq!(v[0].reply, "", "no reply can be posted on a review body");
     }
 
     #[test]

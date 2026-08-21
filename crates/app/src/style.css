@@ -743,6 +743,7 @@ select option { background: var(--panel-2); color: var(--text); }
 .badge.conflict { color: var(--red); background: var(--red-wash); font-weight: 600; }
 /* A standing PR approval, on the board card and at the merge gate. */
 .badge.approved { color: var(--green); background: var(--green-wash); font-weight: 600; }
+.badge.commented { color: var(--amber); background: var(--amber-wash); font-weight: 600; }
 
 /* The PR description, as the author wrote it. Pre-wrapped (it's markdown source,
    not rendered) and capped so a long one can't push the review controls off. */

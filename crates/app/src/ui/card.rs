@@ -90,13 +90,18 @@ pub fn CardView(card: Card) -> Element {
     // narrower `reviewer_comment_count` left the panel offering a triage the card
     // itself hid. Which count lights the dock badge is a separate question — that
     // one stays the assigned reviewer's job (see `Card::needs_attention`).
-    let can_read = matches!(st, CardState::PrReview(PrReviewSub::Idle)) && card.comment_count > 0;
+    // ...and an unread review *body* (a body-only review's summary text) counts
+    // like a comment: it's feedback the triage pass can read.
+    let can_read =
+        matches!(st, CardState::PrReview(PrReviewSub::Idle)) && card.has_triageable_feedback();
     let selecting = matches!(st, CardState::PrReview(PrReviewSub::SelectingFixes { .. }));
     let can_merge = matches!(st, CardState::ReadyToMerge);
     // Comments can land after triage already carried the card to the merge
     // gate; offer another pass alongside Merge — but only while some thread
-    // still awaits an answer (the poll keeps the count fresh here too).
-    let can_reevaluate = can_merge && card.unanswered_count > 0;
+    // still awaits an answer (the poll keeps the count fresh here too), or a
+    // review body landed unread.
+    let can_reevaluate =
+        can_merge && (card.unanswered_count > 0 || !card.pending_review_bodies().is_empty());
     // A ready-to-merge card whose PR is still a draft must be marked ready before
     // GitHub will merge it — offer that instead of a merge that would fail.
     let pr_is_draft = card
@@ -110,6 +115,15 @@ pub fn CardView(card: Card) -> Element {
     // Who approved the PR, for the badge tooltip. Empty = no approval landed,
     // no badge.
     let approved_by = card.approved_by().join(", ");
+    // Reviewers whose review *body* awaits reading — a body-only review (e.g.
+    // a bot's report) leaves no comment count, so this is its board-level
+    // visibility. Informational: no state change rides on it.
+    let commented_by = card
+        .pending_review_bodies()
+        .iter()
+        .map(|r| r.author.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     // The worktree holds committed, reviewable work from just-implemented through
     // PR review until merge. "Show diff" lives in the card actions menu; the
     // preview controls sit inline on the card and need a run command configured.
@@ -288,6 +302,15 @@ pub fn CardView(card: Card) -> Element {
                         class: "badge approved",
                         title: "Approved by {approved_by}",
                         "✓ approved"
+                    }
+                }
+                // An unread review body — feedback with no inline comments to
+                // count, worth seeing from the board until read or triaged.
+                if card.pr.is_some() && !commented_by.is_empty() {
+                    span {
+                        class: "badge commented",
+                        title: "Review comment from {commented_by} — open the card to read it",
+                        "💬 commented"
                     }
                 }
             }
