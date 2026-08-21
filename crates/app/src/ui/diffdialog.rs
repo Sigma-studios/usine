@@ -161,6 +161,15 @@ pub fn DiffDialogHost() -> Element {
     let drafts = review.as_ref().map(|(_, e)| e.comments.clone());
     let review_id = review.as_ref().map(|(t, _)| t.id);
 
+    // While the review worktree holds the PR branch checked out, the head can't
+    // be refetched (git refuses), so the diff shows the branch as checked out.
+    let checked_out = match target {
+        DiffTarget::Review(review_id) => state
+            .review_task(review_id)
+            .is_some_and(|t| t.worktree_path.is_some()),
+        DiffTarget::Card(_) => false,
+    };
+
     rsx! {
         div { class: "modal-overlay", onclick: move |_| dismiss(),
             div {
@@ -217,6 +226,11 @@ pub fn DiffDialogHost() -> Element {
                             div { class: "hint error", "Couldn't compute the diff: {msg}" }
                         },
                         Some(DiffState::Ready(data)) => rsx! {
+                            if checked_out {
+                                div { class: "hint",
+                                    "Showing the PR as checked out for the review — pushes made after the review started aren't included."
+                                }
+                            }
                             DiffView {
                                 data,
                                 drafts: drafts.clone(),
