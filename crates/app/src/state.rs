@@ -15,8 +15,8 @@ use usine_core::{
     spawn_executor, AdoptProbe, AppSettings, Card, CardState, DesignSub, DiffState, DirtyAction,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle, Forge,
     GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, Provider,
-    ProviderFactory, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory,
-    SimForge, SimGit, Store, UsageSnapshot,
+    ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity,
+    SimFactory, SimForge, SimGit, Store, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -110,6 +110,11 @@ pub struct AppState {
     /// happening — this is what drives the spinner and the disabled actions in
     /// that window. In-memory only: nothing is in flight at startup.
     pub busy: Signal<HashSet<Uuid>>,
+    /// The executor's run queue (cards/reviews waiting for a free concurrency
+    /// slot), in order — index = place in line. Replaced wholesale via
+    /// `RunQueueChanged` events. In-memory only: the queue doesn't survive a
+    /// restart (interrupted-run recovery picks queued cards up as `Failed`).
+    pub run_queue: Signal<Vec<QueuedTarget>>,
     /// The providers' account-level rate-limit usage (session/weekly windows),
     /// refreshed by the executor's background poll and rendered by the bottom
     /// usage bar. In-memory only — it's refetched shortly after launch.
@@ -228,6 +233,7 @@ impl AppState {
             previews: Signal::new(HashMap::new()),
             diffs: Signal::new(HashMap::new()),
             busy: Signal::new(HashSet::new()),
+            run_queue: Signal::new(Vec::new()),
             usage: Signal::new(UsageSnapshot::default()),
             event_rx: Signal::new(Some(rx)),
         }
@@ -368,6 +374,10 @@ impl AppState {
                 let id = evt.card_id;
                 let mut auto_reviews = self.auto_reviews;
                 auto_reviews.write().insert(id, auto);
+            }
+            ExecutorEventKind::RunQueueChanged { entries } => {
+                let mut queue = self.run_queue;
+                queue.set(entries);
             }
             ExecutorEventKind::CardBusy { busy } => {
                 let id = evt.card_id;
@@ -585,6 +595,16 @@ impl AppState {
     /// was) active this session.
     pub fn preview(&self, card_id: Uuid) -> Option<(PreviewStatus, Vec<PreviewUrl>)> {
         self.previews.read().get(&card_id).cloned()
+    }
+
+    /// The 1-based place in the run queue of a card's (or review task's)
+    /// waiting launch, or `None` if it isn't queued.
+    pub fn queue_position(&self, id: Uuid) -> Option<usize> {
+        self.run_queue
+            .read()
+            .iter()
+            .position(|t| t.id() == id)
+            .map(|i| i + 1)
     }
 
     /// The current computed diff state for a card, if one has been requested this

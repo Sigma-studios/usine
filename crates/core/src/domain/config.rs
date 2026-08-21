@@ -264,6 +264,20 @@ pub struct AppSettings {
     /// `code`. `None`/blank disables the action.
     #[serde(default)]
     pub editor_command: Option<String>,
+    /// Global cap on concurrently running agent runs and validation checks
+    /// (the memory/compute-heavy work) across all projects; further starts
+    /// queue FIFO and launch as slots free. `0` = unlimited. Agent Chat
+    /// questions, PR-comment triage, and previews are exempt (see
+    /// `RunMode::is_capped`).
+    #[serde(default = "default_max_concurrent_runs")]
+    pub max_concurrent_runs: u32,
+}
+
+/// Serde default for [`AppSettings::max_concurrent_runs`]: a settings record
+/// written before the field existed must load as the default cap, not as 0
+/// (which would mean unlimited).
+pub(crate) fn default_max_concurrent_runs() -> u32 {
+    5
 }
 
 impl Default for AppSettings {
@@ -284,6 +298,7 @@ impl AppSettings {
             default_review: base.review,
             terminal_command: None,
             editor_command: None,
+            max_concurrent_runs: default_max_concurrent_runs(),
         }
     }
 
@@ -352,6 +367,8 @@ mod tests {
         assert_eq!(s.terminal_command, None);
         assert_eq!(s.editor_command, None);
         assert_eq!(s.default_review, None);
+        // The concurrency cap defaults to 5, not 0 — 0 would mean unlimited.
+        assert_eq!(s.max_concurrent_runs, 5);
     }
 
     #[test]

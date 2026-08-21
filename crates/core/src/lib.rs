@@ -19,7 +19,7 @@ pub mod infra;
 
 pub use agent::events::{
     AdoptProbe, AgentEvent, DirtyAction, ExecutorCommand, ExecutorEvent, ExecutorEventKind,
-    OpenTarget, RunControl, Severity,
+    OpenTarget, QueuedTarget, RunControl, Severity,
 };
 pub use agent::executor::{spawn as spawn_executor, ExecutorConfig, ExecutorHandle};
 pub use agent::handoff::{parse_handoff, Handoff, HANDOFF_INSTRUCTION};

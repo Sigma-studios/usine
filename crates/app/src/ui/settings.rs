@@ -60,6 +60,7 @@ pub fn SettingsModal() -> Element {
     let provider = settings.default_provider;
     let terminal_command = settings.terminal_command.clone().unwrap_or_default();
     let editor_command = settings.editor_command.clone().unwrap_or_default();
+    let max_concurrent_runs = settings.max_concurrent_runs;
     let terminal_example = terminal_command_example();
     let mut tab = use_signal(|| SettingsTab::Models);
 
@@ -212,6 +213,30 @@ pub fn SettingsModal() -> Element {
                         }
                     }
                     div { class: "hint", "Runs on the card's worktree (or the project checkout if it has none). {{path}} is replaced by the directory; if you leave it out it's added at the end, so `zed` or `code` alone works too. Blank disables the action." }
+                }
+                div { class: "section",
+                    h3 { "Concurrency" }
+                    div { class: "field",
+                        label { r#for: "settings-max-runs", "Max concurrent runs" }
+                        input {
+                            id: "settings-max-runs",
+                            r#type: "number",
+                            min: "0",
+                            step: "1",
+                            value: "{max_concurrent_runs}",
+                            onchange: {
+                                let settings = settings.clone();
+                                move |e: Event<FormData>| {
+                                    if let Ok(v) = e.value().trim().parse::<u32>() {
+                                        let mut s = settings.clone();
+                                        s.max_concurrent_runs = v;
+                                        state.save_settings(s);
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    div { class: "hint", "Caps concurrently running agent runs and validation checks across all projects (default 5); further runs queue and start automatically. 0 = unlimited. Agent Chat questions, PR-comment triage, and previews aren't counted." }
                 }
                 }
                 div { class: "modal-actions",

@@ -515,6 +515,23 @@ impl ExecutorCommand {
     }
 }
 
+/// One entry waiting in the run queue, as shown to the UI: the card (any card
+/// run or validation check) or contributor-PR review task holding the place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedTarget {
+    Card(Uuid),
+    Review(Uuid),
+}
+
+impl QueuedTarget {
+    /// The slot-holder id (card id or review-task id).
+    pub fn id(&self) -> Uuid {
+        match self {
+            QueuedTarget::Card(id) | QueuedTarget::Review(id) => *id,
+        }
+    }
+}
+
 /// An event from the executor to the UI.
 #[derive(Debug, Clone)]
 pub struct ExecutorEvent {
@@ -602,6 +619,11 @@ pub enum ExecutorEventKind {
     /// windows for the usage bar); the UI replaces its snapshot wholesale.
     /// Not card-scoped.
     UsageUpdated(UsageSnapshot),
+    /// The run queue changed (an entry queued, launched, or was purged). The
+    /// full ordered queue — index = place in line; the UI replaces its copy
+    /// wholesale. Not card-scoped. In-memory only: the queue doesn't survive a
+    /// restart (interrupted-run recovery picks the queued cards up as `Failed`).
+    RunQueueChanged { entries: Vec<QueuedTarget> },
     /// Show a toast (often an error).
     Toast { severity: Severity, message: String },
 }
@@ -653,6 +675,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::AttachmentsChanged { paths },
+        }
+    }
+    pub fn run_queue_changed(entries: Vec<QueuedTarget>) -> Self {
+        ExecutorEvent {
+            card_id: Uuid::nil(),
+            kind: ExecutorEventKind::RunQueueChanged { entries },
         }
     }
     pub fn card_busy(card_id: Uuid, busy: bool) -> Self {

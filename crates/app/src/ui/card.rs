@@ -36,6 +36,11 @@ pub fn CardView(card: Card) -> Element {
     // executor now has to drop.
     let busy = state.busy.read().contains(&id);
 
+    // The card's launch is parked in the run queue waiting for a concurrency
+    // slot: the card sits in a running state, but nothing is executing — show
+    // its place in line instead of a spinner.
+    let queued_pos = state.queue_position(id);
+
     let st = &card.state;
     let running = st.is_running();
     let failed = st.is_failed();
@@ -228,13 +233,19 @@ pub fn CardView(card: Card) -> Element {
             div { class: "card-meta",
                 // `busy` covers the gap the card's own state can't: the command
                 // is working, but hasn't transitioned the card yet.
-                if running || busy {
+                if (running || busy) && queued_pos.is_none() {
                     span { class: "spinner" }
                 }
                 if is_investigation {
                     span { class: "badge kind", "Investigation" }
                 }
-                if needs_answer {
+                if let Some(n) = queued_pos {
+                    span {
+                        class: "badge queued",
+                        title: "Waiting for a free run slot (see max concurrent runs in Settings)",
+                        "queued #{n}"
+                    }
+                } else if needs_answer {
                     span { class: "badge intervention", "needs answer" }
                 } else if externally_closed {
                     span { class: "badge intervention", "{status}" }

@@ -118,6 +118,11 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
     // button sits there looking unclicked for the whole fetch + worktree build.
     let busy = state.busy.read().contains(&id);
 
+    // The review run is parked in the run queue waiting for a concurrency
+    // slot: the task reads `Reviewing`, but nothing is executing — show its
+    // place in line instead of a spinner.
+    let queued_pos = state.queue_position(id);
+
     let st = &task.status;
     let status_label = st.status_label();
     let running = st.is_running();
@@ -230,10 +235,18 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
             }
             div { class: "card-meta",
                 span { class: "review-author", "@{task.author}" }
-                if running || busy {
+                if (running || busy) && queued_pos.is_none() {
                     span { class: "spinner" }
                 }
-                span { class: "badge status", "{status_label}" }
+                if let Some(n) = queued_pos {
+                    span {
+                        class: "badge queued",
+                        title: "Waiting for a free run slot (see max concurrent runs in Settings)",
+                        "queued #{n}"
+                    }
+                } else {
+                    span { class: "badge status", "{status_label}" }
+                }
                 // CI and mergeability are worth knowing *before* spending a review
                 // pass — a red or conflicting PR usually isn't ready for one.
                 if checks.is_reportable() {
