@@ -1,5 +1,6 @@
-//! Global settings modal (opened via the cog next to Home). For now it holds
-//! only the default models used to seed new projects and cards.
+//! Global settings modal (opened via the cog next to Home). Holds the default
+//! models for new cards and contributor-PR reviews across every project, plus
+//! app-wide config (open-in commands, run cap).
 
 use dioxus::prelude::*;
 use usine_core::{CardConfig, PreviewPort};
@@ -170,7 +171,7 @@ pub fn SettingsModal() -> Element {
                         }
                         div { class: "hint", "Self-review, PR-comment triage, and contributor PR reviews." }
                     }
-                    div { class: "hint", "Applies to projects and cards created from now on." }
+                    div { class: "hint", "Used for new cards and contributor PR reviews in every project. Existing cards keep their own models (editable on the card)." }
                 }
                 }
                 if tab() == SettingsTab::Config {

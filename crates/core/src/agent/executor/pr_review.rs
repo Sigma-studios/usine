@@ -466,10 +466,14 @@ impl Executor {
             "{project_guide}\n\n{}",
             crate::agent::review::PR_REVIEW_INSTRUCTION
         );
+        // Provider/spec come from the *current* global settings, not a snapshot
+        // taken at project creation — a settings change applies to the next
+        // review run in any project.
+        let settings = self.store.settings()?;
         let cfg = RunConfig {
-            provider: project.config.default_provider,
+            provider: settings.default_provider,
             project_dir: wt,
-            spec: project.config.review_spec(),
+            spec: settings.review_spec(),
             mode: RunMode::Review,
             session_id: task.session_id,
             prompt,
@@ -478,7 +482,7 @@ impl Executor {
             attachments: Vec::new(),
         };
         self.review_progress(task.id, "Reviewing the changes…");
-        let provider = self.providers.make(project.config.default_provider);
+        let provider = self.providers.make(settings.default_provider);
         let interactive = provider.interactive();
         let handle = provider.start(cfg).await?;
         lock(&self.review_runs).insert(task.id, (run_id, handle.control));

@@ -13,7 +13,8 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, AppSettings, Card, CardState, DesignSub, Effort, ExecutorCommand,
     ExecutorConfig, ExecutorEventKind, Forge, GhForge, GitOps, ModelSpec, PrReviewSub, Project,
-    Provider, RealGit, ReviewSub, RunConfig, RunMode, SimFactory, SimForge, SimGit, Store,
+    ProjectConfig, Provider, RealGit, ReviewSub, RunConfig, RunMode, SimFactory, SimForge, SimGit,
+    Store,
 };
 
 #[tokio::main]
@@ -288,14 +289,14 @@ async fn sim_pipeline() -> anyhow::Result<()> {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let proj_dir = std::env::temp_dir().join(format!("usine-sim-smoke-{secs}"));
     std::fs::create_dir_all(&proj_dir)?;
-    let project = Project::new("smoke", proj_dir, settings.new_project_config());
+    let project = Project::new("smoke", proj_dir, ProjectConfig::default());
     store.upsert_project(&project)?;
 
     let card = Card::new(
         project.id,
         "Smoke test card",
         "Run the end-to-end smoke test.",
-        project.config.new_card_config(),
+        settings.new_card_config(),
     );
     store.upsert_card(&card)?;
     let card_id = card.id;
@@ -550,14 +551,14 @@ async fn real_e2e() -> anyhow::Result<()> {
 
     let store = Store::open_in_memory()?;
     let settings = AppSettings::default();
-    let project = Project::new(name.clone(), repo.clone(), settings.new_project_config());
+    let project = Project::new(name.clone(), repo.clone(), ProjectConfig::default());
     store.upsert_project(&project)?;
 
     let mut card = Card::new(
         project.id,
         "Add a greeting file",
         "Add a file named HELLO.md containing a single friendly one-line greeting. Keep it minimal.",
-        project.config.new_card_config(),
+        settings.new_card_config(),
     );
     // Keep the test cheap.
     card.config.plan = ModelSpec::new("sonnet", Effort::Low);

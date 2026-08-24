@@ -160,7 +160,7 @@ impl Executor {
             project_id,
             &title,
             &description,
-            project.config.new_card_config(),
+            self.store.settings()?.new_card_config(),
         );
         // Adoption enters the pipeline where an implement run exits: parked at
         // the self-review gate. A direct set, not a Transition — this creation

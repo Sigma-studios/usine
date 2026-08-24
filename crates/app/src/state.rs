@@ -14,7 +14,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
     spawn_executor, AdoptProbe, AppSettings, Card, CardState, DesignSub, DiffState, DirtyAction,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle, Forge,
-    GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, Provider,
+    GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig, Provider,
     ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity,
     SimFactory, SimForge, SimGit, Store, UsageSnapshot,
 };
@@ -802,7 +802,7 @@ impl AppState {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
-        let mut config = self.settings.read().new_project_config();
+        let mut config = ProjectConfig::default();
         // Fork worktrees from the repo's integration branch (prefers `dev`).
         if !demo_mode() {
             config.base_branch = usine_core::infra::git::detect_base_branch(&path);
@@ -824,14 +824,13 @@ impl AppState {
     }
 
     pub fn create_card(&self, project_id: Uuid, title: String, description: String) {
-        // Read the project's defaults from signals (no store read on the UI thread).
-        let config = match self.projects.read().iter().find(|p| p.id == project_id) {
-            Some(p) => p.config.new_card_config(),
-            None => {
-                push_toast(Severity::Error, "unknown project");
-                return;
-            }
-        };
+        if !self.projects.read().iter().any(|p| p.id == project_id) {
+            push_toast(Severity::Error, "unknown project");
+            return;
+        }
+        // Seed from the *current* global settings (kept live by the
+        // `SettingsUpdated` echo) — no store read on the UI thread.
+        let config = self.settings.read().new_card_config();
         let card = Card::new(project_id, title, description, config);
         // Select now; the card itself arrives via `CardUpdated`.
         let mut selected = self.selected_card;
@@ -841,7 +840,7 @@ impl AppState {
         });
     }
 
-    /// Persist global settings (default models for new projects/cards). The
+    /// Persist global settings (default models for new cards everywhere). The
     /// settings signal updates on the `SettingsUpdated` echo.
     pub fn save_settings(&self, settings: AppSettings) {
         self.send(ExecutorCommand::SaveSettings {
@@ -942,15 +941,17 @@ fn open_store() -> Store {
 /// demonstrates the whole pipeline.
 fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
     let path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut config = settings.new_project_config();
     // Without contributors to watch, a scan finds nothing and the review board
     // stays empty — these are the authors `SimForge::list_review_prs` returns.
-    config.review_contributors = vec!["octocat".into(), "hubot".into()];
+    let config = ProjectConfig {
+        review_contributors: vec!["octocat".into(), "hubot".into()],
+        ..Default::default()
+    };
     let project = Project::new("Demo project", path, config);
     store.upsert_project(&project)?;
 
     let mk = |title: &str, desc: &str, state: CardState| {
-        let mut c = Card::new(project.id, title, desc, project.config.new_card_config());
+        let mut c = Card::new(project.id, title, desc, settings.new_card_config());
         c.state = state;
         c
     };
