@@ -25,8 +25,9 @@ pub const HANDOFF_INSTRUCTION: &str = "\
 When you have finished making changes, hand the work off to the human who will review it. Emit a \
 fenced code block tagged `usine-handoff` containing a JSON object shaped like \
 {\"summary\": \"<what was done>\", \"questions\": [\"<open question>\"], \"tests\": [\"<what to check>\"]}.\n\
-- `summary`: a short recap of all the work done, for someone who did not watch you work — one \
-short line per change, newline-separated, covering everything meaningful in the diff (features, \
+- `summary`: a short recap of all the work done, for someone who did not watch you work. Start it \
+with a `TL;DR:` line followed by 1-3 bullet points (`- ` lines) giving the headline outcome, then \
+one short line per change, newline-separated, covering everything meaningful in the diff (features, \
 refactors, tests, docs, config). Note in place anything you had to work around or deliberately \
 leave out; if part of the task is unfinished, or you are unsure a change is right, say so plainly \
 on its own line.\n\
@@ -41,12 +42,21 @@ human eye, but the reviewer should know it has been exercised once. Use an \
 empty array if the change has no observable behaviour.\n\
 Be honest and specific — this is the note a careful engineer leaves a colleague, not a sales pitch.";
 
+/// Appended to fix runs, whose stripped final message becomes the "Fixes recap"
+/// the user reads at the merge step. Must NOT mention the hand-off block tag:
+/// fix runs report through this recap, not a hand-off.
+pub const FIX_RECAP_INSTRUCTION: &str = "\
+Your final message is shown to the user as the recap of this fix run. Start it with a `TL;DR:` — \
+1-3 short bullet points saying what you changed (and anything you judged not worth changing or \
+could not fix) — then any detail worth keeping.";
+
 /// An implement run's hand-off to its reviewer. Every field is optional: an agent
 /// with nothing to ask emits `questions: []`, and a change with no observable
 /// behaviour emits `tests: []`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
-    /// A short recap of the work done, one line per change.
+    /// A short recap of the work done: a `TL;DR:` header with bullet points,
+    /// then one line per change.
     #[serde(default)]
     pub summary: String,
     /// Decisions or ambiguities the agent wants the user to weigh in on.

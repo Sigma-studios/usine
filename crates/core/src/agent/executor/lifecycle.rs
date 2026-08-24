@@ -275,7 +275,7 @@ impl Executor {
         // implement run also hands off to the human who reviews it next — a
         // recap, its open questions, and what to test — which the
         // awaiting-review panel renders. Fix runs report through their own recap
-        // and don't need one.
+        // instead, and are told their final message is it.
         let extra = match mode {
             RunMode::Implement | RunMode::ApplyFixes => {
                 let mut tail = String::new();
@@ -287,6 +287,9 @@ impl Executor {
                 if mode == RunMode::Implement {
                     tail.push_str("\n\n");
                     tail.push_str(crate::agent::handoff::HANDOFF_INSTRUCTION);
+                } else {
+                    tail.push_str("\n\n");
+                    tail.push_str(crate::agent::handoff::FIX_RECAP_INSTRUCTION);
                 }
                 Some(match extra {
                     Some(e) => format!("{e}\n\n{tail}"),

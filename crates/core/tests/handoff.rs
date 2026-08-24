@@ -215,10 +215,19 @@ async fn only_implement_runs_are_asked_for_a_hand_off() {
         !fixes.contains("usine-handoff"),
         "a fix run must not be asked for a hand-off:\n{fixes}"
     );
+    // …but it is asked to open its recap with a TL;DR.
+    assert!(
+        fixes.contains("TL;DR"),
+        "a fix run is asked for a TL;DR-led recap:\n{fixes}"
+    );
     // Both write runs still author their own commit message.
     assert!(fixes.contains("usine-commit"));
     let implement = prompt_for(&prompts, RunMode::Implement).expect("an implement run");
     assert!(implement.contains("usine-commit"));
+    assert!(
+        implement.contains("usine-handoff") && implement.contains("TL;DR"),
+        "the implement prompt asks for a hand-off whose summary leads with a TL;DR"
+    );
 
     let review = prompt_for(&prompts, RunMode::Review).expect("a self-review run");
     assert!(
