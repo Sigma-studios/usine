@@ -292,6 +292,22 @@ async fn a_resolve_runs_push_resets_the_cached_conflict() {
     );
     handle.send(ExecutorCommand::ResolveConflicts { card_id: card.id });
 
+    // Wait for the resolve run to actually start (the card leaves the gate)
+    // before watching for the landing: the background poll's first tick also
+    // emits a `CardUpdated` for the still-`ReadyToMerge` card (the sim forge's
+    // comment counts differ from the seeded zeros), and matching that pre-run
+    // echo would read the seeded `Conflicting` instead of the reset the run
+    // performs.
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if c.id == card.id && !matches!(c.state, CardState::ReadyToMerge) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
     // The run goes through applying-fixes and lands back at the gate.
     let mergeable = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c)
