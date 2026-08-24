@@ -237,6 +237,16 @@ impl Executor {
                 dir
             }
         };
+        // Register the preview artifacts' exclude guard before the run starts:
+        // finalize's `git add -A` must never sweep a late-touched request
+        // sentinel (or the preview info / port-offset files) onto the branch.
+        // This is the one choke point every write run passes through — new,
+        // rebuilt, and adopted worktrees alike, including ones created before
+        // these files existed, which creation-site-only registration misses.
+        if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
+            crate::infra::git::ensure_excluded(&project_dir, super::preview::PREVIEW_EXCLUDES)
+                .await;
+        }
         // Always send the full task description. `--resume` adds conversation
         // continuity when the session has saved state, but claude only persists
         // at turn boundaries — a run killed mid-turn resumes with an empty
@@ -269,8 +279,10 @@ impl Executor {
         // executor uses it when committing the worktree (see `finalize_run`), so
         // commits aren't a repeated generic `usine: <title>`. When the project can
         // run (a `run_script` is set), they are also told to verify their work
-        // against the app the executor brings up in this worktree (see the
-        // `EnsurePreview` below) — same condition the preview itself keys on, so
+        // against the app in this worktree — eagerly started by the
+        // `EnsurePreview` below when the project's `auto_preview` is on, or
+        // available on request via the sentinel watcher when it's off. Both the
+        // variant choice and the dispatch below key off the same conditions, so
         // the agent is never told to test against an app that can't exist. An
         // implement run also hands off to the human who reviews it next — a
         // recap, its open questions, and what to test — which the
@@ -280,7 +292,13 @@ impl Executor {
             RunMode::Implement | RunMode::ApplyFixes => {
                 let mut tail = String::new();
                 if let Some(run) = super::preview::run_command(&project.config) {
-                    tail.push_str(&crate::agent::testing::testing_instruction(&run));
+                    let has_ports = !project.config.preview_ports.is_empty();
+                    let instruction = if project.config.auto_preview {
+                        crate::agent::testing::testing_instruction(&run, has_ports)
+                    } else {
+                        crate::agent::testing::testing_instruction_on_request(&run, has_ports)
+                    };
+                    tail.push_str(&instruction);
                     tail.push_str("\n\n");
                 }
                 tail.push_str(crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION);
@@ -296,6 +314,9 @@ impl Executor {
             _ => extra,
         };
         let is_resume = resume_session.is_some();
+        // Kept for the preview dispatch below (a write run's `project_dir` is
+        // its isolated worktree); `RunConfig` moves the original.
+        let run_dir = project_dir.clone();
         let cfg = RunConfig {
             provider: card.config.provider,
             project_dir,
@@ -374,10 +395,26 @@ impl Executor {
         // it so a parked card holds no containers. Routed through the command channel — this
         // launch usually runs inside an exclusive command, and a slow setup
         // (deps, docker) must not hold the card busy or delay the agent.
+        //
+        // With the project's `auto_preview` off, nothing starts eagerly;
+        // instead a watcher lets the agent request the app mid-run via the
+        // sentinel file. No run script means no watcher either — a preview
+        // could never start, and the prompt above omits the testing
+        // instruction on that same condition.
         if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
-            let _ = self
-                .cmd_tx
-                .unbounded_send(ExecutorCommand::EnsurePreview { card_id: card.id });
+            if project.config.auto_preview {
+                let _ = self
+                    .cmd_tx
+                    .unbounded_send(ExecutorCommand::EnsurePreview { card_id: card.id });
+            } else if super::preview::run_command(&project.config).is_some() {
+                super::preview::spawn_preview_request_watcher(
+                    run_dir,
+                    card.id,
+                    run_id,
+                    self.runs.clone(),
+                    self.cmd_tx.clone(),
+                );
+            }
         }
         Ok(())
     }

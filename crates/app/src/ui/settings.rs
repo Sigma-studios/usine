@@ -617,6 +617,24 @@ fn CommandsTab(pid: Uuid) -> Element {
                 div { class: "hint", "Launches the app in the worktree. Required to enable the “Test app” button." }
             }
             div { class: "field",
+                label { class: "adopt-choice",
+                    input {
+                        r#type: "checkbox",
+                        checked: project.config.auto_preview,
+                        onchange: {
+                            let project = project.clone();
+                            move |_| {
+                                let mut p = project.clone();
+                                p.config.auto_preview = !p.config.auto_preview;
+                                state.save_project(p);
+                            }
+                        },
+                    }
+                    "Start the app automatically during agent runs"
+                }
+                div { class: "hint", "When off, the agent can still request the app mid-run when it needs to test in it." }
+            }
+            div { class: "field",
                 label { "Preview ports" }
                 div { class: "port-list",
                     if project.config.preview_ports.is_empty() {
