@@ -188,6 +188,19 @@ pub struct ProjectConfig {
     /// Per-service ports the preview exposes, surfaced as clickable URLs.
     #[serde(default)]
     pub preview_ports: Vec<PreviewPort>,
+    /// Start the app automatically alongside every write run so the agent can
+    /// self-test (the default). When off, the agent can still request the app
+    /// mid-run by creating the preview-request sentinel in its worktree (see
+    /// `agent::testing::PREVIEW_REQUEST_FILE`).
+    #[serde(default = "default_auto_preview")]
+    pub auto_preview: bool,
+}
+
+/// Serde default for [`ProjectConfig::auto_preview`]: a project config stored
+/// before the field existed must keep today's eager-start behavior, not
+/// silently flip every existing project to on-request.
+pub(crate) fn default_auto_preview() -> bool {
+    true
 }
 
 impl ProjectConfig {
@@ -238,6 +251,7 @@ impl Default for ProjectConfig {
             validate_script: None,
             worktree_teardown_script: None,
             preview_ports: Vec::new(),
+            auto_preview: true,
         }
     }
 }
