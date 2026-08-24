@@ -1,9 +1,11 @@
 //! The per-project `auto_preview` toggle and its on-request sentinel channel:
 //! with the toggle off, a write run starts NO app; the agent can request one
 //! mid-run by creating `.usine-preview-request` in its worktree, which a
-//! watcher bound to the run's lifetime turns into exactly one preview. The
-//! sentinel itself must never reach the card's branch — its exclude is
-//! registered at launch, before the run can touch it.
+//! watcher bound to the run's lifetime turns into a preview — one per touch
+//! (the watcher lives on so a failed start can be re-requested). The sentinel
+//! itself must never reach the card's branch — its exclude is registered at
+//! launch, before the run can touch it. And a request that only lands once
+//! the card has parked must launch nothing: there is no reap left to stop it.
 //!
 //! The first two tests reuse `preview_reap.rs`'s shape (SimGit, a pre-seeded
 //! temp worktree, a long-lived run script); the branch-hygiene test runs
@@ -158,6 +160,40 @@ async fn sentinel_triggers_exactly_one_preview() {
         _ => None,
     })
     .await;
+}
+
+/// An `EnsurePreview` that lands after the card parked — a sentinel consumed
+/// in the run's final instant — must launch nothing: the park's
+/// `reap_idle_preview` has already come and gone, so an app started now would
+/// be orphaned on a parked card.
+#[tokio::test]
+async fn ensure_preview_on_parked_card_launches_nothing() {
+    let wt = tempfile::tempdir().unwrap();
+    let (store, card_id) = seed(
+        CardState::AwaitingReview(ReviewSub::ReadyForReview),
+        wt.path(),
+    );
+    let (handle, mut rx) = executor(&store);
+
+    handle.send(ExecutorCommand::EnsurePreview { card_id });
+
+    // The guard makes this a silent no-op: no preview event may ever arrive.
+    // Bound the wait — the run script is a `while true` loop, so a launch
+    // that slipped through would surface as `SettingUp`/`Running` well
+    // within this window.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let evt = tokio::time::timeout_at(deadline, rx.next()).await;
+        match evt {
+            Err(_) => break, // window elapsed with no preview activity
+            Ok(Some(e)) => {
+                if let ExecutorEventKind::PreviewUpdated { status, .. } = &e.kind {
+                    panic!("a parked card must not gain a preview, got {status:?}");
+                }
+            }
+            Ok(None) => panic!("event stream closed unexpectedly"),
+        }
+    }
 }
 
 // --- branch hygiene, against REAL git -----------------------------------

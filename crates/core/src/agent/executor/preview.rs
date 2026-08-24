@@ -201,6 +201,18 @@ impl Executor {
         // without having emitted a status (the UI never saw this attempt).
         let target = (|| {
             let card = self.store.get_card(card_id).ok()?;
+            // The run this preview serves may already be over: a sentinel
+            // consumed in its final instant queues an `EnsurePreview` that
+            // lands *after* the park's `reap_idle_preview` — which found no
+            // slot and did nothing — so launching now would strand an app (and
+            // its worktree infra) on a parked card, with nothing left to reap
+            // it. Mirror the reap's own guard: parked card, no preview. A park
+            // racing in *after* this check is the covered case instead — the
+            // reap then sees this claim and the launch self-reaps at its next
+            // generation checkpoint.
+            if !card.state.is_running() {
+                return None;
+            }
             let project = self.store.get_project(card.project_id).ok()?;
             run_command(&project.config)?;
             let worktree = card.worktree_path.filter(|w| w.exists())?;
@@ -720,11 +732,14 @@ impl Executor {
 ///
 /// Bound to the run's lifetime: the loop exits as soon as the runs map no
 /// longer holds this exact run (end-of-run cleanup, the NeedsInput teardown,
-/// or a newer run replacing it). A sentinel already present at spawn — e.g.
-/// touched in the previous run's final poll gap — triggers on the first tick
-/// rather than being swept: the agent did ask, and it makes tests
-/// deterministic. `EnsurePreview` tolerates every "nothing to do" case, so a
-/// stale trigger is harmless.
+/// or a newer run replacing it) — and only then, not after a trigger: if the
+/// preview it started failed (setup script error, a transient port or docker
+/// issue), the agent's re-touch of the sentinel must request another start,
+/// not be silently ignored for the rest of the run. While a preview is up a
+/// re-touch is harmless — `EnsurePreview` finds the slot claimed and no-ops.
+/// A sentinel already present at spawn — e.g. touched in the previous run's
+/// final poll gap — triggers on the first tick rather than being swept: the
+/// agent did ask, and it makes tests deterministic.
 pub(super) fn spawn_preview_request_watcher(
     worktree: PathBuf,
     card_id: Uuid,
@@ -743,7 +758,6 @@ pub(super) fn spawn_preview_request_watcher(
             if sentinel.exists() {
                 let _ = std::fs::remove_file(&sentinel);
                 let _ = cmd_tx.unbounded_send(ExecutorCommand::EnsurePreview { card_id });
-                return;
             }
         }
     });

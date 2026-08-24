@@ -76,8 +76,11 @@ pub fn testing_instruction_on_request(run_script: &str, has_ports: bool) -> Stri
 /// How the agent should actually observe its change in the running app, shared
 /// by both instruction variants. With declared preview ports the app is
 /// URL-reachable; without them it's a windowed program, so the only observation
-/// is a screenshot — and a failure to capture one (e.g. a missing
-/// screen-recording permission) must be reported, not guessed around.
+/// is a screenshot — of the app's window ONLY, never the full display: the
+/// rest of the screen is the user's other windows (mail, chats, secrets),
+/// which must not enter the agent's context. A failure to capture the window
+/// (e.g. a missing screen-recording permission) must be reported, not guessed
+/// around — and not worked around with a full-screen grab.
 fn observation_route(has_ports: bool) -> &'static str {
     if has_ports {
         "After implementing, if the change has behaviour observable in the running app, verify it \
@@ -87,10 +90,15 @@ fn observation_route(has_ports: bool) -> &'static str {
          hand-off."
     } else {
         "The app has no declared URLs — it runs as a windowed program. After implementing, if the \
-         change is visible in the app, verify it by capturing a screenshot of its window (e.g. \
-         macOS `screencapture` to a temporary png) and reading the image; fix what you find and \
-         re-verify. If you can't capture the window (e.g. a missing screen-recording permission), \
-         don't guess — say exactly that in your hand-off."
+         change is visible in the app, verify it by capturing a screenshot of the app's window \
+         ONLY and reading the image — on macOS `screencapture -l <window-id>` to a temporary png, \
+         resolving the window id first (e.g. via `osascript` or `GetWindowID`). NEVER capture the \
+         full display: the rest of the screen is the user's other windows and their contents, \
+         which must not enter your context — and the app may be obscured or on another Space \
+         anyway. Fix what you find and re-verify. If you can't capture the app's window \
+         specifically (e.g. a missing screen-recording permission, or no way to resolve its \
+         window id), don't fall back to a full-screen grab and don't guess — say exactly that in \
+         your hand-off."
     }
 }
 
@@ -127,6 +135,10 @@ mod tests {
         assert!(s.contains("screenshot"));
         assert!(s.contains("screen-recording permission"));
         assert!(!s.contains("curl"));
+        // Window-scoped capture only — a full-display grab would feed the
+        // user's other windows into the agent's context.
+        assert!(s.contains("-l <window-id>"));
+        assert!(s.contains("NEVER capture the full display"));
     }
 
     #[test]
