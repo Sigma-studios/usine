@@ -55,7 +55,8 @@ could not fix) — then any detail worth keeping.";
 /// behaviour emits `tests: []`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
-    /// A short recap of the work done, one line per change.
+    /// A short recap of the work done: a `TL;DR:` header with bullet points,
+    /// then one line per change.
     #[serde(default)]
     pub summary: String,
     /// Decisions or ambiguities the agent wants the user to weigh in on.
