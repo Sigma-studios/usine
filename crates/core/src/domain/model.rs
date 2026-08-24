@@ -1465,7 +1465,9 @@ impl Card {
     pub fn pending_review_bodies(&self) -> Vec<&ReviewSummary> {
         self.reviews
             .iter()
-            .filter(|r| r.has_body_feedback() && !self.triaged_review_bodies.contains(&r.body_key()))
+            .filter(|r| {
+                r.has_body_feedback() && !self.triaged_review_bodies.contains(&r.body_key())
+            })
             .collect()
     }
 
@@ -1890,7 +1892,8 @@ mod tests {
 
         // A second reviewer still requesting changes blocks the approval —
         // `latestReviews` carries one verdict per reviewer.
-        card.reviews.push(ReviewSummary::new("hubot", "CHANGES_REQUESTED"));
+        card.reviews
+            .push(ReviewSummary::new("hubot", "CHANGES_REQUESTED"));
         assert!(!card.approval_clears_merge());
         card.reviews.pop();
 
@@ -1933,7 +1936,8 @@ mod tests {
         assert!(card.no_reviewer_clears_merge(None));
 
         // ...but an unsolicited change request does.
-        card.reviews.push(ReviewSummary::new("hubot", "CHANGES_REQUESTED"));
+        card.reviews
+            .push(ReviewSummary::new("hubot", "CHANGES_REQUESTED"));
         assert!(!card.no_reviewer_clears_merge(None));
         card.reviews.pop();
 

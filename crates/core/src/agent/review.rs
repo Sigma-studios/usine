@@ -412,7 +412,7 @@ mod tests {
             review_body_of: Some("argus@2026-08-21T13:58:00Z".into()),
         }];
         let text = "```usine-review\n[{\"id\":9000000000000000,\"worth_fixing\":false,\"opinion\":\"a pass report\",\"reply\":\"thanks!\"}]\n```";
-        let v = parse_triage(&text, &comments);
+        let v = parse_triage(text, &comments);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].rationale, "a pass report");
         assert_eq!(v[0].reply, "", "no reply can be posted on a review body");
