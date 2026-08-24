@@ -732,7 +732,8 @@ select option { background: var(--panel-2); color: var(--text); }
    `.card-meta` and `.card-actions` wholesale so the two boards look like one
    product. Only the PR number — which has no equivalent on a card — is styled
    here, as a monospace prefix inside the title. */
-.review-pr-num { color: var(--muted); font-family: ui-monospace, monospace; font-weight: 500; margin-right: 6px; }
+.review-pr-num { color: var(--muted); font-family: ui-monospace, monospace; font-weight: 500; margin-right: 6px; text-decoration: none; }
+.review-pr-num:hover { color: var(--text); text-decoration: underline; }
 .review-author { color: var(--muted); font-size: 12px; }
 .reviewed-tag { color: var(--green); font-size: 12px; font-weight: 600; }
 

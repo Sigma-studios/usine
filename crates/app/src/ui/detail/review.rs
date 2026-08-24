@@ -62,7 +62,14 @@ pub fn ReviewDetail() -> Element {
                         }
                         div { class: "card-meta",
                             span { class: "badge", "{project}" }
-                            span { class: "badge", "#{task.pr_number}" }
+                            a {
+                                class: "badge pr-link",
+                                href: "{url}",
+                                target: "_blank",
+                                rel: "noreferrer",
+                                title: "Open pull request on GitHub",
+                                "#{task.pr_number}"
+                            }
                             span { class: "badge", "@{task.author}" }
                             span { class: "badge status", "{status}" }
                             if task.checks.is_reportable() {
@@ -128,7 +135,6 @@ fn ReviewPanel(task: ReviewTask) -> Element {
             if task.mergeable.is_conflicting() {
                 div { class: "hint error", "This PR conflicts with {task.base_ref}." }
             }
-            a { class: "wt-path", href: "{task.url}", target: "_blank", rel: "noreferrer", "Open on GitHub ↗" }
         }
 
         // The author's own account of the change. Reviewing a diff without the
