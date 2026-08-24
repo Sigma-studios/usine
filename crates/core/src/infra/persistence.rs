@@ -1268,7 +1268,7 @@ mod tests {
         let project = Project::new(
             "demo",
             PathBuf::from("/tmp/demo"),
-            settings.new_project_config(),
+            crate::ProjectConfig::default(),
         );
         store.upsert_project(&project).unwrap();
 
@@ -1276,7 +1276,7 @@ mod tests {
             project.id,
             "Add feature",
             "Implement the thing",
-            project.config.new_card_config(),
+            settings.new_card_config(),
         );
         store.upsert_card(&card).unwrap();
 
