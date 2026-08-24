@@ -14,7 +14,7 @@
 //! makes it fast (dependencies, build output, build caches) lives in the
 //! worktree, which teardown leaves alone.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -33,6 +33,21 @@ const TEARDOWN_CANDIDATES: &[&str] = &["teardown-worktree.sh", "scripts/teardown
 
 /// How long a `SIGTERM`ed preview tree gets to exit cleanly before `SIGKILL`.
 const KILL_GRACE: Duration = Duration::from_millis(800);
+
+/// How often the request watcher polls a write run's worktree for the agent's
+/// preview-request sentinel.
+const PREVIEW_REQUEST_POLL: Duration = Duration::from_secs(3);
+
+/// Every usine runtime artifact a worktree can carry that must never land on
+/// the card's branch: the preview info file, the agent's preview-request
+/// sentinel, and the setup script's port-offset file. Registered in the repo's
+/// shared `info/exclude` so a `git add -A` — finalize's auto-commit, or one
+/// the agent runs itself — can't sweep them onto the branch.
+pub(super) const PREVIEW_EXCLUDES: &[&str] = &[
+    crate::agent::testing::PREVIEW_INFO_FILE,
+    crate::agent::testing::PREVIEW_REQUEST_FILE,
+    ".wt-offset",
+];
 
 /// Outcome of the preview setup step: it either ran to completion, or a
 /// concurrent [`Executor::stop_preview`] reaped it mid-run.
@@ -186,6 +201,18 @@ impl Executor {
         // without having emitted a status (the UI never saw this attempt).
         let target = (|| {
             let card = self.store.get_card(card_id).ok()?;
+            // The run this preview serves may already be over: a sentinel
+            // consumed in its final instant queues an `EnsurePreview` that
+            // lands *after* the park's `reap_idle_preview` — which found no
+            // slot and did nothing — so launching now would strand an app (and
+            // its worktree infra) on a parked card, with nothing left to reap
+            // it. Mirror the reap's own guard: parked card, no preview. A park
+            // racing in *after* this check is the covered case instead — the
+            // reap then sees this claim and the launch self-reaps at its next
+            // generation checkpoint.
+            if !card.state.is_running() {
+                return None;
+            }
             let project = self.store.get_project(card.project_id).ok()?;
             run_command(&project.config)?;
             let worktree = card.worktree_path.filter(|w| w.exists())?;
@@ -444,15 +471,11 @@ impl Executor {
         // Surface the URLs to an agent working in this worktree too (see
         // `agent::testing`) — written before the reaper is spawned, so an app
         // that dies instantly can't have its reaper clear the file first and
-        // then be overwritten by a stale "running". The exclude guard keeps the
-        // file — and the setup script's `.wt-offset` — from ever being swept
-        // into a commit by a `git add -A` (finalize's auto-commit, or one the
-        // agent runs itself).
-        crate::infra::git::ensure_excluded(
-            worktree,
-            &[crate::agent::testing::PREVIEW_INFO_FILE, ".wt-offset"],
-        )
-        .await;
+        // then be overwritten by a stale "running". Write runs register the
+        // exclude guard at launch already; this call is what covers
+        // review-preview worktrees (which never pass through `launch`), and
+        // it's idempotent.
+        crate::infra::git::ensure_excluded(worktree, PREVIEW_EXCLUDES).await;
         let _ = std::fs::write(
             worktree.join(crate::agent::testing::PREVIEW_INFO_FILE),
             crate::agent::testing::preview_info_json(&urls),
@@ -699,6 +722,45 @@ impl Executor {
             .evt_tx
             .unbounded_send(ExecutorEvent::preview_updated(card_id, status, urls));
     }
+}
+
+/// Watch a write run's worktree for the agent's preview-request sentinel
+/// ([`crate::agent::testing::PREVIEW_REQUEST_FILE`]) and, on hit, delete it
+/// and dispatch `EnsurePreview` — the on-request half of the `auto_preview`
+/// toggle. Spawned from `lifecycle::launch` only when the toggle is off and
+/// the project has a run script (no other way a preview could start).
+///
+/// Bound to the run's lifetime: the loop exits as soon as the runs map no
+/// longer holds this exact run (end-of-run cleanup, the NeedsInput teardown,
+/// or a newer run replacing it) — and only then, not after a trigger: if the
+/// preview it started failed (setup script error, a transient port or docker
+/// issue), the agent's re-touch of the sentinel must request another start,
+/// not be silently ignored for the rest of the run. While a preview is up a
+/// re-touch is harmless — `EnsurePreview` finds the slot claimed and no-ops.
+/// A sentinel already present at spawn — e.g. touched in the previous run's
+/// final poll gap — triggers on the first tick rather than being swept: the
+/// agent did ask, and it makes tests deterministic.
+pub(super) fn spawn_preview_request_watcher(
+    worktree: PathBuf,
+    card_id: Uuid,
+    run_id: Uuid,
+    runs: RunMap,
+    cmd_tx: UnboundedSender<ExecutorCommand>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PREVIEW_REQUEST_POLL);
+        loop {
+            interval.tick().await;
+            if lock(&runs).get(&card_id).map(|(rid, _)| *rid) != Some(run_id) {
+                return;
+            }
+            let sentinel = worktree.join(crate::agent::testing::PREVIEW_REQUEST_FILE);
+            if sentinel.exists() {
+                let _ = std::fs::remove_file(&sentinel);
+                let _ = cmd_tx.unbounded_send(ExecutorCommand::EnsurePreview { card_id });
+            }
+        }
+    });
 }
 
 /// The project's launch command, trimmed to `None` if unset/blank. `pub(super)`
