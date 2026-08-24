@@ -100,7 +100,7 @@ impl Forge for LiveForge {
     async fn is_merged(&self, r: &Path, n: u64) -> usine_core::Result<bool> {
         SimForge.is_merged(r, n).await
     }
-    async fn merge_status(&self, r: &Path, n: u64) -> usine_core::Result<usine_core::MergeStatus> {
+    async fn merge_status(&self, r: &Path, n: u64) -> usine_core::Result<usine_core::Mergeable> {
         SimForge.merge_status(r, n).await
     }
     async fn delete_remote_branch(&self, r: &Path, b: &str) -> usine_core::Result<()> {

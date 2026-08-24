@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, Card, CardConfig, CardState, ExecutorCommand, ExecutorConfig, ExecutorEvent,
-    ExecutorEventKind, GitOps, MergeOutcome, Project, ProjectConfig, Result, ReviewSub, SimFactory,
-    SimForge, SimGit, Store,
+    spawn_executor, Card, CardConfig, CardState, CheckStatus, ExecutorCommand, ExecutorConfig,
+    ExecutorEvent, ExecutorEventKind, GitOps, MergeOutcome, Mergeable, PrInfo, Project,
+    ProjectConfig, Result, ReviewSub, ReviewSummary, SimFactory, SimForge, SimGit, Store,
 };
 
 /// Simulator git that records the branches it was asked to delete.
@@ -149,4 +149,75 @@ async fn back_to_start_deletes_the_discarded_branch() {
         store.get_card(card_id).unwrap().branch.is_none(),
         "the card's branch pointer is cleared"
     );
+}
+
+/// Back to Start drops the PR — so it must drop the caches *derived* from that
+/// PR too. Left in place, a brand-new PR from the next attempt inherits them:
+/// a card reset from a conflicting merge gate would reach `ReadyToMerge` still
+/// wearing the old PR's `Conflicting` and offer "Resolve conflicts" instead of
+/// Merge, and stale comment counts would offer triage on comments that no
+/// longer exist.
+#[tokio::test]
+async fn back_to_start_forgets_the_dropped_prs_caches() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-back-to-start-caches"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    // A card at the merge gate whose PR left every cache dirty.
+    let mut card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    card.state = CardState::ReadyToMerge;
+    card.branch = Some("feat/thing".into());
+    card.pr = Some(PrInfo {
+        number: 7,
+        url: "https://github.com/example/repo/pull/7".into(),
+        title: "t".into(),
+        state: "open".into(),
+        reviewer: None,
+        reviewer_recorded: false,
+    });
+    card.reviewer_comment_count = 3;
+    card.comment_count = 4;
+    card.unanswered_count = 2;
+    card.reviews = vec![ReviewSummary::new("alice", "CHANGES_REQUESTED")];
+    card.triaged_review_bodies = vec!["alice@2026-01-01T00:00:00Z".into()];
+    card.checks = CheckStatus::Failing;
+    card.mergeable = Mergeable::Conflicting;
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    // The comment poll's first tick fires at startup and rewrites these same
+    // caches from the simulated forge (still to non-default values); let it
+    // land before resetting so it can't race the assertions below.
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card_id => Some(()),
+        _ => None,
+    })
+    .await;
+    handle.send(ExecutorCommand::BackToStart { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if matches!(c.state, CardState::StartingBlock) => {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let reset = store.get_card(card_id).unwrap();
+    assert!(reset.pr.is_none(), "the PR pointer is dropped");
+    assert_eq!(reset.reviewer_comment_count, 0);
+    assert_eq!(reset.comment_count, 0);
+    assert_eq!(reset.unanswered_count, 0);
+    assert!(reset.reviews.is_empty());
+    assert!(reset.triaged_review_bodies.is_empty());
+    assert_eq!(reset.checks, CheckStatus::None);
+    assert_eq!(reset.mergeable, Mergeable::Unknown);
 }
