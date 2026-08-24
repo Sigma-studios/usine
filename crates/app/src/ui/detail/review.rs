@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::transcript::TranscriptView;
 use crate::state::AppState;
 use crate::ui::diffdialog::{event_value, open_review_diff, open_review_diff_at, parse_event};
-use crate::ui::icons::{IconDiff, IconExternal};
+use crate::ui::icons::IconDiff;
 use crate::ui::reviewdraft;
 
 /// The detail panel for the selected review task.
@@ -44,15 +44,6 @@ pub fn ReviewDetail() -> Element {
                                 onclick: move |_| open_review_diff(id),
                                 IconDiff {}
                             }
-                            a {
-                                class: "card-icon-btn",
-                                href: "{url}",
-                                target: "_blank",
-                                rel: "noreferrer",
-                                title: "Open on GitHub",
-                                "aria-label": "Open on GitHub",
-                                IconExternal {}
-                            }
                             button {
                                 class: "detail-close",
                                 "aria-label": "Close panel",
@@ -62,7 +53,14 @@ pub fn ReviewDetail() -> Element {
                         }
                         div { class: "card-meta",
                             span { class: "badge", "{project}" }
-                            span { class: "badge", "#{task.pr_number}" }
+                            a {
+                                class: "badge pr-link",
+                                href: "{url}",
+                                target: "_blank",
+                                rel: "noreferrer",
+                                title: "Open pull request on GitHub",
+                                "#{task.pr_number}"
+                            }
                             span { class: "badge", "@{task.author}" }
                             span { class: "badge status", "{status}" }
                             if task.checks.is_reportable() {
@@ -128,7 +126,6 @@ fn ReviewPanel(task: ReviewTask) -> Element {
             if task.mergeable.is_conflicting() {
                 div { class: "hint error", "This PR conflicts with {task.base_ref}." }
             }
-            a { class: "wt-path", href: "{task.url}", target: "_blank", rel: "noreferrer", "Open on GitHub ↗" }
         }
 
         // The author's own account of the change. Reviewing a diff without the

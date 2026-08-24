@@ -195,7 +195,18 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                 // default action and would otherwise cancel a button's Enter activation).
                 onkeydown: move |e| e.stop_propagation(),
                 div { class: "card-title",
-                    span { class: "review-pr-num", "#{task.pr_number}" }
+                    a {
+                        class: "review-pr-num",
+                        href: "{task.url}",
+                        target: "_blank",
+                        rel: "noreferrer",
+                        title: "Open pull request on GitHub",
+                        // Don't let a click on the link also select the card
+                        // (its Enter activation is already shielded by the
+                        // card-top keydown handler above).
+                        onclick: move |e| e.stop_propagation(),
+                        "#{task.pr_number}"
+                    }
                     "{task.pr_title}"
                 }
                 div { class: "card-menu-wrap",
