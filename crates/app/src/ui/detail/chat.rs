@@ -30,6 +30,13 @@ pub(super) fn AgentChatSection(
 ) -> Element {
     let state = use_context::<AppState>();
     let mut text = drafts::use_draft(card_id, "chat", String::new);
+    // The box is *uncontrolled* (`initial_value` → `defaultValue`), so a
+    // re-render can never rewind what has been typed since the keystroke that
+    // caused it — see `src/stress.rs`. The cost is that clearing the signal no
+    // longer clears the DOM: `defaultValue` doesn't touch a user-dirtied field.
+    // Both sends therefore bump this generation, and the element is keyed with
+    // it, so the clear lands as a fresh, empty element.
+    let mut generation = use_signal(|| 0u32);
     let exchange = state.answers.read().get(&card_id).cloned();
     let blank = text.read().trim().is_empty();
     let request_label = match (blank, request_label_nonblank) {
@@ -50,10 +57,35 @@ pub(super) fn AgentChatSection(
                 div { class: "plan-box", "{answer}" }
             }
             div { class: "field",
-                textarea {
-                    placeholder: "What should change — or what do you want to know?",
-                    value: "{text}",
-                    oninput: move |e| text.set(e.value()),
+                if crate::stress::fix_a() {
+                    // A lone child's `key` is ignored — Dioxus only honors keys
+                    // among siblings in a list — so the single-item `for` is what
+                    // makes the generation bump actually remount the element.
+                    for g in [generation()] {
+                        textarea {
+                            key: "{g}",
+                            // Stable hook for the debug keystroke-drop harness.
+                            id: "chat-input",
+                            placeholder: "What should change — or what do you want to know?",
+                            initial_value: "{text.peek()}",
+                            oninput: move |e| {
+                                let v = e.value();
+                                crate::stress::record_chat_input(&v);
+                                text.set(v);
+                            },
+                        }
+                    }
+                } else {
+                    textarea {
+                        id: "chat-input",
+                        placeholder: "What should change — or what do you want to know?",
+                        value: "{text}",
+                        oninput: move |e| {
+                            let v = e.value();
+                            crate::stress::record_chat_input(&v);
+                            text.set(v);
+                        },
+                    }
                 }
             }
             div { class: "row",
@@ -65,6 +97,7 @@ pub(super) fn AgentChatSection(
                         if !t.is_empty() || request_enabled_when_blank {
                             on_request.call(t);
                             text.set(String::new());
+                            generation += 1;
                         }
                     },
                     "{request_label}"
@@ -77,6 +110,7 @@ pub(super) fn AgentChatSection(
                         if !q.is_empty() {
                             state.send(ExecutorCommand::AskQuestion { card_id, question: q });
                             text.set(String::new());
+                            generation += 1;
                         }
                     },
                     "Ask questions"

@@ -164,6 +164,10 @@ fn EditableTitle(card_id: Uuid, title: String) -> Element {
     let state = use_context::<AppState>();
     let mut buf = use_signal(|| title.clone());
     let mut committed = use_signal(|| title.clone());
+    // Uncontrolled field (see `chat.rs`): only a remount can push a value back
+    // into it, so Escape's revert bumps this generation and the input is keyed
+    // with it. The remount costs focus, which `onmounted` puts back.
+    let mut generation = use_signal(|| 0u32);
     use_drop(move || {
         let t = buf.peek().clone();
         if t != *committed.peek() {
@@ -171,22 +175,34 @@ fn EditableTitle(card_id: Uuid, title: String) -> Element {
         }
     });
     rsx! {
-        input {
-            class: "detail-title-input",
-            value: "{buf}",
-            placeholder: "Untitled card",
-            "aria-label": "Card title",
-            oninput: move |e| buf.set(e.value()),
-            onchange: move |e| {
-                let t = e.value();
-                committed.set(t.clone());
-                state.update_card(card_id, |c| c.title = t);
-            },
-            onkeydown: move |e: KeyboardEvent| {
-                if e.key() == Key::Escape {
-                    buf.set(committed.peek().clone());
-                }
-            },
+        for g in [generation()] {
+            input {
+                key: "{g}",
+                class: "detail-title-input",
+                initial_value: "{buf.peek()}",
+                placeholder: "Untitled card",
+                "aria-label": "Card title",
+                oninput: move |e| buf.set(e.value()),
+                onchange: move |e| {
+                    let t = e.value();
+                    committed.set(t.clone());
+                    state.update_card(card_id, |c| c.title = t);
+                },
+                onkeydown: move |e: KeyboardEvent| {
+                    if e.key() == Key::Escape {
+                        buf.set(committed.peek().clone());
+                        generation += 1;
+                    }
+                },
+                onmounted: move |e: MountedEvent| {
+                    // Only after a revert — the first mount must not steal focus.
+                    if g > 0 {
+                        spawn(async move {
+                            let _ = e.data().set_focus(true).await;
+                        });
+                    }
+                },
+            }
         }
     }
 }
@@ -556,6 +572,8 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
         &question,
         || None::<String>,
     );
+    // Uncontrolled field (see `chat.rs`); the send clears it via a remount.
+    let mut generation = use_signal(|| 0u32);
     let can_send = selected.read().is_some() || !answer.read().trim().is_empty();
 
     rsx! {
@@ -588,10 +606,15 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                     }
                 }
                 div { class: "row",
-                    input {
-                        placeholder: if options.is_empty() { "Type an answer…" } else { "Or type an answer…" },
-                        value: "{answer}",
-                        oninput: move |e| answer.set(e.value()),
+                    for g in [generation()] {
+                        input {
+                            key: "{g}",
+                            // Stable hook for the debug regression checks.
+                            id: "intervention-answer",
+                            placeholder: if options.is_empty() { "Type an answer…" } else { "Or type an answer…" },
+                            initial_value: "{answer.peek()}",
+                            oninput: move |e| answer.set(e.value()),
+                        }
                     }
                     button {
                         class: "btn primary",
@@ -609,6 +632,7 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                                 state.send(ExecutorCommand::Answer { card_id, text: parts.join("\n\n") });
                                 selected.set(None);
                                 answer.set(String::new());
+                                generation += 1;
                             }
                         },
                         "Send answer"

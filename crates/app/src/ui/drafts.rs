@@ -53,10 +53,19 @@ pub fn use_draft(
     let sig = use_signal(|| restore_str(&DRAFTS.peek(), key).unwrap_or(init));
     use_effect(move || {
         let v = sig.read().clone();
+        #[cfg(debug_assertions)]
+        MIRROR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         mirror_str(&mut DRAFTS.write(), key, v, &seeded);
     });
     sig
 }
+
+/// How many times the mirror effect has run, across every draft field. The
+/// keystroke-drop harness reports it: under a heavy enough render load Dioxus
+/// never reaches the point where queued effects run, and the draft store stops
+/// mirroring altogether.
+#[cfg(debug_assertions)]
+pub static MIRROR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Origin-keyed variant for working copies of agent output (fix verdicts, plan
 /// answers, an intervention's typed answer). The draft is stored alongside a
@@ -90,6 +99,14 @@ where
 /// seed (the confirm dialog fires the command, or the seed is nonempty).
 pub fn forget(owner: Uuid, field: &'static str) {
     DRAFTS.write().remove(&DraftKey { owner, field });
+}
+
+/// Read one field's mirrored draft without subscribing. Debug-only: the
+/// keystroke-drop harness compares what the DOM kept against what the Rust
+/// side actually received.
+#[cfg(debug_assertions)]
+pub fn peek(owner: Uuid, field: &'static str) -> Option<String> {
+    DRAFTS.peek().get(&DraftKey { owner, field }).cloned()
 }
 
 /// Drop every draft belonging to `owner` — called when a card or review is

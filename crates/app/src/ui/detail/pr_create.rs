@@ -252,7 +252,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                     input {
                         id: "pr-branch",
                         placeholder: "e.g. feat/licensee-export",
-                        value: "{branch_name}",
+                        initial_value: "{branch_name.peek()}",
                         oninput: move |e| branch_name.set(e.value()),
                     }
                     if branch_rewritten {
@@ -265,11 +265,19 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
                 div { class: "field",
                     label { r#for: "pr-title", "Title" }
-                    input { id: "pr-title", value: "{title}", oninput: move |e| title.set(e.value()) }
+                    input {
+                        id: "pr-title",
+                        initial_value: "{title.peek()}",
+                        oninput: move |e| title.set(e.value()),
+                    }
                 }
                 div { class: "field",
                     label { r#for: "pr-body", "Description" }
-                    textarea { id: "pr-body", value: "{body}", oninput: move |e| body.set(e.value()) }
+                    textarea {
+                        id: "pr-body",
+                        initial_value: "{body.peek()}",
+                        oninput: move |e| body.set(e.value()),
+                    }
                 }
                 div { class: "field",
                     label { r#for: "pr-reviewer", "Reviewer" }
@@ -297,7 +305,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                             input {
                                 id: "pr-reviewer",
                                 placeholder: "GitHub username",
-                                value: "{reviewer}",
+                                initial_value: "{reviewer.peek()}",
                                 oninput: move |e| reviewer.set(e.value()),
                             }
                         }
