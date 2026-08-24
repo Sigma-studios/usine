@@ -13,7 +13,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, DraftComment, ExecutorCommand, ExecutorConfig,
-    ExecutorEvent, ExecutorEventKind, Forge, MergeStatus, PrInfo, PrReviewSub, PrSummary, Project,
+    ExecutorEvent, ExecutorEventKind, Forge, Mergeable, PrInfo, PrReviewSub, PrSummary, Project,
     ProjectConfig, ReviewComment, ReviewEvent, ReviewSub, ReviewSummary, ReviewThread, SimFactory,
     SimForge, SimGit, Store,
 };
@@ -80,7 +80,7 @@ impl Forge for QuietForge {
     async fn is_merged(&self, r: &Path, n: u64) -> usine_core::Result<bool> {
         SimForge.is_merged(r, n).await
     }
-    async fn merge_status(&self, r: &Path, n: u64) -> usine_core::Result<MergeStatus> {
+    async fn merge_status(&self, r: &Path, n: u64) -> usine_core::Result<Mergeable> {
         SimForge.merge_status(r, n).await
     }
     async fn delete_remote_branch(&self, r: &Path, b: &str) -> usine_core::Result<()> {

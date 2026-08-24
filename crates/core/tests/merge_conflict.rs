@@ -20,14 +20,14 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardState, CoreError, DraftComment,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome,
-    MergeStatus, PrInfo, PrSummary, Project, ProjectConfig, Provider, ProviderFactory, RealGit,
+    Mergeable, PrInfo, PrSummary, Project, ProjectConfig, Provider, ProviderFactory, RealGit,
     ReviewComment, ReviewEvent, ReviewSummary, RunConfig, RunHandle, RunMode, Severity, SimFactory,
     SimForge, SimGit, Store,
 };
 
 /// A forge whose merge always fails, reporting `status` when asked why.
 struct RefusingForge {
-    status: MergeStatus,
+    status: Mergeable,
 }
 
 #[async_trait]
@@ -40,7 +40,7 @@ impl Forge for RefusingForge {
     async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
         Ok(false)
     }
-    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<MergeStatus> {
+    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<Mergeable> {
         Ok(self.status)
     }
     async fn delete_remote_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
@@ -134,7 +134,7 @@ fn ready_to_merge_card(store: &Store, project_id: uuid::Uuid) -> Card {
     card
 }
 
-fn seeded(status: MergeStatus) -> (Store, Card, UnboundedReceiver<ExecutorEvent>) {
+fn seeded(status: Mergeable) -> (Store, Card, UnboundedReceiver<ExecutorEvent>) {
     let store = Store::open_in_memory().unwrap();
     let project = Project::new(
         "p",
@@ -162,7 +162,7 @@ fn seeded(status: MergeStatus) -> (Store, Card, UnboundedReceiver<ExecutorEvent>
 /// conflicts with), and the card stays merge-able rather than being failed.
 #[tokio::test]
 async fn a_conflicting_merge_offers_to_resolve_instead_of_erroring() {
-    let (store, card, mut rx) = seeded(MergeStatus::Conflicting);
+    let (store, card, mut rx) = seeded(Mergeable::Conflicting);
 
     let (pr, base) = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::MergeConflict { pr_number, base } if e.card_id == card.id => {
@@ -193,7 +193,7 @@ async fn a_conflicting_merge_offers_to_resolve_instead_of_erroring() {
 /// would have swept these into the conflict dialog.
 #[tokio::test]
 async fn a_non_conflicting_merge_failure_still_errors() {
-    let (store, card, mut rx) = seeded(MergeStatus::Mergeable);
+    let (store, card, mut rx) = seeded(Mergeable::Clean);
 
     let msg = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::Toast {
@@ -222,7 +222,7 @@ async fn a_non_conflicting_merge_failure_still_errors() {
 /// merge error stands rather than a dialog appearing on a guess.
 #[tokio::test]
 async fn an_unknown_merge_status_is_never_guessed_into_a_conflict() {
-    let (_store, _card, mut rx) = seeded(MergeStatus::Unknown);
+    let (_store, _card, mut rx) = seeded(Mergeable::Unknown);
 
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::Toast {
@@ -308,7 +308,7 @@ fn resolving(
         store: store.clone(),
         providers: Arc::new(SimFactory),
         forge: Arc::new(RefusingForge {
-            status: MergeStatus::Conflicting,
+            status: Mergeable::Conflicting,
         }),
         git,
     });
@@ -443,7 +443,7 @@ async fn a_retried_conflict_fix_still_knows_about_the_merge() {
             failed_once: Arc::new(Mutex::new(false)),
         }),
         forge: Arc::new(RefusingForge {
-            status: MergeStatus::Conflicting,
+            status: Mergeable::Conflicting,
         }),
         git: Arc::new(ConflictingGit),
     });
