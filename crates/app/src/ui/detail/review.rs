@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::transcript::TranscriptView;
 use crate::state::AppState;
 use crate::ui::diffdialog::{event_value, open_review_diff, open_review_diff_at, parse_event};
-use crate::ui::icons::{IconDiff, IconExternal};
+use crate::ui::icons::IconDiff;
 use crate::ui::reviewdraft;
 
 /// The detail panel for the selected review task.
@@ -43,15 +43,6 @@ pub fn ReviewDetail() -> Element {
                                 "aria-label": "Show the diff",
                                 onclick: move |_| open_review_diff(id),
                                 IconDiff {}
-                            }
-                            a {
-                                class: "card-icon-btn",
-                                href: "{url}",
-                                target: "_blank",
-                                rel: "noreferrer",
-                                title: "Open on GitHub",
-                                "aria-label": "Open on GitHub",
-                                IconExternal {}
                             }
                             button {
                                 class: "detail-close",
