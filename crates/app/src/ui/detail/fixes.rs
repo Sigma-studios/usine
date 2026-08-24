@@ -64,9 +64,16 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                 {
                     let cid = v.comment.id;
                     let checked = v.selected;
-                    let path = match v.comment.line {
-                        Some(l) => format!("{}:{}", v.comment.path, l),
-                        None => v.comment.path.clone(),
+                    // A synthetic item built from a review's *body* has no
+                    // path/line — label it the way the prompts do.
+                    let is_review_body = v.comment.review_body_of.is_some();
+                    let path = if is_review_body {
+                        "PR review summary".to_string()
+                    } else {
+                        match v.comment.line {
+                            Some(l) => format!("{}:{}", v.comment.path, l),
+                            None => v.comment.path.clone(),
+                        }
                     };
                     let body = v.comment.body.clone();
                     let rationale = v.rationale.clone();
@@ -82,9 +89,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     let vclass = if v.worth_fixing { "verdict-yes" } else { "verdict-no" };
                     // For PR comments, the reply posted if the comment is left
                     // unchecked (i.e. not fixed) — editable, and offered even when
-                    // the agent drafted none, so the user can add their own.
+                    // the agent drafted none, so the user can add their own. Not
+                    // for a review-body item: GitHub has no reply endpoint for a
+                    // review body, so a typed reply would be silently discarded.
                     let reply = v.reply.clone();
-                    let show_reply = !self_review && !checked;
+                    let show_reply = !self_review && !checked && !is_review_body;
                     rsx! {
                         div { key: "{cid}", class: "comment",
                             input {

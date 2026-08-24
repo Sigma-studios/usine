@@ -41,7 +41,10 @@ per comment, shaped like {\"id\": 123, \"severity\": \"high\", \"worth_fixing\":
 assessment of how serious the comment's underlying issue is — one of \"critical\", \"high\", \
 \"medium\", or \"low\" — independent of whether it's worth fixing. `opinion` is shown to the user \
 as your recommendation; `reply` is the message posted on the comment when the user chooses NOT to \
-fix it — a polite, one- or two-sentence explanation. Include exactly one item per comment id listed.";
+fix it — a polite, one- or two-sentence explanation. An item located at \"PR review summary\" is \
+not an inline comment but the body of a submitted review (often a full report): judge whether the \
+concerns it raises are worth acting on; no reply can be posted on it. Include exactly one item per \
+comment id listed.";
 
 /// Built-in review guidance used when the project has no `review.md`.
 pub const DEFAULT_REVIEW_PROMPT: &str = "\
@@ -165,11 +168,17 @@ fn find_block(text: &str) -> Option<&str> {
 }
 
 /// Extract and parse the `usine-review` JSON array. Tolerant of a missing or
-/// malformed block (returns an empty vec), like [`crate::agent::plan::parse_plan`].
+/// malformed block (returns an empty vec), like [`crate::agent::plan::parse_plan`]
+/// — and of a single malformed item: each element is deserialized on its own,
+/// so one bad object (an out-of-range id, a string where a bool belongs) drops
+/// that verdict alone instead of every verdict in the array.
 fn parse_raw(text: &str) -> Vec<RawVerdict> {
     find_block(text)
-        .and_then(|b| serde_json::from_str(b).ok())
+        .and_then(|b| serde_json::from_str::<Vec<serde_json::Value>>(b).ok())
         .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
 }
 
 /// Self-review: turn the agent's invented findings into verdicts over synthetic
@@ -186,6 +195,7 @@ pub fn parse_self_review(text: &str) -> Vec<FixVerdict> {
                 path: r.path,
                 line: r.line,
                 body: r.issue,
+                review_body_of: None,
             },
             selected: r.worth_fixing,
             worth_fixing: r.worth_fixing,
@@ -198,7 +208,9 @@ pub fn parse_self_review(text: &str) -> Vec<FixVerdict> {
 
 /// PR triage: join each verdict to its comment by id. A comment the agent didn't
 /// return a verdict for defaults to worth-fixing/selected so it's never silently
-/// dropped from the user's picker.
+/// dropped from the user's picker. A review-*body* item keeps its reply blank
+/// whatever the agent drafted — GitHub has no endpoint to reply to a review
+/// body, so the picker must not promise one.
 pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
     let raw = parse_raw(text);
     comments
@@ -210,7 +222,11 @@ pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
                 worth_fixing: r.worth_fixing,
                 severity: normalize_severity(&r.severity),
                 rationale: r.opinion.clone(),
-                reply: r.reply.clone(),
+                reply: if c.review_body_of.is_some() {
+                    String::new()
+                } else {
+                    r.reply.clone()
+                },
             },
             None => FixVerdict {
                 comment: c.clone(),
@@ -360,6 +376,7 @@ mod tests {
                 path: "a.rs".into(),
                 line: Some(1),
                 body: "c1".into(),
+                review_body_of: None,
             },
             ReviewComment {
                 id: 2,
@@ -367,6 +384,7 @@ mod tests {
                 path: "b.rs".into(),
                 line: None,
                 body: "c2".into(),
+                review_body_of: None,
             },
         ];
         // Only a verdict for id 1; id 2 must be backfilled as worth-fixing.
@@ -379,6 +397,58 @@ mod tests {
             v[1].worth_fixing,
             "missing verdict backfills to worth-fixing"
         );
+    }
+
+    #[test]
+    fn triage_blanks_the_reply_on_a_review_body_item() {
+        // GitHub has no endpoint to reply to a review body, so whatever the
+        // agent drafted must not reach the picker as a promised reply.
+        let comments = vec![ReviewComment {
+            id: 9_000_000_000_000_000,
+            author: "argus".into(),
+            path: String::new(),
+            line: None,
+            body: "## Report\n\nno concerns".into(),
+            review_body_of: Some("argus@2026-08-21T13:58:00Z".into()),
+        }];
+        let text = "```usine-review\n[{\"id\":9000000000000000,\"worth_fixing\":false,\"opinion\":\"a pass report\",\"reply\":\"thanks!\"}]\n```";
+        let v = parse_triage(text, &comments);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rationale, "a pass report");
+        assert_eq!(v[0].reply, "", "no reply can be posted on a review body");
+    }
+
+    #[test]
+    fn one_malformed_item_drops_that_verdict_alone() {
+        let comments = vec![
+            ReviewComment {
+                id: 1,
+                author: "r".into(),
+                path: "a.rs".into(),
+                line: Some(1),
+                body: "c1".into(),
+                review_body_of: None,
+            },
+            ReviewComment {
+                id: 2,
+                author: "r".into(),
+                path: "b.rs".into(),
+                line: None,
+                body: "c2".into(),
+                review_body_of: None,
+            },
+        ];
+        // The second item's id overflows u64 (an agent echoing a big id back
+        // through a float) — it must not take the first item's verdict with it.
+        let text = "```usine-review\n[\
+            {\"id\":1,\"worth_fixing\":false,\"opinion\":\"nit\",\"reply\":\"as-is\"},\
+            {\"id\":18446744073709552000,\"worth_fixing\":false,\"opinion\":\"lost\"}\
+            ]\n```";
+        let v = parse_triage(text, &comments);
+        assert_eq!(v.len(), 2);
+        assert!(!v[0].worth_fixing, "the well-formed verdict survives");
+        assert_eq!(v[0].rationale, "nit");
+        assert!(v[1].worth_fixing, "the bad item backfills, alone");
     }
 
     #[test]

@@ -128,6 +128,10 @@ pub enum ExecutorCommand {
     RejectPlan { card_id: Uuid, feedback: String },
     /// Fetch and triage PR review comments.
     FetchComments { card_id: Uuid },
+    /// Mark every pending review *body* on the card's PR as read — the
+    /// one-click dismissal for a body-only review (e.g. a bot's pass report)
+    /// the user has read on GitHub and doesn't need an agent to triage.
+    MarkReviewBodiesRead { card_id: Uuid },
     /// Apply the (edited, checked) review-comment fixes — the verdicts as the
     /// user left them, edits included: checked bodies go to the fix run,
     /// unchecked replies get posted on GitHub. `note` is the user's own
@@ -375,6 +379,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ApprovePlan { card_id }
             | ExecutorCommand::RejectPlan { card_id, .. }
             | ExecutorCommand::FetchComments { card_id }
+            | ExecutorCommand::MarkReviewBodiesRead { card_id }
             | ExecutorCommand::ApplyFixes { card_id, .. }
             | ExecutorCommand::CreatePr { card_id, .. }
             | ExecutorCommand::ReviseImplementation { card_id, .. }
@@ -503,6 +508,7 @@ impl ExecutorCommand {
             self,
             ExecutorCommand::CreateCard { .. }
                 | ExecutorCommand::SaveCard { .. }
+                | ExecutorCommand::MarkReviewBodiesRead { .. }
                 | ExecutorCommand::AddProject { .. }
                 | ExecutorCommand::SaveProject { .. }
                 | ExecutorCommand::SaveSettings { .. }

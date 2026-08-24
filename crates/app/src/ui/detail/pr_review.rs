@@ -17,10 +17,14 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
         .unwrap_or(false);
     // Triage needs something to triage: any review comment, from the assigned
     // reviewer or another one (the dock badge stays the assigned reviewer's job,
-    // but every comment is worth reading). The poll — and the ↻ button — keep this
-    // total fresh while the card sits in `Idle`.
-    let can_triage =
-        matches!(card.state, CardState::PrReview(PrReviewSub::Idle)) && card.comment_count > 0;
+    // but every comment is worth reading) — or an unread review *body*, the
+    // summary text a body-only review carries all its feedback in. The poll —
+    // and the ↻ button — keep both fresh while the card sits in `Idle`.
+    let can_triage = matches!(card.state, CardState::PrReview(PrReviewSub::Idle))
+        && card.has_triageable_feedback();
+    // Bodies not yet handled (triaged or marked read) — what the "Mark as
+    // read" button below clears.
+    let has_pending_bodies = !card.pending_review_bodies().is_empty();
     let is_fetching = matches!(
         card.state,
         CardState::PrReview(PrReviewSub::FetchingComments)
@@ -72,14 +76,35 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                     {
                         let author = r.author.clone();
                         let rstate = r.state.clone();
+                        // The review's summary text — for a body-only review
+                        // (a bot report, or a human Comment review with no
+                        // inline comments) this is the entire feedback, so
+                        // show it in full. Bot bodies can be long: the
+                        // plan-box style pre-wraps and scrolls.
+                        let body = r.body.trim().to_string();
                         rsx! {
                             div { key: "{author}", class: "comment",
-                                div {
-                                    div { class: "path", "{author}" }
-                                    div { "{rstate}" }
+                                div { class: "comment-main",
+                                    div { class: "comment-head",
+                                        div { class: "path", "{author}" }
+                                        div { "{rstate}" }
+                                    }
+                                    if !body.is_empty() {
+                                        div { class: "plan-box", "{body}" }
+                                    }
                                 }
                             }
                         }
+                    }
+                }
+                if has_pending_bodies {
+                    div { class: "hint",
+                        "A review's summary text awaits you — triage it below, or mark it read if it needs nothing."
+                    }
+                    button {
+                        class: "btn",
+                        onclick: move |_| state.send(ExecutorCommand::MarkReviewBodiesRead { card_id: id }),
+                        "Mark as read"
                     }
                 }
             }

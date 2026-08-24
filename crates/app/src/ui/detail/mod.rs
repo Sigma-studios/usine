@@ -207,6 +207,11 @@ fn CardPanel(card: Card) -> Element {
     // Who approved the PR (same poll keeps it fresh) — restated at the merge
     // gate so the approval that made the card mergeable stays visible.
     let approved_by = card.approved_by().join(", ");
+    // How many review bodies (a body-only review's summary text) still await
+    // reading — they gate the merge-gate "reevaluate" offer alongside the
+    // unanswered threads, so feedback landing at `ReadyToMerge` gets triaged
+    // before merging.
+    let pending_bodies = card.pending_review_bodies().len();
     let recap = state.review_recaps.read().get(&id).cloned();
     let fail_msg = if let CardState::Failed { message, .. } = &card.state {
         Some(message.clone())
@@ -311,20 +316,36 @@ fn CardPanel(card: Card) -> Element {
             FixSelection { card_id: id, verdicts: verdicts.clone(), self_review: true }
         }
 
-        if is_ready && card.unanswered_count > 0 {
+        if is_ready && (card.unanswered_count > 0 || pending_bodies > 0) {
             div { class: "section",
                 h3 { "New review comments" }
                 div { class: "hint",
-                    if card.unanswered_count == 1 {
+                    if card.unanswered_count == 0 {
+                        // Only review bodies await — a body-only review (e.g. a
+                        // bot report) landed after the card reached the gate.
+                        "A review's summary text on the PR hasn't been read yet. Have the agent read and triage it before merging — or mark it read if it needs nothing."
+                    } else if card.unanswered_count == 1 {
                         "A review comment on the PR has no answer yet — it arrived after (or survived) the last pass. Have the agent read and triage it before merging."
                     } else {
                         {format!("{} review threads on the PR have no answer yet — they arrived after (or survived) the last pass. Have the agent read and triage them before merging.", card.unanswered_count)}
                     }
                 }
-                button {
-                    class: "btn primary",
-                    onclick: move |_| state.send(ExecutorCommand::FetchComments { card_id: id }),
-                    "Reevaluate comments"
+                div { class: "row",
+                    button {
+                        class: "btn primary",
+                        onclick: move |_| state.send(ExecutorCommand::FetchComments { card_id: id }),
+                        "Reevaluate comments"
+                    }
+                    // A pending review body can also be dismissed by hand —
+                    // same affordance as the PR-review panel, so a body landing
+                    // at the merge gate doesn't force a full triage run.
+                    if pending_bodies > 0 {
+                        button {
+                            class: "btn",
+                            onclick: move |_| state.send(ExecutorCommand::MarkReviewBodiesRead { card_id: id }),
+                            "Mark as read"
+                        }
+                    }
                 }
             }
         }
@@ -349,13 +370,20 @@ fn CardPanel(card: Card) -> Element {
                         "Mark ready for review"
                     }
                 } else {
-                    if !approved_by.is_empty() || checks.is_reportable() {
+                    if !approved_by.is_empty() || checks.is_reportable() || pending_bodies > 0 {
                         div { class: "card-meta",
                             if !approved_by.is_empty() {
                                 span {
                                     class: "badge approved",
                                     title: "An approving review has been submitted on the PR",
                                     "✓ Approved by {approved_by}"
+                                }
+                            }
+                            if pending_bodies > 0 {
+                                span {
+                                    class: "badge commented",
+                                    title: "A review's summary text hasn't been read yet — see \"New review comments\" above",
+                                    "💬 commented"
                                 }
                             }
                             if checks.is_reportable() {
