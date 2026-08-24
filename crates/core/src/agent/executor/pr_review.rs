@@ -105,19 +105,57 @@ impl Executor {
                 || mergeable != card.mergeable
             {
                 // Deliberately don't bump `updated_at`: a background refresh isn't
-                // a user-facing edit and shouldn't reorder the board.
+                // a user-facing edit and shouldn't reorder the board. The fetch
+                // above ran unlocked, so the executor may have rewritten the card
+                // meanwhile — a resolve run's clean-merge push resets `mergeable`
+                // and `checks`, Back to Start clears every PR-derived cache — and
+                // this tick's values pre-date that write. Blindly writing them
+                // back would resurrect exactly the stale gate those paths just
+                // fixed, so inside the atomic mutate: skip a card that left the
+                // polled states or swapped PRs, and per field only overwrite what
+                // nobody touched since the snapshot. The concurrent writer's
+                // fresher knowledge wins; the next tick refetches against it.
+                let mut changed = false;
                 let updated = self.store.mutate_card(card.id, |c| {
-                    c.reviewer_comment_count = by_reviewer;
-                    c.comment_count = total;
-                    c.unanswered_count = unanswered;
-                    c.reviews = reviews;
-                    c.checks = checks;
-                    c.mergeable = mergeable;
+                    if c.pr.as_ref().map(|p| p.number) != Some(pr_number)
+                        || !matches!(
+                            c.state,
+                            CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+                        )
+                    {
+                        return Ok(());
+                    }
+                    if c.reviewer_comment_count == card.reviewer_comment_count {
+                        changed |= c.reviewer_comment_count != by_reviewer;
+                        c.reviewer_comment_count = by_reviewer;
+                    }
+                    if c.comment_count == card.comment_count {
+                        changed |= c.comment_count != total;
+                        c.comment_count = total;
+                    }
+                    if c.unanswered_count == card.unanswered_count {
+                        changed |= c.unanswered_count != unanswered;
+                        c.unanswered_count = unanswered;
+                    }
+                    if c.reviews == card.reviews {
+                        changed |= c.reviews != reviews;
+                        c.reviews = reviews;
+                    }
+                    if c.checks == card.checks {
+                        changed |= c.checks != checks;
+                        c.checks = checks;
+                    }
+                    if c.mergeable == card.mergeable {
+                        changed |= c.mergeable != mergeable;
+                        c.mergeable = mergeable;
+                    }
                     Ok(())
                 })?;
-                let _ = self
-                    .evt_tx
-                    .unbounded_send(ExecutorEvent::updated(updated.clone()));
+                if changed {
+                    let _ = self
+                        .evt_tx
+                        .unbounded_send(ExecutorEvent::updated(updated.clone()));
+                }
                 updated
             } else {
                 card
