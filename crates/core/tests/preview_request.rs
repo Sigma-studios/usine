@@ -310,7 +310,15 @@ async fn sentinel_never_reaches_the_branch() {
         "the sentinel must never land on the branch, got tree:\n{tree}"
     );
     // The repo-shared exclude carries all three preview artifacts.
-    let exclude = git_stdout(&repo, &["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"]);
+    let exclude = git_stdout(
+        &repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ],
+    );
     let exclude = std::fs::read_to_string(exclude.trim()).unwrap_or_default();
     for pattern in [".usine-preview.json", SENTINEL, ".wt-offset"] {
         assert!(
