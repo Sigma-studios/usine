@@ -311,14 +311,23 @@ async fn finalize_run(
                                     Severity::Warning,
                                     format!("push failed: {e}"),
                                 ));
-                            } else if card.checks != CheckStatus::None {
+                            } else if card.checks != CheckStatus::None
+                                || card.mergeable != Mergeable::Unknown
+                            {
                                 // The push re-triggers CI, so whatever status the
                                 // card cached (say, the `Failing` a fix run set out
                                 // to cure) is stale the moment it lands. Show
                                 // `Pending` now instead of leaving the red layout —
                                 // and its re-offered fix — up until the next poll.
+                                // The cached mergeability is stale the same way (a
+                                // conflict-resolve run's merge commit just cured
+                                // the `Conflicting` the card shows), and needs the
+                                // reset even on a no-CI repo.
                                 if let Ok(updated) = store.mutate_card(card_id, |c| {
-                                    c.checks = CheckStatus::Pending;
+                                    if c.checks != CheckStatus::None {
+                                        c.checks = CheckStatus::Pending;
+                                    }
+                                    c.mergeable = Mergeable::Unknown;
                                     Ok(())
                                 }) {
                                     let _ = evt_tx.unbounded_send(ExecutorEvent::updated(updated));

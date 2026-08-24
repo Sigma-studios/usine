@@ -20,18 +20,6 @@ use crate::domain::model::{
 };
 use crate::error::{CoreError, Result};
 
-/// Whether the forge can merge a PR as-is.
-///
-/// `Unknown` is a real answer, not an error: GitHub recomputes mergeability
-/// asynchronously after every push, and reports `UNKNOWN` until it lands. A
-/// caller that needs certainty must poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeStatus {
-    Mergeable,
-    Conflicting,
-    Unknown,
-}
-
 /// A one-line summary of an open PR discovered by the review poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrSummary {
@@ -206,17 +194,6 @@ pub fn pr_mergeable_args(pr_number: u64) -> Vec<String> {
         "--jq".into(),
         ".mergeable".into(),
     ]
-}
-
-/// Map GitHub's `mergeable` field onto [`MergeStatus`]. Anything other than the
-/// two decided answers — including the empty output of a PR that has vanished —
-/// is `Unknown`, never a guess.
-fn parse_merge_status(out: &str) -> MergeStatus {
-    match out.trim() {
-        "CONFLICTING" => MergeStatus::Conflicting,
-        "MERGEABLE" => MergeStatus::Mergeable,
-        _ => MergeStatus::Unknown,
-    }
 }
 
 /// Delete the PR's head branch on the remote (what `--delete-branch` would have
@@ -485,9 +462,11 @@ pub fn run_log_args(run_id: u64) -> Vec<String> {
 
 /// Map GitHub's `mergeable` enum onto [`Mergeable`]. Anything other than the two
 /// definitive answers (notably `UNKNOWN`, returned while GitHub computes the
-/// merge) stays `Unknown` so the UI can stay silent rather than guess.
+/// merge, and the empty output of a PR that has vanished) stays `Unknown` so
+/// callers stay silent rather than guess. Trimmed because [`Forge::merge_status`]
+/// feeds it raw `gh --jq` output, newline and all.
 pub fn parse_mergeable(raw: &str) -> Mergeable {
-    match raw.to_ascii_uppercase().as_str() {
+    match raw.trim().to_ascii_uppercase().as_str() {
         "MERGEABLE" => Mergeable::Clean,
         "CONFLICTING" => Mergeable::Conflicting,
         _ => Mergeable::Unknown,
@@ -695,8 +674,11 @@ pub trait Forge: Send + Sync {
     async fn is_merged(&self, repo: &Path, pr_number: u64) -> Result<bool>;
 
     /// Whether the PR still merges cleanly onto its base. Asked after a failed
-    /// merge to recognize a conflict.
-    async fn merge_status(&self, repo: &Path, pr_number: u64) -> Result<MergeStatus>;
+    /// merge to recognize a conflict, and by the background poll to gate the
+    /// merge button. `Unknown` is a real answer, not an error: GitHub recomputes
+    /// mergeability asynchronously after every push, and reports `UNKNOWN` until
+    /// it lands — a caller that needs certainty must poll.
+    async fn merge_status(&self, repo: &Path, pr_number: u64) -> Result<Mergeable>;
 
     /// Delete the PR's head branch on the remote.
     async fn delete_remote_branch(&self, repo: &Path, branch: &str) -> Result<()>;
@@ -944,9 +926,9 @@ impl Forge for GhForge {
         Ok(out.trim() == "MERGED")
     }
 
-    async fn merge_status(&self, repo: &Path, pr_number: u64) -> Result<MergeStatus> {
+    async fn merge_status(&self, repo: &Path, pr_number: u64) -> Result<Mergeable> {
         let out = run_gh(repo, &pr_mergeable_args(pr_number)).await?;
-        Ok(parse_merge_status(&out))
+        Ok(parse_mergeable(&out))
     }
 
     async fn delete_remote_branch(&self, repo: &Path, branch: &str) -> Result<()> {
@@ -1192,8 +1174,8 @@ impl Forge for SimForge {
         Ok(true)
     }
 
-    async fn merge_status(&self, _repo: &Path, _pr_number: u64) -> Result<MergeStatus> {
-        Ok(MergeStatus::Mergeable)
+    async fn merge_status(&self, _repo: &Path, _pr_number: u64) -> Result<Mergeable> {
+        Ok(Mergeable::Clean)
     }
 
     async fn delete_remote_branch(&self, _repo: &Path, _branch: &str) -> Result<()> {
@@ -1556,6 +1538,10 @@ mod tests {
         assert_eq!(parse_mergeable("CONFLICTING"), Mergeable::Conflicting);
         assert_eq!(parse_mergeable("UNKNOWN"), Mergeable::Unknown);
         assert_eq!(parse_mergeable(""), Mergeable::Unknown);
+        // The merge_status path hands over raw `gh --jq` output — whitespace
+        // must not turn a decided answer into `Unknown`.
+        assert_eq!(parse_mergeable("CONFLICTING\n"), Mergeable::Conflicting);
+        assert_eq!(parse_mergeable(" MERGEABLE "), Mergeable::Clean);
     }
 
     #[test]
@@ -1636,20 +1622,6 @@ mod tests {
         assert_eq!(&args[0..3], &["pr", "view", "7"]);
         assert!(args.windows(2).any(|w| w == ["--json", "mergeable"]));
         assert!(args.windows(2).any(|w| w == ["--jq", ".mergeable"]));
-    }
-
-    /// Only GitHub's two decided answers are decided here. `UNKNOWN` (GitHub is
-    /// still computing mergeability) and anything unexpected must not be read as
-    /// "no conflict" — that would silently swallow a conflicting PR.
-    #[test]
-    fn merge_status_only_commits_to_the_decided_answers() {
-        assert_eq!(
-            parse_merge_status("CONFLICTING\n"),
-            MergeStatus::Conflicting
-        );
-        assert_eq!(parse_merge_status(" MERGEABLE "), MergeStatus::Mergeable);
-        assert_eq!(parse_merge_status("UNKNOWN"), MergeStatus::Unknown);
-        assert_eq!(parse_merge_status(""), MergeStatus::Unknown);
     }
 
     #[test]

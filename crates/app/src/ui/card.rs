@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use usine_core::{
-    Card, CardKind, CardState, DesignSub, ExecutorCommand, PrReviewSub, PreviewStatus, ReviewSub,
+    Card, CardKind, CardState, CheckStatus, DesignSub, ExecutorCommand, PrReviewSub, PreviewStatus,
+    ReviewSub,
 };
 use uuid::Uuid;
 
@@ -96,6 +97,18 @@ pub fn CardView(card: Card) -> Element {
         matches!(st, CardState::PrReview(PrReviewSub::Idle)) && card.has_triageable_feedback();
     let selecting = matches!(st, CardState::PrReview(PrReviewSub::SelectingFixes { .. }));
     let can_merge = matches!(st, CardState::ReadyToMerge);
+    // The merge button is a promise the executor must keep, so don't show it
+    // when the merge would be refused: a conflicting PR gets a resolve run, a
+    // red build gets a fix run (both self-guarding — they re-read the forge and
+    // no-op with a toast if the problem healed since), and a still-running
+    // build gets nothing at all — the "• CI" badge explains the wait and the
+    // poll brings the button back on its own. The detail panel keeps the
+    // explicit "Merge anyway" override for the states that can use one.
+    // Conflicts win over failing checks: the resolve pushes a merge commit
+    // that re-runs CI anyway.
+    let conflicting = can_merge && card.mergeable.is_conflicting();
+    let ci_failing = can_merge && !conflicting && card.checks == CheckStatus::Failing;
+    let ci_pending = can_merge && !conflicting && card.checks == CheckStatus::Pending;
     // Comments can land after triage already carried the card to the merge
     // gate; offer another pass alongside Merge — but only while some thread
     // still awaits an answer (the poll keeps the count fresh here too), or a
@@ -398,19 +411,39 @@ pub fn CardView(card: Card) -> Element {
                     }
                 }
                 if can_merge && !pr_is_draft {
-                    button {
-                        class: "btn success",
-                        onclick: move |e| {
-                            e.stop_propagation();
-                            super::confirm_then_send(
-                                state,
-                                "Merge pull request",
-                                "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
-                                "Merge",
-                                ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
-                            );
-                        },
-                        "Merge"
+                    if conflicting {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                state.send(ExecutorCommand::ResolveConflicts { card_id: id });
+                            },
+                            "Resolve conflicts"
+                        }
+                    } else if ci_failing {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                state.send(ExecutorCommand::FixChecks { card_id: id });
+                            },
+                            "Fix checks"
+                        }
+                    } else if !ci_pending {
+                        button {
+                            class: "btn success",
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                super::confirm_then_send(
+                                    state,
+                                    "Merge pull request",
+                                    "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
+                                    "Merge",
+                                    ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
+                                );
+                            },
+                            "Merge"
+                        }
                     }
                 }
                 if failed {

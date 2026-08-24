@@ -33,12 +33,12 @@ use crate::agent::provider::{ProviderFactory, RunConfig, RunMode};
 use crate::domain::config::CardKind;
 use crate::domain::model::{
     now_millis, Card, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict, Intervention,
-    PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary,
-    ReviewTask, ReviewThread, RunSub,
+    Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,
+    ReviewSummary, ReviewTask, ReviewThread, RunSub,
 };
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::{CoreError, Result};
-use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState, MergeStatus};
+use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState};
 use crate::infra::git::{canonicalize_branch_case, sanitize_branch_name, GitOps, MergeOutcome};
 use crate::infra::persistence::Store;
 

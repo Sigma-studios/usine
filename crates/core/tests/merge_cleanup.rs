@@ -20,7 +20,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, CoreError, DraftComment, ExecutorCommand,
-    ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome, MergeStatus,
+    ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome, Mergeable,
     PrInfo, PrSummary, Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewSummary,
     SimFactory, SimForge, SimGit, Store,
 };
@@ -131,8 +131,8 @@ impl Forge for CleanupFailsForge {
     async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
         Ok(true)
     }
-    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<MergeStatus> {
-        Ok(MergeStatus::Mergeable)
+    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<Mergeable> {
+        Ok(Mergeable::Clean)
     }
     // The rest is never reached by a merge; defer to the simulator.
     async fn create_pr(
@@ -371,8 +371,8 @@ async fn an_already_merged_pr_still_completes_the_card() {
         async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
             Ok(true)
         }
-        async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<MergeStatus> {
-            Ok(MergeStatus::Mergeable)
+        async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<Mergeable> {
+            Ok(Mergeable::Clean)
         }
         async fn delete_remote_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
             Ok(())

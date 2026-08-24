@@ -118,6 +118,16 @@ impl Executor {
         let number = pr.number;
         self.store.mutate_card(card_id, |c| {
             c.pr = Some(pr.clone());
+            // A brand-new PR has no feedback or check results yet — clear the
+            // PR-derived caches so nothing from an earlier PR of this card
+            // (however it was dropped) leaks onto this one.
+            c.reviewer_comment_count = 0;
+            c.comment_count = 0;
+            c.unanswered_count = 0;
+            c.reviews.clear();
+            c.triaged_review_bodies.clear();
+            c.checks = CheckStatus::None;
+            c.mergeable = Mergeable::Unknown;
             c.updated_at = now_millis();
             Ok(())
         })?;
@@ -538,9 +548,10 @@ impl Executor {
     /// [`comment_counts`]. The unanswered count is `None` when the thread
     /// listing failed — it rides on GraphQL, unlike the other two — so callers
     /// keep the card's previous value rather than guessing; the CI check status
-    /// follows the same convention when its fetch failed. The PR's live
-    /// lifecycle state rides along under the same convention (`None` = can't
-    /// tell), feeding [`Self::reconcile_pr_live_state`].
+    /// and the mergeability follow the same convention when their fetch failed
+    /// (a fetched `Mergeable::Unknown` is a real answer and is stored as-is).
+    /// The PR's live lifecycle state rides along under the same convention
+    /// (`None` = can't tell), feeding [`Self::reconcile_pr_live_state`].
     pub(super) async fn fetch_review_status(
         &self,
         repo: &Path,
@@ -550,6 +561,7 @@ impl Executor {
         Vec<ReviewSummary>,
         Option<usize>,
         Option<CheckStatus>,
+        Option<Mergeable>,
         Option<LivePrState>,
     )> {
         let comments = self.forge.fetch_comments(repo, pr_number).await?;
@@ -570,6 +582,15 @@ impl Executor {
                 None
             }
         };
+        let mergeable = match self.forge.merge_status(repo, pr_number).await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(
+                    "review-status refresh: couldn't read mergeability of #{pr_number}: {e}"
+                );
+                None
+            }
+        };
         let live = match self.forge.pr_live_state(repo, pr_number).await {
             Ok(v) => v,
             Err(e) => {
@@ -579,7 +600,7 @@ impl Executor {
                 None
             }
         };
-        Ok((comments, reviews, unanswered, checks, live))
+        Ok((comments, reviews, unanswered, checks, mergeable, live))
     }
 
     /// Refresh the submitted reviews *and* the comment counts on the card's PR.
@@ -599,7 +620,7 @@ impl Executor {
         let reviewer = pr
             .effective_reviewer(project.config.reviewer.as_deref())
             .map(str::to_string);
-        let (comments, reviews, unanswered, checks, live) =
+        let (comments, reviews, unanswered, checks, mergeable, live) =
             self.fetch_review_status(&project.path, pr.number).await?;
         // A PR merged or closed on GitHub retires the card before any count
         // mutation or auto-advance — nothing below applies to a gone PR.
@@ -608,14 +629,16 @@ impl Executor {
         }
         let (by_reviewer, total) = comment_counts(&comments, reviewer.as_deref());
         // A failed thread listing keeps the previous count (see fetch_review_status);
-        // a failed checks read likewise keeps the previous status.
+        // a failed checks or mergeability read likewise keeps the previous value.
         let unanswered = unanswered.unwrap_or(card.unanswered_count);
         let checks = checks.unwrap_or(card.checks);
+        let mergeable = mergeable.unwrap_or(card.mergeable);
         let card = if reviews != card.reviews
             || by_reviewer != card.reviewer_comment_count
             || total != card.comment_count
             || unanswered != card.unanswered_count
             || checks != card.checks
+            || mergeable != card.mergeable
         {
             let updated = self.store.mutate_card(card_id, |c| {
                 c.reviews = reviews;
@@ -623,6 +646,7 @@ impl Executor {
                 c.comment_count = total;
                 c.unanswered_count = unanswered;
                 c.checks = checks;
+                c.mergeable = mergeable;
                 Ok(())
             })?;
             let _ = self
@@ -818,6 +842,10 @@ impl Executor {
                 // the branch can resolve it. Offer that instead, leaving the card
                 // in `ReadyToMerge` to merge again once the branch is updated.
                 if self.pr_conflicts(&project.path, pr_number).await {
+                    // Gate the board's merge button right away — waiting for the
+                    // next poll tick would leave it offering the merge that just
+                    // failed.
+                    self.persist_mergeable(card_id, Mergeable::Conflicting);
                     let _ = self.evt_tx.unbounded_send(ExecutorEvent::merge_conflict(
                         card_id,
                         pr_number,
@@ -1039,9 +1067,9 @@ impl Executor {
     async fn pr_conflicts(&self, repo: &Path, pr_number: u64) -> bool {
         for attempt in 0..MERGEABILITY_ATTEMPTS {
             match self.forge.merge_status(repo, pr_number).await {
-                Ok(MergeStatus::Conflicting) => return true,
-                Ok(MergeStatus::Unknown) => {}
-                Ok(MergeStatus::Mergeable) | Err(_) => return false,
+                Ok(Mergeable::Conflicting) => return true,
+                Ok(Mergeable::Unknown) => {}
+                Ok(Mergeable::Clean) | Err(_) => return false,
             }
             if attempt + 1 < MERGEABILITY_ATTEMPTS {
                 tokio::time::sleep(MERGEABILITY_POLL).await;
@@ -1066,6 +1094,28 @@ impl Executor {
             .branch
             .clone()
             .ok_or_else(|| CoreError::other("card has no branch to resolve conflicts on"))?;
+        let pr_number = card
+            .pr
+            .as_ref()
+            .map(|p| p.number)
+            .ok_or_else(|| CoreError::other("card has no PR to resolve conflicts on"))?;
+
+        // Re-read rather than trusting the card's cached snapshot (mirrors
+        // `fix_checks`): the base may have moved back, or a teammate updated the
+        // branch, since the poll recorded `Conflicting`. A definite `Clean`
+        // no-ops — merging the base in anyway would push a pointless merge
+        // commit and re-trigger CI on a PR that was already mergeable. Anything
+        // less definite (still conflicting, not yet computed, or a forge error)
+        // proceeds: the local merge below finds the real answer either way.
+        if let Ok(Mergeable::Clean) = self.forge.merge_status(&project.path, pr_number).await {
+            self.persist_mergeable(card_id, Mergeable::Clean);
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Success,
+                "No conflicts left — the PR merges cleanly. Try merging again.",
+            ));
+            return Ok(());
+        }
 
         // Everything up to the transition is recoverable: a failure here leaves the
         // card sitting in `ReadyToMerge`, where the user can try again.
@@ -1083,12 +1133,34 @@ impl Executor {
             // updated the branch). Publish the merge and let the user retry.
             MergeOutcome::Clean => {
                 self.git.push(&dir, &branch).await?;
+                // The push invalidates the whole cached PR snapshot — this path
+                // skips finalize_run, so mirror its post-push reset here. The
+                // mergeability is stale (the merge commit just cured it), and so
+                // are the checks: the push re-triggers CI, and a leftover
+                // `Passing` would re-show Merge only for the executor to refuse
+                // it with "CI checks are still running".
+                let has_checks = card.checks != CheckStatus::None;
+                if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+                    if c.checks != CheckStatus::None {
+                        c.checks = CheckStatus::Pending;
+                    }
+                    c.mergeable = Mergeable::Unknown;
+                    Ok(())
+                }) {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                }
+                let message = if has_checks {
+                    format!(
+                        "No conflicts left — merged {base} into the branch. \
+                         Merge again once CI passes."
+                    )
+                } else {
+                    format!("No conflicts left — merged {base} into the branch. Try merging again.")
+                };
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                     card_id,
                     Severity::Success,
-                    format!(
-                        "No conflicts left — merged {base} into the branch. Try merging again."
-                    ),
+                    message,
                 ));
                 return Ok(());
             }
@@ -1125,6 +1197,23 @@ impl Executor {
         }
         if let Ok(updated) = self.store.mutate_card(card_id, |c| {
             c.checks = status;
+            Ok(())
+        }) {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        }
+    }
+
+    /// Record a freshly-learned mergeability on the card. Same contract as
+    /// [`Self::persist_checks`]: best-effort, and no `updated_at` bump.
+    fn persist_mergeable(&self, card_id: Uuid, mergeable: Mergeable) {
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        if card.mergeable == mergeable {
+            return;
+        }
+        if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+            c.mergeable = mergeable;
             Ok(())
         }) {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));

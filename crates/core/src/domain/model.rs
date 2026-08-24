@@ -1327,6 +1327,13 @@ pub struct Card {
     /// one offers an agent fix. `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub checks: CheckStatus,
+    /// Whether this card's PR merges cleanly into its base, as of the last
+    /// background poll or manual refresh. Gates the merge button: a conflicting
+    /// PR can't be merged server-side at all, so the board offers a resolve run
+    /// instead of a merge that would only fail. `#[serde(default)]` keeps older
+    /// records loadable.
+    #[serde(default)]
+    pub mergeable: Mergeable,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1359,6 +1366,7 @@ impl Card {
             reviews: Vec::new(),
             triaged_review_bodies: Vec::new(),
             checks: CheckStatus::None,
+            mergeable: Mergeable::Unknown,
             created_at: now,
             updated_at: now,
         }
@@ -1410,15 +1418,18 @@ impl Card {
     /// Deliberately narrow on both sides. Only `Pending` suppresses:
     /// [`CheckStatus::None`] — no checks configured, or nothing polled yet —
     /// badges as before, and since a failed `pr_checks` leaves the last-known
-    /// status on the card, a broken `gh` can't silence a mergeable card. And an
+    /// status on the card, a broken `gh` can't silence a mergeable card. An
     /// unanswered review thread keeps the badge lit regardless, because that one
     /// *is* actionable while CI runs (the gate's "reevaluate comments" offer) and
     /// it's exactly the late comment the poll covers `ReadyToMerge` cards to
-    /// catch.
+    /// catch. And a known merge conflict keeps it lit too: resolving is
+    /// user-actionable while CI runs (the board's "Resolve conflicts" offer),
+    /// and no green build will make a conflicting PR mergeable.
     fn merge_gate_waits_on_ci(&self) -> bool {
         matches!(self.state, CardState::ReadyToMerge)
             && self.checks == CheckStatus::Pending
             && self.unanswered_count == 0
+            && !self.mergeable.is_conflicting()
     }
 
     /// The urgent slice of [`Self::needs_attention`]. Pure delegation to

@@ -17,7 +17,7 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, CheckStatus, CoreError, DraftComment,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, FailedCheck, Forge,
-    MergeStatus, PrInfo, PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent,
+    Mergeable, PrInfo, PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent,
     ReviewSummary, Severity, SimFactory, SimForge, SimGit, Store,
 };
 
@@ -75,11 +75,11 @@ impl Forge for CheckedForge {
     async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
         Ok(self.merged)
     }
-    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<MergeStatus> {
+    async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<Mergeable> {
         Ok(if self.merge_fails {
-            MergeStatus::Conflicting
+            Mergeable::Conflicting
         } else {
-            MergeStatus::Mergeable
+            Mergeable::Clean
         })
     }
     async fn delete_remote_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {

@@ -429,6 +429,27 @@ fn CardPanel(card: Card) -> Element {
                         }
                         "Delete the branch after merging"
                     }
+                    // A conflicting PR replaces the merge button with its only way
+                    // out: resolve with an agent. Deliberately no "Merge anyway"
+                    // here — GitHub cannot merge a conflicting PR server-side, so
+                    // the override would be a lie.
+                    if card.mergeable.is_conflicting() {
+                        div { class: "hint",
+                            "The PR conflicts with the base branch — GitHub can't merge it until the conflicts are resolved. Have the agent resolve them, then merge again."
+                        }
+                        div { class: "option-row",
+                            button {
+                                class: "btn primary",
+                                onclick: move |_| state.send(ExecutorCommand::ResolveConflicts { card_id: id }),
+                                "Resolve conflicts with AI"
+                            }
+                            button {
+                                class: "btn",
+                                onclick: move |_| state.fetch_reviews(id),
+                                "Refresh checks"
+                            }
+                        }
+                    } else {
                     // A red or still-running build replaces the merge button with
                     // its way out: fix with an agent (red only), wait/refresh, or
                     // the explicit "Merge anyway" override. The executor re-checks
@@ -507,6 +528,7 @@ fn CardPanel(card: Card) -> Element {
                                 "Merge PR"
                             }
                         },
+                    }
                     }
                 }
             }
