@@ -107,7 +107,10 @@ pub fn SearchHost() -> Element {
                 r#type: "text",
                 placeholder: "Search cards…",
                 "aria-label": "Search cards",
-                value: "{q}",
+                // Uncontrolled (see `detail/chat.rs`): the box is minted fresh
+                // on every open, so `defaultValue` seeds it and nothing ever
+                // needs to push a value back into it.
+                initial_value: "{q}",
                 oninput: move |e| *SEARCH.write() = Some(e.value()),
                 onkeydown: move |e: KeyboardEvent| {
                     if e.key() == Key::Escape {

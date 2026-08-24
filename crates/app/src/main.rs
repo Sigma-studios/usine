@@ -3,6 +3,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod state;
+#[cfg(debug_assertions)]
+mod stress;
+/// Release stand-in for the debug-only keystroke-drop harness: the fixes it
+/// toggles are always on outside a measurement run.
+#[cfg(not(debug_assertions))]
+mod stress {
+    pub fn fix_a() -> bool {
+        true
+    }
+    pub fn transcript_cap() -> usize {
+        500
+    }
+    pub fn use_stress(_state: crate::state::AppState) {}
+    pub fn record_chat_input(_v: &str) {}
+}
 mod toast;
 mod ui;
 
@@ -288,6 +303,9 @@ fn App() -> Element {
             exec.shutdown();
         }
     });
+
+    // Debug-only keystroke-drop harness (inert unless `USINE_STRESS=1`).
+    stress::use_stress(state);
 
     // Drain executor events into signals — the single reduce point.
     use_future(move || async move {
