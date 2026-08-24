@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, AgentProvider, Card, CardConfig, CardState, CoreError, DraftComment,
+    spawn_executor, AgentProvider, Card, CardConfig, CardState, CheckStatus, CoreError,
+    DraftComment,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome,
     Mergeable, PrInfo, PrSummary, Project, ProjectConfig, Provider, ProviderFactory, RealGit,
     ReviewComment, ReviewEvent, ReviewSummary, RunConfig, RunHandle, RunMode, Severity, SimFactory,
@@ -46,6 +47,12 @@ impl Forge for RefusingForge {
     async fn delete_remote_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
         Ok(())
     }
+    // Failing here keeps the startup comment poll from refreshing the card —
+    // its immediate first tick would race the assertions on the cached
+    // checks/mergeability that the resolve flow itself writes.
+    async fn fetch_comments(&self, _: &Path, _: u64) -> usine_core::Result<Vec<ReviewComment>> {
+        Err(CoreError::forge("comment poll disabled in this test"))
+    }
     // Unreached by a merge; defer to the simulator.
     async fn create_pr(
         &self,
@@ -58,9 +65,6 @@ impl Forge for RefusingForge {
         d: bool,
     ) -> usine_core::Result<PrInfo> {
         SimForge.create_pr(r, t, b, base, h, rev, d).await
-    }
-    async fn fetch_comments(&self, r: &Path, n: u64) -> usine_core::Result<Vec<ReviewComment>> {
-        SimForge.fetch_comments(r, n).await
     }
     async fn list_review_prs(&self, r: &Path, a: &[String]) -> usine_core::Result<Vec<PrSummary>> {
         SimForge.list_review_prs(r, a).await
@@ -289,9 +293,13 @@ impl GitOps for ConflictingGit {
 
 /// Seed a `ReadyToMerge` card with an isolated worktree on disk (the launch
 /// tripwire refuses to run a write agent without one) and ask to resolve.
+/// `status` is what the forge answers when the resolve re-reads mergeability;
+/// the card itself is seeded with the stale snapshot the button was shown
+/// from: `Conflicting`, checks green.
 fn resolving(
     git: Arc<dyn GitOps>,
     worktree: &Path,
+    status: Mergeable,
 ) -> (Store, Card, UnboundedReceiver<ExecutorEvent>) {
     let store = Store::open_in_memory().unwrap();
     let project = Project::new(
@@ -302,14 +310,14 @@ fn resolving(
     store.upsert_project(&project).unwrap();
     let mut card = ready_to_merge_card(&store, project.id);
     card.worktree_path = Some(worktree.to_path_buf());
+    card.mergeable = Mergeable::Conflicting;
+    card.checks = CheckStatus::Passing;
     store.upsert_card(&card).unwrap();
 
     let (handle, rx) = spawn_executor(ExecutorConfig {
         store: store.clone(),
         providers: Arc::new(SimFactory),
-        forge: Arc::new(RefusingForge {
-            status: Mergeable::Conflicting,
-        }),
+        forge: Arc::new(RefusingForge { status }),
         git,
     });
     handle.send(ExecutorCommand::ResolveConflicts { card_id: card.id });
@@ -321,7 +329,11 @@ fn resolving(
 #[tokio::test]
 async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_store, card, mut rx) = resolving(Arc::new(ConflictingGit), tmp.path());
+    let (_store, card, mut rx) = resolving(
+        Arc::new(ConflictingGit),
+        tmp.path(),
+        Mergeable::Conflicting,
+    );
 
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
@@ -341,7 +353,7 @@ async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
 #[tokio::test]
 async fn a_conflict_that_resolved_itself_costs_no_agent_run() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, card, mut rx) = resolving(Arc::new(SimGit), tmp.path());
+    let (store, card, mut rx) = resolving(Arc::new(SimGit), tmp.path(), Mergeable::Conflicting);
 
     let msg = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::Toast {
@@ -358,10 +370,49 @@ async fn a_conflict_that_resolved_itself_costs_no_agent_run() {
     .await;
 
     assert!(msg.contains("No conflicts left"), "got: {msg}");
-    assert!(matches!(
-        store.get_card(card.id).unwrap().state,
-        CardState::ReadyToMerge
-    ));
+    let after = store.get_card(card.id).unwrap();
+    assert!(matches!(after.state, CardState::ReadyToMerge));
+    // The push published a merge commit, so the whole cached PR snapshot is
+    // stale: the green checks must fall back to Pending (a leftover `Passing`
+    // would re-show Merge only for the executor to refuse it while CI re-runs)
+    // and the mergeability back to Unknown until the poll re-reads both.
+    assert_eq!(after.checks, CheckStatus::Pending);
+    assert_eq!(after.mergeable, Mergeable::Unknown);
+}
+
+/// When the forge itself says the PR merges cleanly, the resolve is a pure
+/// no-op: no local merge, no push — the board's "Resolve conflicts" was drawn
+/// from a stale snapshot, and mutating the PR (a pointless merge commit that
+/// re-triggers CI) would make the button's promise a lie. The card just learns
+/// `Clean` so the poll-refreshed board re-shows Merge.
+#[tokio::test]
+async fn a_conflict_the_forge_says_is_gone_is_not_re_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    // ConflictingGit would hand a conflict to an agent — reaching it at all
+    // means the forge's `Clean` answer was ignored, which the panic arm below
+    // catches as the card moving off `ReadyToMerge`.
+    let (store, card, mut rx) = resolving(Arc::new(ConflictingGit), tmp.path(), Mergeable::Clean);
+
+    let msg = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Success,
+            message,
+        } => Some(message.clone()),
+        ExecutorEventKind::CardUpdated(c)
+            if c.id == card.id && !matches!(c.state, CardState::ReadyToMerge) =>
+        {
+            panic!("a healed conflict must not start a resolve: {:?}", c.state)
+        }
+        _ => None,
+    })
+    .await;
+
+    assert!(msg.contains("merges cleanly"), "got: {msg}");
+    let after = store.get_card(card.id).unwrap();
+    assert!(matches!(after.state, CardState::ReadyToMerge));
+    assert_eq!(after.mergeable, Mergeable::Clean);
+    // Nothing was pushed, so the checks the card knew stay as they were.
+    assert_eq!(after.checks, CheckStatus::Passing);
 }
 
 /// Every prompt handed to a provider, tagged with the run mode that asked for it.

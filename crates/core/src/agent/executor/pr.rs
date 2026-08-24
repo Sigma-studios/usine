@@ -118,6 +118,16 @@ impl Executor {
         let number = pr.number;
         self.store.mutate_card(card_id, |c| {
             c.pr = Some(pr.clone());
+            // A brand-new PR has no feedback or check results yet — clear the
+            // PR-derived caches so nothing from an earlier PR of this card
+            // (however it was dropped) leaks onto this one.
+            c.reviewer_comment_count = 0;
+            c.comment_count = 0;
+            c.unanswered_count = 0;
+            c.reviews.clear();
+            c.triaged_review_bodies.clear();
+            c.checks = CheckStatus::None;
+            c.mergeable = Mergeable::Unknown;
             c.updated_at = now_millis();
             Ok(())
         })?;
@@ -1084,6 +1094,28 @@ impl Executor {
             .branch
             .clone()
             .ok_or_else(|| CoreError::other("card has no branch to resolve conflicts on"))?;
+        let pr_number = card
+            .pr
+            .as_ref()
+            .map(|p| p.number)
+            .ok_or_else(|| CoreError::other("card has no PR to resolve conflicts on"))?;
+
+        // Re-read rather than trusting the card's cached snapshot (mirrors
+        // `fix_checks`): the base may have moved back, or a teammate updated the
+        // branch, since the poll recorded `Conflicting`. A definite `Clean`
+        // no-ops — merging the base in anyway would push a pointless merge
+        // commit and re-trigger CI on a PR that was already mergeable. Anything
+        // less definite (still conflicting, not yet computed, or a forge error)
+        // proceeds: the local merge below finds the real answer either way.
+        if let Ok(Mergeable::Clean) = self.forge.merge_status(&project.path, pr_number).await {
+            self.persist_mergeable(card_id, Mergeable::Clean);
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Success,
+                "No conflicts left — the PR merges cleanly. Try merging again.",
+            ));
+            return Ok(());
+        }
 
         // Everything up to the transition is recoverable: a failure here leaves the
         // card sitting in `ReadyToMerge`, where the user can try again.
@@ -1101,15 +1133,36 @@ impl Executor {
             // updated the branch). Publish the merge and let the user retry.
             MergeOutcome::Clean => {
                 self.git.push(&dir, &branch).await?;
-                // The push invalidates whatever mergeability the card cached —
-                // this path skips finalize_run, so reset it here.
-                self.persist_mergeable(card_id, Mergeable::Unknown);
+                // The push invalidates the whole cached PR snapshot — this path
+                // skips finalize_run, so mirror its post-push reset here. The
+                // mergeability is stale (the merge commit just cured it), and so
+                // are the checks: the push re-triggers CI, and a leftover
+                // `Passing` would re-show Merge only for the executor to refuse
+                // it with "CI checks are still running".
+                let has_checks = card.checks != CheckStatus::None;
+                if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+                    if c.checks != CheckStatus::None {
+                        c.checks = CheckStatus::Pending;
+                    }
+                    c.mergeable = Mergeable::Unknown;
+                    Ok(())
+                }) {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                }
+                let message = if has_checks {
+                    format!(
+                        "No conflicts left — merged {base} into the branch. \
+                         Merge again once CI passes."
+                    )
+                } else {
+                    format!(
+                        "No conflicts left — merged {base} into the branch. Try merging again."
+                    )
+                };
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                     card_id,
                     Severity::Success,
-                    format!(
-                        "No conflicts left — merged {base} into the branch. Try merging again."
-                    ),
+                    message,
                 ));
                 return Ok(());
             }

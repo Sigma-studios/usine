@@ -741,6 +741,17 @@ impl Executor {
             // A genuine do-over: drop the run artifacts so the next Start is fresh.
             c.last_session = None;
             c.pr = None;
+            // The PR-derived caches describe the PR just dropped; kept, a
+            // brand-new PR from the next attempt would inherit them — e.g.
+            // reach `ReadyToMerge` still wearing the old PR's `Conflicting`
+            // and offer "Resolve conflicts" instead of Merge.
+            c.reviewer_comment_count = 0;
+            c.comment_count = 0;
+            c.unanswered_count = 0;
+            c.reviews.clear();
+            c.triaged_review_bodies.clear();
+            c.checks = CheckStatus::None;
+            c.mergeable = Mergeable::Unknown;
             c.cost = crate::Cost::ZERO;
             // Only forget the worktree/branch once they're actually gone, so a
             // worktree that resisted removal isn't leaked out of the card's memory.
