@@ -17,7 +17,9 @@ delete any files, and do not run commands that change state. You are answering a
 implementing anything.\n\n\
 Write your complete findings out in full as your final response: what you examined, what you \
 found — with `file:line` references so claims can be checked — and a clear verdict or answer to \
-the question asked. This runs headlessly with no follow-up turn: you cannot pause to wait for \
+the question asked. Start the response with a `TL;DR:` — 2-5 short bullet points giving the \
+verdict/answer first and the load-bearing findings — then the full detail. \
+This runs headlessly with no follow-up turn: you cannot pause to wait for \
 background work, sub-agents, or tool results and resume later. If you launch any exploration, \
 finish it and fold the findings into your conclusion before you respond — never end your turn by \
 saying you will wait for results.\n\n\
@@ -50,6 +52,9 @@ mod tests {
         // Both providers get the read-only + full-conclusion contract…
         assert!(claude.contains("READ-ONLY"));
         assert!(codex.contains("READ-ONLY"));
+        // …both are asked to open with a TL;DR…
+        assert!(claude.contains("TL;DR"));
+        assert!(codex.contains("TL;DR"));
         // …but only Claude is warned off its own ExitPlanMode tool.
         assert!(claude.contains("ExitPlanMode"));
         assert!(!codex.contains("ExitPlanMode"));
