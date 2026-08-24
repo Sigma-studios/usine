@@ -941,10 +941,12 @@ fn open_store() -> Store {
 /// demonstrates the whole pipeline.
 fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
     let path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut config = ProjectConfig::default();
     // Without contributors to watch, a scan finds nothing and the review board
     // stays empty — these are the authors `SimForge::list_review_prs` returns.
-    config.review_contributors = vec!["octocat".into(), "hubot".into()];
+    let config = ProjectConfig {
+        review_contributors: vec!["octocat".into(), "hubot".into()],
+        ..Default::default()
+    };
     let project = Project::new("Demo project", path, config);
     store.upsert_project(&project)?;
 
