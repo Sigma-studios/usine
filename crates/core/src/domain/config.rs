@@ -1,7 +1,11 @@
 //! Configuration: per-card, per-project, and global defaults.
 //!
-//! Defaults cascade: a new card inherits its project's defaults, and a new
-//! project inherits the global [`AppSettings`].
+//! Model defaults live in one place — the global [`AppSettings`] — and seed
+//! each card's [`CardConfig`] at creation. There is deliberately no per-project
+//! model layer: changing the global settings applies to the next card (and
+//! contributor-PR review) in *every* project, existing cards keep their own
+//! editable config. [`ProjectConfig`] holds only forge/preview/worktree
+//! settings.
 
 use std::path::Path;
 
@@ -134,22 +138,14 @@ pub struct PreviewPort {
     pub base: u16,
 }
 
-/// Per-project defaults plus forge settings (reviewer, base branch) and the
-/// preview/worktree scripts that let the app be run straight from a card's
-/// worktree. `#[serde(default)]` on the newer fields keeps `ProjectRecord`s
-/// written before they existed loadable (the store uses a self-describing JSON
-/// codec, so absent fields fall back to the default).
+/// Per-project forge settings (reviewer, base branch) and the preview/worktree
+/// scripts that let the app be run straight from a card's worktree. Model
+/// defaults are *not* here — they come live from [`AppSettings`] (records
+/// written when this struct carried `default_*` model fields still load: the
+/// store's self-describing JSON codec ignores unknown fields, and
+/// `#[serde(default)]` on the newer fields covers the other direction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
-    pub default_provider: Provider,
-    pub default_plan: ModelSpec,
-    pub default_implement: ModelSpec,
-    /// Review-phase model for this project. Seeds new cards' `review`, and is
-    /// the spec the contributor-PR review runs at (those have no card behind
-    /// them). `None` means "same as `default_implement`" — see
-    /// [`CardConfig::review`]. Read it through [`Self::review_spec`].
-    #[serde(default)]
-    pub default_review: Option<ModelSpec>,
     /// GitHub username to request as reviewer on created PRs.
     pub reviewer: Option<String>,
     /// Auto-detected base branch, refreshed from the repo at every startup.
@@ -191,25 +187,6 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// Build the [`CardConfig`] a new card in this project should start with.
-    pub fn new_card_config(&self) -> CardConfig {
-        CardConfig {
-            provider: self.default_provider,
-            kind: CardKind::default(),
-            plan: self.default_plan.clone(),
-            implement: self.default_implement.clone(),
-            review: self.default_review.clone(),
-        }
-    }
-
-    /// The spec this project's contributor-PR reviews run at, and the fallback
-    /// behind [`CardConfig::review_spec`] for cards it seeds.
-    pub fn review_spec(&self) -> ModelSpec {
-        self.default_review
-            .clone()
-            .unwrap_or_else(|| self.default_implement.clone())
-    }
-
     /// The base branch every git/PR operation should use: the user's pin when
     /// one is set (blank counts as unset), else the auto-detected branch.
     pub fn effective_base_branch(&self) -> &str {
@@ -223,12 +200,7 @@ impl ProjectConfig {
 
 impl Default for ProjectConfig {
     fn default() -> Self {
-        let base = CardConfig::default_for(Provider::Claude);
         ProjectConfig {
-            default_provider: base.provider,
-            default_plan: base.plan,
-            default_implement: base.implement,
-            default_review: base.review,
             reviewer: None,
             base_branch: "dev".to_string(),
             pinned_base_branch: None,
@@ -242,14 +214,17 @@ impl Default for ProjectConfig {
     }
 }
 
-/// Global app defaults, used to seed new projects.
+/// Global app defaults: the models new cards start with (in every project) and
+/// the spec contributor-PR reviews run at, plus app-wide commands and limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub default_provider: Provider,
     pub default_plan: ModelSpec,
     pub default_implement: ModelSpec,
-    /// Review-phase default for new projects. `None` means "same as
-    /// `default_implement`" — see [`CardConfig::review`].
+    /// Review-phase default: seeds new cards' `review` and is the spec
+    /// contributor-PR reviews run at (those have no card behind them). `None`
+    /// means "same as `default_implement`" — see [`CardConfig::review`]. Read
+    /// it through [`Self::review_spec`], never directly.
     #[serde(default)]
     pub default_review: Option<ModelSpec>,
     /// Command run for a card's "Open in terminal" action. `{path}` is replaced
@@ -302,17 +277,25 @@ impl AppSettings {
         }
     }
 
-    /// Build the [`ProjectConfig`] a new project should start with. Only the
-    /// model defaults come from global settings; everything else (base branch,
-    /// preview ports, worktree scripts) uses `ProjectConfig`'s own defaults.
-    pub fn new_project_config(&self) -> ProjectConfig {
-        ProjectConfig {
-            default_provider: self.default_provider,
-            default_plan: self.default_plan.clone(),
-            default_implement: self.default_implement.clone(),
-            default_review: self.default_review.clone(),
-            ..ProjectConfig::default()
+    /// Build the [`CardConfig`] a new card should start with — read from the
+    /// *current* settings at creation time, so a global change applies to the
+    /// next card in every project.
+    pub fn new_card_config(&self) -> CardConfig {
+        CardConfig {
+            provider: self.default_provider,
+            kind: CardKind::default(),
+            plan: self.default_plan.clone(),
+            implement: self.default_implement.clone(),
+            review: self.default_review.clone(),
         }
+    }
+
+    /// The spec contributor-PR reviews run at, and the fallback behind
+    /// [`CardConfig::review_spec`] for cards these settings seed.
+    pub fn review_spec(&self) -> ModelSpec {
+        self.default_review
+            .clone()
+            .unwrap_or_else(|| self.default_implement.clone())
     }
 }
 
@@ -374,7 +357,10 @@ mod tests {
     #[test]
     fn project_config_without_new_fields_still_loads() {
         // A ProjectRecord written before `pinned_base_branch`/`validate_script`
-        // existed must deserialize (JSON codec + `#[serde(default)]`).
+        // existed must deserialize (JSON codec + `#[serde(default)]`). The
+        // `default_*` model fields were later *removed* from ProjectConfig, so
+        // this fixture also proves records that still carry them load — the
+        // codec ignores unknown fields.
         let json = r#"{
             "default_provider": "claude",
             "default_plan": {"model": "opus", "effort": "xhigh"},
@@ -465,19 +451,17 @@ mod tests {
             default_review: Some(ModelSpec::new("sonnet", Effort::High)),
             ..AppSettings::default()
         };
-        let project = settings.new_project_config();
         assert_eq!(
-            project.review_spec(),
+            settings.review_spec(),
             ModelSpec::new("sonnet", Effort::High)
         );
-
-        let card = project.new_card_config();
+        let card = settings.new_card_config();
         assert_eq!(card.review_spec(), ModelSpec::new("sonnet", Effort::High));
 
-        // With no override anywhere, every level resolves to its implement spec.
-        let project = AppSettings::default().new_project_config();
-        assert_eq!(project.review_spec(), project.default_implement);
-        let card = project.new_card_config();
+        // With no override anywhere, both levels resolve to their implement spec.
+        let settings = AppSettings::default();
+        assert_eq!(settings.review_spec(), settings.default_implement);
+        let card = settings.new_card_config();
         assert_eq!(card.review_spec(), card.implement);
     }
 }
