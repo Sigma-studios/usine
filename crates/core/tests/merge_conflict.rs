@@ -19,11 +19,10 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardState, CheckStatus, CoreError,
-    DraftComment,
-    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome,
-    Mergeable, PrInfo, PrSummary, Project, ProjectConfig, Provider, ProviderFactory, RealGit,
-    ReviewComment, ReviewEvent, ReviewSummary, RunConfig, RunHandle, RunMode, Severity, SimFactory,
-    SimForge, SimGit, Store,
+    DraftComment, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps,
+    MergeOutcome, Mergeable, PrInfo, PrSummary, Project, ProjectConfig, Provider, ProviderFactory,
+    RealGit, ReviewComment, ReviewEvent, ReviewSummary, RunConfig, RunHandle, RunMode, Severity,
+    SimFactory, SimForge, SimGit, Store,
 };
 
 /// A forge whose merge always fails, reporting `status` when asked why.
@@ -329,11 +328,8 @@ fn resolving(
 #[tokio::test]
 async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_store, card, mut rx) = resolving(
-        Arc::new(ConflictingGit),
-        tmp.path(),
-        Mergeable::Conflicting,
-    );
+    let (_store, card, mut rx) =
+        resolving(Arc::new(ConflictingGit), tmp.path(), Mergeable::Conflicting);
 
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(

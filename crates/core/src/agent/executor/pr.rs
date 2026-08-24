@@ -1155,9 +1155,7 @@ impl Executor {
                          Merge again once CI passes."
                     )
                 } else {
-                    format!(
-                        "No conflicts left — merged {base} into the branch. Try merging again."
-                    )
+                    format!("No conflicts left — merged {base} into the branch. Try merging again.")
                 };
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                     card_id,
