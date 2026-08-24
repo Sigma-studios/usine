@@ -701,6 +701,15 @@ pub struct ReviewComment {
     pub path: String,
     pub line: Option<u64>,
     pub body: String,
+    /// Set on the synthetic triage item built from a review's *body* (the
+    /// summary text of a submitted review, not an inline comment): it holds
+    /// that review's [`ReviewSummary::body_key`], so applying the picker can
+    /// record the body as handled. GitHub offers no reply endpoint for a
+    /// review body and it has no path/line, so a `Some` here also means "no
+    /// decline reply, render the location as the review summary".
+    /// `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub review_body_of: Option<String>,
 }
 
 /// The agent's verdict on whether a review comment is worth fixing, plus the
@@ -759,9 +768,72 @@ pub struct ReviewSummary {
     pub author: String,
     /// `APPROVED` / `CHANGES_REQUESTED` / `COMMENTED` / `DISMISSED`.
     pub state: String,
+    /// The review's summary text — where a body-only review (a bot report, or
+    /// a human's Comment review with no inline comments) carries its entire
+    /// content. `#[serde(default)]` keeps records persisted before this was
+    /// captured loadable; the poll's reviews comparison refreshes them.
+    #[serde(default)]
+    pub body: String,
+    /// When the review was submitted (ISO timestamp from the forge). With no
+    /// usable review id from `gh pr view --json latestReviews`, `author` +
+    /// this is what identifies a body across polls — see [`Self::body_key`].
+    /// `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub submitted_at: String,
+}
+
+/// FNV-1a over the given text — a tiny hash that is stable across runs and
+/// releases, which [`ReviewSummary::body_key`] needs for its persisted keys.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 impl ReviewSummary {
+    /// A summary with no body — what tests and the simulator mostly need.
+    pub fn new(author: impl Into<String>, state: impl Into<String>) -> Self {
+        ReviewSummary {
+            author: author.into(),
+            state: state.into(),
+            body: String::new(),
+            submitted_at: String::new(),
+        }
+    }
+
+    /// The durable identity of this review's body: `author@submittedAt`
+    /// (author lowercased — GitHub logins are case-insensitive). What
+    /// `Card::triaged_review_bodies` records once the body has been handled,
+    /// so a new review from the same author (new timestamp) nags afresh.
+    ///
+    /// With no timestamp (a forge that omitted `submittedAt`), fall back to a
+    /// hash of the body text: a bare `author@` key, once recorded as handled,
+    /// would swallow every future body-only review from that author. The hash
+    /// is FNV-1a rather than [`std::hash::DefaultHasher`] because these keys
+    /// persist across program runs and Rust upgrades.
+    pub fn body_key(&self) -> String {
+        if self.submitted_at.is_empty() {
+            format!(
+                "{}@body:{:016x}",
+                self.author.to_lowercase(),
+                fnv1a(self.body.trim())
+            )
+        } else {
+            format!("{}@{}", self.author.to_lowercase(), self.submitted_at)
+        }
+    }
+
+    /// Whether this review's *body* is feedback the user should read: a
+    /// non-verdict review (`COMMENTED`) or a change request whose substance
+    /// lives in the summary text. An `APPROVED` body ("LGTM 🚀") is displayed
+    /// but never counts — it must not hold the card short of the merge gate.
+    pub fn has_body_feedback(&self) -> bool {
+        !self.body.trim().is_empty()
+            && (self.state.eq_ignore_ascii_case("COMMENTED") || self.requests_changes())
+    }
     /// Whether this review approves the PR. GitHub uppercases these, but we
     /// compare case-insensitively so a stray casing can't silently drop the
     /// badge (or strand a card short of the merge gate).
@@ -1241,6 +1313,14 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub reviews: Vec<ReviewSummary>,
+    /// The [`ReviewSummary::body_key`]s of review bodies already handled — via
+    /// a triage pass whose picker was applied, or the panel's explicit "Mark
+    /// as read". A body-only review counts as feedback (badge, triage offer,
+    /// merge-gate block) exactly until its key lands here; keys of reviews no
+    /// longer in [`Self::reviews`] are harmless leftovers. `#[serde(default)]`
+    /// keeps older records loadable.
+    #[serde(default)]
+    pub triaged_review_bodies: Vec<String>,
     /// The rolled-up CI state of this card's PR, as of the last background poll
     /// or manual refresh. Gates the merge button: a red or still-running build
     /// blocks the merge (with an explicit "merge anyway" override), and a red
@@ -1277,6 +1357,7 @@ impl Card {
             comment_count: 0,
             unanswered_count: 0,
             reviews: Vec::new(),
+            triaged_review_bodies: Vec::new(),
             checks: CheckStatus::None,
             created_at: now,
             updated_at: now,
@@ -1293,11 +1374,14 @@ impl Card {
     ///
     /// A PR parked in `PrReview(Idle)` only counts once a review has actually
     /// landed — either the assigned reviewer left comments
-    /// ([`Self::reviewer_comment_count`]) or a submitted review carries an
-    /// actionable verdict ([`ReviewSummary::is_actionable`]). The latter is what
-    /// catches an approval or change request that came in with no inline
-    /// comments, which the count alone would miss. The background poll keeps both
-    /// fresh, so a freshly opened PR awaiting review still doesn't nag on its own.
+    /// ([`Self::reviewer_comment_count`]), a submitted review carries an
+    /// actionable verdict ([`ReviewSummary::is_actionable`]), or an unread
+    /// review *body* awaits ([`Self::pending_review_bodies`] — any author, same
+    /// stance as the verdicts: a body-only review is feedback that would
+    /// otherwise be invisible). The verdict path is what catches an approval or
+    /// change request that came in with no inline comments, which the count
+    /// alone would miss. The background poll keeps all of these fresh, so a
+    /// freshly opened PR awaiting review still doesn't nag on its own.
     ///
     /// And a card at the merge gate stops counting while its build is in flight —
     /// see [`Self::merge_gate_waits_on_ci`].
@@ -1308,7 +1392,8 @@ impl Card {
         self.state.needs_attention()
             || (matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
                 && (self.reviewer_comment_count > 0
-                    || self.reviews.iter().any(ReviewSummary::is_actionable)))
+                    || self.reviews.iter().any(ReviewSummary::is_actionable)
+                    || !self.pending_review_bodies().is_empty()))
     }
 
     /// True when `ReadyToMerge` is waiting on CI rather than on the user: the
@@ -1357,14 +1442,40 @@ impl Card {
     /// Deliberately conservative on both sides. Any comment at all (from the
     /// assigned reviewer or another one) means triage still has work to do, so
     /// the user reads it before merging rather than having the card slide past.
-    /// And a change request anywhere blocks: `latestReviews` reports one verdict
-    /// per reviewer, so an approval from one reviewer must not clear a second
+    /// An unread review *body* blocks for the same reason — feedback that lives
+    /// in a review's summary text must be read (triaged, or marked read) before
+    /// the card slides to the merge gate; in the common bot-then-approve flow
+    /// this self-heals, since `latestReviews` keeps one review per author and
+    /// the later approval replaces the body-carrying COMMENTED. And a change
+    /// request anywhere blocks: `latestReviews` reports one verdict per
+    /// reviewer, so an approval from one reviewer must not clear a second
     /// reviewer's outstanding objection.
     pub fn approval_clears_merge(&self) -> bool {
         matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
             && self.comment_count == 0
+            && self.pending_review_bodies().is_empty()
             && self.reviews.iter().any(ReviewSummary::is_approved)
             && !self.reviews.iter().any(ReviewSummary::requests_changes)
+    }
+
+    /// The submitted reviews whose body still awaits the user: body feedback
+    /// (see [`ReviewSummary::has_body_feedback`]) not yet recorded in
+    /// [`Self::triaged_review_bodies`]. What the badge, the triage offer, and
+    /// the merge-clear predicates all read, so one definition of "pending".
+    pub fn pending_review_bodies(&self) -> Vec<&ReviewSummary> {
+        self.reviews
+            .iter()
+            .filter(|r| {
+                r.has_body_feedback() && !self.triaged_review_bodies.contains(&r.body_key())
+            })
+            .collect()
+    }
+
+    /// Whether a triage pass has anything to chew on: an inline comment from
+    /// any reviewer, or an unread review body. Gates the panel's and board's
+    /// "Evaluate the review" offer.
+    pub fn has_triageable_feedback(&self) -> bool {
+        self.comment_count > 0 || !self.pending_review_bodies().is_empty()
     }
 
     /// The reviewers whose latest review approves this card's PR.
@@ -1389,12 +1500,14 @@ impl Card {
     /// `reviewer` is the *effective* reviewer — see
     /// [`PrInfo::effective_reviewer`], which every caller goes through. Same
     /// conservatism as the approval route: any comment from anyone
-    /// means the user triages it before merging, and an unsolicited
-    /// CHANGES_REQUESTED review blocks even though nobody was asked for it.
+    /// means the user triages it before merging, an unread review body
+    /// likewise, and an unsolicited CHANGES_REQUESTED review blocks even
+    /// though nobody was asked for it.
     pub fn no_reviewer_clears_merge(&self, reviewer: Option<&str>) -> bool {
         matches!(self.state, CardState::PrReview(PrReviewSub::Idle))
             && reviewer.is_none()
             && self.comment_count == 0
+            && self.pending_review_bodies().is_empty()
             && !self.reviews.iter().any(ReviewSummary::requests_changes)
     }
 }
@@ -1647,29 +1760,83 @@ mod tests {
         // A review that landed with no inline comments — the count alone stays 0,
         // but a bare `COMMENTED`/`DISMISSED` verdict still isn't actionable.
         card.reviews = vec![
-            ReviewSummary {
-                author: "bot".into(),
-                state: "COMMENTED".into(),
-            },
-            ReviewSummary {
-                author: "old".into(),
-                state: "DISMISSED".into(),
-            },
+            ReviewSummary::new("bot", "COMMENTED"),
+            ReviewSummary::new("old", "DISMISSED"),
         ];
         assert!(!card.needs_attention());
 
         // An approval with no inline comments → badge (this is the case the
         // comment count misses entirely).
-        card.reviews.push(ReviewSummary {
-            author: "octocat".into(),
-            state: "APPROVED".into(),
-        });
+        card.reviews.push(ReviewSummary::new("octocat", "APPROVED"));
         assert!(card.needs_attention());
 
         // And the comment path still stands on its own.
         card.reviews.clear();
         card.reviewer_comment_count = 2;
         assert!(card.needs_attention());
+    }
+
+    #[test]
+    fn review_bodies_count_as_feedback_until_handled() {
+        let body_review = |author: &str, state: &str| ReviewSummary {
+            author: author.into(),
+            state: state.into(),
+            body: "## Report\n\npass · high confidence".into(),
+            submitted_at: "2026-08-21T13:58:00Z".into(),
+        };
+
+        // An APPROVED body ("LGTM 🚀") is display-only, never feedback.
+        assert!(!body_review("octocat", "APPROVED").has_body_feedback());
+        // A blank or whitespace body carries nothing, whatever the state.
+        assert!(!ReviewSummary::new("bot", "COMMENTED").has_body_feedback());
+        // COMMENTED and CHANGES_REQUESTED bodies are the real thing.
+        assert!(body_review("bot", "COMMENTED").has_body_feedback());
+        assert!(body_review("bot", "CHANGES_REQUESTED").has_body_feedback());
+
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::PrReview(PrReviewSub::Idle);
+        card.reviews = vec![body_review("bot", "COMMENTED")];
+
+        // Pending body: badge lit, triage offered, merge-clear blocked even
+        // alongside an approval from another reviewer.
+        assert_eq!(card.pending_review_bodies().len(), 1);
+        assert!(card.needs_attention());
+        assert!(card.has_triageable_feedback());
+        card.reviews.push(ReviewSummary::new("octocat", "APPROVED"));
+        assert!(!card.approval_clears_merge());
+        assert!(!card.no_reviewer_clears_merge(None));
+
+        // Handled (triaged or marked read) by key: everything clears.
+        card.triaged_review_bodies = vec![card.reviews[0].body_key()];
+        assert!(card.pending_review_bodies().is_empty());
+        assert!(!card.has_triageable_feedback());
+        assert!(card.approval_clears_merge());
+
+        // A newer body from the same author (new timestamp) nags afresh.
+        card.reviews[0].submitted_at = "2026-08-22T09:00:00Z".into();
+        assert_eq!(card.pending_review_bodies().len(), 1);
+        assert!(!card.approval_clears_merge());
+    }
+
+    #[test]
+    fn body_key_without_a_timestamp_falls_back_to_the_body_text() {
+        // A forge that omits submittedAt must not collapse every review from
+        // an author onto one `author@` key — marking one body read would then
+        // swallow all future ones.
+        let mut r = ReviewSummary::new("Bot", "COMMENTED");
+        r.body = "first report".into();
+        let first = r.body_key();
+        assert!(first.starts_with("bot@body:"), "got: {first}");
+
+        r.body = "second report".into();
+        assert_ne!(r.body_key(), first, "a different body gets a new key");
+        // Stable for the same body — persisted keys must keep matching.
+        r.body = "first report".into();
+        assert_eq!(r.body_key(), first);
+
+        // With a timestamp, the key is the timestamp form as before.
+        r.submitted_at = "2026-08-21T13:58:00Z".into();
+        assert_eq!(r.body_key(), "bot@2026-08-21T13:58:00Z");
     }
 
     #[test]
@@ -1711,17 +1878,11 @@ mod tests {
         assert!(!card.approval_clears_merge());
 
         // A non-verdict review doesn't clear anything either.
-        card.reviews = vec![ReviewSummary {
-            author: "bot".into(),
-            state: "COMMENTED".into(),
-        }];
+        card.reviews = vec![ReviewSummary::new("bot", "COMMENTED")];
         assert!(!card.approval_clears_merge());
 
         // Approval, no inline comments → the case with no triage chain to ride.
-        card.reviews.push(ReviewSummary {
-            author: "octocat".into(),
-            state: "APPROVED".into(),
-        });
+        card.reviews.push(ReviewSummary::new("octocat", "APPROVED"));
         assert!(card.approval_clears_merge());
 
         // Any comment at all means triage has work; the user reads it first.
@@ -1731,10 +1892,8 @@ mod tests {
 
         // A second reviewer still requesting changes blocks the approval —
         // `latestReviews` carries one verdict per reviewer.
-        card.reviews.push(ReviewSummary {
-            author: "hubot".into(),
-            state: "CHANGES_REQUESTED".into(),
-        });
+        card.reviews
+            .push(ReviewSummary::new("hubot", "CHANGES_REQUESTED"));
         assert!(!card.approval_clears_merge());
         card.reviews.pop();
 
@@ -1771,22 +1930,14 @@ mod tests {
 
         // A non-blocking drive-by review doesn't hold the card back...
         card.reviews = vec![
-            ReviewSummary {
-                author: "bot".into(),
-                state: "COMMENTED".into(),
-            },
-            ReviewSummary {
-                author: "octocat".into(),
-                state: "APPROVED".into(),
-            },
+            ReviewSummary::new("bot", "COMMENTED"),
+            ReviewSummary::new("octocat", "APPROVED"),
         ];
         assert!(card.no_reviewer_clears_merge(None));
 
         // ...but an unsolicited change request does.
-        card.reviews.push(ReviewSummary {
-            author: "hubot".into(),
-            state: "CHANGES_REQUESTED".into(),
-        });
+        card.reviews
+            .push(ReviewSummary::new("hubot", "CHANGES_REQUESTED"));
         assert!(!card.no_reviewer_clears_merge(None));
         card.reviews.pop();
 

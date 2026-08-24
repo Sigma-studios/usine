@@ -393,6 +393,9 @@ impl Executor {
             ExecutorCommand::ApprovePlan { card_id } => self.approve_plan(card_id).await,
             ExecutorCommand::Answer { card_id, text } => self.answer(card_id, text).await,
             ExecutorCommand::FetchComments { card_id } => self.fetch_comments(card_id).await,
+            ExecutorCommand::MarkReviewBodiesRead { card_id } => {
+                self.mark_review_bodies_read(card_id)
+            }
             ExecutorCommand::ApplyFixes {
                 card_id,
                 verdicts,
@@ -1069,6 +1072,13 @@ fn one_line_capped(s: &str, max: usize) -> String {
 /// The restart-log line for a review comment the user checked for fixing —
 /// shared by the PR-comment and self-review fix paths.
 fn fixed_comment_qa(v: &FixVerdict) -> String {
+    if v.comment.review_body_of.is_some() {
+        return format!(
+            "Fix applied per PR review summary (@{}): {}",
+            v.comment.author,
+            one_line_capped(&v.comment.body, 200)
+        );
+    }
     let line = v.comment.line.map(|l| format!(":{l}")).unwrap_or_default();
     format!(
         "Fix applied per review comment: {}{} — {}",
@@ -1144,9 +1154,13 @@ fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
     if !selected.is_empty() {
         out.push_str("Address the following review comments:\n");
         for v in selected {
-            let loc = match v.comment.line {
-                Some(line) => format!("{}:{}", v.comment.path, line),
-                None => v.comment.path.clone(),
+            let loc = if v.comment.review_body_of.is_some() {
+                "PR review summary".to_string()
+            } else {
+                match v.comment.line {
+                    Some(line) => format!("{}:{}", v.comment.path, line),
+                    None => v.comment.path.clone(),
+                }
             };
             // Indent continuation lines so a multi-line comment stays one bullet.
             out.push_str(&format!(
@@ -1365,9 +1379,15 @@ fn thread_triage_items(comments: &[ReviewComment], threads: &[ReviewThread]) -> 
 fn triage_prompt(comments: &[crate::domain::model::ReviewComment]) -> String {
     let mut s = String::from("Pull-request review comments to triage:\n\n");
     for c in comments {
-        let loc = match c.line {
-            Some(l) => format!("{}:{}", c.path, l),
-            None => c.path.clone(),
+        // A review-body item has no path/line; its location is the review
+        // itself (the instruction explains what that means to the agent).
+        let loc = if c.review_body_of.is_some() {
+            "PR review summary".to_string()
+        } else {
+            match c.line {
+                Some(l) => format!("{}:{}", c.path, l),
+                None => c.path.clone(),
+            }
         };
         // Indent continuation lines so a multi-line comment stays one item and
         // can't masquerade as the next id in the list.
@@ -1435,6 +1455,7 @@ mod tests {
                 path: "src/a.rs".into(),
                 line: Some(9),
                 body: "fix this".into(),
+                review_body_of: None,
             },
             worth_fixing: true,
             severity: "medium".into(),
@@ -1520,6 +1541,7 @@ mod tests {
             path: "src/a.rs".into(),
             line: Some(1),
             body: "feedback".into(),
+            review_body_of: None,
         }
     }
 
@@ -1532,6 +1554,7 @@ mod tests {
             path: "src/a.rs".into(),
             line: Some(id),
             body: body.into(),
+            review_body_of: None,
         };
         let comments = [
             mk(10, "reviewer", "This lock is held across an await."),
@@ -1603,6 +1626,21 @@ mod tests {
         assert!(
             p.contains("fix this\n  and also this"),
             "continuation lines are indented under the bullet:\n{p}"
+        );
+    }
+
+    #[test]
+    fn triage_prompt_locates_a_review_body_item_at_the_review_summary() {
+        let mut c = comment("argus");
+        c.id = 9_000_000_000_000_000;
+        c.path = String::new();
+        c.line = None;
+        c.review_body_of = Some("argus@2026-08-21T13:58:00Z".into());
+        let p = triage_prompt(&[c]);
+        assert!(p.contains("[PR review summary]"), "got:\n{p}");
+        assert!(
+            !p.contains("[]"),
+            "the empty path must not leak as the location:\n{p}"
         );
     }
 
