@@ -78,14 +78,16 @@ pub fn ReviewDetail() -> Element {
                             }
                         }
                     }
-                    div { class: "detail-body",
-                        // Remount on every status change so the draft editor's signals
-                        // (checkboxes, edited bodies, verdict) reset instead of leaking
-                        // the previous review's input. Dioxus only honors `key` for
-                        // siblings in a *list*, hence the single-item `for` — see the
-                        // same trick in `super::CardDetail`.
-                        for t in [task.clone()] {
-                            ReviewPanel { key: "{id}:{status_key}", task: t }
+                    // Remount on every status change so the draft editor's signals
+                    // (checkboxes, edited bodies, verdict) reset instead of leaking
+                    // the previous review's input. Dioxus only honors `key` for
+                    // siblings in a *list*, hence the single-item `for` — see the
+                    // same trick in `super::CardDetail`. The key is on the
+                    // `.detail-body` scroll container itself so its `scrollTop`
+                    // (which the WebView preserves on reused nodes) resets too.
+                    for t in [task.clone()] {
+                        div { key: "{id}:{status_key}", class: "detail-body",
+                            ReviewPanel { task: t }
                         }
                     }
                 }

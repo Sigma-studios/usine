@@ -123,19 +123,26 @@ fn CardDetail() -> Element {
                             }
                         }
                     }
-                    div { class: "{body_class}",
-                        // Remount the panel whenever the selected card or its state
-                        // changes, so every per-card/per-state form signal (the
-                        // description mirror, skip-plan, answers, …) resets instead of
-                        // leaking the previously-viewed card's input.
-                        //
-                        // Dioxus only honors `key` for siblings in a *list*: a lone
-                        // child's key is ignored and its scope — with all its
-                        // `use_signal` state — is reused across renders. Wrapping in a
-                        // single-item `for` puts CardPanel in a keyed-list context, so a
-                        // changed key genuinely tears it down and rebuilds it.
-                        for c in [card.clone()] {
-                            CardPanel { key: "{id}:{state_key}", card: c }
+                    // Remount the panel whenever the selected card or its state
+                    // changes, so every per-card/per-state form signal (the
+                    // description mirror, skip-plan, answers, …) resets instead of
+                    // leaking the previously-viewed card's input.
+                    //
+                    // Dioxus only honors `key` for siblings in a *list*: a lone
+                    // child's key is ignored and its scope — with all its
+                    // `use_signal` state — is reused across renders. Wrapping in a
+                    // single-item `for` puts the subtree in a keyed-list context, so
+                    // a changed key genuinely tears it down and rebuilds it.
+                    //
+                    // The key sits on the `.detail-body` scroll container itself:
+                    // the WebView keeps `scrollTop` on a reused DOM node, so keying
+                    // only the child would carry card A's scroll offset into card
+                    // B's panel (opening it "scrolled to the bottom"). Recreating
+                    // the container resets scroll to the top. Busy flips only swap
+                    // `body_class` in place and keep the scroll position.
+                    for c in [card.clone()] {
+                        div { key: "{id}:{state_key}", class: "{body_class}",
+                            CardPanel { card: c }
                         }
                     }
                 }
