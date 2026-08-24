@@ -323,17 +323,29 @@ fn CardPanel(card: Card) -> Element {
                     if card.unanswered_count == 0 {
                         // Only review bodies await — a body-only review (e.g. a
                         // bot report) landed after the card reached the gate.
-                        "A review's summary text on the PR hasn't been read yet. Have the agent read and triage it before merging."
+                        "A review's summary text on the PR hasn't been read yet. Have the agent read and triage it before merging — or mark it read if it needs nothing."
                     } else if card.unanswered_count == 1 {
                         "A review comment on the PR has no answer yet — it arrived after (or survived) the last pass. Have the agent read and triage it before merging."
                     } else {
                         {format!("{} review threads on the PR have no answer yet — they arrived after (or survived) the last pass. Have the agent read and triage them before merging.", card.unanswered_count)}
                     }
                 }
-                button {
-                    class: "btn primary",
-                    onclick: move |_| state.send(ExecutorCommand::FetchComments { card_id: id }),
-                    "Reevaluate comments"
+                div { class: "row",
+                    button {
+                        class: "btn primary",
+                        onclick: move |_| state.send(ExecutorCommand::FetchComments { card_id: id }),
+                        "Reevaluate comments"
+                    }
+                    // A pending review body can also be dismissed by hand —
+                    // same affordance as the PR-review panel, so a body landing
+                    // at the merge gate doesn't force a full triage run.
+                    if pending_bodies > 0 {
+                        button {
+                            class: "btn",
+                            onclick: move |_| state.send(ExecutorCommand::MarkReviewBodiesRead { card_id: id }),
+                            "Mark as read"
+                        }
+                    }
                 }
             }
         }

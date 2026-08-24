@@ -117,13 +117,20 @@ pub fn CardView(card: Card) -> Element {
     let approved_by = card.approved_by().join(", ");
     // Reviewers whose review *body* awaits reading — a body-only review (e.g.
     // a bot's report) leaves no comment count, so this is its board-level
-    // visibility. Informational: no state change rides on it.
-    let commented_by = card
-        .pending_review_bodies()
-        .iter()
-        .map(|r| r.author.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // visibility. Informational: no state change rides on it. Only shown while
+    // the card is at the PR or merge gate — the states whose panels offer a way
+    // to read and dismiss it; past the merge (Done) it would nag forever with
+    // no dismissal path.
+    let body_actionable = matches!(st, CardState::PrReview(_) | CardState::ReadyToMerge);
+    let commented_by = if body_actionable {
+        card.pending_review_bodies()
+            .iter()
+            .map(|r| r.author.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    };
     // The worktree holds committed, reviewable work from just-implemented through
     // PR review until merge. "Show diff" lives in the card actions menu; the
     // preview controls sit inline on the card and need a run command configured.

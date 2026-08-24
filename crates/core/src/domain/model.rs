@@ -782,6 +782,17 @@ pub struct ReviewSummary {
     pub submitted_at: String,
 }
 
+/// FNV-1a over the given text — a tiny hash that is stable across runs and
+/// releases, which [`ReviewSummary::body_key`] needs for its persisted keys.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 impl ReviewSummary {
     /// A summary with no body — what tests and the simulator mostly need.
     pub fn new(author: impl Into<String>, state: impl Into<String>) -> Self {
@@ -797,8 +808,22 @@ impl ReviewSummary {
     /// (author lowercased — GitHub logins are case-insensitive). What
     /// `Card::triaged_review_bodies` records once the body has been handled,
     /// so a new review from the same author (new timestamp) nags afresh.
+    ///
+    /// With no timestamp (a forge that omitted `submittedAt`), fall back to a
+    /// hash of the body text: a bare `author@` key, once recorded as handled,
+    /// would swallow every future body-only review from that author. The hash
+    /// is FNV-1a rather than [`std::hash::DefaultHasher`] because these keys
+    /// persist across program runs and Rust upgrades.
     pub fn body_key(&self) -> String {
-        format!("{}@{}", self.author.to_lowercase(), self.submitted_at)
+        if self.submitted_at.is_empty() {
+            format!(
+                "{}@body:{:016x}",
+                self.author.to_lowercase(),
+                fnv1a(self.body.trim())
+            )
+        } else {
+            format!("{}@{}", self.author.to_lowercase(), self.submitted_at)
+        }
     }
 
     /// Whether this review's *body* is feedback the user should read: a
@@ -1789,6 +1814,27 @@ mod tests {
         card.reviews[0].submitted_at = "2026-08-22T09:00:00Z".into();
         assert_eq!(card.pending_review_bodies().len(), 1);
         assert!(!card.approval_clears_merge());
+    }
+
+    #[test]
+    fn body_key_without_a_timestamp_falls_back_to_the_body_text() {
+        // A forge that omits submittedAt must not collapse every review from
+        // an author onto one `author@` key — marking one body read would then
+        // swallow all future ones.
+        let mut r = ReviewSummary::new("Bot", "COMMENTED");
+        r.body = "first report".into();
+        let first = r.body_key();
+        assert!(first.starts_with("bot@body:"), "got: {first}");
+
+        r.body = "second report".into();
+        assert_ne!(r.body_key(), first, "a different body gets a new key");
+        // Stable for the same body — persisted keys must keep matching.
+        r.body = "first report".into();
+        assert_eq!(r.body_key(), first);
+
+        // With a timestamp, the key is the timestamp form as before.
+        r.submitted_at = "2026-08-21T13:58:00Z".into();
+        assert_eq!(r.body_key(), "bot@2026-08-21T13:58:00Z");
     }
 
     #[test]

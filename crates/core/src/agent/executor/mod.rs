@@ -1632,7 +1632,7 @@ mod tests {
     #[test]
     fn triage_prompt_locates_a_review_body_item_at_the_review_summary() {
         let mut c = comment("argus");
-        c.id = u64::MAX;
+        c.id = 9_000_000_000_000_000;
         c.path = String::new();
         c.line = None;
         c.review_body_of = Some("argus@2026-08-21T13:58:00Z".into());

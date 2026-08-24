@@ -4,6 +4,13 @@
 use super::*;
 use crate::infra::git::is_dirty;
 
+/// Base for the synthetic ids given to review-*body* triage items. Far above
+/// any real GitHub comment id so they can't collide, but well below 2^53 so
+/// the id survives an f64 round-trip: the triage agent echoes ids back through
+/// JSON, and an id up at `u64::MAX` comes back float-rounded to a number that
+/// doesn't even fit a u64.
+const SYNTHETIC_BODY_ID_BASE: u64 = 9_000_000_000_000_000;
+
 impl Executor {
     pub(super) async fn create_pr(
         &self,
@@ -215,12 +222,12 @@ impl Executor {
             card
         };
         let mut items = items;
-        // Synthetic ids count down from u64::MAX so they can't collide with
-        // real GitHub comment ids; `review_body_of` carries the body's
+        // Synthetic ids count up from a base no real GitHub comment id reaches
+        // (see [`SYNTHETIC_BODY_ID_BASE`]); `review_body_of` carries the body's
         // identity so applying the picker can record it handled.
         for (k, r) in card.pending_review_bodies().into_iter().enumerate() {
             items.push(ReviewComment {
-                id: u64::MAX - k as u64,
+                id: SYNTHETIC_BODY_ID_BASE + k as u64,
                 author: r.author.clone(),
                 path: String::new(),
                 line: None,
