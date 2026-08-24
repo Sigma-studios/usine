@@ -14,6 +14,8 @@ use crate::domain::model::Provider;
 /// Claude-specific addendum.
 pub const PLAN_QUESTIONS_INSTRUCTION: &str = "\
 Write your complete implementation plan out in full as your final response. \
+Start it with a `TL;DR:` — 2-5 short bullet points summarizing what will be done and the key \
+decisions — then the full plan. \
 This runs headlessly with no follow-up turn: you cannot pause to wait for \
 background work, sub-agents, or tool results and resume later. If you launch any exploration, \
 finish it and fold the findings into your plan before you respond — never end your turn by \
@@ -116,6 +118,9 @@ mod tests {
         // Both providers get the questions-block contract…
         assert!(claude.contains("usine-questions"));
         assert!(codex.contains("usine-questions"));
+        // …both are asked to open the plan with a TL;DR…
+        assert!(claude.contains("TL;DR"));
+        assert!(codex.contains("TL;DR"));
         // …but only Claude is warned off its own ExitPlanMode tool.
         assert!(claude.contains("ExitPlanMode"));
         assert!(!codex.contains("ExitPlanMode"));

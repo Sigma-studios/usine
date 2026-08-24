@@ -1138,8 +1138,9 @@ fn question_extra(stage: &str, plan: Option<&str>, question: &str) -> String {
     s.push_str(question);
     s.push_str(
         "\n\nThis is a READ-ONLY turn: do NOT modify, create, or delete any files, and do not \
-         commit or push. Inspect whatever you need, then answer concisely in your final message. \
-         Do not ask questions back — state your assumptions instead. If investigating the \
+         commit or push. Inspect whatever you need, then answer concisely in your final message; \
+         if the answer runs longer than a few sentences, start it with a `TL;DR:` of 2-3 bullet \
+         points. Do not ask questions back — state your assumptions instead. If investigating the \
          question reveals a real defect, say so plainly; the user will decide whether to send a \
          change request.",
     );
@@ -1437,6 +1438,12 @@ mod tests {
             PathBuf::from("/att/ef56ab78-notes-2.txt"),
         ];
         assert_eq!(next_pasted_number(&existing), 1);
+    }
+
+    #[test]
+    fn question_extra_asks_for_a_tldr_on_long_answers() {
+        let extra = question_extra("Stage.", None, "Why is the sky blue?");
+        assert!(extra.contains("TL;DR"));
     }
 
     #[test]
