@@ -58,11 +58,19 @@ where
 /// A store with one project (carrying `validate_script`) and one card parked at
 /// `ReadyForReview` with a branch and a REAL worktree dir the check runs in.
 fn seed(validate_script: Option<&str>, worktree: &std::path::Path) -> (Store, uuid::Uuid) {
+    seed_with(
+        ProjectConfig {
+            validate_script: validate_script.map(str::to_string),
+            ..ProjectConfig::default()
+        },
+        worktree,
+    )
+}
+
+/// [`seed`] over a fully-specified project config, for the cases that also need
+/// a setup command or a custom gate timeout.
+fn seed_with(config: ProjectConfig, worktree: &std::path::Path) -> (Store, uuid::Uuid) {
     let store = Store::open_in_memory().unwrap();
-    let config = ProjectConfig {
-        validate_script: validate_script.map(str::to_string),
-        ..ProjectConfig::default()
-    };
     let project = Project::new("p", PathBuf::from("/tmp/usine-validation-gate-p"), config);
     store.upsert_project(&project).unwrap();
     let mut card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
@@ -249,4 +257,69 @@ async fn interrupted_check_resumes_at_the_same_attempt() {
     })
     .await;
     wait_for_review_sub(&mut rx, card_id, |s| matches!(s, ReviewSub::ReadyForPr)).await;
+}
+
+/// The gate prepares the worktree before it judges it: the setup command runs
+/// first, so a check that depends on what setup installs passes instead of
+/// failing on a missing environment.
+#[tokio::test]
+async fn setup_command_runs_before_the_check() {
+    let wt = tempfile::tempdir().unwrap();
+    let (store, card_id) = seed_with(
+        ProjectConfig {
+            worktree_setup_script: Some("echo ready > deps".into()),
+            // Fails unless setup already put `deps` in the worktree.
+            validate_script: Some("test -f deps".into()),
+            ..ProjectConfig::default()
+        },
+        wt.path(),
+    );
+    let (handle, mut rx) = executor(&store);
+
+    handle.send(ExecutorCommand::SkipReview { card_id });
+
+    wait_for_review_sub(&mut rx, card_id, |s| {
+        matches!(s, ReviewSub::Validating { attempt: 1 })
+    })
+    .await;
+    // Passing on the first attempt is the whole assertion: the check saw the
+    // setup command's output, and no fix run was needed to get there.
+    wait_for_review_sub(&mut rx, card_id, |s| matches!(s, ReviewSub::ReadyForPr)).await;
+    assert!(wt.path().join("deps").exists(), "setup didn't run");
+}
+
+/// A setup command that fails is a worktree that couldn't be prepared, not a
+/// verdict on the work: the card parks at `Failed` (retryable) with the output,
+/// and no fix attempt is spent on something the code can't repair.
+#[tokio::test]
+async fn failing_setup_parks_the_card_without_running_the_check() {
+    let wt = tempfile::tempdir().unwrap();
+    let (store, card_id) = seed_with(
+        ProjectConfig {
+            worktree_setup_script: Some("echo SETUP-BROKE; exit 1".into()),
+            validate_script: Some("touch check-ran".into()),
+            ..ProjectConfig::default()
+        },
+        wt.path(),
+    );
+    let (handle, mut rx) = executor(&store);
+
+    handle.send(ExecutorCommand::SkipReview { card_id });
+
+    let message = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => match &c.state {
+            CardState::Failed { message, .. } => Some(message.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    assert!(
+        message.contains("SETUP-BROKE"),
+        "failure message: {message}"
+    );
+    assert!(
+        !wt.path().join("check-ran").exists(),
+        "the check ran despite setup failing"
+    );
 }

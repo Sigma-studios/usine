@@ -554,6 +554,7 @@ fn CommandsTab(pid: Uuid) -> Element {
         .worktree_teardown_script
         .clone()
         .unwrap_or_default();
+    let validate_timeout = project.config.validate_timeout_minutes;
 
     rsx! {
         div { class: "section",
@@ -597,7 +598,35 @@ fn CommandsTab(pid: Uuid) -> Element {
                         }
                     },
                 }
-                div { class: "hint", "Runs in the card's worktree before a PR is opened. Non-zero exit fails validation and sends the output to the agent to fix." }
+                div { class: "hint", "Runs in the card's worktree before a PR is opened, after the setup command. Non-zero exit fails validation and sends the output to the agent to fix." }
+            }
+            div { class: "field",
+                label { "Validate timeout (minutes)" }
+                input {
+                    class: "port-num",
+                    r#type: "number",
+                    min: "1",
+                    max: "1440",
+                    placeholder: "30",
+                    value: "{validate_timeout}",
+                    onchange: {
+                        let project = project.clone();
+                        move |e: Event<FormData>| {
+                            let v = e.value().trim().to_string();
+                            // Blank stores 0, which the config reads back as the
+                            // default — that is how the field is reset. Anything
+                            // unparseable is ignored and the field snaps back to
+                            // the stored value on the next render.
+                            let parsed = if v.is_empty() { Some(0) } else { v.parse::<u32>().ok() };
+                            if let Some(n) = parsed {
+                                let mut p = project.clone();
+                                p.config.validate_timeout_minutes = n;
+                                state.save_project(p);
+                            }
+                        }
+                    },
+                }
+                div { class: "hint", "How long setup + validate may take before the card fails as timed out. Raise it for stacks whose first build in a fresh worktree is slow." }
             }
             div { class: "field",
                 label { "Run command" }
