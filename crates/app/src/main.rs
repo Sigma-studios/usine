@@ -78,9 +78,20 @@ fn main() {
     if let Some(icon) = load_window_icon() {
         window = window.with_window_icon(Some(icon));
     }
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(Config::new().with_window(window))
-        .launch(App);
+    // macOS keeps the default menu, so `cfg` is never reassigned there.
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
+    let mut cfg = Config::new().with_window(window);
+    // Dioxus builds a default "Window / Edit" menu bar for every platform. On
+    // macOS that lives in the system menu bar and carries the standard
+    // Cmd+C/V/Q shortcuts, so it stays; on Linux/Windows it is drawn *inside*
+    // the window as a GTK/Win32 menu strip above our own chrome, which looks
+    // out of place and does nothing the app doesn't already do (the webview
+    // handles clipboard keys itself). Drop it there.
+    #[cfg(not(target_os = "macos"))]
+    {
+        cfg = cfg.with_menu(None);
+    }
+    dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
 /// Make the installed `usine` command act like a detached GUI launcher: when run
