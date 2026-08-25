@@ -22,7 +22,7 @@ impl Executor {
                 }
             };
             for project in projects {
-                if !project.config.review_contributors.is_empty() {
+                if project.config.tracks_contributor_prs() {
                     if let Err(e) = self.scan_reviews(project.id).await {
                         tracing::warn!("review scan for {} failed: {e}", project.name);
                     }
@@ -191,17 +191,43 @@ impl Executor {
     /// create a `ToReview` task for each PR we don't already track. Emits the
     /// project's full task list so the UI can refresh its badges and board.
     pub(super) async fn scan_reviews(&self, project_id: Uuid) -> Result<()> {
+        // One scan per project at a time. `ScanReviews` is project-scoped, so
+        // the dispatcher's per-card exclusivity doesn't cover it, and the
+        // manual scan fired when a contributor is added lands right on top of
+        // the 5-minute poll. Two overlapping scans would each decide, from a
+        // task listing taken before their own `gh` round trip, that the same
+        // new PR is untracked — and create a task apiece for it.
+        let gate = {
+            let mut locks = lock(&self.scan_locks);
+            Arc::clone(locks.entry(project_id).or_default())
+        };
+        let _scan = gate.lock().await;
         let project = self.store.get_project(project_id)?;
-        let existing = self.store.list_review_tasks_for_project(project_id)?;
-        let dismissed = self.store.dismissed_reviews(project_id).unwrap_or_default();
-        if !project.config.review_contributors.is_empty() {
-            let prs = self
-                .forge
-                .list_review_prs(&project.path, &project.config.review_contributors)
-                .await?;
+        if project.config.tracks_contributor_prs() {
+            let scope = if project.config.review_all_contributors {
+                ReviewScope::Everyone
+            } else {
+                ReviewScope::Authors(project.config.review_contributors.clone())
+            };
+            // PRs belonging to this project's own cards are never contributor
+            // reviews. `-author:@me` covers the usual case, but usine's agents
+            // may push under a different GitHub account — this is what keeps
+            // "everyone" mode from pulling our own work onto the review board.
+            let own_prs: HashSet<u64> = self
+                .store
+                .list_cards_for_project(project_id)?
+                .iter()
+                .filter_map(|c| c.pr.as_ref().map(|p| p.number))
+                .collect();
+            let prs = self.forge.list_review_prs(&project.path, scope).await?;
+            // Read the board *after* the round trip: the listing is a second
+            // old, and a task started or dismissed meanwhile must not be
+            // duplicated or resurrected.
+            let existing = self.store.list_review_tasks_for_project(project_id)?;
+            let dismissed = self.store.dismissed_reviews(project_id).unwrap_or_default();
             for pr in &prs {
                 // Permanently dismissed by the user — never re-add it.
-                if dismissed.contains(&pr.number) {
+                if dismissed.contains(&pr.number) || own_prs.contains(&pr.number) {
                     continue;
                 }
                 let base = if pr.base_ref.is_empty() {
