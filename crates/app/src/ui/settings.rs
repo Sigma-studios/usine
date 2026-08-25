@@ -554,6 +554,7 @@ fn CommandsTab(pid: Uuid) -> Element {
         .worktree_teardown_script
         .clone()
         .unwrap_or_default();
+    let screenshot_script = project.config.screenshot_script.clone().unwrap_or_default();
 
     rsx! {
         div { class: "section",
@@ -634,6 +635,24 @@ fn CommandsTab(pid: Uuid) -> Element {
                     "Start the app automatically during agent runs"
                 }
                 div { class: "hint", "When off, the agent can still request the app mid-run when it needs to test in it." }
+            }
+            div { class: "field",
+                label { "Screenshot command (optional)" }
+                input {
+                    r#type: "text",
+                    placeholder: "e.g. ./screenshot.sh {{path}}",
+                    value: "{screenshot_script}",
+                    onchange: {
+                        let project = project.clone();
+                        move |e: Event<FormData>| {
+                            let mut p = project.clone();
+                            let v = e.value().trim().to_string();
+                            p.config.screenshot_script = if v.is_empty() { None } else { Some(v) };
+                            state.save_project(p);
+                        }
+                    },
+                }
+                div { class: "hint", "How the agent captures the running app's window, with {{path}} standing in for the image to write. Only used when no ports are declared below — a windowed app is the case where a screenshot is the only way to see the change." }
             }
             div { class: "field",
                 label { "Preview ports" }

@@ -13,8 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::model::{Effort, ModelSpec, Provider};
 
-/// The token replaced by the target directory in a configured "open in
-/// terminal/editor" command (see [`AppSettings::terminal_command`]).
+/// The token replaced by a path in the configured commands that take one: the
+/// target directory in an "open in terminal/editor" command (see
+/// [`AppSettings::terminal_command`]), and the destination image in a project's
+/// [`ProjectConfig::screenshot_script`]. One token across both so a user who has
+/// learned it once doesn't have to learn a second.
 pub const OPEN_PATH_PLACEHOLDER: &str = "{path}";
 
 /// Split a user-configured open-command template into a program + argv, with
@@ -190,6 +193,19 @@ pub struct ProjectConfig {
     /// `agent::testing::PREVIEW_REQUEST_FILE`).
     #[serde(default = "default_auto_preview")]
     pub auto_preview: bool,
+    /// Command the *agent* runs to capture a screenshot of the running app's
+    /// window, with [`OPEN_PATH_PLACEHOLDER`] standing in for the destination
+    /// image. Only consulted for a windowed app (a project with no declared
+    /// [`Self::preview_ports`]), where a screenshot is the agent's only way to
+    /// observe its change.
+    ///
+    /// It exists because there is no portable answer: capturing one window
+    /// depends on the OS and, on Linux, on the compositor — and a project that
+    /// runs its app on a private display (a nested compositor, an Xvfb) is the
+    /// only thing that knows how to reach it. Unset falls back to per-platform
+    /// guidance, which may simply not work.
+    #[serde(default)]
+    pub screenshot_script: Option<String>,
 }
 
 /// Serde default for [`ProjectConfig::auto_preview`]: a project config stored
@@ -209,6 +225,14 @@ impl ProjectConfig {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.base_branch)
     }
+
+    /// The project's screenshot command, `None` when unset or blank.
+    pub fn screenshot_command(&self) -> Option<&str> {
+        self.screenshot_script
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 impl Default for ProjectConfig {
@@ -224,6 +248,7 @@ impl Default for ProjectConfig {
             worktree_teardown_script: None,
             preview_ports: Vec::new(),
             auto_preview: true,
+            screenshot_script: None,
         }
     }
 }
@@ -387,6 +412,19 @@ mod tests {
         assert_eq!(c.validate_script, None);
         assert_eq!(c.effective_base_branch(), "main");
         assert!(c.preview_ports.is_empty());
+        assert_eq!(c.screenshot_command(), None);
+    }
+
+    #[test]
+    fn screenshot_command_ignores_a_blank_setting() {
+        let mut c = ProjectConfig::default();
+        assert_eq!(c.screenshot_command(), None);
+
+        c.screenshot_script = Some("   ".to_string());
+        assert_eq!(c.screenshot_command(), None);
+
+        c.screenshot_script = Some("  ./shot.sh {path}  ".to_string());
+        assert_eq!(c.screenshot_command(), Some("./shot.sh {path}"));
     }
 
     #[test]
