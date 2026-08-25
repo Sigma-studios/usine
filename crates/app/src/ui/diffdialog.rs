@@ -10,8 +10,10 @@
 //! the scannable index into it.
 //!
 //! Like the confirm/menu hosts, it renders once at the app root from a global
-//! signal holding what to show. It computes the diff on open (if not already
-//! cached) and offers a recompute for after a revision.
+//! signal holding what to show. It recomputes the diff on every open — the
+//! cached entry is keyed by entity id alone, and the same id can mean two
+//! different diffs (a PR, then the fix committed on top of it) — and offers a
+//! manual recompute for after a revision.
 
 use std::collections::HashSet;
 
@@ -57,6 +59,9 @@ struct DiffRequest {
     /// DOM id to scroll into view once the diff has rendered — set when the user
     /// jumped here from a specific drafted comment.
     scroll_to: Option<String>,
+    /// Fresh per open. The host computes once per token, which is what makes an
+    /// open recompute rather than re-show whatever the cache holds.
+    token: Uuid,
 }
 
 static DIFF_DIALOG: GlobalSignal<Option<DiffRequest>> = Signal::global(|| None);
@@ -66,6 +71,7 @@ pub(crate) fn open_diff_dialog(card_id: Uuid) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Card(card_id),
         scroll_to: None,
+        token: Uuid::new_v4(),
     });
 }
 
@@ -74,6 +80,7 @@ pub(crate) fn open_review_diff(review_id: Uuid) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Review(review_id),
         scroll_to: None,
+        token: Uuid::new_v4(),
     });
 }
 
@@ -83,6 +90,7 @@ pub(crate) fn open_review_diff_at(review_id: Uuid, comment_index: usize) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Review(review_id),
         scroll_to: Some(reviewdraft::anchor_id(comment_index)),
+        token: Uuid::new_v4(),
     });
 }
 
@@ -99,12 +107,16 @@ pub(crate) fn dismiss_dialog() {
 #[component]
 pub fn DiffDialogHost() -> Element {
     let state = use_context::<AppState>();
-    // Compute the diff when the dialog opens with nothing cached yet. Re-runs
-    // when the target or the diff map changes; the `is_none` guard stops it
-    // from re-firing once `Computing` lands.
+    // Compute the diff once per open. Not "when nothing is cached": the cache is
+    // keyed by entity id, so a review that has since moved to the fix gate would
+    // otherwise re-show the PR diff computed while validating it — under a hint
+    // announcing the fix. The token makes the effect fire exactly once per open,
+    // so a `Computing` landing in the map can't re-trigger it.
+    let mut computed = use_signal(|| None::<Uuid>);
     use_effect(move || {
         if let Some(req) = DIFF_DIALOG.read().as_ref() {
-            if state.diffs.read().get(&req.target.id()).is_none() {
+            if *computed.peek() != Some(req.token) {
+                computed.set(Some(req.token));
                 state.send(req.target.compute());
             }
         }
@@ -144,8 +156,8 @@ pub fn DiffDialogHost() -> Element {
             .review_task(review_id)
             .map(|t| {
                 (
-                    fix_state_of(&t.status).is_some(),
-                    fix_gate_ready(&t.status).then(|| t.head_ref.clone()),
+                    t.status.fix_gate().is_some(),
+                    t.status.fix_gate_ready().then(|| t.head_ref.clone()),
                 )
             })
             .unwrap_or((false, None)),
@@ -647,24 +659,6 @@ fn FixBar(review_id: Uuid, head_ref: String) -> Element {
                 }
             }
         }
-    }
-}
-
-/// The fix state behind a (possibly nested) `Failed`, if any.
-fn fix_state_of(status: &usine_core::ReviewStatus) -> Option<(&[DraftComment], &str)> {
-    match status {
-        usine_core::ReviewStatus::Failed { previous, .. } => fix_state_of(previous),
-        other => other.fix_state(),
-    }
-}
-
-/// Whether a committed fix is waiting at the push gate (a fix run still in
-/// flight has nothing to act on yet).
-fn fix_gate_ready(status: &usine_core::ReviewStatus) -> bool {
-    match status {
-        usine_core::ReviewStatus::FixReady { .. } => true,
-        usine_core::ReviewStatus::Failed { previous, .. } => fix_gate_ready(previous),
-        _ => false,
     }
 }
 

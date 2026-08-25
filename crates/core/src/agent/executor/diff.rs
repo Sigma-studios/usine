@@ -150,11 +150,7 @@ impl Executor {
 }
 
 /// The base sha of a task whose fix is running or waiting at the gate, once one
-/// has been recorded. Looks through `Failed` for the same reason the gate's
-/// actions do: a rejected push leaves a diff worth reading.
+/// has been recorded (a run still queued has none yet).
 fn fix_diff_base(status: &crate::ReviewStatus) -> Option<(&[crate::DraftComment], &str)> {
-    match status {
-        crate::ReviewStatus::Failed { previous, .. } => fix_diff_base(previous),
-        other => other.fix_state().filter(|(_, sha)| !sha.is_empty()),
-    }
+    status.fix_gate().filter(|(_, sha)| !sha.is_empty())
 }

@@ -35,6 +35,11 @@ struct Log {
     /// Plain PR comments (the "pushed <sha>" follow-up, the retraction).
     pr_comments: Vec<String>,
     commits: usize,
+    /// How many times the PR head was fetched into its local branch, and how
+    /// many times the checkout was (re)built — both force-update the branch, so
+    /// either one happening on a redo would wipe the fix commits.
+    fetches: usize,
+    worktree_adds: usize,
 }
 
 type Shared = Arc<Mutex<Log>>;
@@ -51,6 +56,7 @@ struct RecordingGit {
 #[async_trait]
 impl GitOps for RecordingGit {
     async fn worktree_add_existing(&self, _: &Path, _: &str, path: &Path) -> Result<()> {
+        self.log.lock().unwrap().worktree_adds += 1;
         std::fs::create_dir_all(path)?;
         Ok(())
     }
@@ -88,6 +94,7 @@ impl GitOps for RecordingGit {
         SimGit.worktree_add_detached(r, p, c).await
     }
     async fn fetch_pr(&self, r: &Path, n: u64, b: &str) -> Result<()> {
+        self.log.lock().unwrap().fetches += 1;
         SimGit.fetch_pr(r, n, b).await
     }
     async fn reset_mixed(&self, d: &Path, g: &str) -> Result<()> {
@@ -585,4 +592,84 @@ async fn a_pr_merged_mid_fix_settles_as_reviewed() {
     );
     assert!(task.worktree_path.is_none());
     assert!(h.log.lock().unwrap().pushes.is_empty());
+}
+
+#[tokio::test]
+async fn redoing_the_fix_keeps_the_commits_and_never_refetches() {
+    let mut h = harness(same_repo_target());
+    let (review_id, drafts, event) = drafted(&mut h).await;
+    let pr_number = h.store.get_review_task(review_id).unwrap().pr_number;
+
+    h.handle.send(ExecutorCommand::PublishReviewAndFix {
+        review_id,
+        drafts,
+        event,
+        body: "A few notes.".into(),
+    });
+    wait_status(&mut h.rx, review_id, |s| {
+        matches!(s, ReviewStatus::FixReady { .. })
+    })
+    .await;
+    let checkout = h.store.get_review_task(review_id).unwrap().worktree_path;
+    let (fetches, adds) = {
+        let log = h.log.lock().unwrap();
+        (log.fetches, log.worktree_adds)
+    };
+
+    // The user sends it back with feedback. The whole point of the redo is that
+    // it runs *in the same checkout*: re-fetching the PR head force-updates the
+    // local branch, which would throw the fix commit away — and the published
+    // review already promises that fix.
+    h.handle.send(ExecutorCommand::ReviseReviewFix {
+        review_id,
+        note: "keep the helper private".into(),
+    });
+    wait_status(&mut h.rx, review_id, |s| {
+        matches!(s, ReviewStatus::Fixing { .. })
+    })
+    .await;
+    let status = wait_status(&mut h.rx, review_id, |s| {
+        matches!(s, ReviewStatus::FixReady { .. })
+    })
+    .await;
+
+    {
+        let log = h.log.lock().unwrap();
+        assert_eq!(
+            log.fetches, fetches,
+            "the redo never re-fetches the PR head"
+        );
+        assert_eq!(
+            log.worktree_adds, adds,
+            "the redo reuses the checkout rather than rebuilding it"
+        );
+        assert_eq!(log.commits, 2, "the redo commits on top of the first pass");
+        assert!(log.pushes.is_empty(), "a redo still pushes nothing");
+    }
+    match &status {
+        ReviewStatus::FixReady { base_sha, .. } => assert_eq!(
+            base_sha, "basesha0",
+            "the gate still diffs over the PR head the first pass started from"
+        ),
+        other => panic!("expected FixReady, got {other:?}"),
+    }
+    assert_eq!(
+        h.store.get_review_task(review_id).unwrap().worktree_path,
+        checkout,
+        "the same checkout carries the fix across the redo"
+    );
+
+    // And the redone fix pushes like any other.
+    h.handle.send(ExecutorCommand::PushReviewFix { review_id });
+    wait_status(&mut h.rx, review_id, |s| {
+        matches!(s, ReviewStatus::Reviewed)
+    })
+    .await;
+    assert_eq!(
+        h.log.lock().unwrap().pushes,
+        vec![(
+            "origin".to_string(),
+            format!("usine-review/{pr_number}:feat/cache")
+        )]
+    );
 }

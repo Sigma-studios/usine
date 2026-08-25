@@ -133,7 +133,7 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
     // gate the checkout is the user's again (and running the app against the fix
     // before pushing it is exactly what the preview is for).
     let fixing = matches!(st, ReviewStatus::Fixing { .. });
-    let fix_ready = fix_gate_ready(st);
+    let fix_ready = st.fix_gate_ready();
     let published = matches!(st, ReviewStatus::Reviewed);
     // The PR left GitHub (merged or closed) before the review finished — the
     // only thing left to do is acknowledge it.
@@ -142,6 +142,8 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
     // A published or retired task's checkout is torn down, so there's nothing
     // left to run or open; everything before that has (or can get) one on demand.
     let has_checkout = !published && !retired;
+    // A fix we pledged on GitHub and haven't pushed or retracted yet.
+    let has_fix = st.fix_gate().is_some();
     let run_configured = state
         .projects
         .read()
@@ -228,6 +230,7 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                                     // A torn-down checkout can't be opened or run,
                                     // but it can still be re-fetched for a diff.
                                     has_checkout,
+                                    has_fix,
                                 },
                                 target_id: id,
                                 title: menu_title.clone(),
@@ -349,7 +352,9 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                         "Dismiss"
                     }
                 }
-                if failed && !fix_ready && !fix_faulted(st) {
+                // A fault out of the fix flow is not a review to retry: the review
+                // is already on GitHub (the panel offers the gate's actions instead).
+                if failed && st.fix_gate().is_none() {
                     button {
                         class: "btn",
                         title: "Retry the review",
@@ -434,25 +439,5 @@ fn ReviewPreviewControls(review_id: Uuid, tools: PreviewTools) -> Element {
                 IconStop {}
             }
         },
-    }
-}
-
-/// Whether a committed fix is waiting at the push gate — including one whose
-/// push was rejected, which is retried from the same place.
-fn fix_gate_ready(status: &ReviewStatus) -> bool {
-    match status {
-        ReviewStatus::FixReady { .. } => true,
-        ReviewStatus::Failed { previous, .. } => fix_gate_ready(previous),
-        _ => false,
-    }
-}
-
-/// Whether a fault came out of the fix flow rather than the review pass. Such a
-/// task's review is already on GitHub, so the board must not offer to re-run it
-/// (the panel offers the gate's actions instead).
-fn fix_faulted(status: &ReviewStatus) -> bool {
-    match status {
-        ReviewStatus::Failed { previous, .. } => fix_faulted(previous),
-        other => other.fix_state().is_some(),
     }
 }

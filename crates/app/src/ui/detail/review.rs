@@ -251,8 +251,8 @@ fn ReviewPanel(task: ReviewTask) -> Element {
             // A fault carried over from a fix run is not a review to retry: the
             // review is published, and the checkout (with any commits already
             // made) is still there. Offer the gate's actions instead.
-            ReviewStatus::Failed { message, previous } if fix_state_of(previous).is_some() => {
-                let (comments, _) = fix_state_of(previous).unwrap();
+            ReviewStatus::Failed { message, previous } if previous.fix_gate().is_some() => {
+                let (comments, _) = previous.fix_gate().unwrap();
                 rsx! {
                     FixGate {
                         review_id: id,
@@ -262,7 +262,7 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                         // Only a fix that got as far as committing can be
                         // pushed; a run that faulted before that has nothing
                         // on the branch, so Redo is the way out.
-                        pushable: fix_committed(previous),
+                        pushable: previous.fix_gate_ready(),
                         failure: Some(message.clone()),
                     }
                 }
@@ -570,25 +570,6 @@ fn FixGate(
                 }
             }
         }
-    }
-}
-
-/// Whether a fix reached the gate — i.e. something is committed and waiting to
-/// be pushed. A fault *after* the gate (a rejected push) still counts.
-fn fix_committed(status: &ReviewStatus) -> bool {
-    match status {
-        ReviewStatus::FixReady { .. } => true,
-        ReviewStatus::Failed { previous, .. } => fix_committed(previous),
-        _ => false,
-    }
-}
-
-/// The fix state behind a (possibly nested) `Failed`, if any — what tells a
-/// faulted fix from a faulted review pass.
-fn fix_state_of(status: &ReviewStatus) -> Option<(&[DraftComment], &str)> {
-    match status {
-        ReviewStatus::Failed { previous, .. } => fix_state_of(previous),
-        other => other.fix_state(),
     }
 }
 

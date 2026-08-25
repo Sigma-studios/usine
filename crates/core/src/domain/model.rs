@@ -1125,6 +1125,28 @@ impl ReviewStatus {
         }
     }
 
+    /// [`Self::fix_state`] looked through `Failed`: the comments and base sha of
+    /// a fix that is running, waiting at the gate, or faulted out of either.
+    /// This is what keeps the gate's actions (push, redo, discard) available
+    /// after a rejected push or a crashed fix run.
+    pub fn fix_gate(&self) -> Option<(&[DraftComment], &str)> {
+        match self {
+            ReviewStatus::Failed { previous, .. } => previous.fix_gate(),
+            other => other.fix_state(),
+        }
+    }
+
+    /// Whether a fix is committed and waiting at the gate (as opposed to a fix
+    /// run still in flight, or one that faulted before committing). A fault
+    /// *after* the gate — a rejected push — still counts.
+    pub fn fix_gate_ready(&self) -> bool {
+        match self {
+            ReviewStatus::FixReady { .. } => true,
+            ReviewStatus::Failed { previous, .. } => previous.fix_gate_ready(),
+            _ => false,
+        }
+    }
+
     pub fn is_failed(&self) -> bool {
         matches!(self, ReviewStatus::Failed { .. })
     }
