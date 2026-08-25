@@ -176,6 +176,9 @@ pub enum ExecutorCommand {
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
+    /// List the GitHub logins with an open PR on a project's repo — the
+    /// contributor picker's suggestions. Result: a `PrAuthors` event.
+    ListPrAuthors { project_id: Uuid },
 
     // --- branch adoption (turning an existing branch into a card) ---------
     /// List a project's branches that could be adopted into a card (local +
@@ -430,6 +433,7 @@ impl ExecutorCommand {
             // Project-scoped / global — no single entity. `AdoptBranch`
             // creates its card mid-handler and claims it there.
             ExecutorCommand::ListReviewers { .. }
+            | ExecutorCommand::ListPrAuthors { .. }
             | ExecutorCommand::ListAdoptSources { .. }
             | ExecutorCommand::ProbeAdoptSource { .. }
             | ExecutorCommand::AdoptBranch { .. }
@@ -578,6 +582,11 @@ pub enum ExecutorEventKind {
         project_id: Uuid,
         logins: Vec<String>,
     },
+    /// The GitHub logins with an open PR on a project's repo (project-scoped).
+    PrAuthors {
+        project_id: Uuid,
+        logins: Vec<String>,
+    },
     /// A project's adoptable branches (project-scoped; the adopt dialog's
     /// picker replaces its list).
     AdoptSources { project_id: Uuid, refs: Vec<String> },
@@ -708,6 +717,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id: Uuid::nil(),
             kind: ExecutorEventKind::Reviewers { project_id, logins },
+        }
+    }
+    pub fn pr_authors(project_id: Uuid, logins: Vec<String>) -> Self {
+        ExecutorEvent {
+            card_id: Uuid::nil(),
+            kind: ExecutorEventKind::PrAuthors { project_id, logins },
         }
     }
     pub fn adopt_sources(project_id: Uuid, refs: Vec<String>) -> Self {

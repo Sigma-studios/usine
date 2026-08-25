@@ -297,20 +297,69 @@ pub fn pr_for_head_args(head: &str) -> Vec<String> {
     ]
 }
 
-/// Open PRs authored by any of `authors` that the current user hasn't yet
-/// reviewed. `author:` qualifiers OR together; `-reviewed-by:@me` is how "PRs I
-/// haven't reviewed" is expressed; drafts are excluded. Scoped to the current
-/// repo by `gh pr list`.
-pub fn review_prs_args(authors: &[String]) -> Vec<String> {
+/// A GitHub login as typed by a human, or `None` if it can't be one.
+///
+/// Everything downstream interpolates the login straight into a `gh --search`
+/// query, where a space turns the rest of the input into a free-text term that
+/// ANDs with the whole query — so "Nathan FCG" or a pasted profile URL would
+/// silently return nothing instead of that person's PRs. Accepted shapes are a
+/// bare login, `@login`, and any `github.com/login` URL; the result is checked
+/// against GitHub's own rule (alphanumerics and single inner hyphens, at most
+/// 39 characters) so nothing else can ever reach a query.
+pub fn normalize_login(input: &str) -> Option<String> {
+    let raw = input.trim();
+    // A pasted profile URL: keep the first path segment after the host, so
+    // `https://github.com/foo/bar/pull/1` and `github.com/foo` both give `foo`.
+    let raw = match raw.split_once("github.com/") {
+        Some((_, rest)) => rest.split(['/', '?', '#']).next().unwrap_or(""),
+        None => raw,
+    };
+    let login = raw.trim().trim_start_matches('@').trim();
+    let valid = !login.is_empty()
+        && login.len() <= 39
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && !login.contains("--");
+    valid.then(|| login.to_string())
+}
+
+/// Which open PRs the review board should track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewScope {
+    /// Only PRs authored by these logins.
+    Authors(Vec<String>),
+    /// Every open PR except the current user's own.
+    Everyone,
+}
+
+/// Open PRs in `scope` that the current user hasn't yet reviewed.
+/// [`ReviewScope::Authors`] ORs `author:` qualifiers together;
+/// [`ReviewScope::Everyone`] excludes the current user's own PRs instead.
+/// `-reviewed-by:@me` is how "PRs I haven't reviewed" is expressed; drafts are
+/// excluded. Scoped to the current repo by `gh pr list`.
+pub fn review_prs_args(scope: &ReviewScope) -> Vec<String> {
     let mut search = String::from("-reviewed-by:@me -is:draft");
-    for a in authors.iter().filter(|a| !a.is_empty()) {
-        search.push_str(&format!(" author:{a}"));
+    match scope {
+        ReviewScope::Authors(authors) => {
+            // Anything that isn't a login is dropped rather than interpolated:
+            // a stray space would AND a free-text term onto the whole query and
+            // quietly empty the board (see [`normalize_login`]).
+            for a in authors.iter().filter_map(|a| normalize_login(a)) {
+                search.push_str(&format!(" author:{a}"));
+            }
+        }
+        ReviewScope::Everyone => search.push_str(" -author:@me"),
     }
     vec![
         "pr".into(),
         "list".into(),
         "--state".into(),
         "open".into(),
+        // `gh pr list` caps a `--search` listing at 30 by default, which would
+        // silently truncate the listing on a busy repo.
+        "--limit".into(),
+        "100".into(),
         // `body`, `statusCheckRollup` and `mergeable` ride along on the same
         // listing so the board can show intent and CI state without an extra
         // round-trip per PR.
@@ -319,6 +368,115 @@ pub fn review_prs_args(authors: &[String]) -> Vec<String> {
         "--search".into(),
         search,
     ]
+}
+
+/// The open PRs whose authors the contributor picker suggests. Mirrors the
+/// scan's own filters (open, not a draft, not mine) so the picker can't
+/// advertise someone the scan would find nothing for — but deliberately *not*
+/// `-reviewed-by:@me`: someone whose PR you already reviewed once is still
+/// someone worth tracking from now on.
+pub fn pr_authors_args() -> Vec<String> {
+    vec![
+        "pr".into(),
+        "list".into(),
+        "--state".into(),
+        "open".into(),
+        "--limit".into(),
+        "100".into(),
+        "--json".into(),
+        "author".into(),
+        "--search".into(),
+        "-is:draft -author:@me".into(),
+    ]
+}
+
+/// Distinct human logins out of a `gh pr list --json author` payload, busiest
+/// author first (ties broken by login) so the picker leads with whoever has the
+/// most PRs waiting. Bots are dropped and logins deduped case-insensitively —
+/// GitHub logins are case-insensitive, and the same person spelled two ways
+/// would otherwise show up twice.
+pub fn parse_pr_authors(value: &Value) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for pr in value.as_array().map(Vec::as_slice).unwrap_or_default() {
+        if pr.pointer("/author/is_bot").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(login) = pr.pointer("/author/login").and_then(Value::as_str) else {
+            continue;
+        };
+        let login = login.trim();
+        if login.is_empty() {
+            continue;
+        }
+        match counts
+            .iter_mut()
+            .find(|(l, _)| l.eq_ignore_ascii_case(login))
+        {
+            Some((_, n)) => *n += 1,
+            None => counts.push((login.to_string(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    counts.into_iter().map(|(l, _)| l).collect()
+}
+
+/// Turn a `gh pr list` review listing into [`PrSummary`]s. `drop_bots` skips
+/// bot-authored PRs — without it, "everyone" mode on a repo with dependabot or
+/// renovate would flood the review board. An explicitly pinned author is always
+/// honoured, so the author path never drops anything.
+pub fn parse_review_prs(value: &Value, drop_bots: bool) -> Vec<PrSummary> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| {
+            !drop_bots || p.pointer("/author/is_bot").and_then(Value::as_bool) != Some(true)
+        })
+        .map(|p| PrSummary {
+            number: p.get("number").and_then(Value::as_u64).unwrap_or(0),
+            title: p
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            author: p
+                .pointer("/author/login")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            head_ref: p
+                .get("headRefName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            base_ref: p
+                .get("baseRefName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            url: p
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            body: p
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            checks: p
+                .get("statusCheckRollup")
+                .map(rollup_status)
+                .unwrap_or_default(),
+            mergeable: p
+                .get("mergeable")
+                .and_then(Value::as_str)
+                .map(parse_mergeable)
+                .unwrap_or_default(),
+        })
+        .filter(|p| p.number != 0)
+        .collect()
 }
 
 /// Collapse a PR's `statusCheckRollup` array into a single [`CheckStatus`].
@@ -631,8 +789,8 @@ pub trait Forge: Send + Sync {
 
     async fn fetch_comments(&self, repo: &Path, pr_number: u64) -> Result<Vec<ReviewComment>>;
 
-    /// Open PRs by any of `authors` that the current user hasn't yet reviewed.
-    async fn list_review_prs(&self, repo: &Path, authors: &[String]) -> Result<Vec<PrSummary>>;
+    /// Open PRs in `scope` that the current user hasn't yet reviewed.
+    async fn list_review_prs(&self, repo: &Path, scope: ReviewScope) -> Result<Vec<PrSummary>>;
 
     /// Submit a review (a batch of inline comments + an overall verdict) on a PR.
     async fn submit_review(
@@ -646,6 +804,13 @@ pub trait Forge: Send + Sync {
 
     /// GitHub logins that can be requested as PR reviewers on this repo.
     async fn list_reviewers(&self, repo: &Path) -> Result<Vec<String>>;
+
+    /// GitHub logins with an open PR on this repo — the contributor picker's
+    /// suggestions, which collaborators alone miss entirely for fork PRs.
+    /// Defaulted rather than required: test doubles never call it.
+    async fn list_pr_authors(&self, _repo: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 
     /// The latest submitted review per reviewer (who actually reviewed).
     async fn list_submitted_reviews(
@@ -812,60 +977,18 @@ impl Forge for GhForge {
             .collect())
     }
 
-    async fn list_review_prs(&self, repo: &Path, authors: &[String]) -> Result<Vec<PrSummary>> {
-        let authors: Vec<String> = authors.iter().filter(|a| !a.is_empty()).cloned().collect();
-        if authors.is_empty() {
-            return Ok(Vec::new());
+    async fn list_review_prs(&self, repo: &Path, scope: ReviewScope) -> Result<Vec<PrSummary>> {
+        // No pinned authors means nothing to search for — skip the gh call
+        // entirely rather than issuing an unqualified listing.
+        if let ReviewScope::Authors(authors) = &scope {
+            if authors.iter().all(|a| a.is_empty()) {
+                return Ok(Vec::new());
+            }
         }
-        let json = run_gh(repo, &review_prs_args(&authors)).await?;
+        let drop_bots = matches!(scope, ReviewScope::Everyone);
+        let json = run_gh(repo, &review_prs_args(&scope)).await?;
         let value: Value = serde_json::from_str(&json)?;
-        let arr = value.as_array().cloned().unwrap_or_default();
-        Ok(arr
-            .iter()
-            .map(|p| PrSummary {
-                number: p.get("number").and_then(Value::as_u64).unwrap_or(0),
-                title: p
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                author: p
-                    .pointer("/author/login")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                head_ref: p
-                    .get("headRefName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                base_ref: p
-                    .get("baseRefName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                url: p
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                body: p
-                    .get("body")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                checks: p
-                    .get("statusCheckRollup")
-                    .map(rollup_status)
-                    .unwrap_or_default(),
-                mergeable: p
-                    .get("mergeable")
-                    .and_then(Value::as_str)
-                    .map(parse_mergeable)
-                    .unwrap_or_default(),
-            })
-            .filter(|p| p.number != 0)
-            .collect())
+        Ok(parse_review_prs(&value, drop_bots))
     }
 
     async fn submit_review(
@@ -889,6 +1012,12 @@ impl Forge for GhForge {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect())
+    }
+
+    async fn list_pr_authors(&self, repo: &Path) -> Result<Vec<String>> {
+        let json = run_gh(repo, &pr_authors_args()).await?;
+        let value: Value = serde_json::from_str(&json)?;
+        Ok(parse_pr_authors(&value))
     }
 
     async fn list_submitted_reviews(
@@ -1086,8 +1215,8 @@ impl Forge for SimForge {
         ])
     }
 
-    async fn list_review_prs(&self, _repo: &Path, _authors: &[String]) -> Result<Vec<PrSummary>> {
-        Ok(vec![
+    async fn list_review_prs(&self, _repo: &Path, scope: ReviewScope) -> Result<Vec<PrSummary>> {
+        let mut prs = vec![
             PrSummary {
                 number: 101,
                 title: "Add caching layer".into(),
@@ -1113,7 +1242,24 @@ impl Forge for SimForge {
                 checks: CheckStatus::Failing,
                 mergeable: Mergeable::Conflicting,
             },
-        ])
+        ];
+        // "Everyone" mode must be visibly different in the simulator: a PR by
+        // someone who is *not* a collaborator, i.e. exactly the fork
+        // contributor the pinned-author path can never reach.
+        if scope == ReviewScope::Everyone {
+            prs.push(PrSummary {
+                number: 103,
+                title: "Typo in the onboarding guide".into(),
+                author: "outside-contributor".into(),
+                head_ref: "docs/typo".into(),
+                base_ref: "main".into(),
+                url: "https://github.com/example/repo/pull/103".into(),
+                body: "Drive-by fix from a fork — the author isn't a repo collaborator.".into(),
+                checks: CheckStatus::Passing,
+                mergeable: Mergeable::Clean,
+            });
+        }
+        Ok(prs)
     }
 
     async fn submit_review(
@@ -1129,6 +1275,16 @@ impl Forge for SimForge {
 
     async fn list_reviewers(&self, _repo: &Path) -> Result<Vec<String>> {
         Ok(vec!["octocat".into(), "hubot".into(), "monalisa".into()])
+    }
+
+    async fn list_pr_authors(&self, _repo: &Path) -> Result<Vec<String>> {
+        // `outside-contributor` and `drive-by` are deliberately absent from
+        // `list_reviewers` — they're what the picker gains over collaborators.
+        Ok(vec![
+            "octocat".into(),
+            "outside-contributor".into(),
+            "drive-by".into(),
+        ])
     }
 
     async fn list_submitted_reviews(
@@ -1404,7 +1560,7 @@ mod tests {
 
     #[test]
     fn review_prs_request_body_and_check_fields() {
-        let args = review_prs_args(&["octocat".into()]);
+        let args = review_prs_args(&ReviewScope::Authors(vec!["octocat".into()]));
         let fields = args
             .iter()
             .find(|a| a.contains("headRefName"))
@@ -1677,7 +1833,11 @@ mod tests {
 
     #[test]
     fn review_prs_search_ors_authors_and_excludes_reviewed_and_drafts() {
-        let args = review_prs_args(&["alice".into(), "bob".into(), "".into()]);
+        let args = review_prs_args(&ReviewScope::Authors(vec![
+            "alice".into(),
+            "bob".into(),
+            "".into(),
+        ]));
         assert_eq!(&args[0..2], &["pr", "list"]);
         assert!(args.windows(2).any(|w| w == ["--state", "open"]));
         let search = args
@@ -1692,6 +1852,125 @@ mod tests {
         // Empty author is skipped, not emitted as a bare `author:`.
         assert!(!search.contains("author: "));
         assert!(!search.ends_with("author:"));
+        // Without an explicit limit gh silently truncates a search listing at 30.
+        assert!(args.windows(2).any(|w| w == ["--limit", "100"]));
+    }
+
+    #[test]
+    fn normalize_login_accepts_the_shapes_people_paste() {
+        assert_eq!(normalize_login("octocat").as_deref(), Some("octocat"));
+        assert_eq!(normalize_login("  @octocat ").as_deref(), Some("octocat"));
+        assert_eq!(
+            normalize_login("https://github.com/octocat").as_deref(),
+            Some("octocat")
+        );
+        assert_eq!(
+            normalize_login("https://github.com/octocat/repo/pull/7").as_deref(),
+            Some("octocat")
+        );
+        assert_eq!(
+            normalize_login("github.com/octo-cat").as_deref(),
+            Some("octo-cat")
+        );
+    }
+
+    #[test]
+    fn normalize_login_rejects_anything_a_search_would_choke_on() {
+        // A space is the dangerous one: it becomes a free-text term ANDed with
+        // the rest of the query, so the board silently empties.
+        assert_eq!(normalize_login("Nathan FCG"), None);
+        assert_eq!(normalize_login(""), None);
+        assert_eq!(normalize_login("@"), None);
+        assert_eq!(normalize_login("-lead"), None);
+        assert_eq!(normalize_login("trail-"), None);
+        assert_eq!(normalize_login("do--uble"), None);
+        assert_eq!(normalize_login("no_underscores"), None);
+        assert_eq!(normalize_login(&"a".repeat(40)), None);
+    }
+
+    #[test]
+    fn review_prs_search_drops_authors_that_are_not_logins() {
+        let args = review_prs_args(&ReviewScope::Authors(vec![
+            "Nathan FCG".into(),
+            "https://github.com/octocat".into(),
+            "@alice".into(),
+        ]));
+        let search = args
+            .iter()
+            .skip_while(|a| *a != "--search")
+            .nth(1)
+            .expect("search term");
+        assert!(!search.contains("Nathan"));
+        assert!(!search.contains("github.com"));
+        assert!(search.contains("author:octocat"));
+        assert!(search.contains("author:alice"));
+    }
+
+    #[test]
+    fn review_prs_everyone_excludes_own_prs_and_names_no_author() {
+        let args = review_prs_args(&ReviewScope::Everyone);
+        let search = args
+            .iter()
+            .skip_while(|a| *a != "--search")
+            .nth(1)
+            .expect("search term");
+        assert!(search.contains("-author:@me"));
+        assert!(search.contains("-reviewed-by:@me"));
+        assert!(search.contains("-is:draft"));
+        // No positive `author:` qualifier, which would narrow it back down.
+        assert!(!search.contains(" author:"));
+        assert!(args.windows(2).any(|w| w == ["--limit", "100"]));
+    }
+
+    #[test]
+    fn parse_review_prs_drops_bots_only_when_asked() {
+        let value = serde_json::json!([
+            { "number": 1, "title": "human", "author": { "login": "alice", "is_bot": false } },
+            { "number": 2, "title": "bump", "author": { "login": "dependabot", "is_bot": true } },
+        ]);
+        let kept: Vec<u64> = parse_review_prs(&value, false)
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(kept, vec![1, 2]);
+        let filtered: Vec<u64> = parse_review_prs(&value, true)
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(filtered, vec![1]);
+    }
+
+    #[test]
+    fn pr_authors_args_lists_open_non_draft_prs_by_others() {
+        let args = pr_authors_args();
+        assert_eq!(&args[0..2], &["pr", "list"]);
+        assert!(args.windows(2).any(|w| w == ["--state", "open"]));
+        assert!(args.windows(2).any(|w| w == ["--json", "author"]));
+        assert!(args.windows(2).any(|w| w == ["--limit", "100"]));
+        let search = args
+            .iter()
+            .skip_while(|a| *a != "--search")
+            .nth(1)
+            .expect("search term");
+        assert!(search.contains("-is:draft"));
+        assert!(search.contains("-author:@me"));
+        // Someone whose PR you reviewed once is still worth tracking, so the
+        // suggestions deliberately don't inherit the scan's reviewed filter.
+        assert!(!search.contains("-reviewed-by:@me"));
+    }
+
+    #[test]
+    fn parse_pr_authors_ranks_by_open_prs_dedupes_and_drops_bots() {
+        let value = serde_json::json!([
+            { "author": { "login": "alice", "is_bot": false } },
+            { "author": { "login": "bob", "is_bot": false } },
+            { "author": { "login": "Alice", "is_bot": false } },
+            { "author": { "login": "renovate", "is_bot": true } },
+            { "author": { "login": "carol", "is_bot": false } },
+        ]);
+        // alice has two (case-insensitively the same person), then the
+        // one-PR authors alphabetically; the bot never shows up.
+        assert_eq!(parse_pr_authors(&value), vec!["alice", "bob", "carol"]);
     }
 
     #[test]

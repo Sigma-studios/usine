@@ -21,8 +21,8 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, CoreError, DraftComment, ExecutorCommand,
     ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps, MergeOutcome, Mergeable,
-    PrInfo, PrSummary, Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewSummary,
-    SimFactory, SimForge, SimGit, Store,
+    PrInfo, PrSummary, Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewScope,
+    ReviewSummary, SimFactory, SimForge, SimGit, Store,
 };
 
 /// Run `git <args>` in `dir`, asserting success.
@@ -152,8 +152,12 @@ impl Forge for CleanupFailsForge {
     async fn fetch_comments(&self, r: &Path, n: u64) -> usine_core::Result<Vec<ReviewComment>> {
         SimForge.fetch_comments(r, n).await
     }
-    async fn list_review_prs(&self, r: &Path, a: &[String]) -> usine_core::Result<Vec<PrSummary>> {
-        SimForge.list_review_prs(r, a).await
+    async fn list_review_prs(
+        &self,
+        r: &Path,
+        s: ReviewScope,
+    ) -> usine_core::Result<Vec<PrSummary>> {
+        SimForge.list_review_prs(r, s).await
     }
     async fn submit_review(
         &self,
@@ -395,9 +399,9 @@ async fn an_already_merged_pr_still_completes_the_card() {
         async fn list_review_prs(
             &self,
             r: &Path,
-            a: &[String],
+            s: ReviewScope,
         ) -> usine_core::Result<Vec<PrSummary>> {
-            SimForge.list_review_prs(r, a).await
+            SimForge.list_review_prs(r, s).await
         }
         async fn submit_review(
             &self,
