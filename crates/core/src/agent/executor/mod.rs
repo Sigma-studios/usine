@@ -138,6 +138,7 @@ pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<Execu
                     in_flight: Arc::new(Mutex::new(HashSet::new())),
                     previews: previews_for_exec,
                     validations: validations_for_exec,
+                    scan_locks: Mutex::new(HashMap::new()),
                     gate: Mutex::new(gate::RunGate::new()),
                     self_ref: self_ref.clone(),
                 });
@@ -290,6 +291,11 @@ fn cancel_run(runs: &RunMap, card_id: Uuid, run_id: Uuid) {
     }
 }
 
+/// Per-project locks serializing review scans (see `Executor::scan_reviews`).
+/// Entries are created on first scan and kept: one `Arc<Mutex<()>>` per project
+/// is nothing, and dropping one mid-scan would defeat the point.
+type ScanLocks = Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>;
+
 struct Executor {
     store: Store,
     providers: Arc<dyn ProviderFactory>,
@@ -308,6 +314,9 @@ struct Executor {
     /// Running validation checks' process-group pids, keyed by card id (see
     /// [`ValidationMap`]).
     validations: ValidationMap,
+    /// Serializes review scans per project, so two overlapping scans can't both
+    /// decide a just-opened PR is untracked and create a task apiece for it.
+    scan_locks: ScanLocks,
     /// The global concurrency gate: active slot owners + the FIFO queue of
     /// launches waiting for one (see [`gate::RunGate`]).
     gate: Mutex<gate::RunGate>,

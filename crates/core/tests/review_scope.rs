@@ -100,3 +100,37 @@ async fn all_contributors_scans_without_a_pinned_list() {
         "everyone mode missed the fork contributor: {authors:?}"
     );
 }
+
+/// Two scans fired back to back — what happens when the "scan now" of a freshly
+/// added contributor lands on top of the 5-minute poll. Each decides what to
+/// create from a task listing read before its own forge round trip, so without
+/// serialization both see the same PR as untracked and create a task apiece.
+#[tokio::test]
+async fn overlapping_scans_create_one_task_per_pr() {
+    let (handle, mut rx, project_id) = spawn(ProjectConfig {
+        review_all_contributors: true,
+        ..Default::default()
+    });
+
+    handle.send(ExecutorCommand::ScanReviews { project_id });
+    handle.send(ExecutorCommand::ScanReviews { project_id });
+
+    // Both scans emit the project's full task list; the second one's is the
+    // settled state, so wait until two updates have gone by.
+    let mut seen = 0;
+    let tasks = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::ReviewTasksUpdated { tasks, .. } => {
+            seen += 1;
+            (seen == 2).then(|| tasks.clone())
+        }
+        _ => None,
+    })
+    .await;
+
+    let mut numbers: Vec<u64> = tasks.iter().map(|t| t.pr_number).collect();
+    let total = numbers.len();
+    numbers.sort_unstable();
+    numbers.dedup();
+    assert_eq!(numbers.len(), total, "duplicate review tasks: {tasks:?}");
+    assert!(!numbers.is_empty(), "the scan found no PRs to dedupe");
+}

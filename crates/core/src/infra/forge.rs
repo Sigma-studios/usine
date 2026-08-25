@@ -297,6 +297,33 @@ pub fn pr_for_head_args(head: &str) -> Vec<String> {
     ]
 }
 
+/// A GitHub login as typed by a human, or `None` if it can't be one.
+///
+/// Everything downstream interpolates the login straight into a `gh --search`
+/// query, where a space turns the rest of the input into a free-text term that
+/// ANDs with the whole query — so "Nathan FCG" or a pasted profile URL would
+/// silently return nothing instead of that person's PRs. Accepted shapes are a
+/// bare login, `@login`, and any `github.com/login` URL; the result is checked
+/// against GitHub's own rule (alphanumerics and single inner hyphens, at most
+/// 39 characters) so nothing else can ever reach a query.
+pub fn normalize_login(input: &str) -> Option<String> {
+    let raw = input.trim();
+    // A pasted profile URL: keep the first path segment after the host, so
+    // `https://github.com/foo/bar/pull/1` and `github.com/foo` both give `foo`.
+    let raw = match raw.split_once("github.com/") {
+        Some((_, rest)) => rest.split(['/', '?', '#']).next().unwrap_or(""),
+        None => raw,
+    };
+    let login = raw.trim().trim_start_matches('@').trim();
+    let valid = !login.is_empty()
+        && login.len() <= 39
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && !login.contains("--");
+    valid.then(|| login.to_string())
+}
+
 /// Which open PRs the review board should track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewScope {
@@ -315,7 +342,10 @@ pub fn review_prs_args(scope: &ReviewScope) -> Vec<String> {
     let mut search = String::from("-reviewed-by:@me -is:draft");
     match scope {
         ReviewScope::Authors(authors) => {
-            for a in authors.iter().filter(|a| !a.is_empty()) {
+            // Anything that isn't a login is dropped rather than interpolated:
+            // a stray space would AND a free-text term onto the whole query and
+            // quietly empty the board (see [`normalize_login`]).
+            for a in authors.iter().filter_map(|a| normalize_login(a)) {
                 search.push_str(&format!(" author:{a}"));
             }
         }
@@ -1824,6 +1854,56 @@ mod tests {
         assert!(!search.ends_with("author:"));
         // Without an explicit limit gh silently truncates a search listing at 30.
         assert!(args.windows(2).any(|w| w == ["--limit", "100"]));
+    }
+
+    #[test]
+    fn normalize_login_accepts_the_shapes_people_paste() {
+        assert_eq!(normalize_login("octocat").as_deref(), Some("octocat"));
+        assert_eq!(normalize_login("  @octocat ").as_deref(), Some("octocat"));
+        assert_eq!(
+            normalize_login("https://github.com/octocat").as_deref(),
+            Some("octocat")
+        );
+        assert_eq!(
+            normalize_login("https://github.com/octocat/repo/pull/7").as_deref(),
+            Some("octocat")
+        );
+        assert_eq!(
+            normalize_login("github.com/octo-cat").as_deref(),
+            Some("octo-cat")
+        );
+    }
+
+    #[test]
+    fn normalize_login_rejects_anything_a_search_would_choke_on() {
+        // A space is the dangerous one: it becomes a free-text term ANDed with
+        // the rest of the query, so the board silently empties.
+        assert_eq!(normalize_login("Nathan FCG"), None);
+        assert_eq!(normalize_login(""), None);
+        assert_eq!(normalize_login("@"), None);
+        assert_eq!(normalize_login("-lead"), None);
+        assert_eq!(normalize_login("trail-"), None);
+        assert_eq!(normalize_login("do--uble"), None);
+        assert_eq!(normalize_login("no_underscores"), None);
+        assert_eq!(normalize_login(&"a".repeat(40)), None);
+    }
+
+    #[test]
+    fn review_prs_search_drops_authors_that_are_not_logins() {
+        let args = review_prs_args(&ReviewScope::Authors(vec![
+            "Nathan FCG".into(),
+            "https://github.com/octocat".into(),
+            "@alice".into(),
+        ]));
+        let search = args
+            .iter()
+            .skip_while(|a| *a != "--search")
+            .nth(1)
+            .expect("search term");
+        assert!(!search.contains("Nathan"));
+        assert!(!search.contains("github.com"));
+        assert!(search.contains("author:octocat"));
+        assert!(search.contains("author:alice"));
     }
 
     #[test]

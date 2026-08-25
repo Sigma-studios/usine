@@ -56,7 +56,7 @@ pub use domain::model::{
 pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
 pub use error::{CoreError, Result};
 pub use infra::forge::{
-    FailedCheck, Forge, GhForge, LivePrState, PrSummary, ReviewScope, SimForge,
+    normalize_login, FailedCheck, Forge, GhForge, LivePrState, PrSummary, ReviewScope, SimForge,
 };
 pub use infra::git::{
     remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,

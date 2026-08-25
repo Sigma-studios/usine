@@ -3,7 +3,7 @@
 //! app-wide config (open-in commands, run cap).
 
 use dioxus::prelude::*;
-use usine_core::{CardConfig, PreviewPort, Project};
+use usine_core::{normalize_login, CardConfig, PreviewPort, Project};
 use uuid::Uuid;
 
 use super::widgets::{
@@ -330,22 +330,55 @@ pub fn ProjectSettingsModal() -> Element {
 /// scan straight away so the PR lands in seconds instead of at the next
 /// 5-minute poll — `SaveProject` runs inline in the dispatcher, ahead of the
 /// spawned scan, so the scan is guaranteed to see the saved config.
-/// A blank, `@`-prefixed or already-pinned login is a no-op.
-fn add_contributor(state: AppState, project: &Project, login: &str) {
-    let login = login.trim().trim_start_matches('@').trim().to_string();
-    if login.is_empty()
-        || project
-            .config
-            .review_contributors
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&login))
+///
+/// The input is normalized first (`@login` and pasted profile URLs are
+/// accepted) and rejected if it can't be a GitHub login: it ends up
+/// interpolated into a `gh --search` query, where a space would turn the rest
+/// into a free-text term and quietly empty the board. `Err` carries the message
+/// to show; an already-pinned login is a silent no-op.
+fn add_contributor(state: AppState, project: &Project, input: &str) -> Result<(), String> {
+    let Some(login) = normalize_login(input) else {
+        return Err(if input.trim().is_empty() {
+            "Enter a GitHub login.".into()
+        } else {
+            format!(
+                "“{}” isn’t a GitHub login — letters, digits and hyphens only.",
+                input.trim()
+            )
+        });
+    };
+    if project
+        .config
+        .review_contributors
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&login))
     {
-        return;
+        return Ok(());
     }
     let mut p = project.clone();
     p.config.review_contributors.push(login);
     state.save_project(p);
     state.scan_reviews(project.id);
+    Ok(())
+}
+
+/// Submit whatever is in the manual login box: on success the box is cleared,
+/// otherwise the text stays put with the reason underneath so it can be fixed
+/// rather than retyped.
+fn submit_manual(
+    state: AppState,
+    project: &Project,
+    mut manual: Signal<String>,
+    mut manual_err: Signal<String>,
+) {
+    let input = manual.peek().clone();
+    match add_contributor(state, project, &input) {
+        Ok(()) => {
+            manual.set(String::new());
+            manual_err.set(String::new());
+        }
+        Err(msg) => manual_err.set(msg),
+    }
 }
 
 /// The "Reviews" tab: which contributors' PRs to surface on the review board, and
@@ -396,6 +429,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
         .cloned()
         .collect();
     let mut manual = use_signal(String::new);
+    let mut manual_err = use_signal(String::new);
 
     rsx! {
         div { class: "section",
@@ -476,13 +510,19 @@ fn ReviewsTab(pid: Uuid) -> Element {
                     value: "",
                     onchange: {
                         let project = project.clone();
-                        move |e: Event<FormData>| add_contributor(state, &project, &e.value())
+                        // Every option is a login gh gave us, so this can't fail.
+                        move |e: Event<FormData>| { let _ = add_contributor(state, &project, &e.value()); }
                     },
                     option { value: "", disabled: true, selected: true,
-                        if author_opts.is_empty() && collab_opts.is_empty() {
-                            "Everyone found is already selected"
-                        } else {
+                        if !author_opts.is_empty() || !collab_opts.is_empty() {
                             "+ Add contributor…"
+                        } else if pr_authors.is_empty() && people.is_empty() {
+                            // Nothing came back at all — an unauthenticated gh, or
+                            // a repo with no open PRs. Don't claim the lists are
+                            // exhausted by what's already selected.
+                            "No one found — type a login below"
+                        } else {
+                            "Everyone found is already selected"
                         }
                     }
                     if !author_opts.is_empty() {
@@ -503,18 +543,20 @@ fn ReviewsTab(pid: Uuid) -> Element {
                 // Always available, not just when the lists come back empty: a
                 // fork contributor may have no open PR right now and is never a
                 // collaborator, so there has to be a way to type a login.
-                div { class: "field add-row",
+                div { class: "add-row",
                     input {
                         r#type: "text",
                         placeholder: "GitHub login",
                         value: "{manual}",
-                        oninput: move |e: Event<FormData>| manual.set(e.value()),
+                        oninput: move |e: Event<FormData>| {
+                            manual.set(e.value());
+                            manual_err.set(String::new());
+                        },
                         onkeydown: {
                             let project = project.clone();
                             move |e: Event<KeyboardData>| {
                                 if e.key() == Key::Enter {
-                                    add_contributor(state, &project, &manual.peek().clone());
-                                    manual.set(String::new());
+                                    submit_manual(state, &project, manual, manual_err);
                                 }
                             }
                         },
@@ -523,15 +565,16 @@ fn ReviewsTab(pid: Uuid) -> Element {
                         class: "btn",
                         onclick: {
                             let project = project.clone();
-                            move |_| {
-                                add_contributor(state, &project, &manual.peek().clone());
-                                manual.set(String::new());
-                            }
+                            move |_| submit_manual(state, &project, manual, manual_err)
                         },
                         "Add"
                     }
                 }
-                div { class: "hint", "Not listed? Type any GitHub login — fork contributors aren't repo collaborators." }
+                if manual_err().is_empty() {
+                    div { class: "hint", "Not listed? Type any GitHub login — fork contributors aren't repo collaborators." }
+                } else {
+                    div { class: "hint error", "{manual_err}" }
+                }
             }
         }
         div { class: "section",
