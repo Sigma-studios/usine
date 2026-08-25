@@ -220,6 +220,26 @@ pub enum ExecutorCommand {
         event: ReviewEvent,
         body: String,
     },
+    /// Publish the drafted review AND fix its comments ourselves: every selected
+    /// comment is posted carrying the pledge that the reviewer will handle it,
+    /// then a write agent implements them in the PR's own checkout. Nothing is
+    /// pushed — the run parks at the `FixReady` gate. Moves the task Awaiting
+    /// validation → Fixing.
+    PublishReviewAndFix {
+        review_id: Uuid,
+        drafts: Vec<DraftComment>,
+        event: ReviewEvent,
+        body: String,
+    },
+    /// From the fix gate: push the committed fix onto the PR's own head branch
+    /// and comment on the PR saying so. The task settles at Reviewed.
+    PushReviewFix { review_id: Uuid },
+    /// From the fix gate: send the fix back to the agent with feedback, keeping
+    /// the commits it already made.
+    ReviseReviewFix { review_id: Uuid, note: String },
+    /// From the fix gate: abandon the fix, retract the pledge on the PR, and
+    /// tear the checkout down. The task settles at Reviewed.
+    DiscardReviewFix { review_id: Uuid },
     /// Drop a review task (e.g. a stale one, or one reviewed elsewhere), cancelling
     /// any run and tearing down its worktree.
     DismissReview { review_id: Uuid },
@@ -422,6 +442,10 @@ impl ExecutorCommand {
             // entity from any card but flows through the same per-id plumbing.
             ExecutorCommand::StartReview { review_id, .. }
             | ExecutorCommand::PublishReview { review_id, .. }
+            | ExecutorCommand::PublishReviewAndFix { review_id, .. }
+            | ExecutorCommand::PushReviewFix { review_id }
+            | ExecutorCommand::ReviseReviewFix { review_id, .. }
+            | ExecutorCommand::DiscardReviewFix { review_id }
             | ExecutorCommand::DismissReview { review_id }
             | ExecutorCommand::ComputeReviewDiff { review_id }
             | ExecutorCommand::OpenReviewWorktree { review_id, .. }
@@ -474,6 +498,10 @@ impl ExecutorCommand {
             ExecutorCommand::Start { .. }
                 | ExecutorCommand::StartReview { .. }
                 | ExecutorCommand::PublishReview { .. }
+                | ExecutorCommand::PublishReviewAndFix { .. }
+                | ExecutorCommand::PushReviewFix { .. }
+                | ExecutorCommand::ReviseReviewFix { .. }
+                | ExecutorCommand::DiscardReviewFix { .. }
                 | ExecutorCommand::Answer { .. }
                 | ExecutorCommand::ApprovePlan { .. }
                 | ExecutorCommand::RejectPlan { .. }

@@ -69,6 +69,28 @@ impl Executor {
 
         self.emit_diff(review_id, DiffState::Computing);
 
+        // A PR whose review we published and are now fixing ourselves: the
+        // question at the gate is "what did the agent change?", not "what does
+        // this PR do". Diff the fix commits alone, over the PR head the fix was
+        // based on. No fetch — the branch is checked out (git would refuse) and
+        // its commits are ours, not the author's. A fix run still queued has no
+        // base sha yet, and falls through to the PR's own diff.
+        if let Some((_, base_sha)) = fix_diff_base(&task.status) {
+            let repo = project.path.clone();
+            let (base_sha, branch) = (base_sha.to_string(), branch.clone());
+            let computed =
+                tokio::task::spawn_blocking(move || compute_branch_diff(&repo, &base_sha, &branch))
+                    .await
+                    .map_err(|e| CoreError::other(format!("diff task panicked: {e}")))?;
+            let state = match computed {
+                Ok(data) if data.files.is_empty() => DiffState::Empty,
+                Ok(data) => DiffState::Ready(data),
+                Err(e) => DiffState::Failed(e.to_string()),
+            };
+            self.emit_diff(review_id, state);
+            return Ok(());
+        }
+
         // Refresh the branch even when it exists: the author may have pushed
         // since the last fetch, and a stale diff is worse than a slow one.
         // Non-fatal: while the branch is checked out in the review worktree the
@@ -124,5 +146,15 @@ impl Executor {
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::diff_updated(card_id, state));
+    }
+}
+
+/// The base sha of a task whose fix is running or waiting at the gate, once one
+/// has been recorded. Looks through `Failed` for the same reason the gate's
+/// actions do: a rejected push leaves a diff worth reading.
+fn fix_diff_base(status: &crate::ReviewStatus) -> Option<(&[crate::DraftComment], &str)> {
+    match status {
+        crate::ReviewStatus::Failed { previous, .. } => fix_diff_base(previous),
+        other => other.fix_state().filter(|(_, sha)| !sha.is_empty()),
     }
 }

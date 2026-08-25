@@ -1050,6 +1050,28 @@ pub enum ReviewStatus {
     },
     /// The review was submitted to GitHub.
     Reviewed,
+    /// The review was published and a write agent is implementing the comments
+    /// the reviewer pledged to fix, in the PR's own checkout. `base_sha` is the
+    /// PR head the worktree was rebuilt on, recorded at launch (empty while the
+    /// run is still queued): it is the diff base for the gate and proves the
+    /// branch moved. `comments` ride along so a redo or a retry needs no
+    /// re-review.
+    Fixing {
+        comments: Vec<DraftComment>,
+        base_sha: String,
+        /// The user's feedback on a redo ("keep the helper private"), folded
+        /// into the run's prompt. Empty on the first pass. Kept in the state so
+        /// a queued or crash-resumed run rebuilds the same prompt.
+        note: String,
+    },
+    /// The fix is committed in the checkout and waiting for the user to read the
+    /// diff and approve the push. Nothing has been pushed yet. `summary` is the
+    /// agent's own account of what it changed.
+    FixReady {
+        comments: Vec<DraftComment>,
+        base_sha: String,
+        summary: String,
+    },
     /// The PR left GitHub before the review finished: `merged: true` means it
     /// was merged without waiting for this review; `merged: false` means it was
     /// closed without merging. Kept on the board (rather than pruned) precisely
@@ -1070,15 +1092,37 @@ impl ReviewStatus {
             ReviewStatus::ToReview => ReviewColumn::ToReview,
             ReviewStatus::Reviewing => ReviewColumn::Reviewing,
             ReviewStatus::AwaitingValidation { .. } => ReviewColumn::AwaitingValidation,
-            ReviewStatus::Reviewed => ReviewColumn::Reviewed,
+            // The review *is* published in both fix states — the fix is an
+            // addendum to it, not a step before it.
+            ReviewStatus::Reviewed
+            | ReviewStatus::Fixing { .. }
+            | ReviewStatus::FixReady { .. } => ReviewColumn::Reviewed,
             ReviewStatus::MergedWithoutReview { .. } => ReviewColumn::MergedWithoutReview,
             ReviewStatus::Failed { previous, .. } => previous.column(),
         }
     }
 
-    /// True while the review agent is actively running (drives startup recovery).
+    /// True while an agent is actively running for this task — the review pass
+    /// or the follow-up fix run (drives startup recovery and the board spinner).
+    /// `FixReady` is a gate, not a run, so it is excluded.
     pub fn is_running(&self) -> bool {
-        matches!(self, ReviewStatus::Reviewing)
+        matches!(self, ReviewStatus::Reviewing | ReviewStatus::Fixing { .. })
+    }
+
+    /// The comments a fix run was launched for and the PR head it started from,
+    /// for the two fix states. `None` for every other status — including a
+    /// `Failed` wrapping one, which callers unwrap through `previous` themselves
+    /// so they can tell a live gate from a faulted one.
+    pub fn fix_state(&self) -> Option<(&[DraftComment], &str)> {
+        match self {
+            ReviewStatus::Fixing {
+                comments, base_sha, ..
+            }
+            | ReviewStatus::FixReady {
+                comments, base_sha, ..
+            } => Some((comments, base_sha)),
+            _ => None,
+        }
     }
 
     pub fn is_failed(&self) -> bool {
@@ -1103,6 +1147,7 @@ impl ReviewStatus {
             self,
             ReviewStatus::ToReview
                 | ReviewStatus::AwaitingValidation { .. }
+                | ReviewStatus::FixReady { .. }
                 | ReviewStatus::MergedWithoutReview { .. }
                 | ReviewStatus::Failed { .. }
         )
@@ -1114,6 +1159,8 @@ impl ReviewStatus {
             ReviewStatus::Reviewing => "reviewing…",
             ReviewStatus::AwaitingValidation { .. } => "validate",
             ReviewStatus::Reviewed => "reviewed",
+            ReviewStatus::Fixing { .. } => "fixing…",
+            ReviewStatus::FixReady { .. } => "fix ready",
             ReviewStatus::MergedWithoutReview { merged: true } => "merged w/o review",
             ReviewStatus::MergedWithoutReview { merged: false } => "PR closed",
             ReviewStatus::Failed { .. } => "failed",

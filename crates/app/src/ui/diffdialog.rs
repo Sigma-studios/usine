@@ -135,6 +135,23 @@ pub fn DiffDialogHost() -> Element {
         DiffTarget::Card(_) => None,
     };
 
+    // A PR whose review we published and are now fixing ourselves: the diff on
+    // screen is the agent's fix, not the contributor's PR (see
+    // `compute_review_diff`), and the dialog has to say so. `gate` additionally
+    // means the fix is committed and waiting to be pushed — the bar's actions.
+    let (fixing, gate) = match target {
+        DiffTarget::Review(review_id) => state
+            .review_task(review_id)
+            .map(|t| {
+                (
+                    fix_state_of(&t.status).is_some(),
+                    fix_gate_ready(&t.status).then(|| t.head_ref.clone()),
+                )
+            })
+            .unwrap_or((false, None)),
+        DiffTarget::Card(_) => (false, None),
+    };
+
     let title = match target {
         DiffTarget::Card(card_id) => state
             .cards
@@ -145,7 +162,13 @@ pub fn DiffDialogHost() -> Element {
             .unwrap_or_else(|| "Diff".to_string()),
         DiffTarget::Review(review_id) => state
             .review_task(review_id)
-            .map(|t| format!("PR #{} — {}", t.pr_number, t.pr_title))
+            .map(|t| {
+                if fixing {
+                    format!("Fix for PR #{} — {}", t.pr_number, t.pr_title)
+                } else {
+                    format!("PR #{} — {}", t.pr_number, t.pr_title)
+                }
+            })
             .unwrap_or_else(|| "Pull request".to_string()),
     };
 
@@ -228,7 +251,11 @@ pub fn DiffDialogHost() -> Element {
                         Some(DiffState::Ready(data)) => rsx! {
                             if checked_out {
                                 div { class: "hint",
-                                    "Showing the PR as checked out for the review — pushes made after the review started aren't included."
+                                    if fixing {
+                                        "The fix as committed in the review checkout — not pushed yet."
+                                    } else {
+                                        "Showing the PR as checked out for the review — pushes made after the review started aren't included."
+                                    }
                                 }
                             }
                             DiffView {
@@ -241,6 +268,9 @@ pub fn DiffDialogHost() -> Element {
                 }
                 if let Some(review_id) = review_id {
                     ValidateBar { review_id }
+                }
+                if let Some(head_ref) = gate {
+                    FixBar { review_id: id, head_ref }
                 }
             }
         }
@@ -567,6 +597,74 @@ fn ValidateBar(review_id: Uuid) -> Element {
                 }
             }
         }
+    }
+}
+
+/// The fix gate's bar, pinned under the diff: the same shape as [`ValidateBar`],
+/// but its subject is our own committed fix. Pushing from here means the last
+/// thing seen before the commit leaves the machine is the code it changes.
+#[component]
+fn FixBar(review_id: Uuid, head_ref: String) -> Element {
+    let state = use_context::<AppState>();
+    let mut note = super::drafts::use_draft(review_id, "review.fixnote", String::new);
+    let push_ref = head_ref.clone();
+
+    rsx! {
+        div { class: "review-validate-bar review-fix-bar",
+            div { class: "review-validate-summary",
+                label { class: "review-validate-label", "Send it back with feedback" }
+                textarea {
+                    class: "review-summary-edit",
+                    rows: "2",
+                    placeholder: "What should the agent do differently?",
+                    value: "{note}",
+                    oninput: move |e| note.set(e.value()),
+                }
+            }
+            div { class: "review-validate-actions",
+                button {
+                    class: "btn",
+                    title: "Run the agent again, keeping the commits it already made",
+                    onclick: move |_| {
+                        state.revise_review_fix(review_id, note.read().clone());
+                        super::drafts::forget(review_id, "review.fixnote");
+                        dismiss();
+                    },
+                    "Redo"
+                }
+                button {
+                    class: "btn subtle",
+                    title: "Abandon the fix and tell the author it isn't coming",
+                    onclick: move |_| super::confirm_discard_review_fix(review_id),
+                    "Discard"
+                }
+                button {
+                    class: "btn primary",
+                    onclick: move |_| {
+                        super::confirm_push_review_fix(state, review_id, push_ref.clone());
+                    },
+                    "Push to {head_ref}"
+                }
+            }
+        }
+    }
+}
+
+/// The fix state behind a (possibly nested) `Failed`, if any.
+fn fix_state_of(status: &usine_core::ReviewStatus) -> Option<(&[DraftComment], &str)> {
+    match status {
+        usine_core::ReviewStatus::Failed { previous, .. } => fix_state_of(previous),
+        other => other.fix_state(),
+    }
+}
+
+/// Whether a committed fix is waiting at the push gate (a fix run still in
+/// flight has nothing to act on yet).
+fn fix_gate_ready(status: &usine_core::ReviewStatus) -> bool {
+    match status {
+        usine_core::ReviewStatus::FixReady { .. } => true,
+        usine_core::ReviewStatus::Failed { previous, .. } => fix_gate_ready(previous),
+        _ => false,
     }
 }
 

@@ -713,6 +713,13 @@ impl AppState {
     // one posts to someone else's PR, the other is a permanent dismissal — so
     // there are deliberately no bare send helpers for them here.
 
+    /// Send a committed fix back to the agent with feedback. Unlike the push and
+    /// the discard, this posts nothing and touches no branch, so it needs no
+    /// confirm of its own.
+    pub fn revise_review_fix(&self, review_id: Uuid, note: String) {
+        self.send(ExecutorCommand::ReviseReviewFix { review_id, note });
+    }
+
     /// Run the project's app from a PR's review checkout (checked out on demand).
     pub fn start_review_preview(&self, review_id: Uuid) {
         self.send(ExecutorCommand::StartReviewPreview { review_id });

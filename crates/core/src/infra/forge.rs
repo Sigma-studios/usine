@@ -180,6 +180,91 @@ pub fn parse_live_pr_state(json: &str) -> Option<LivePrState> {
     }
 }
 
+/// Where a PR's head branch lives, and whether we may push to it — what
+/// "I'll fix this myself" needs to know *before* the promise is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrPushTarget {
+    /// The PR's head branch name, as the target repo holds it.
+    pub head_ref: String,
+    /// Whether the head is on a fork rather than this repo.
+    pub cross_repo: bool,
+    /// `owner/repo` of the head repository (forks only; empty otherwise).
+    pub head_repo: String,
+    /// Whether the author ticked "allow edits by maintainers".
+    pub maintainer_can_modify: bool,
+}
+
+impl PrPushTarget {
+    /// Whether a maintainer may push to this head: always for a same-repo
+    /// branch, only with the author's consent for a fork.
+    pub fn pushable(&self) -> bool {
+        !self.cross_repo || self.maintainer_can_modify
+    }
+}
+
+/// Read where a PR's head lives and whether maintainers may push to it.
+pub fn pr_push_target_args(pr_number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        pr_number.to_string(),
+        "--json".into(),
+        "headRefName,isCrossRepository,headRepository,headRepositoryOwner,maintainerCanModify"
+            .into(),
+    ]
+}
+
+/// Map `gh pr view --json headRefName,…` onto [`PrPushTarget`]. `None` for junk
+/// or a payload with no head branch — "can't tell", never "not pushable": the
+/// caller refuses to promise a fix rather than guessing either way.
+pub fn parse_push_target(json: &str) -> Option<PrPushTarget> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let head_ref = v.get("headRefName").and_then(Value::as_str)?;
+    if head_ref.is_empty() {
+        return None;
+    }
+    // `headRepository` is the repo alone; its owner is a sibling field.
+    let owner = v
+        .pointer("/headRepositoryOwner/login")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let name = v
+        .pointer("/headRepository/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let head_repo = if owner.is_empty() || name.is_empty() {
+        String::new()
+    } else {
+        format!("{owner}/{name}")
+    };
+    Some(PrPushTarget {
+        head_ref: head_ref.to_string(),
+        cross_repo: v
+            .get("isCrossRepository")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        head_repo,
+        maintainer_can_modify: v
+            .get("maintainerCanModify")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Post a plain (non-review) comment on a PR's conversation. The PR's issue
+/// endpoint is the one that takes a bare body; `--input -` keeps a multi-line
+/// body out of argv.
+pub fn pr_comment_args(pr_number: u64) -> Vec<String> {
+    vec![
+        "api".into(),
+        "--method".into(),
+        "POST".into(),
+        format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"),
+        "--input".into(),
+        "-".into(),
+    ]
+}
+
 /// Read whether the PR still merges cleanly onto its base. Asked *after* a merge
 /// fails, so a conflict can be told apart from every other reason `gh pr merge`
 /// exits non-zero (auth, protected branch, failing checks) without matching on
@@ -724,6 +809,21 @@ pub trait Forge: Send + Sync {
         Ok(None)
     }
 
+    /// Where the PR's head branch lives and whether we may push to it.
+    /// `Ok(None)` means "can't tell" and is the default, so forges that don't
+    /// model it leave the caller to proceed on its own judgement.
+    async fn pr_push_target(&self, _repo: &Path, _pr_number: u64) -> Result<Option<PrPushTarget>> {
+        Ok(None)
+    }
+
+    /// Post a plain comment on the PR's conversation (not a review). Used to
+    /// follow up on a published review — "pushed the fix", or "on reflection
+    /// I'm leaving these to you". Defaults to a no-op for forges that don't
+    /// model it.
+    async fn comment_on_pr(&self, _repo: &Path, _pr_number: u64, _body: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// The open PR whose head branch is `head`, if one exists. Best-effort
     /// dialog context (the adopt probe's "open PR" warning): "no PR" and "can't
     /// tell" both come back `None`, so forges that don't model it — the sim,
@@ -997,6 +1097,18 @@ impl Forge for GhForge {
         Ok(parse_live_pr_state(&json))
     }
 
+    async fn pr_push_target(&self, repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
+        let json = run_gh(repo, &pr_push_target_args(pr_number)).await?;
+        Ok(parse_push_target(&json))
+    }
+
+    async fn comment_on_pr(&self, repo: &Path, pr_number: u64, body: &str) -> Result<()> {
+        let stdin = serde_json::to_string(&serde_json::json!({ "body": body }))?;
+        run_gh_stdin(repo, &pr_comment_args(pr_number), &stdin)
+            .await
+            .map(|_| ())
+    }
+
     async fn pr_for_head(&self, repo: &Path, head: &str) -> Result<Option<PrInfo>> {
         // `gh pr view <branch>` exits non-zero when the branch has no PR — the
         // common case here, folded into `None` along with genuine failures
@@ -1125,6 +1237,16 @@ impl Forge for SimForge {
         _comments: &[DraftComment],
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// A same-repo, pushable head, so "publish & fix" runs end to end in the sim.
+    async fn pr_push_target(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
+        Ok(Some(PrPushTarget {
+            head_ref: format!("sim/pr-{pr_number}"),
+            cross_repo: false,
+            head_repo: String::new(),
+            maintainer_can_modify: true,
+        }))
     }
 
     async fn list_reviewers(&self, _repo: &Path) -> Result<Vec<String>> {
@@ -1692,6 +1814,52 @@ mod tests {
         // Empty author is skipped, not emitted as a bare `author:`.
         assert!(!search.contains("author: "));
         assert!(!search.ends_with("author:"));
+    }
+
+    #[test]
+    fn push_target_reads_a_same_repo_pr_as_pushable() {
+        let args = pr_push_target_args(7);
+        assert!(args.iter().any(|a| a.contains("maintainerCanModify")));
+        let t = parse_push_target(
+            r#"{"headRefName":"feat/x","isCrossRepository":false,"maintainerCanModify":false,
+                "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"me"}}"#,
+        )
+        .expect("parsed");
+        assert_eq!(t.head_ref, "feat/x");
+        assert!(t.pushable(), "our own repo is always pushable");
+    }
+
+    #[test]
+    fn push_target_refuses_a_fork_without_maintainer_edits() {
+        let t = parse_push_target(
+            r#"{"headRefName":"feat/x","isCrossRepository":true,"maintainerCanModify":false,
+                "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"octocat"}}"#,
+        )
+        .expect("parsed");
+        assert_eq!(t.head_repo, "octocat/repo");
+        assert!(!t.pushable());
+        let allowed = parse_push_target(
+            r#"{"headRefName":"feat/x","isCrossRepository":true,"maintainerCanModify":true,
+                "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"octocat"}}"#,
+        )
+        .expect("parsed");
+        assert!(allowed.pushable());
+    }
+
+    #[test]
+    fn push_target_is_none_for_junk_or_a_headless_payload() {
+        assert!(parse_push_target("not json").is_none());
+        assert!(parse_push_target(r#"{"headRefName":""}"#).is_none());
+        assert!(parse_push_target("{}").is_none());
+    }
+
+    #[test]
+    fn pr_comment_posts_to_the_issue_endpoint_via_stdin() {
+        let args = pr_comment_args(7);
+        assert!(args
+            .iter()
+            .any(|a| a == "repos/{owner}/{repo}/issues/7/comments"));
+        assert!(args.windows(2).any(|w| w == ["--input", "-"]));
     }
 
     #[test]
