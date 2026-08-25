@@ -161,6 +161,11 @@ pub struct ProjectConfig {
     /// Picked from the same collaborator list as `reviewer`.
     #[serde(default)]
     pub review_contributors: Vec<String>,
+    /// Track *every* open PR on the repo that isn't the current user's, instead
+    /// of the pinned `review_contributors` list. The list is kept while this is
+    /// on, so turning it back off restores the previous selection.
+    #[serde(default)]
+    pub review_all_contributors: bool,
     /// Command run in a freshly-created worktree to make it runnable — install
     /// deps, stand up an isolated DB, assign per-worktree ports, etc. When unset,
     /// a conventional `setup-worktree.sh` in the repo is auto-detected. It must
@@ -202,6 +207,12 @@ pub(crate) fn default_auto_preview() -> bool {
 impl ProjectConfig {
     /// The base branch every git/PR operation should use: the user's pin when
     /// one is set (blank counts as unset), else the auto-detected branch.
+    /// Whether the review board should poll this project at all: either the
+    /// user tracks everyone, or they pinned at least one contributor.
+    pub fn tracks_contributor_prs(&self) -> bool {
+        self.review_all_contributors || !self.review_contributors.is_empty()
+    }
+
     pub fn effective_base_branch(&self) -> &str {
         self.pinned_base_branch
             .as_deref()
@@ -218,6 +229,7 @@ impl Default for ProjectConfig {
             base_branch: "dev".to_string(),
             pinned_base_branch: None,
             review_contributors: Vec::new(),
+            review_all_contributors: false,
             worktree_setup_script: None,
             run_script: None,
             validate_script: None,

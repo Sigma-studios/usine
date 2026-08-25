@@ -3,7 +3,7 @@
 //! app-wide config (open-in commands, run cap).
 
 use dioxus::prelude::*;
-use usine_core::{CardConfig, PreviewPort};
+use usine_core::{CardConfig, PreviewPort, Project};
 use uuid::Uuid;
 
 use super::widgets::{
@@ -326,6 +326,28 @@ pub fn ProjectSettingsModal() -> Element {
     }
 }
 
+/// Pin one more contributor whose open PRs the review board should track, then
+/// scan straight away so the PR lands in seconds instead of at the next
+/// 5-minute poll — `SaveProject` runs inline in the dispatcher, ahead of the
+/// spawned scan, so the scan is guaranteed to see the saved config.
+/// A blank, `@`-prefixed or already-pinned login is a no-op.
+fn add_contributor(state: AppState, project: &Project, login: &str) {
+    let login = login.trim().trim_start_matches('@').trim().to_string();
+    if login.is_empty()
+        || project
+            .config
+            .review_contributors
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&login))
+    {
+        return;
+    }
+    let mut p = project.clone();
+    p.config.review_contributors.push(login);
+    state.save_project(p);
+    state.scan_reviews(project.id);
+}
+
 /// The "Reviews" tab: which contributors' PRs to surface on the review board, and
 /// the reviewer requested by default when opening this project's own PRs.
 #[component]
@@ -335,10 +357,13 @@ fn ReviewsTab(pid: Uuid) -> Element {
         return rsx! {};
     };
 
-    // Populate the collaborator list once on open; the refresh button re-runs it.
+    // Populate both people lists once on open; the refresh button re-runs them.
     use_hook(move || {
         if state.reviewers.peek().get(&pid).is_none() {
             state.fetch_reviewers(pid);
+        }
+        if state.pr_authors.peek().get(&pid).is_none() {
+            state.fetch_pr_authors(pid);
         }
     });
     let people = state
@@ -347,14 +372,30 @@ fn ReviewsTab(pid: Uuid) -> Element {
         .get(&pid)
         .cloned()
         .unwrap_or_default();
+    let pr_authors = state
+        .pr_authors
+        .read()
+        .get(&pid)
+        .cloned()
+        .unwrap_or_default();
     let contributors = project.config.review_contributors.clone();
+    let track_all = project.config.review_all_contributors;
     let current_reviewer = project.config.reviewer.clone().unwrap_or_default();
-    // Collaborators not yet selected — the options offered by the add dropdown.
-    let available: Vec<String> = people
+    let selected = |l: &String| contributors.iter().any(|c| c.eq_ignore_ascii_case(l));
+    // Two groups of suggestions, both minus what's already picked. PR authors
+    // lead — they're the answer to "why isn't this contributor listed?" — and a
+    // collaborator who also has an open PR is only offered once, up there.
+    let author_opts: Vec<String> = pr_authors
         .iter()
-        .filter(|l| !contributors.contains(l))
+        .filter(|l| !selected(l))
         .cloned()
         .collect();
+    let collab_opts: Vec<String> = people
+        .iter()
+        .filter(|l| !selected(l) && !author_opts.iter().any(|a| a.eq_ignore_ascii_case(l)))
+        .cloned()
+        .collect();
+    let mut manual = use_signal(String::new);
 
     rsx! {
         div { class: "section",
@@ -365,89 +406,132 @@ fn ReviewsTab(pid: Uuid) -> Element {
                 }
                 button {
                     class: "btn icon",
-                    title: "Refresh collaborators",
-                    onclick: move |_| state.fetch_reviewers(pid),
+                    title: "Refresh people",
+                    onclick: move |_| {
+                        state.fetch_reviewers(pid);
+                        state.fetch_pr_authors(pid);
+                    },
                     "↻"
                 }
             }
-            // Selected contributors as removable chips.
-            div { class: "chips",
-                if contributors.is_empty() {
-                    span { class: "chips-empty", "None selected yet." }
+            div { class: "field",
+                label { class: "adopt-choice",
+                    input {
+                        r#type: "checkbox",
+                        checked: track_all,
+                        onchange: {
+                            let project = project.clone();
+                            move |_| {
+                                let mut p = project.clone();
+                                p.config.review_all_contributors = !track_all;
+                                state.save_project(p);
+                                // Turning it on shouldn't mean waiting out the
+                                // 5-minute poll before anything shows up.
+                                if !track_all {
+                                    state.scan_reviews(pid);
+                                }
+                            }
+                        },
+                    }
+                    "Track every contributor's open PRs"
                 }
-                for login in contributors.iter() {
-                    {
-                        let login = login.clone();
-                        let project = project.clone();
-                        let login_rm = login.clone();
-                        rsx! {
-                            span { key: "{login}", class: "chip",
-                                "{login}"
-                                button {
-                                    class: "chip-remove",
-                                    title: "Remove",
-                                    "aria-label": "Remove {login}",
-                                    onclick: move |_| {
-                                        let mut p = project.clone();
-                                        p.config.review_contributors.retain(|l| l != &login_rm);
-                                        state.save_project(p);
-                                    },
-                                    "×"
+                div { class: "hint", "Every open PR that isn't yours lands on the review board. Bot PRs are skipped; dismiss anything you don't want." }
+            }
+            if track_all {
+                if !contributors.is_empty() {
+                    div { class: "hint", "{contributors.len()} pinned contributor(s) kept for when you turn this off." }
+                }
+            } else {
+                // Selected contributors as removable chips.
+                div { class: "chips",
+                    if contributors.is_empty() {
+                        span { class: "chips-empty", "None selected yet." }
+                    }
+                    for login in contributors.iter() {
+                        {
+                            let login = login.clone();
+                            let project = project.clone();
+                            let login_rm = login.clone();
+                            rsx! {
+                                span { key: "{login}", class: "chip",
+                                    "{login}"
+                                    button {
+                                        class: "chip-remove",
+                                        title: "Remove",
+                                        "aria-label": "Remove {login}",
+                                        onclick: move |_| {
+                                            let mut p = project.clone();
+                                            p.config.review_contributors.retain(|l| l != &login_rm);
+                                            state.save_project(p);
+                                        },
+                                        "×"
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            if people.is_empty() {
-                // No collaborator list to pick from — plain comma-separated entry.
-                div { class: "field",
-                    input {
-                        r#type: "text",
-                        placeholder: "octocat, hubot",
-                        value: "{contributors.join(\", \")}",
-                        onchange: {
-                            let project = project.clone();
-                            move |e: Event<FormData>| {
-                                let mut p = project.clone();
-                                p.config.review_contributors = e
-                                    .value()
-                                    .split(',')
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-                                state.save_project(p);
-                            }
-                        },
-                    }
-                }
-                div { class: "hint", "No collaborators found — enter GitHub logins separated by commas, or ↻ to fetch them." }
-            } else {
-                // Pick from the collaborator list to add.
                 select {
                     class: "add-select",
                     value: "",
                     onchange: {
                         let project = project.clone();
-                        move |e: Event<FormData>| {
-                            let login = e.value();
-                            if login.is_empty() {
-                                return;
-                            }
-                            let mut p = project.clone();
-                            if !p.config.review_contributors.contains(&login) {
-                                p.config.review_contributors.push(login);
-                                state.save_project(p);
-                            }
-                        }
+                        move |e: Event<FormData>| add_contributor(state, &project, &e.value())
                     },
                     option { value: "", disabled: true, selected: true,
-                        if available.is_empty() { "All collaborators selected" } else { "+ Add contributor…" }
+                        if author_opts.is_empty() && collab_opts.is_empty() {
+                            "Everyone found is already selected"
+                        } else {
+                            "+ Add contributor…"
+                        }
                     }
-                    for login in available.iter() {
-                        option { key: "{login}", value: "{login}", "{login}" }
+                    if !author_opts.is_empty() {
+                        optgroup { label: "Open PR authors",
+                            for login in author_opts.iter() {
+                                option { key: "{login}", value: "{login}", "{login}" }
+                            }
+                        }
+                    }
+                    if !collab_opts.is_empty() {
+                        optgroup { label: "Collaborators",
+                            for login in collab_opts.iter() {
+                                option { key: "{login}", value: "{login}", "{login}" }
+                            }
+                        }
                     }
                 }
+                // Always available, not just when the lists come back empty: a
+                // fork contributor may have no open PR right now and is never a
+                // collaborator, so there has to be a way to type a login.
+                div { class: "field add-row",
+                    input {
+                        r#type: "text",
+                        placeholder: "GitHub login",
+                        value: "{manual}",
+                        oninput: move |e: Event<FormData>| manual.set(e.value()),
+                        onkeydown: {
+                            let project = project.clone();
+                            move |e: Event<KeyboardData>| {
+                                if e.key() == Key::Enter {
+                                    add_contributor(state, &project, &manual.peek().clone());
+                                    manual.set(String::new());
+                                }
+                            }
+                        },
+                    }
+                    button {
+                        class: "btn",
+                        onclick: {
+                            let project = project.clone();
+                            move |_| {
+                                add_contributor(state, &project, &manual.peek().clone());
+                                manual.set(String::new());
+                            }
+                        },
+                        "Add"
+                    }
+                }
+                div { class: "hint", "Not listed? Type any GitHub login — fork contributors aren't repo collaborators." }
             }
         }
         div { class: "section",

@@ -38,7 +38,7 @@ use crate::domain::model::{
 };
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::{CoreError, Result};
-use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState};
+use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState, ReviewScope};
 use crate::infra::git::{canonicalize_branch_case, sanitize_branch_name, GitOps, MergeOutcome};
 use crate::infra::persistence::Store;
 
@@ -425,6 +425,7 @@ impl Executor {
                 self.convert_to_implementation(card_id).await
             }
             ExecutorCommand::ListReviewers { project_id } => self.list_reviewers(project_id).await,
+            ExecutorCommand::ListPrAuthors { project_id } => self.list_pr_authors(project_id).await,
             ExecutorCommand::ListAdoptSources { project_id } => {
                 self.list_adopt_sources(project_id).await
             }
