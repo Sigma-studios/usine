@@ -69,21 +69,18 @@ fn confirm_then_send(
 /// dialog names it — including how many comments carry no judgement at all.
 /// Empty when nothing is selected.
 fn severity_breakdown(drafts: &[DraftComment]) -> String {
-    let selected: Vec<&DraftComment> = drafts.iter().filter(|d| d.selected).collect();
-    let count = |pred: &dyn Fn(&str) -> bool| {
-        selected
-            .iter()
-            .filter(|d| pred(&usine_core::normalize_severity(&d.severity)))
-            .count()
-    };
+    // One pass over the drafts, normalising each severity once: counts land in
+    // `SEVERITY_LEVELS` order, with anything unrated in the trailing slot.
+    let mut counts = [0usize; SEVERITY_LEVELS.len() + 1];
+    for d in drafts.iter().filter(|d| d.selected) {
+        counts[usine_core::severity_rank(&d.severity).unwrap_or(SEVERITY_LEVELS.len())] += 1;
+    }
     let mut parts: Vec<String> = SEVERITY_LEVELS
         .iter()
-        .filter_map(|level| match count(&|s: &str| s == *level) {
-            0 => None,
-            n => Some(format!("{n} {level}")),
-        })
+        .zip(counts)
+        .filter_map(|(level, n)| (n > 0).then(|| format!("{n} {level}")))
         .collect();
-    if let n @ 1.. = count(&str::is_empty) {
+    if let n @ 1.. = counts[SEVERITY_LEVELS.len()] {
         parts.push(format!("{n} untagged"));
     }
     if parts.is_empty() {

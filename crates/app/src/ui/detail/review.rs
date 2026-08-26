@@ -395,9 +395,15 @@ fn DraftSelection(
                                 details { class: "draft", open: true,
                                     summary {
                                         // `summary` toggles the `details` on click; changing
-                                        // the level shouldn't also collapse the row.
+                                        // the level shouldn't also collapse the row. The
+                                        // toggle is the summary's default action, so it
+                                        // takes `prevent_default` as well as stopping the
+                                        // bubble.
                                         div {
-                                            onclick: move |e| e.stop_propagation(),
+                                            onclick: move |e| {
+                                                e.stop_propagation();
+                                                e.prevent_default();
+                                            },
                                             SeverityPicker {
                                                 severity: sev.clone(),
                                                 on_change: move |s| reviewdraft::set_severity(i, s),

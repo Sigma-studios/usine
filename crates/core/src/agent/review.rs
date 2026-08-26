@@ -157,15 +157,21 @@ struct RawVerdict {
 /// source of truth for both the agent's vocabulary and the maintainer's picker.
 pub const SEVERITY_LEVELS: [&str; 4] = ["critical", "high", "medium", "low"];
 
-/// Clamp a severity string to one of [`SEVERITY_LEVELS`] (lower-cased), or empty
-/// if it is something unexpected — the agent returning nonsense, or the user
-/// deliberately clearing the level.
-pub fn normalize_severity(s: &str) -> String {
-    let s = s.trim().to_lowercase();
+/// The index of a severity string in [`SEVERITY_LEVELS`] (most severe first),
+/// or `None` if it is something unexpected — the agent returning nonsense, or
+/// the user deliberately clearing the level.
+pub fn severity_rank(s: &str) -> Option<usize> {
+    let s = s.trim();
     SEVERITY_LEVELS
         .iter()
-        .find(|l| **l == s)
-        .map(|l| (*l).to_string())
+        .position(|l| l.eq_ignore_ascii_case(s))
+}
+
+/// Clamp a severity string to one of [`SEVERITY_LEVELS`] (lower-cased), or empty
+/// if it carries no level.
+pub fn normalize_severity(s: &str) -> String {
+    severity_rank(s)
+        .map(|i| SEVERITY_LEVELS[i].to_string())
         .unwrap_or_default()
 }
 
@@ -389,11 +395,37 @@ pub fn tagged_drafts(drafts: &[DraftComment]) -> Vec<DraftComment> {
 
 /// Whether a comment's first line starts a markdown block, which must stay at
 /// the start of its own line to render.
+///
+/// Ordered lists count: an item's marker only opens a list at the start of a
+/// line, and a following `2.` cannot interrupt a paragraph, so prefixing a
+/// numbered list would flatten the whole thing into one run of prose.
 fn opens_a_block(body: &str) -> bool {
     let first = body.trim_start();
-    ["```", "#", "-", "*", ">", "|"]
+    if ["```", "~~~", "#", ">", "|"]
         .iter()
         .any(|p| first.starts_with(p))
+    {
+        return true;
+    }
+    let line = first.lines().next().unwrap_or_default();
+    let bytes = line.as_bytes();
+    // A bullet marker opens a list only when a space follows it — `**bold**` and
+    // `-1 is wrong` are prose.
+    if matches!(bytes.first(), Some(b'-' | b'*' | b'+')) && bytes.get(1) == Some(&b' ') {
+        return true;
+    }
+    // A thematic break: three or more of the same marker, spaces aside.
+    if let Some(c @ (b'-' | b'*' | b'_')) = bytes.first().copied() {
+        let marks = bytes.iter().filter(|b| **b == c).count();
+        if marks >= 3 && bytes.iter().all(|b| *b == c || *b == b' ' || *b == b'\t') {
+            return true;
+        }
+    }
+    // An ordered list: `1.` or `1)`, up to CommonMark's nine digits.
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (1..=9).contains(&digits)
+        && matches!(bytes.get(digits), Some(b'.' | b')'))
+        && bytes.get(digits + 1) == Some(&b' ')
 }
 
 /// The extra prompt for the fix run behind "Publish & fix": the comments the
@@ -709,12 +741,43 @@ mod tests {
     /// glued in front of it — the block would stop rendering.
     #[test]
     fn a_body_opening_a_markdown_block_gets_the_marker_on_its_own_line() {
-        for body in ["```rust\nlet x = 1;\n```", "- one\n- two", "> quoted"] {
+        for body in [
+            "```rust\nlet x = 1;\n```",
+            "- one\n- two",
+            "+ one\n+ two",
+            // An ordered list is the sharp case: a `2.` line can't interrupt a
+            // paragraph, so a glued-on label collapses the list entirely.
+            "1. Do X\n2. Do Y",
+            "1) Do X\n2) Do Y",
+            "---",
+            "> quoted",
+        ] {
             let mut d = draft("a.rs", Some(3), body);
             d.severity = "critical".into();
             assert_eq!(
                 tagged_drafts(std::slice::from_ref(&d))[0].body,
-                format!("**\u{1F534} Critical**\n\n{body}")
+                format!("**\u{1F534} Critical**\n\n{body}"),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// Prose that merely *starts* with a marker character is still prose, and
+    /// reads better with the label inline.
+    #[test]
+    fn a_prose_body_keeps_the_marker_inline() {
+        for body in [
+            "**Guard** this unwrap.",
+            "-1 is not a valid index.",
+            "1.5 seconds is too long a timeout.",
+            "*ptr is dereferenced twice.",
+        ] {
+            let mut d = draft("a.rs", Some(3), body);
+            d.severity = "low".into();
+            assert_eq!(
+                tagged_drafts(std::slice::from_ref(&d))[0].body,
+                format!("**\u{1F535} Low:** {body}"),
+                "{body:?}"
             );
         }
     }
