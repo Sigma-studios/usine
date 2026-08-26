@@ -312,6 +312,23 @@ mod tests {
         assert!(body.contains("**`src/a.rs:400`**"));
     }
 
+    /// Publishing tags a rated comment *before* folding, so a comment that ends
+    /// up in the review body carries its criticality there too.
+    #[test]
+    fn fold_keeps_a_tagged_body_intact_in_the_review_body() {
+        let data = DiffData {
+            files: vec![file("src/a.rs", &[Some(10)])],
+        };
+        let mut d = draft("src/a.rs", Some(400));
+        d.body = "**\u{1F534} Critical:** Guard this unwrap.".into();
+        let (inline, body) = fold_unanchorable(Some(&data), vec![d], "");
+        assert!(inline.is_empty());
+        assert!(
+            body.contains("**`src/a.rs:400`** \u{2014} **\u{1F534} Critical:** Guard this unwrap."),
+            "{body}"
+        );
+    }
+
     #[test]
     fn fold_moves_unknown_path_into_body() {
         let data = DiffData {

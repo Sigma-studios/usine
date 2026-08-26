@@ -358,8 +358,18 @@ async fn publish_and_fix_pledges_then_gates_the_push() {
         assert!(log.submitted, "the review was submitted");
         assert_eq!(log.submitted_comments.len(), n);
         for body in &log.submitted_comments {
+            // Prefix and suffix compose on the real path: the criticality marker
+            // opens the comment, the pledge closes it.
             assert!(
-                body.contains("I'm pushing a fix for this one myself"),
+                usine_core::severity_marker("medium")
+                    .into_iter()
+                    .chain(usine_core::severity_marker("low"))
+                    .any(|m| body.starts_with(&format!("**{m}:**"))),
+                "every comment opens with its criticality: {body}"
+            );
+            assert!(
+                body.trim_end()
+                    .ends_with(usine_core::agent::review::FIX_PLEDGE.trim_end()),
                 "every comment carries the pledge: {body}"
             );
         }

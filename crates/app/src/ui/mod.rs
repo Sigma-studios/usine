@@ -31,7 +31,7 @@ pub use settings::{ProjectSettingsModal, SettingsModal};
 pub use sidebar::Sidebar;
 pub use usagebar::UsageBar;
 
-use usine_core::{DraftComment, ExecutorCommand, ReviewEvent};
+use usine_core::{DraftComment, ExecutorCommand, ReviewEvent, SEVERITY_LEVELS};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -62,6 +62,36 @@ fn confirm_then_send(
     });
 }
 
+/// The criticality of what is about to be posted, as " (1 critical, 2 medium)",
+/// most severe first with unrated comments last.
+///
+/// Publishing is irreversible and the level rides out with each comment, so the
+/// dialog names it — including how many comments carry no judgement at all.
+/// Empty when nothing is selected.
+fn severity_breakdown(drafts: &[DraftComment]) -> String {
+    let selected: Vec<&DraftComment> = drafts.iter().filter(|d| d.selected).collect();
+    let count = |pred: &dyn Fn(&str) -> bool| {
+        selected
+            .iter()
+            .filter(|d| pred(&usine_core::normalize_severity(&d.severity)))
+            .count()
+    };
+    let mut parts: Vec<String> = SEVERITY_LEVELS
+        .iter()
+        .filter_map(|level| match count(&|s: &str| s == *level) {
+            0 => None,
+            n => Some(format!("{n} {level}")),
+        })
+        .collect();
+    if let n @ 1.. = count(&str::is_empty) {
+        parts.push(format!("{n} untagged"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" ({})", parts.join(", "))
+}
+
 /// Publish a drafted review to GitHub behind a confirm dialog, from either
 /// validation surface (the detail panel's list or the diff viewer).
 ///
@@ -82,8 +112,8 @@ fn confirm_publish_review(
     let selected = drafts.iter().filter(|d| d.selected).count();
     let what = match selected {
         0 => "a summary-only review".to_string(),
-        1 => "1 inline comment".to_string(),
-        n => format!("{n} inline comments"),
+        1 => format!("1 inline comment{}", severity_breakdown(&drafts)),
+        n => format!("{n} inline comments{}", severity_breakdown(&drafts)),
     };
     let cmd = ExecutorCommand::PublishReview {
         review_id,
@@ -124,6 +154,7 @@ fn confirm_publish_and_fix_review(
     body: String,
 ) {
     let n = drafts.iter().filter(|d| d.selected).count();
+    let breakdown = severity_breakdown(&drafts);
     let cmd = ExecutorCommand::PublishReviewAndFix {
         review_id,
         drafts,
@@ -138,7 +169,7 @@ fn confirm_publish_and_fix_review(
     request_confirm(ConfirmRequest {
         title: "Publish & fix".into(),
         message: format!(
-            "Submit {n} inline comment(s) as “{}”, each saying you'll fix it yourself, then have              an agent fix all {n} in the PR's checkout? Nothing is pushed until you approve the              diff.",
+            "Submit {n} inline comment(s){breakdown} as “{}”, each saying you'll fix it yourself, then have              an agent fix all {n} in the PR's checkout? Nothing is pushed until you approve the              diff.",
             event.label()
         ),
         confirm_label: "Publish & fix".into(),
