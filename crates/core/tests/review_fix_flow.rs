@@ -18,8 +18,8 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, DraftComment, ExecutorCommand, ExecutorConfig, ExecutorEvent,
     ExecutorEventKind, Forge, GitOps, LivePrState, MergeOutcome, Mergeable, PrInfo, PrPushTarget,
-    PrSummary, Project, ProjectConfig, Result, ReviewComment, ReviewEvent, ReviewStatus,
-    ReviewScope, ReviewSummary, ReviewThread, SimFactory, SimForge, SimGit, Store,
+    PrSummary, Project, ProjectConfig, Result, ReviewComment, ReviewEvent, ReviewScope,
+    ReviewStatus, ReviewSummary, ReviewThread, SimFactory, SimForge, SimGit, Store,
 };
 
 /// Everything the doubles saw, in order — the test's whole assertion surface.
