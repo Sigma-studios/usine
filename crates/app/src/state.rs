@@ -909,11 +909,16 @@ fn open_store() -> Store {
     match Store::open(&path) {
         Ok(store) => store,
         Err(e) => {
+            let hint = if e.is_db_locked() {
+                " Quit any other Usine instance — the database allows only one writer."
+            } else {
+                ""
+            };
             push_toast(
                 Severity::Error,
                 format!(
-                    "could not open database ({e}). Maybe another instance is already running; \
-                     using a temporary in-memory store"
+                    "could not open database ({e}).{hint} Falling back to a temporary \
+                     in-memory store — the board starts empty and changes will NOT be saved"
                 ),
             );
             Store::open_in_memory().expect("in-memory store")
