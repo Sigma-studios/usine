@@ -12,6 +12,7 @@ use crate::state::AppState;
 use crate::ui::diffdialog::{event_value, open_review_diff, open_review_diff_at, parse_event};
 use crate::ui::icons::IconDiff;
 use crate::ui::reviewdraft;
+use crate::ui::widgets::SeverityPicker;
 
 /// The detail panel for the selected review task.
 #[component]
@@ -376,14 +377,8 @@ fn DraftSelection(
                         Some(l) => format!("{}:{}", d.path, l),
                         None => d.path.clone(),
                     };
-                    // Severity badge (falls back to a neutral dash when unrated).
+                    // The maintainer's rating, editable — it is published with the comment.
                     let sev = d.severity.clone();
-                    let sev_label = if sev.is_empty() { "—".to_string() } else { sev.clone() };
-                    let sev_class = if sev.is_empty() {
-                        "sev".to_string()
-                    } else {
-                        format!("sev sev-{sev}")
-                    };
                     let body_text = d.body.clone();
                     let rows = fallback_rows(&body_text);
                     rsx! {
@@ -399,7 +394,21 @@ fn DraftSelection(
                                 // visible so a long list stays scannable.
                                 details { class: "draft", open: true,
                                     summary {
-                                        span { class: "{sev_class}", "{sev_label}" }
+                                        // `summary` toggles the `details` on click; changing
+                                        // the level shouldn't also collapse the row. The
+                                        // toggle is the summary's default action, so it
+                                        // takes `prevent_default` as well as stopping the
+                                        // bubble.
+                                        div {
+                                            onclick: move |e| {
+                                                e.stop_propagation();
+                                                e.prevent_default();
+                                            },
+                                            SeverityPicker {
+                                                severity: sev.clone(),
+                                                on_change: move |s| reviewdraft::set_severity(i, s),
+                                            }
+                                        }
                                         span { class: "path", "{loc}" }
                                         button {
                                             class: "draft-jump",

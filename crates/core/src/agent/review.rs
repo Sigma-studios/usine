@@ -63,7 +63,10 @@ Write your review as a fenced code block tagged `usine-review` containing a JSON
 \"severity\": \"high\"}], \"summary\": \"<1-3 sentence overall summary>\", \"event\": \"comment\"}. \
 Each comment's `line` is a line number in the file's NEW version that the changes touch; omit `line` \
 only for a whole-file comment. Keep each `body` to one or two sentences — short and actionable. \
-`severity` is one of \"critical\", \"high\", \"medium\", or \"low\". `event` is your overall verdict: \
+Give every comment a `severity` — one of \"critical\" (must be fixed before merge), \"high\" \
+(should be fixed), \"medium\" (worth considering), or \"low\" (optional nit). It is published to \
+the author alongside the comment, so rate honestly and consistently; a comment you leave unrated \
+goes out with no criticality at all. `event` is your overall verdict: \
 \"comment\" (neutral feedback), \"request_changes\" (problems that should block), or \"approve\" (looks \
 good). If you have no inline comments, use an empty `comments` array.";
 
@@ -150,15 +153,40 @@ struct RawVerdict {
     reply: String,
 }
 
-/// Clamp the agent's severity string to one of the known levels (lower-cased),
-/// or empty if it returned something unexpected.
-fn normalize_severity(s: &str) -> String {
-    match s.trim().to_lowercase().as_str() {
-        "critical" => "critical".into(),
-        "high" => "high".into(),
-        "medium" => "medium".into(),
-        "low" => "low".into(),
-        _ => String::new(),
+/// The criticality levels a comment can carry, most severe first. The single
+/// source of truth for both the agent's vocabulary and the maintainer's picker.
+pub const SEVERITY_LEVELS: [&str; 4] = ["critical", "high", "medium", "low"];
+
+/// The index of a severity string in [`SEVERITY_LEVELS`] (most severe first),
+/// or `None` if it is something unexpected — the agent returning nonsense, or
+/// the user deliberately clearing the level.
+pub fn severity_rank(s: &str) -> Option<usize> {
+    let s = s.trim();
+    SEVERITY_LEVELS
+        .iter()
+        .position(|l| l.eq_ignore_ascii_case(s))
+}
+
+/// Clamp a severity string to one of [`SEVERITY_LEVELS`] (lower-cased), or empty
+/// if it carries no level.
+pub fn normalize_severity(s: &str) -> String {
+    severity_rank(s)
+        .map(|i| SEVERITY_LEVELS[i].to_string())
+        .unwrap_or_default()
+}
+
+/// How a level is written when the comment is published to the author: an emoji
+/// plus a word, so criticality is visible at a glance in a GitHub thread.
+///
+/// `None` for an unrated comment — that is a real outcome, not a missing value:
+/// such a comment is posted verbatim rather than given a level nobody chose.
+pub fn severity_marker(sev: &str) -> Option<&'static str> {
+    match normalize_severity(sev).as_str() {
+        "critical" => Some("\u{1F534} Critical"),
+        "high" => Some("\u{1F7E0} High"),
+        "medium" => Some("\u{1F7E1} Medium"),
+        "low" => Some("\u{1F535} Low"),
+        _ => None,
     }
 }
 
@@ -335,6 +363,71 @@ pub fn pledged_drafts(drafts: &[DraftComment]) -> Vec<DraftComment> {
         .collect()
 }
 
+/// The drafts as they should be *posted*: each rated body opens with its
+/// criticality marker, so the author reads a blocking defect and an optional nit
+/// differently. Unrated bodies pass through byte-identical — nothing is invented
+/// on the author's behalf.
+///
+/// Derived at publish time rather than stored in the draft buffer (the same
+/// contract as [`pledged_drafts`]): the originals are left untouched, a
+/// re-publish can't double the marker up, and the marker composes as a prefix
+/// with the pledge's suffix.
+pub fn tagged_drafts(drafts: &[DraftComment]) -> Vec<DraftComment> {
+    drafts
+        .iter()
+        .map(|d| match severity_marker(&d.severity) {
+            None => d.clone(),
+            Some(marker) => DraftComment {
+                // A body opening with markdown block syntax (a fence, a list, a
+                // heading, a quote, a table) can't follow a label on the same
+                // line without losing its rendering — give it its own line, and
+                // drop the colon, which only reads right when it introduces prose.
+                body: if opens_a_block(&d.body) {
+                    format!("**{marker}**\n\n{}", d.body)
+                } else {
+                    format!("**{marker}:** {}", d.body)
+                },
+                ..d.clone()
+            },
+        })
+        .collect()
+}
+
+/// Whether a comment's first line starts a markdown block, which must stay at
+/// the start of its own line to render.
+///
+/// Ordered lists count: an item's marker only opens a list at the start of a
+/// line, and a following `2.` cannot interrupt a paragraph, so prefixing a
+/// numbered list would flatten the whole thing into one run of prose.
+fn opens_a_block(body: &str) -> bool {
+    let first = body.trim_start();
+    if ["```", "~~~", "#", ">", "|"]
+        .iter()
+        .any(|p| first.starts_with(p))
+    {
+        return true;
+    }
+    let line = first.lines().next().unwrap_or_default();
+    let bytes = line.as_bytes();
+    // A bullet marker opens a list only when a space follows it — `**bold**` and
+    // `-1 is wrong` are prose.
+    if matches!(bytes.first(), Some(b'-' | b'*' | b'+')) && bytes.get(1) == Some(&b' ') {
+        return true;
+    }
+    // A thematic break: three or more of the same marker, spaces aside.
+    if let Some(c @ (b'-' | b'*' | b'_')) = bytes.first().copied() {
+        let marks = bytes.iter().filter(|b| **b == c).count();
+        if marks >= 3 && bytes.iter().all(|b| *b == c || *b == b' ' || *b == b'\t') {
+            return true;
+        }
+    }
+    // An ordered list: `1.` or `1)`, up to CommonMark's nine digits.
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (1..=9).contains(&digits)
+        && matches!(bytes.get(digits), Some(b'.' | b')'))
+        && bytes.get(digits + 1) == Some(&b' ')
+}
+
 /// The extra prompt for the fix run behind "Publish & fix": the comments the
 /// maintainer just published and pledged to fix, plus the framing that makes
 /// this different from fixing one's own branch — it is someone else's PR, and
@@ -357,9 +450,15 @@ pub fn review_fix_prompt(
             Some(line) => format!("{}:{}", c.path, line),
             None => c.path.clone(),
         };
+        // The level the maintainer published tells the fix run what to be
+        // careful with; an unrated comment keeps the bare shape.
+        let sev = match normalize_severity(&c.severity) {
+            s if s.is_empty() => String::new(),
+            s => format!("[{s}] "),
+        };
         // Indent continuation lines so a multi-line comment stays one bullet.
         out.push_str(&format!(
-            "- [{loc}] {}\n",
+            "- {sev}[{loc}] {}\n",
             c.body.trim().replace('\n', "\n  ")
         ));
     }
@@ -607,6 +706,100 @@ mod tests {
     }
 
     #[test]
+    fn every_level_gets_its_marker_and_an_unrated_comment_is_published_verbatim() {
+        for (level, marker) in [
+            ("critical", "\u{1F534} Critical"),
+            ("high", "\u{1F7E0} High"),
+            ("medium", "\u{1F7E1} Medium"),
+            ("low", "\u{1F535} Low"),
+        ] {
+            let mut d = draft("a.rs", Some(3), "Guard this unwrap.");
+            d.severity = level.into();
+            let tagged = tagged_drafts(std::slice::from_ref(&d));
+            assert_eq!(tagged[0].body, format!("**{marker}:** Guard this unwrap."));
+            assert_eq!(tagged[0].severity, level, "the level itself is unchanged");
+        }
+
+        // Unrated — and a level the agent invented, which normalizes to unrated
+        // — post byte-identical.
+        for sev in ["", "  ", "blocker"] {
+            let mut d = draft("a.rs", Some(3), "Guard this unwrap.");
+            d.severity = sev.into();
+            assert_eq!(tagged_drafts(std::slice::from_ref(&d))[0].body, d.body);
+        }
+    }
+
+    #[test]
+    fn tagging_leaves_the_originals_alone() {
+        let drafts = vec![draft("a.rs", Some(3), "Guard this unwrap.")];
+        let tagged = tagged_drafts(&drafts);
+        assert!(tagged[0].body.starts_with("**"));
+        assert_eq!(drafts[0].body, "Guard this unwrap.", "originals untouched");
+    }
+
+    /// A hand-edited comment opening with a fence (or a list) can't have a label
+    /// glued in front of it — the block would stop rendering.
+    #[test]
+    fn a_body_opening_a_markdown_block_gets_the_marker_on_its_own_line() {
+        for body in [
+            "```rust\nlet x = 1;\n```",
+            "- one\n- two",
+            "+ one\n+ two",
+            // An ordered list is the sharp case: a `2.` line can't interrupt a
+            // paragraph, so a glued-on label collapses the list entirely.
+            "1. Do X\n2. Do Y",
+            "1) Do X\n2) Do Y",
+            "---",
+            "> quoted",
+        ] {
+            let mut d = draft("a.rs", Some(3), body);
+            d.severity = "critical".into();
+            assert_eq!(
+                tagged_drafts(std::slice::from_ref(&d))[0].body,
+                format!("**\u{1F534} Critical**\n\n{body}"),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// Prose that merely *starts* with a marker character is still prose, and
+    /// reads better with the label inline.
+    #[test]
+    fn a_prose_body_keeps_the_marker_inline() {
+        for body in [
+            "**Guard** this unwrap.",
+            "-1 is not a valid index.",
+            "1.5 seconds is too long a timeout.",
+            "*ptr is dereferenced twice.",
+        ] {
+            let mut d = draft("a.rs", Some(3), body);
+            d.severity = "low".into();
+            assert_eq!(
+                tagged_drafts(std::slice::from_ref(&d))[0].body,
+                format!("**\u{1F535} Low:** {body}"),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tag_and_the_pledge_compose_as_prefix_and_suffix() {
+        let mut d = draft("a.rs", Some(3), "Guard this unwrap.");
+        d.severity = "high".into();
+        let body = &tagged_drafts(&pledged_drafts(std::slice::from_ref(&d)))[0].body;
+        assert!(body.starts_with("**\u{1F7E0} High:** Guard this unwrap."));
+        assert!(body.ends_with(FIX_PLEDGE.trim_end()));
+    }
+
+    #[test]
+    fn fix_prompt_omits_the_level_for_an_unrated_comment() {
+        let mut d = draft("a.rs", Some(3), "Guard this unwrap.");
+        d.severity = String::new();
+        let p = review_fix_prompt(1, "octocat", std::slice::from_ref(&d), "");
+        assert!(p.contains("- [a.rs:3] Guard this unwrap."));
+    }
+
+    #[test]
     fn fix_prompt_lists_each_comment_and_carries_the_note() {
         let drafts = vec![
             draft("a.rs", Some(3), "Guard this unwrap."),
@@ -615,9 +808,9 @@ mod tests {
         let p = review_fix_prompt(123, "octocat", &drafts, "  keep the helper private  ");
         assert!(p.contains("#123"));
         assert!(p.contains("@octocat"));
-        assert!(p.contains("- [a.rs:3] Guard this unwrap."));
+        assert!(p.contains("- [medium] [a.rs:3] Guard this unwrap."));
         assert!(
-            p.contains("- [b.rs] Stale doc."),
+            p.contains("- [medium] [b.rs] Stale doc."),
             "a line-less comment lists its path alone"
         );
         assert!(p.contains("keep the helper private"));

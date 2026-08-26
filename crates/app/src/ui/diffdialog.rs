@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::reviewdraft;
 use crate::state::AppState;
+use crate::ui::widgets::SeverityPicker;
 
 /// Which entity's diff the dialog is showing. Both are keyed by a plain id in
 /// the executor's per-entity diff map, so only the command used to (re)compute
@@ -497,16 +498,6 @@ fn DiffView(
 #[component]
 fn InlineComment(index: usize, comment: DraftComment) -> Element {
     let sev = comment.severity.clone();
-    let sev_label = if sev.is_empty() {
-        "—".to_string()
-    } else {
-        sev.clone()
-    };
-    let sev_class = if sev.is_empty() {
-        "sev".to_string()
-    } else {
-        format!("sev sev-{sev}")
-    };
     let checked = comment.selected;
     let row_class = if checked {
         "inline-comment"
@@ -529,7 +520,10 @@ fn InlineComment(index: usize, comment: DraftComment) -> Element {
                     "aria-label": "Include this comment in the review",
                     onchange: move |_| reviewdraft::toggle(index),
                 }
-                span { class: "{sev_class}", "{sev_label}" }
+                SeverityPicker {
+                    severity: sev.clone(),
+                    on_change: move |s| reviewdraft::set_severity(index, s),
+                }
                 span { class: "inline-comment-loc",
                     match comment.line {
                         Some(l) => format!("{}:{}", comment.path, l),

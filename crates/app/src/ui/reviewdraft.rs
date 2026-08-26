@@ -96,6 +96,16 @@ pub(crate) fn set_body(index: usize, body: String) {
     }
 }
 
+/// Replace a comment's criticality with the maintainer's judgement. The empty
+/// string clears it — that comment then publishes untagged, verbatim.
+pub(crate) fn set_severity(index: usize, severity: String) {
+    if let Some(d) = DRAFTS.write().as_mut() {
+        if let Some(c) = d.comments.get_mut(index) {
+            c.severity = severity;
+        }
+    }
+}
+
 pub(crate) fn set_summary(summary: String) {
     if let Some(d) = DRAFTS.write().as_mut() {
         d.summary = summary;

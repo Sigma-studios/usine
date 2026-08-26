@@ -648,9 +648,10 @@ impl Executor {
         Ok(())
     }
 
-    /// Anchor the selected drafts against the PR's diff, fold whatever can't be
-    /// placed inline into the body, and POST the review. Returns how many
-    /// comments were folded, which the caller reports back to the user.
+    /// Tag the selected drafts with their criticality, anchor them against the
+    /// PR's diff, fold whatever can't be placed inline into the body, and POST
+    /// the review. Returns how many comments were folded, which the caller
+    /// reports back to the user.
     ///
     /// The posting half of [`Self::publish_review`], shared with
     /// [`Self::publish_review_and_fix`] so both surfaces post identically.
@@ -663,6 +664,9 @@ impl Executor {
         body: &str,
     ) -> Result<usize> {
         let n_selected = selected.len();
+        // Tag before folding, so a comment that ends up in the review body
+        // carries its criticality there too.
+        let selected = crate::agent::review::tagged_drafts(&selected);
         // A draft-less publish — a direct approve from `ToReview` — has nothing
         // to anchor, and its PR may never have been fetched at all.
         let diff = if selected.is_empty() {

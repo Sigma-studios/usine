@@ -488,6 +488,12 @@ select option { background: var(--panel-2); color: var(--text); }
 .sev-high { color: var(--amber); background: var(--amber-wash); border-color: var(--amber-border); }
 .sev-medium { color: var(--accent); background: rgba(108, 140, 255, 0.12); border-color: rgba(108, 140, 255, 0.3); }
 .sev-low { color: var(--muted); }
+/* The severity picker wears the pill's look: the level is editable, but it
+   still reads as a badge rather than a form control. */
+select.sev { appearance: none; -webkit-appearance: none; cursor: pointer; font-family: inherit; line-height: 1.4; }
+select.sev:hover { border-color: var(--muted); }
+select.sev:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+select.sev option { text-transform: none; color: var(--text); background: var(--panel); }
 .verdict-tag.verdict-yes { color: var(--green); border-color: rgba(63, 185, 80, 0.35); }
 .verdict-tag.verdict-no { color: var(--muted); }
 
