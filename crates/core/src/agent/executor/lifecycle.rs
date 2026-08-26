@@ -293,10 +293,11 @@ impl Executor {
                 let mut tail = String::new();
                 if let Some(run) = super::preview::run_command(&project.config) {
                     let has_ports = !project.config.preview_ports.is_empty();
+                    let shot = project.config.screenshot_command();
                     let instruction = if project.config.auto_preview {
-                        crate::agent::testing::testing_instruction(&run, has_ports)
+                        crate::agent::testing::testing_instruction(&run, has_ports, shot)
                     } else {
-                        crate::agent::testing::testing_instruction_on_request(&run, has_ports)
+                        crate::agent::testing::testing_instruction_on_request(&run, has_ports, shot)
                     };
                     tail.push_str(&instruction);
                     tail.push_str("\n\n");

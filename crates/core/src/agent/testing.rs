@@ -23,6 +23,7 @@
 //! finalizers stop it (`reap_idle_preview`), tearing the worktree's isolated
 //! infra down with it.
 
+use crate::domain::config::OPEN_PATH_PLACEHOLDER;
 use crate::domain::model::PreviewUrl;
 
 /// Name of the JSON file the executor writes into a worktree's root once its
@@ -39,8 +40,10 @@ pub const PREVIEW_REQUEST_FILE: &str = ".usine-preview-request";
 /// app eagerly (`auto_preview` on). Kept provider-agnostic and self-contained,
 /// like its siblings in [`crate::agent::commit`] and [`crate::agent::handoff`].
 /// `has_ports` picks the observation route: declared preview ports mean the
-/// agent exercises URLs; none means a windowed app it should screenshot.
-pub fn testing_instruction(run_script: &str, has_ports: bool) -> String {
+/// agent exercises URLs; none means a windowed app it should screenshot, using
+/// the project's `screenshot` command when it has one — which a ported project
+/// is offered too, for the windowed app that fronts its own dev server.
+pub fn testing_instruction(run_script: &str, has_ports: bool, screenshot: Option<&str>) -> String {
     format!(
         "The project's app is being started for you in this worktree (its command: `{run_script}`), \
          owned by the tool that launched you. Do NOT start your own instance and do NOT stop or \
@@ -50,14 +53,18 @@ pub fn testing_instruction(run_script: &str, has_ports: bool) -> String {
          launched, so if it is missing, keep working and check again later.\n{}\n\
          Leave the app running when you finish — the tool that launched you stops it once the work \
          parks.",
-        observation_route(has_ports)
+        observation_route(has_ports, screenshot)
     )
 }
 
 /// The on-request twin of [`testing_instruction`]: appended to write runs when
 /// the project has a `run_script` but `auto_preview` is off. The app is not
 /// started eagerly; the agent asks for it via [`PREVIEW_REQUEST_FILE`].
-pub fn testing_instruction_on_request(run_script: &str, has_ports: bool) -> String {
+pub fn testing_instruction_on_request(
+    run_script: &str,
+    has_ports: bool,
+    screenshot: Option<&str>,
+) -> String {
     format!(
         "The project's app (its command: `{run_script}`) is NOT started automatically for this \
          run. If your change has behaviour observable in the running app, request the app NOW — \
@@ -69,37 +76,96 @@ pub fn testing_instruction_on_request(run_script: &str, has_ports: bool) -> Stri
          your edits.\n{}\n\
          Leave the app running when you finish — the tool that launched you stops it once the work \
          parks.",
-        observation_route(has_ports)
+        observation_route(has_ports, screenshot)
+    )
+}
+
+/// The default way to capture a single window on the platform Usine is running
+/// on, used when the project names no screenshot command of its own.
+/// Deliberately hedged: none of these is dependable enough to promise — which is
+/// exactly why [`crate::domain::config::ProjectConfig::screenshot_script`]
+/// exists.
+#[cfg(target_os = "macos")]
+const PLATFORM_CAPTURE: &str = "On this machine (macOS): `screencapture -l <window-id>` to a \
+     temporary png, resolving the window id first (e.g. via `osascript` or `GetWindowID`).";
+#[cfg(target_os = "linux")]
+const PLATFORM_CAPTURE: &str = "On this machine (Linux) it depends on the session: under \
+     X11/XWayland, resolve the window with `xdotool search --name` and capture just it with \
+     `import -window <id>`; under Wayland use the compositor's own tool (e.g. `spectacle -a -o`, \
+     `grim` with a region) or the desktop portal. If none of them is installed or none can scope \
+     the capture to the window, that is a reason to report a failure — not to grab the display.";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const PLATFORM_CAPTURE: &str = "On this machine (Windows): capture the window's rect via \
+     PowerShell (`GetWindowRect` plus `Graphics.CopyFromScreen`), never the whole desktop.";
+
+/// The configured screenshot command, spelled out for the agent: where the
+/// destination path goes (including when the template has no
+/// [`OPEN_PATH_PLACEHOLDER`] — same trailing-argument rule as
+/// [`crate::domain::config::resolve_open_command`]) and, crucially, that the
+/// image must land outside the worktree: finalize's auto-commit is a
+/// `git add -A`, and unlike the runtime artifacts in `PREVIEW_EXCLUDES` a
+/// screenshot has no fixed name to exclude, so keeping it out of the tree is
+/// the only guard.
+fn configured_capture(cmd: &str) -> String {
+    format!(
+        "run `{cmd}` with `{OPEN_PATH_PLACEHOLDER}` replaced by a .png path outside the worktree \
+         (e.g. under `$TMPDIR`) — if the command has no `{OPEN_PATH_PLACEHOLDER}`, pass that path \
+         as its last argument instead — then read that image. Do not write it inside the worktree: \
+         it would be swept into the commit"
     )
 }
 
 /// How the agent should actually observe its change in the running app, shared
-/// by both instruction variants. With declared preview ports the app is
-/// URL-reachable; without them it's a windowed program, so the only observation
-/// is a screenshot — of the app's window ONLY, never the full display: the
-/// rest of the screen is the user's other windows (mail, chats, secrets),
-/// which must not enter the agent's context. A failure to capture the window
-/// (e.g. a missing screen-recording permission) must be reported, not guessed
-/// around — and not worked around with a full-screen grab.
-fn observation_route(has_ports: bool) -> &'static str {
+/// by both instruction variants.
+///
+/// With declared preview ports the app is URL-reachable — plus its window, when
+/// the project configured a command for that. Without them it's a
+/// windowed program, so the only observation is a screenshot — of the app's
+/// window ONLY, never the full display: the rest of the screen is the user's
+/// other windows (mail, chats, secrets), which must not enter the agent's
+/// context. A project can name the command for that, and should: how you
+/// capture one window depends on the OS and, on Linux, on the compositor, and a
+/// project whose preview runs on a private display is the only thing that knows
+/// how to reach it. Without one we fall back to [`PLATFORM_CAPTURE`]. Either
+/// way, a failure to capture must be reported, not guessed around — and not
+/// worked around with a full-screen grab.
+fn observation_route(has_ports: bool, screenshot: Option<&str>) -> String {
     if has_ports {
-        "After implementing, if the change has behaviour observable in the running app, verify it \
-         there before you finish: exercise those URLs (curl, or the project's own scripts), check \
-         the change works end to end, fix what you find, and re-verify. If the app never comes up, \
-         or the change is not observable this way, skip the in-app check and say so in your \
-         hand-off."
-    } else {
+        let urls = "After implementing, if the change has behaviour observable in the running \
+                    app, verify it there before you finish: exercise those URLs (curl, or the \
+                    project's own scripts), check the change works end to end, fix what you find, \
+                    and re-verify. If the app never comes up, or the change is not observable this \
+                    way, skip the in-app check and say so in your hand-off.";
+        // A project can declare ports *and* a screenshot command — a windowed
+        // app fronting its own dev server. The command was configured
+        // deliberately, so offer it alongside the URLs rather than dropping it.
+        return match screenshot {
+            Some(cmd) => format!(
+                "{urls} If the change is also visible in a window, screenshot the app's window \
+                 ONLY and read the image: {}. NEVER capture the full display: the rest of the \
+                 screen is the user's other windows and their contents, which must not enter your \
+                 context.",
+                configured_capture(cmd)
+            ),
+            None => urls.to_string(),
+        };
+    }
+    let capture = match screenshot {
+        Some(cmd) => format!(
+            "This project provides the command for it: {}.",
+            configured_capture(cmd)
+        ),
+        None => PLATFORM_CAPTURE.to_string(),
+    };
+    format!(
         "The app has no declared URLs — it runs as a windowed program. After implementing, if the \
          change is visible in the app, verify it by capturing a screenshot of the app's window \
-         ONLY and reading the image — on macOS `screencapture -l <window-id>` to a temporary png, \
-         resolving the window id first (e.g. via `osascript` or `GetWindowID`). NEVER capture the \
-         full display: the rest of the screen is the user's other windows and their contents, \
-         which must not enter your context — and the app may be obscured or on another Space \
-         anyway. Fix what you find and re-verify. If you can't capture the app's window \
-         specifically (e.g. a missing screen-recording permission, or no way to resolve its \
-         window id), don't fall back to a full-screen grab and don't guess — say exactly that in \
-         your hand-off."
-    }
+         ONLY and reading the image. {capture} NEVER capture the full display: the rest of the \
+         screen is the user's other windows and their contents, which must not enter your context \
+         — and the app may be obscured or on another workspace anyway. Fix what you find and \
+         re-verify. If you can't capture the app's window specifically, don't fall back to a \
+         full-screen grab and don't guess — say exactly what failed in your hand-off."
+    )
 }
 
 /// The contents of [`PREVIEW_INFO_FILE`]: the running app's URLs. `urls` can be
@@ -119,7 +185,7 @@ mod tests {
 
     #[test]
     fn instruction_names_the_run_script_and_info_file() {
-        let s = testing_instruction("pnpm dev", true);
+        let s = testing_instruction("pnpm dev", true, None);
         assert!(s.contains("`pnpm dev`"));
         assert!(s.contains(PREVIEW_INFO_FILE));
         // Eager mode: the app is started for the agent, no sentinel involved.
@@ -131,19 +197,58 @@ mod tests {
 
     #[test]
     fn portless_instruction_takes_the_screenshot_route() {
-        let s = testing_instruction("cargo run", false);
+        let s = testing_instruction("cargo run", false, None);
         assert!(s.contains("screenshot"));
-        assert!(s.contains("screen-recording permission"));
         assert!(!s.contains("curl"));
         // Window-scoped capture only — a full-display grab would feed the
         // user's other windows into the agent's context.
-        assert!(s.contains("-l <window-id>"));
         assert!(s.contains("NEVER capture the full display"));
+        assert!(s.contains("don't fall back to a full-screen grab"));
+        // With no configured command the agent gets the host platform's route,
+        // not another platform's (which would be an instruction it cannot run).
+        assert!(s.contains(PLATFORM_CAPTURE));
+    }
+
+    #[test]
+    fn a_configured_screenshot_command_replaces_the_platform_guess() {
+        let s = testing_instruction("cargo run", false, Some("./shot.sh {path}"));
+        assert!(s.contains("`./shot.sh {path}`"));
+        assert!(s.contains(OPEN_PATH_PLACEHOLDER));
+        // The platform fallback is exactly what it supersedes.
+        assert!(!s.contains(PLATFORM_CAPTURE));
+        // The privacy floor holds either way.
+        assert!(s.contains("NEVER capture the full display"));
+    }
+
+    /// A project with URLs leads with them — exercising the app is a better
+    /// check than looking at it — but a screenshot command it deliberately
+    /// configured is still offered: a windowed app can front a dev server.
+    #[test]
+    fn declared_ports_keep_an_offered_screenshot_command() {
+        let s = testing_instruction("pnpm dev", true, Some("./shot.sh {path}"));
+        assert!(s.contains("curl"));
+        assert!(s.contains("`./shot.sh {path}`"));
+        assert!(s.contains("NEVER capture the full display"));
+    }
+
+    /// Wherever the capture command is offered, the image goes outside the
+    /// worktree (finalize's `git add -A` would otherwise commit it) and a
+    /// command without the placeholder still learns where the path goes.
+    #[test]
+    fn capture_keeps_the_image_out_of_the_worktree() {
+        for s in [
+            testing_instruction("cargo run", false, Some("./shot.sh")),
+            testing_instruction("pnpm dev", true, Some("./shot.sh")),
+        ] {
+            assert!(s.contains("outside the worktree"));
+            assert!(s.contains("$TMPDIR"));
+            assert!(s.contains("as its last argument"));
+        }
     }
 
     #[test]
     fn on_request_instruction_names_the_sentinel() {
-        let s = testing_instruction_on_request("pnpm dev", true);
+        let s = testing_instruction_on_request("pnpm dev", true, None);
         assert!(s.contains("`pnpm dev`"));
         assert!(s.contains(PREVIEW_REQUEST_FILE));
         assert!(s.contains(PREVIEW_INFO_FILE));
@@ -155,7 +260,7 @@ mod tests {
 
     #[test]
     fn on_request_portless_takes_the_screenshot_route() {
-        let s = testing_instruction_on_request("cargo run", false);
+        let s = testing_instruction_on_request("cargo run", false, None);
         assert!(s.contains(PREVIEW_REQUEST_FILE));
         assert!(s.contains("screenshot"));
         assert!(!s.contains("curl"));
