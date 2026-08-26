@@ -98,16 +98,6 @@ impl Executor {
             .worktree_path
             .clone()
             .ok_or_else(|| CoreError::other("card has no worktree to validate in"))?;
-        // The gate runs in the same prepared worktree a preview would: the setup
-        // command owns "make this worktree runnable" (dependencies, an isolated
-        // database, per-worktree ports), so without it the check reports on a
-        // missing environment rather than on the work. Re-running it here is safe
-        // by the same contract that lets every preview start re-run it.
-        let setup = super::preview::resolve_script(
-            &project.config.worktree_setup_script,
-            &worktree,
-            super::preview::SETUP_CANDIDATES,
-        );
         let timeout = project.config.validate_timeout();
 
         // The concurrency gate: either take a slot now or park in the queue —
@@ -124,6 +114,26 @@ impl Executor {
                     None => return Ok(()),
                 }
             }
+        };
+
+        // The gate runs in the same prepared worktree a preview would: the setup
+        // command owns "make this worktree runnable" (dependencies, an isolated
+        // database, per-worktree ports), so without it the check reports on a
+        // missing environment rather than on the work. Re-running it here is safe
+        // by the same contract that lets every preview start re-run it.
+        //
+        // Except when the card's preview slot is taken: that preview's own setup
+        // already prepared this worktree, and it is still live (the reap skips
+        // running cards), so re-running setup underneath it would reset the very
+        // database and ports the running app is using.
+        let setup = if lock(&self.previews).contains_key(&card_id) {
+            None
+        } else {
+            super::preview::resolve_script(
+                &project.config.worktree_setup_script,
+                &worktree,
+                super::preview::SETUP_CANDIDATES,
+            )
         };
 
         // Register the check as the card's active run: cancel, teardown, and

@@ -11,6 +11,10 @@ use super::widgets::{
 };
 use crate::state::AppState;
 
+/// Upper bound (a day) on the validate timeout field, enforced on save as well
+/// as by the input, since a typed value bypasses the input's `max`.
+const MAX_VALIDATE_TIMEOUT_MINUTES: u32 = 1440;
+
 static SETTINGS_OPEN: GlobalSignal<bool> = Signal::global(|| false);
 
 /// Which project's settings modal is open (its review-contributors picker), if any.
@@ -554,7 +558,13 @@ fn CommandsTab(pid: Uuid) -> Element {
         .worktree_teardown_script
         .clone()
         .unwrap_or_default();
-    let validate_timeout = project.config.validate_timeout_minutes;
+    // 0 is the stored form of "cleared", which the config reads back as the
+    // default — render it blank (the placeholder shows the default) rather than
+    // as a `0` the gate never honours.
+    let validate_timeout = match project.config.validate_timeout_minutes {
+        0 => String::new(),
+        n => n.to_string(),
+    };
 
     rsx! {
         div { class: "section",
@@ -606,7 +616,7 @@ fn CommandsTab(pid: Uuid) -> Element {
                     class: "port-num",
                     r#type: "number",
                     min: "1",
-                    max: "1440",
+                    max: "{MAX_VALIDATE_TIMEOUT_MINUTES}",
                     placeholder: "30",
                     value: "{validate_timeout}",
                     onchange: {
@@ -620,7 +630,8 @@ fn CommandsTab(pid: Uuid) -> Element {
                             let parsed = if v.is_empty() { Some(0) } else { v.parse::<u32>().ok() };
                             if let Some(n) = parsed {
                                 let mut p = project.clone();
-                                p.config.validate_timeout_minutes = n;
+                                // Typed values bypass the input's max, so clamp.
+                                p.config.validate_timeout_minutes = n.min(MAX_VALIDATE_TIMEOUT_MINUTES);
                                 state.save_project(p);
                             }
                         }
