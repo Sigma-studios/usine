@@ -348,7 +348,7 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                     }
                 }
             }
-            ExecutorEventKind::Reviewers { .. } => {}
+            ExecutorEventKind::Reviewers { .. } | ExecutorEventKind::PrAuthors { .. } => {}
             ExecutorEventKind::CardUpdated(card) => {
                 let label = card.state.status_label().to_string();
                 if label == last_label {
@@ -584,7 +584,7 @@ async fn real_e2e() -> anyhow::Result<()> {
             ExecutorEventKind::Toast { severity, message } => {
                 println!("   [{severity:?}] {message}")
             }
-            ExecutorEventKind::Reviewers { .. } => {}
+            ExecutorEventKind::Reviewers { .. } | ExecutorEventKind::PrAuthors { .. } => {}
             ExecutorEventKind::CardUpdated(card) => {
                 let label = card.state.status_label().to_string();
                 if label == last_label {

@@ -541,6 +541,18 @@ impl Executor {
         Ok(())
     }
 
+    /// Look up the logins with an open PR on the project's repo — the
+    /// contributor picker's suggestions, which cover the fork contributors the
+    /// collaborator list can't. Project-scoped: emits a `PrAuthors` event.
+    pub(super) async fn list_pr_authors(&self, project_id: Uuid) -> Result<()> {
+        let project = self.store.get_project(project_id)?;
+        let logins = self.forge.list_pr_authors(&project.path).await?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::pr_authors(project_id, logins));
+        Ok(())
+    }
+
     /// Read a PR's current review comments, submitted reviews, and unanswered-
     /// thread count together — the shared fetch behind both the background poll
     /// ([`Self::poll_pr_comments`]) and the panel's manual refresh

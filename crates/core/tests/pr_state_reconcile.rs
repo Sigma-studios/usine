@@ -17,8 +17,8 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, CheckStatus, CoreError, DraftComment,
     ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, LivePrState, Mergeable, PrInfo,
-    PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent, ReviewStatus, ReviewSummary,
-    ReviewTask, SimFactory, SimForge, SimGit, Store,
+    PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent, ReviewScope, ReviewStatus,
+    ReviewSummary, ReviewTask, SimFactory, SimForge, SimGit, Store,
 };
 
 /// A forge that answers `pr_live_state` from a per-PR table (`fail_live` makes
@@ -49,7 +49,11 @@ impl Forge for LiveForge {
         }
         Ok(self.live.get(&n).copied())
     }
-    async fn list_review_prs(&self, _: &Path, _: &[String]) -> usine_core::Result<Vec<PrSummary>> {
+    async fn list_review_prs(
+        &self,
+        _: &Path,
+        _: ReviewScope,
+    ) -> usine_core::Result<Vec<PrSummary>> {
         Ok(self.open_prs.clone())
     }
     // Unreached by the reconciliation; defer to the simulator.

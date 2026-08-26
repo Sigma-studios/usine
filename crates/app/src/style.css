@@ -831,6 +831,15 @@ select option { background: var(--panel-2); color: var(--text); }
   width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
 }
+/* Login box + Add button on one line. Sits outside `.field` on purpose: that
+   rule's `flex-direction: column` would stack them. */
+.add-row { display: flex; flex-direction: row; align-items: center; gap: 6px; margin-top: 6px; }
+.add-row input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+}
+.hint.error { color: var(--red); }
 
 /* Bottom usage bar: per-provider session (5h) / weekly (7d) rate-limit gauges.
    Only mounted when some window is non-zero, so it costs no space until then. */

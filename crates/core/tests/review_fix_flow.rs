@@ -19,7 +19,7 @@ use usine_core::{
     spawn_executor, DraftComment, ExecutorCommand, ExecutorConfig, ExecutorEvent,
     ExecutorEventKind, Forge, GitOps, LivePrState, MergeOutcome, Mergeable, PrInfo, PrPushTarget,
     PrSummary, Project, ProjectConfig, Result, ReviewComment, ReviewEvent, ReviewStatus,
-    ReviewSummary, ReviewThread, SimFactory, SimForge, SimGit, Store,
+    ReviewScope, ReviewSummary, ReviewThread, SimFactory, SimForge, SimGit, Store,
 };
 
 /// Everything the doubles saw, in order — the test's whole assertion surface.
@@ -153,11 +153,11 @@ impl Forge for RecordingForge {
         Ok(())
     }
 
-    async fn list_review_prs(&self, repo: &Path, authors: &[String]) -> Result<Vec<PrSummary>> {
+    async fn list_review_prs(&self, repo: &Path, scope: ReviewScope) -> Result<Vec<PrSummary>> {
         if self.merged.load(Ordering::SeqCst) {
             return Ok(Vec::new());
         }
-        SimForge.list_review_prs(repo, authors).await
+        SimForge.list_review_prs(repo, scope).await
     }
 
     async fn pr_live_state(&self, _: &Path, _: u64) -> Result<Option<LivePrState>> {
