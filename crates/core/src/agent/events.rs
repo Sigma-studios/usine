@@ -374,6 +374,10 @@ pub enum ExecutorCommand {
     /// Set whether the card auto-starts its self-review pass when the
     /// implementation finishes (on by default).
     SetAutoReview { card_id: Uuid, auto: bool },
+    /// Set a card's cosmetic "blocked" marker: tints the card on the board and
+    /// silences its attention badge. Purely an annotation — no lifecycle effect,
+    /// and nothing but the user toggles it.
+    SetBlocked { card_id: Uuid, blocked: bool },
     /// Copy an image into the card's managed attachments dir (`src` = the file
     /// the user picked). Claude-only; the path is injected into the prompt.
     AttachImage { card_id: Uuid, src: PathBuf },
@@ -437,6 +441,7 @@ impl ExecutorCommand {
             | ExecutorCommand::DeleteCard { card_id }
             | ExecutorCommand::SetSkipPlan { card_id, .. }
             | ExecutorCommand::SetAutoReview { card_id, .. }
+            | ExecutorCommand::SetBlocked { card_id, .. }
             | ExecutorCommand::AttachImage { card_id, .. }
             | ExecutorCommand::AttachImageBytes { card_id, .. }
             | ExecutorCommand::DetachImage { card_id, .. } => *card_id,
@@ -546,6 +551,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::SaveSettings { .. }
                 | ExecutorCommand::SetSkipPlan { .. }
                 | ExecutorCommand::SetAutoReview { .. }
+                | ExecutorCommand::SetBlocked { .. }
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }

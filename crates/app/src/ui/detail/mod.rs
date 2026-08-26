@@ -118,6 +118,16 @@ fn CardDetail() -> Element {
                             span { class: "badge", "{project}" }
                             span { class: "badge provider {provider_class}", "{provider}" }
                             span { class: "badge status", "{status}" }
+                            // Read-only here — the toggle lives in the board's
+                            // actions dropdown — but an open card should still
+                            // explain why it stopped badging.
+                            if card.blocked {
+                                span {
+                                    class: "badge blocked",
+                                    title: "Marked blocked — this card doesn't count toward the attention badge",
+                                    "blocked"
+                                }
+                            }
                             if !cost.is_zero() {
                                 span { class: "badge cost", "{cost}" }
                             }

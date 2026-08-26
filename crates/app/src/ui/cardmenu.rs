@@ -32,6 +32,9 @@ pub(crate) enum MenuKind {
         /// non-done card (the open falls back to the project), or a done card
         /// whose worktree still exists on disk.
         can_open: bool,
+        /// The card's cosmetic "blocked" marker — decides which way the
+        /// mark/unmark entry reads. Offered in every state.
+        blocked: bool,
     },
     Review {
         pr_number: u64,
@@ -88,7 +91,7 @@ pub fn CardMenuHost() -> Element {
                 style: "{pos}",
                 onclick: move |e| e.stop_propagation(),
                 match req.kind.clone() {
-                    MenuKind::Card { can_reset, can_done, can_diff, can_open } => rsx! {
+                    MenuKind::Card { can_reset, can_done, can_diff, can_open, blocked } => rsx! {
                         CardMenuItems {
                             card_id: id,
                             title: req.title.clone(),
@@ -96,6 +99,7 @@ pub fn CardMenuHost() -> Element {
                             can_done,
                             can_diff,
                             can_open,
+                            blocked,
                         }
                     },
                     MenuKind::Review { pr_number, has_checkout, has_fix } => rsx! {
@@ -115,9 +119,17 @@ fn CardMenuItems(
     can_done: bool,
     can_diff: bool,
     can_open: bool,
+    blocked: bool,
 ) -> Element {
     let state = use_context::<AppState>();
     let id = card_id;
+    // Cosmetic and reversible, so no confirm dialog — same treatment as
+    // "Show diff" / "Open in editor".
+    let block_label = if blocked {
+        "Mark unblocked"
+    } else {
+        "Mark blocked"
+    };
     // One title clone per handler (each closure moves its own copy).
     let reset_title = title.clone();
     let done_title = title.clone();
@@ -187,6 +199,14 @@ fn CardMenuItems(
                 },
                 "Mark as done"
             }
+        }
+        button {
+            class: "menu-item",
+            onclick: move |_| {
+                dismiss();
+                state.send(ExecutorCommand::SetBlocked { card_id: id, blocked: !blocked });
+            },
+            "{block_label}"
         }
         button {
             class: "menu-item danger",
