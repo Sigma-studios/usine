@@ -193,6 +193,13 @@ pub fn CardView(card: Card) -> Element {
     } else {
         card_class.to_string()
     };
+    // Appended last so the blocked tint wins the border on a failed card, while
+    // `.card.selected`'s ring still shows.
+    let card_class = if card.blocked {
+        format!("{card_class} blocked")
+    } else {
+        card_class
+    };
     let status = card.state.status_label();
     let title = if card.title.trim().is_empty() {
         "Untitled".to_string()
@@ -243,6 +250,7 @@ pub fn CardView(card: Card) -> Element {
                                     can_done: !is_done,
                                     can_diff,
                                     can_open,
+                                    blocked: card.blocked,
                                 },
                                 target_id: id,
                                 title: menu_title.clone(),
@@ -272,6 +280,15 @@ pub fn CardView(card: Card) -> Element {
                 }
                 if is_investigation {
                     span { class: "badge kind", "Investigation" }
+                }
+                // Sits beside the status badge rather than replacing it: the
+                // marker is an annotation, and the real state still matters.
+                if card.blocked {
+                    span {
+                        class: "badge blocked",
+                        title: "Marked blocked — this card doesn't count toward the attention badge",
+                        "blocked"
+                    }
                 }
                 if let Some(n) = queued_pos {
                     span {
