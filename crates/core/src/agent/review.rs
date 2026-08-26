@@ -305,6 +305,84 @@ pub fn parse_pr_review(text: &str) -> (Vec<DraftComment>, String, ReviewEvent) {
     (drafts, raw.summary, parse_event(&raw.event))
 }
 
+// ---------------------------------------------------------------------------
+// "Publish & fix": the maintainer posts the review *and* fixes it themselves
+// ---------------------------------------------------------------------------
+
+/// Appended to every comment published through "Publish & fix", so the author
+/// reads each one as a note, not a request. A constant rather than something
+/// the user edits: it is appended at publish time and never enters the draft
+/// buffer, so a re-publish can't double it up and the user's own wording of the
+/// comment stays theirs.
+pub const FIX_PLEDGE: &str =
+    "\n\n_↳ I'm pushing a fix for this one myself — nothing needed from you here._";
+
+/// Appended to the review body of a "Publish & fix" review, so the pledge is
+/// stated once at the top level too.
+pub const FIX_PLEDGE_SUMMARY: &str = "\n\nI'm fixing the comments in this review myself; \
+I'll follow up on this PR when the change lands.";
+
+/// The drafts as they should be *posted* by "Publish & fix": each body carries
+/// [`FIX_PLEDGE`]. The originals are left untouched — the caller keeps them on
+/// the task as the fix run's instructions, without the pledge prose.
+pub fn pledged_drafts(drafts: &[DraftComment]) -> Vec<DraftComment> {
+    drafts
+        .iter()
+        .map(|d| DraftComment {
+            body: format!("{}{FIX_PLEDGE}", d.body.trim_end()),
+            ..d.clone()
+        })
+        .collect()
+}
+
+/// The extra prompt for the fix run behind "Publish & fix": the comments the
+/// maintainer just published and pledged to fix, plus the framing that makes
+/// this different from fixing one's own branch — it is someone else's PR, and
+/// the change should be the smallest one that answers each comment.
+///
+/// `note` is the user's feedback on a redo; empty on the first pass.
+pub fn review_fix_prompt(
+    pr_number: u64,
+    author: &str,
+    comments: &[DraftComment],
+    note: &str,
+) -> String {
+    let mut out = format!(
+        "You are the maintainer of this repository. You have just published a review on pull \
+         request #{pr_number} by @{author}, and told the author that you would fix the following \
+         comments yourself. This checkout is that PR's own branch. Address every comment:\n"
+    );
+    for c in comments {
+        let loc = match c.line {
+            Some(line) => format!("{}:{}", c.path, line),
+            None => c.path.clone(),
+        };
+        // Indent continuation lines so a multi-line comment stays one bullet.
+        out.push_str(&format!(
+            "- [{loc}] {}\n",
+            c.body.trim().replace('\n', "\n  ")
+        ));
+    }
+    let note = note.trim();
+    if !note.is_empty() {
+        out.push_str(
+            "\nThe maintainer reviewed your first attempt and left this feedback, which carries \
+             the same weight as any comment above — address it too:\n",
+        );
+        out.push_str(note);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nThis is someone else's pull request: make the SMALLEST change that addresses each \
+         comment, in the style of the surrounding code, and do not restructure or \"improve\" \
+         anything the comments don't ask about. Do not commit or push — the app commits for you, \
+         and the maintainer approves the push separately. If a comment turns out to be wrong or \
+         not worth acting on, leave that code alone and say so plainly in your final message \
+         instead of inventing a change.",
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +571,62 @@ mod tests {
         let (drafts, _, event) = parse_pr_review("no block");
         assert!(drafts.is_empty());
         assert_eq!(event, ReviewEvent::Comment);
+    }
+
+    fn draft(path: &str, line: Option<u64>, body: &str) -> DraftComment {
+        DraftComment {
+            path: path.into(),
+            line,
+            body: body.into(),
+            severity: "medium".into(),
+            selected: true,
+        }
+    }
+
+    #[test]
+    fn pledge_is_appended_to_every_comment_and_leaves_originals_alone() {
+        let drafts = vec![
+            draft("a.rs", Some(3), "Guard this unwrap."),
+            draft("b.rs", None, "Stale doc."),
+        ];
+        let pledged = pledged_drafts(&drafts);
+        assert_eq!(pledged.len(), 2);
+        for (p, d) in pledged.iter().zip(&drafts) {
+            assert!(
+                p.body.starts_with(d.body.trim_end()),
+                "keeps the user's wording"
+            );
+            assert!(
+                p.body.ends_with(FIX_PLEDGE.trim_end()),
+                "carries the pledge"
+            );
+            assert_eq!(p.path, d.path);
+            assert_eq!(p.line, d.line);
+        }
+        assert_eq!(drafts[0].body, "Guard this unwrap.", "originals untouched");
+    }
+
+    #[test]
+    fn fix_prompt_lists_each_comment_and_carries_the_note() {
+        let drafts = vec![
+            draft("a.rs", Some(3), "Guard this unwrap."),
+            draft("b.rs", None, "Stale doc."),
+        ];
+        let p = review_fix_prompt(123, "octocat", &drafts, "  keep the helper private  ");
+        assert!(p.contains("#123"));
+        assert!(p.contains("@octocat"));
+        assert!(p.contains("- [a.rs:3] Guard this unwrap."));
+        assert!(
+            p.contains("- [b.rs] Stale doc."),
+            "a line-less comment lists its path alone"
+        );
+        assert!(p.contains("keep the helper private"));
+        assert!(p.contains("Do not commit or push"));
+    }
+
+    #[test]
+    fn fix_prompt_omits_the_feedback_block_without_a_note() {
+        let p = review_fix_prompt(7, "hubot", &[draft("a.rs", Some(1), "x")], "   ");
+        assert!(!p.contains("left this feedback"));
     }
 }

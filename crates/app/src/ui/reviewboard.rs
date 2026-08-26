@@ -129,6 +129,11 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
     let failed = st.is_failed();
     let can_start = matches!(st, ReviewStatus::ToReview);
     let can_validate = matches!(st, ReviewStatus::AwaitingValidation { .. });
+    // A write agent owns the checkout while the fix runs; once it parks at the
+    // gate the checkout is the user's again (and running the app against the fix
+    // before pushing it is exactly what the preview is for).
+    let fixing = matches!(st, ReviewStatus::Fixing { .. });
+    let fix_ready = st.fix_gate_ready();
     let published = matches!(st, ReviewStatus::Reviewed);
     // The PR left GitHub (merged or closed) before the review finished — the
     // only thing left to do is acknowledge it.
@@ -137,6 +142,8 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
     // A published or retired task's checkout is torn down, so there's nothing
     // left to run or open; everything before that has (or can get) one on demand.
     let has_checkout = !published && !retired;
+    // A fix we pledged on GitHub and haven't pushed or retracted yet.
+    let has_fix = st.fix_gate().is_some();
     let run_configured = state
         .projects
         .read()
@@ -144,7 +151,7 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
         .find(|p| p.id == task.project_id)
         .map(|p| p.config.run_script.is_some())
         .unwrap_or(false);
-    let preview = if has_checkout && run_configured {
+    let preview = if has_checkout && run_configured && !fixing {
         match state.preview(id) {
             Some((PreviewStatus::SettingUp, _)) => PreviewTools::Starting,
             Some((PreviewStatus::Running, urls)) => PreviewTools::Running {
@@ -223,6 +230,7 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                                     // A torn-down checkout can't be opened or run,
                                     // but it can still be re-fetched for a diff.
                                     has_checkout,
+                                    has_fix,
                                 },
                                 target_id: id,
                                 title: menu_title.clone(),
@@ -318,6 +326,18 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                         "Validate comments"
                     }
                 }
+                if fix_ready {
+                    button {
+                        class: "btn primary",
+                        title: "Read the committed fix before it's pushed",
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            state.select_review(Some(id));
+                            super::diffdialog::open_review_diff(id);
+                        },
+                        "Review the fix"
+                    }
+                }
                 if published {
                     span { class: "reviewed-tag", "✓ published" }
                 }
@@ -332,7 +352,9 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                         "Dismiss"
                     }
                 }
-                if failed {
+                // A fault out of the fix flow is not a review to retry: the review
+                // is already on GitHub (the panel offers the gate's actions instead).
+                if failed && st.fix_gate().is_none() {
                     button {
                         class: "btn",
                         title: "Retry the review",

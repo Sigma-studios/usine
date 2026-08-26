@@ -38,6 +38,11 @@ pub(crate) enum MenuKind {
         /// Whether a checkout exists (or can be made) to open or run. False once
         /// the review is published and its worktree has been torn down.
         has_checkout: bool,
+        /// Whether the published review pledged a fix we're still on the hook
+        /// for — a running fix run, or one waiting at the push gate. Dismissing
+        /// such a PR would drop the promise silently *and* blacklist it, so the
+        /// menu offers the fix's own discard instead.
+        has_fix: bool,
     },
 }
 
@@ -93,8 +98,8 @@ pub fn CardMenuHost() -> Element {
                             can_open,
                         }
                     },
-                    MenuKind::Review { pr_number, has_checkout } => rsx! {
-                        ReviewMenuItems { review_id: id, pr_number, has_checkout }
+                    MenuKind::Review { pr_number, has_checkout, has_fix } => rsx! {
+                        ReviewMenuItems { review_id: id, pr_number, has_checkout, has_fix }
                     },
                 }
             }
@@ -203,8 +208,12 @@ fn CardMenuItems(
 /// A PR-under-review's actions. "Show diff" works in every state (the PR head is
 /// fetched on demand); opening and running need a checkout, which every state but
 /// `Reviewed` either has or can make.
+///
+/// The last entry is the way out, and which one that is depends on whether we
+/// owe the author a fix: a published pledge is discarded (retracted on the PR,
+/// PR stays on the board), anything else is dismissed (permanent, silent).
 #[component]
-fn ReviewMenuItems(review_id: Uuid, pr_number: u64, has_checkout: bool) -> Element {
+fn ReviewMenuItems(review_id: Uuid, pr_number: u64, has_checkout: bool, has_fix: bool) -> Element {
     let state = use_context::<AppState>();
     let id = review_id;
 
@@ -235,13 +244,26 @@ fn ReviewMenuItems(review_id: Uuid, pr_number: u64, has_checkout: bool) -> Eleme
                 "Open in editor"
             }
         }
-        button {
-            class: "menu-item danger",
-            onclick: move |_| {
-                dismiss();
-                super::confirm_dismiss_review(id, pr_number);
-            },
-            "Dismiss"
+        if has_fix {
+            // The review is on GitHub promising a fix: the way out is the gate's
+            // discard, which retracts that promise and leaves the PR on the board.
+            button {
+                class: "menu-item danger",
+                onclick: move |_| {
+                    dismiss();
+                    super::confirm_discard_review_fix(id);
+                },
+                "Discard the fix"
+            }
+        } else {
+            button {
+                class: "menu-item danger",
+                onclick: move |_| {
+                    dismiss();
+                    super::confirm_dismiss_review(id, pr_number);
+                },
+                "Dismiss"
+            }
         }
     }
 }

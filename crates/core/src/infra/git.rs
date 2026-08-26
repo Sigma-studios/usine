@@ -213,6 +213,35 @@ pub fn fetch_args(remote: &str) -> Vec<String> {
     vec!["fetch".into(), remote.into()]
 }
 
+/// Push an explicit refspec to `remote` (which may be a URL, for a fork whose
+/// head we're allowed to edit). No `-u`: the local review branch must not adopt
+/// someone else's PR branch as its upstream.
+pub fn push_refspec_args(remote: &str, refspec: &str) -> Vec<String> {
+    vec!["push".into(), remote.into(), refspec.into()]
+}
+
+/// The checked-out commit, abbreviated — the sha a fix's diff is based on, and
+/// the one named back to the author once it's pushed.
+pub fn head_sha_args() -> Vec<String> {
+    vec!["rev-parse".into(), "--short".into(), "HEAD".into()]
+}
+
+pub fn remote_url_args(remote: &str) -> Vec<String> {
+    vec!["remote".into(), "get-url".into(), remote.into()]
+}
+
+/// The URL to push a fork's PR branch to, derived from `head_repo`
+/// (`owner/repo`) and the transport the user already uses for `origin`. Keeping
+/// the transport matters: an HTTPS-authenticated user has no SSH key loaded,
+/// and an SSH user often has no HTTPS credential helper.
+pub fn fork_push_url(origin_url: &str, head_repo: &str) -> String {
+    if origin_url.starts_with("git@") || origin_url.starts_with("ssh://") {
+        format!("git@github.com:{head_repo}.git")
+    } else {
+        format!("https://github.com/{head_repo}.git")
+    }
+}
+
 /// Every local branch plus every `origin/*` remote-tracking branch, shorthand.
 /// Feeds the adopt-branch picker; `origin/HEAD` (a symref, not a branch) rides
 /// along and is filtered by the caller.
@@ -359,6 +388,21 @@ pub trait GitOps: Send + Sync {
     }
     /// Push `branch` to `origin`, setting upstream.
     async fn push(&self, dir: &Path, branch: &str) -> Result<()>;
+    /// Push an explicit refspec to `remote` (a remote name or a URL), without
+    /// touching the local branch's upstream. Backends that don't model remotes
+    /// treat it as a no-op.
+    async fn push_refspec(&self, _dir: &Path, _remote: &str, _refspec: &str) -> Result<()> {
+        Ok(())
+    }
+    /// The abbreviated sha of `dir`'s HEAD. Backends that don't model history
+    /// report an empty string, which callers must read as "no information".
+    async fn head_sha(&self, _dir: &Path) -> Result<String> {
+        Ok(String::new())
+    }
+    /// A remote's configured URL (empty when unknown — see [`Self::head_sha`]).
+    async fn remote_url(&self, _dir: &Path, _remote: &str) -> Result<String> {
+        Ok(String::new())
+    }
 }
 
 /// Shells out to the real `git` binary.
@@ -566,6 +610,23 @@ impl GitOps for RealGit {
         )
         .await
         .map(|_| ())
+    }
+
+    async fn push_refspec(&self, dir: &Path, remote: &str, refspec: &str) -> Result<()> {
+        run_git(dir, &push_refspec_args(remote, refspec))
+            .await
+            .map(|_| ())
+    }
+
+    async fn head_sha(&self, dir: &Path) -> Result<String> {
+        Ok(run_git(dir, &head_sha_args()).await?.trim().to_string())
+    }
+
+    async fn remote_url(&self, dir: &Path, remote: &str) -> Result<String> {
+        Ok(run_git(dir, &remote_url_args(remote))
+            .await?
+            .trim()
+            .to_string())
     }
 }
 
@@ -855,6 +916,34 @@ fn exclude_additions(existing: &str, patterns: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_refspec_sets_no_upstream() {
+        let args = push_refspec_args("origin", "usine-review/12:feat/x");
+        assert_eq!(args, vec!["push", "origin", "usine-review/12:feat/x"]);
+        assert!(!args.iter().any(|a| a == "-u"));
+    }
+
+    #[test]
+    fn fork_push_url_keeps_the_origin_transport() {
+        assert_eq!(
+            fork_push_url("git@github.com:me/repo.git", "octocat/repo"),
+            "git@github.com:octocat/repo.git"
+        );
+        assert_eq!(
+            fork_push_url("ssh://git@github.com/me/repo.git", "octocat/repo"),
+            "git@github.com:octocat/repo.git"
+        );
+        assert_eq!(
+            fork_push_url("https://github.com/me/repo.git", "octocat/repo"),
+            "https://github.com/octocat/repo.git"
+        );
+        // No origin URL to read → HTTPS, which needs no key loaded.
+        assert_eq!(
+            fork_push_url("", "octocat/repo"),
+            "https://github.com/octocat/repo.git"
+        );
+    }
 
     #[test]
     fn exclude_additions_skips_present_lines() {
