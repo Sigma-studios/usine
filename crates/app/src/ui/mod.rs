@@ -78,7 +78,8 @@ fn severity_breakdown(drafts: &[DraftComment]) -> String {
     let mut parts: Vec<String> = SEVERITY_LEVELS
         .iter()
         .zip(counts)
-        .filter_map(|(level, n)| (n > 0).then(|| format!("{n} {level}")))
+        .filter(|&(_, n)| n > 0)
+        .map(|(level, n)| format!("{n} {level}"))
         .collect();
     if let n @ 1.. = counts[SEVERITY_LEVELS.len()] {
         parts.push(format!("{n} untagged"));
