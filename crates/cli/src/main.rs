@@ -384,6 +384,7 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                             card_id,
                             verdicts: all,
                             note: String::new(),
+                            prompt: None,
                         });
                     }
                     CardState::AwaitingReview(ReviewSub::ReadyForPr) => {
@@ -405,6 +406,7 @@ async fn sim_pipeline() -> anyhow::Result<()> {
                             card_id,
                             verdicts: verdicts.clone(),
                             note: String::new(),
+                            prompt: None,
                         });
                     }
                     CardState::ReadyToMerge => exec.send(ExecutorCommand::Merge {

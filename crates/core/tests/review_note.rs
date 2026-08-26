@@ -3,6 +3,9 @@
 //! none of the agent's findings; with no note and nothing checked, the picker
 //! must still short-circuit straight to the PR; and an edited finding must reach
 //! the fix run's prompt as edited — the command carries the verdicts wholesale.
+//! The picker's steering also rides through: a per-finding instruction reaches
+//! the prompt attached to its comment, and a hand-edited task is sent verbatim
+//! (blank meaning "run nothing" even with rows checked).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -127,6 +130,7 @@ async fn a_note_alone_launches_a_fix_run() {
         card_id,
         verdicts: vec![],
         note: "  also rename `x` to `count`  ".into(),
+        prompt: None,
     });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
@@ -173,6 +177,7 @@ async fn an_edited_finding_reaches_the_fix_prompt_as_edited() {
         card_id,
         verdicts,
         note: String::new(),
+        prompt: None,
     });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c)
@@ -220,6 +225,7 @@ async fn nothing_checked_and_no_note_still_skips_to_the_pr() {
         card_id,
         verdicts: vec![],
         note: "   ".into(),
+        prompt: None,
     });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) => match &c.state {
@@ -234,4 +240,181 @@ async fn nothing_checked_and_no_note_still_skips_to_the_pr() {
     .await;
 
     assert!(store.get_card(card_id).unwrap().qa_log.is_empty());
+}
+
+#[tokio::test]
+async fn a_per_finding_instruction_reaches_the_fix_prompt() {
+    let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    verdicts[0].selected = true;
+    verdicts[0].instruction = "do it in the extractor, not the caller".into();
+    for v in &mut verdicts[1..] {
+        v.selected = false;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: String::new(),
+        prompt: None,
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let fixes = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run");
+    assert!(
+        fixes.contains("do it in the extractor, not the caller"),
+        "the steering must reach the fix prompt:\n{fixes}"
+    );
+
+    let qa = store.get_card(card_id).unwrap().qa_log;
+    assert!(
+        qa.iter()
+            .any(|l| l.starts_with("Fix applied per review comment:")
+                && l.ends_with("as instructed: do it in the extractor, not the caller")),
+        "the restart log must restate the steering: {qa:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_edited_task_is_sent_verbatim() {
+    let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    verdicts[0].selected = true;
+    for v in &mut verdicts[1..] {
+        v.selected = false;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: String::new(),
+        prompt: Some("Do exactly this: rename the log field and nothing else.".into()),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let fixes = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run");
+    assert!(
+        fixes.contains("Do exactly this: rename the log field and nothing else."),
+        "the hand-written task must be what the agent gets:\n{fixes}"
+    );
+    assert!(
+        !fixes.contains("Address the following review comments:"),
+        "and it must replace the generated task, not be appended to it:\n{fixes}"
+    );
+
+    // The bookkeeping still follows the checkboxes, and the edited task itself
+    // goes on the restart log so a later reset knows what was actually sent.
+    let qa = store.get_card(card_id).unwrap().qa_log;
+    assert!(
+        qa.iter()
+            .any(|l| l.starts_with("Fix applied per review comment:")),
+        "a checked row is still logged as fixed: {qa:?}"
+    );
+    assert!(
+        qa.iter()
+            .any(|l| l.starts_with("Fix task as sent (edited by the user):")
+                && l.contains("Do exactly this")),
+        "the sent task must be on the log: {qa:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_blank_edited_task_runs_nothing() {
+    let (handle, mut rx, store, card_id, _prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    // Rows are checked, but the user blanked the task: nothing to run.
+    for v in &mut verdicts {
+        v.selected = true;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: String::new(),
+        prompt: Some("   ".into()),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) => match &c.state {
+            CardState::AwaitingReview(ReviewSub::ReadyForPr) => Some(()),
+            CardState::AwaitingReview(ReviewSub::ApplyingFixes) => {
+                panic!("a blank task must not launch a run")
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    assert!(store.get_card(card_id).unwrap().qa_log.is_empty());
+}
+
+#[tokio::test]
+async fn an_edited_task_does_not_log_the_dropped_note() {
+    let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    // The user typed a note AND then hand-wrote the task: the note is replaced
+    // wholesale, so it never reaches the agent — and must not be recorded as a
+    // request either, or a later "back to start" would restate it.
+    verdicts[0].selected = true;
+    for v in &mut verdicts[1..] {
+        v.selected = false;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: "also rename `x` to `count`".into(),
+        prompt: Some("Do exactly this: rename the log field and nothing else.".into()),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let fixes = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run");
+    assert!(
+        !fixes.contains("also rename `x` to `count`"),
+        "the note is not part of the hand-written task:\n{fixes}"
+    );
+
+    let qa = store.get_card(card_id).unwrap().qa_log;
+    assert!(
+        !qa.iter().any(|l| l.starts_with("Requested change:")),
+        "a note the agent never saw must not be logged as a request: {qa:?}"
+    );
 }

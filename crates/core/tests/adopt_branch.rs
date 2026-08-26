@@ -211,6 +211,7 @@ async fn adopt_runs_the_self_review_pipeline() {
         card_id: card.id,
         verdicts: Vec::new(),
         note: String::new(),
+        prompt: None,
     });
     wait_for_state(&mut rx, |c| {
         matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr))

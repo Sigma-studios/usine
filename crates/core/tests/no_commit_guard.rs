@@ -241,6 +241,7 @@ async fn a_no_op_fix_run_advances_without_claiming_fixes() {
         card_id,
         verdicts,
         note: String::new(),
+        prompt: None,
     });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => match &c.state {
