@@ -1,5 +1,11 @@
-//! The pre-PR validation gate: run the project's validate command in the card's
-//! worktree, and loop failures through an agent fix run.
+//! The pre-PR validation gate: prepare the card's worktree, run the project's
+//! validate command in it, and loop failures through an agent fix run.
+//!
+//! The gate is two supervised steps sharing one deadline — the project's setup
+//! command (skipped when it has none), then the check — because the check is
+//! only meaningful in a worktree that was made runnable first: a fresh worktree
+//! has no installed dependencies, no isolated database, and no allocated ports
+//! until setup puts them there.
 //!
 //! The executor applies `StartValidation` whenever a card reaches `ReadyForPr`
 //! with a validate command configured (see the trigger sites in `self_review.rs`
@@ -22,11 +28,6 @@ use super::preview::kill_group;
 use super::*;
 use crate::domain::config::ProjectConfig;
 use crate::domain::state_machine::MAX_VALIDATION_ATTEMPTS;
-
-/// Wall-clock ceiling for one check run. A build-and-test can legitimately take
-/// a while; a hang should fail the card (retryable), not burn a fix attempt on
-/// feeding a timeout message to the agent.
-const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How much of the check's output tail is kept for the fix prompt and the
 /// parked panel. The interesting part of a failing build/test run is almost
@@ -97,6 +98,7 @@ impl Executor {
             .worktree_path
             .clone()
             .ok_or_else(|| CoreError::other("card has no worktree to validate in"))?;
+        let timeout = project.config.validate_timeout();
 
         // The concurrency gate: either take a slot now or park in the queue —
         // the card stays `Validating` and the pump re-enters this function
@@ -112,6 +114,26 @@ impl Executor {
                     None => return Ok(()),
                 }
             }
+        };
+
+        // The gate runs in the same prepared worktree a preview would: the setup
+        // command owns "make this worktree runnable" (dependencies, an isolated
+        // database, per-worktree ports), so without it the check reports on a
+        // missing environment rather than on the work. Re-running it here is safe
+        // by the same contract that lets every preview start re-run it.
+        //
+        // Except when the card's preview slot is taken: that preview's own setup
+        // already prepared this worktree, and it is still live (the reap skips
+        // running cards), so re-running setup underneath it would reset the very
+        // database and ports the running app is using.
+        let setup = if lock(&self.previews).contains_key(&card_id) {
+            None
+        } else {
+            super::preview::resolve_script(
+                &project.config.worktree_setup_script,
+                &worktree,
+                super::preview::SETUP_CANDIDATES,
+            )
         };
 
         // Register the check as the card's active run: cancel, teardown, and
@@ -135,8 +157,10 @@ impl Executor {
             card_id,
             run_id,
             attempt,
+            setup,
             cmd,
             worktree,
+            timeout,
             ctl_rx,
             slot,
         ));
@@ -287,48 +311,46 @@ fn spawn_capture_reader<S: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
-/// The check run itself: spawn the command in the worktree, stream + capture
-/// its output, and route the exit through the state machine. Mirrors
-/// `run_actor`'s contract: it owns its `runs` slot until it exits, applies only
-/// agent-driven transitions, and backs off silently when superseded.
-#[allow(clippy::too_many_arguments)]
-async fn validation_actor(
-    store: Store,
-    evt_tx: UnboundedSender<ExecutorEvent>,
-    executor: Weak<Executor>,
-    runs: RunMap,
-    validations: ValidationMap,
-    card_id: Uuid,
-    run_id: Uuid,
-    attempt: u32,
-    cmd: String,
-    worktree: PathBuf,
-    mut ctl_rx: UnboundedReceiver<RunControl>,
-    // The check's concurrency slot; dropping it when the actor ends releases
-    // the slot and pumps the run queue. The fix run a failing exit launches
-    // re-admits under its own generation, so whichever of the two lands first
-    // the card ends up holding exactly one slot (see `gate.rs`).
-    _slot: super::gate::SlotGuard,
-) {
-    let cleanup = |validations: &ValidationMap, runs: &RunMap| {
-        lock(validations).remove(&card_id);
-        // Only clear the runs slot if it's still ours — a newer run for this
-        // card may have already replaced it.
-        let mut map = lock(runs);
-        if map
-            .get(&card_id)
-            .map(|(rid, _)| *rid == run_id)
-            .unwrap_or(false)
-        {
-            map.remove(&card_id);
-        }
-    };
+/// How one supervised step of the gate ended. Setup and the check run exactly
+/// the same way, so they share this; what differs is how a failure is routed —
+/// see `validation_actor`.
+enum StepOutcome {
+    /// Exited zero.
+    Passed,
+    /// Exited non-zero, carrying the rendered output tail (exit status included).
+    Failed(String),
+    /// Cancelled, or the control channel closed. `cancel()`/teardown has already
+    /// moved the card, so the caller must return without applying anything.
+    Cancelled,
+    /// Ran past the gate's shared deadline.
+    TimedOut,
+    /// The command never started, or waiting on it failed — a broken environment
+    /// rather than a verdict on the work.
+    Broken(String),
+}
 
+/// Run one step of the gate to completion in the worktree: spawn it in its own
+/// process group, stream its output to the transcript while collecting the
+/// bounded tail, and supervise it against cancel and the gate's shared
+/// `deadline`.
+///
+/// The pid is registered in `validations` for as long as the step runs, so app
+/// shutdown can reap it. The two steps overwrite each other's entry there, which
+/// is harmless: they never overlap, and the actor's `cleanup` clears the slot.
+async fn run_step(
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    validations: &ValidationMap,
+    card_id: Uuid,
+    cmd: &str,
+    worktree: &Path,
+    ctl_rx: &mut UnboundedReceiver<RunControl>,
+    deadline: tokio::time::Instant,
+) -> StepOutcome {
     let mut command = Command::new("sh");
     command
         .arg("-lc")
-        .arg(&cmd)
-        .current_dir(&worktree)
+        .arg(cmd)
+        .current_dir(worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -338,24 +360,11 @@ async fn validation_actor(
 
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            let _ = apply_transition(
-                &store,
-                &evt_tx,
-                card_id,
-                Transition::AgentError {
-                    message: format!("failed to run the validate command `{cmd}`: {e}"),
-                },
-            );
-            // Parked at `Failed` — light-stop the preview the pipeline left up.
-            reap_idle_preview_direct(&executor, card_id);
-            cleanup(&validations, &runs);
-            return;
-        }
+        Err(e) => return StepOutcome::Broken(format!("failed to run `{cmd}`: {e}")),
     };
     let pid = child.id();
     if let Some(pid) = pid {
-        lock(&validations).insert(card_id, pid);
+        lock(validations).insert(card_id, pid);
     }
 
     let tail: SharedTail = Arc::new(Mutex::new(OutputTail::default()));
@@ -377,21 +386,19 @@ async fn validation_actor(
         ));
     }
 
-    let timeout = tokio::time::sleep(VALIDATION_TIMEOUT);
+    let timeout = tokio::time::sleep_until(deadline);
     tokio::pin!(timeout);
     let status = loop {
         tokio::select! {
             ctl = ctl_rx.next() => match ctl {
                 // Cancelled (or the executor dropped the channel): kill the
-                // tree and exit without applying anything — `cancel()` /
-                // teardown already moved the card where it belongs.
+                // tree and let the caller exit without applying anything.
                 Some(RunControl::Cancel) | None => {
                     if let Some(pid) = pid {
                         kill_group(pid).await;
                     }
                     let _ = child.wait().await;
-                    cleanup(&validations, &runs);
-                    return;
+                    return StepOutcome::Cancelled;
                 }
                 // Answer/Interrupt are meaningless for a script.
                 Some(_) => continue,
@@ -402,16 +409,7 @@ async fn validation_actor(
                     kill_group(pid).await;
                 }
                 let _ = child.wait().await;
-                let _ = apply_transition(&store, &evt_tx, card_id, Transition::AgentError {
-                    message: format!(
-                        "validation timed out after {} min",
-                        VALIDATION_TIMEOUT.as_secs() / 60
-                    ),
-                });
-                // Parked at `Failed` — light-stop the preview.
-                reap_idle_preview_direct(&executor, card_id);
-                cleanup(&validations, &runs);
-                return;
+                return StepOutcome::TimedOut;
             }
         }
     };
@@ -419,6 +417,153 @@ async fn validation_actor(
     for r in readers {
         let _ = r.await;
     }
+    match status {
+        Ok(s) if s.success() => StepOutcome::Passed,
+        Ok(s) => {
+            let mut output = lock(&tail).render();
+            if output.is_empty() {
+                output = "(no output)".to_string();
+            }
+            output.push_str(&format!("\n[{s}]"));
+            StepOutcome::Failed(output)
+        }
+        Err(e) => StepOutcome::Broken(format!("`{cmd}` failed to run: {e}")),
+    }
+}
+
+/// The check run itself: spawn the command in the worktree, stream + capture
+/// its output, and route the exit through the state machine. Mirrors
+/// `run_actor`'s contract: it owns its `runs` slot until it exits, applies only
+/// agent-driven transitions, and backs off silently when superseded.
+#[allow(clippy::too_many_arguments)]
+async fn validation_actor(
+    store: Store,
+    evt_tx: UnboundedSender<ExecutorEvent>,
+    executor: Weak<Executor>,
+    runs: RunMap,
+    validations: ValidationMap,
+    card_id: Uuid,
+    run_id: Uuid,
+    attempt: u32,
+    // The project's worktree setup command, when it has one. Runs first.
+    setup: Option<String>,
+    cmd: String,
+    worktree: PathBuf,
+    timeout: Duration,
+    mut ctl_rx: UnboundedReceiver<RunControl>,
+    // The check's concurrency slot; dropping it when the actor ends releases
+    // the slot and pumps the run queue. The fix run a failing exit launches
+    // re-admits under its own generation, so whichever of the two lands first
+    // the card ends up holding exactly one slot (see `gate.rs`).
+    _slot: super::gate::SlotGuard,
+) {
+    let cleanup = |validations: &ValidationMap, runs: &RunMap| {
+        lock(validations).remove(&card_id);
+        // Only clear the runs slot if it's still ours — a newer run for this
+        // card may have already replaced it.
+        let mut map = lock(runs);
+        if map
+            .get(&card_id)
+            .map(|(rid, _)| *rid == run_id)
+            .unwrap_or(false)
+        {
+            map.remove(&card_id);
+        }
+    };
+
+    // Park the card at `Failed` (retryable) and light-stop the preview the
+    // pipeline left up. The state machine only accepts `AgentError` on a running
+    // card, so a card that moved on absorbs this as a no-op.
+    let abort = |message: String| {
+        let _ = apply_transition(&store, &evt_tx, card_id, Transition::AgentError { message });
+        reap_idle_preview_direct(&executor, card_id);
+    };
+
+    // One deadline for the whole gate rather than one per step: what the project
+    // configures is how long a trip through the gate may take, and a setup that
+    // ate the entire budget has already made the check pointless.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let timed_out = || format!("validation timed out after {} min", timeout.as_secs() / 60);
+
+    // 1. Prepare the worktree, when the project says how.
+    if let Some(setup) = &setup {
+        transcript(
+            &store,
+            &evt_tx,
+            card_id,
+            format!("▶ worktree setup: {setup}"),
+        );
+        match run_step(
+            &evt_tx,
+            &validations,
+            card_id,
+            setup,
+            &worktree,
+            &mut ctl_rx,
+            deadline,
+        )
+        .await
+        {
+            StepOutcome::Passed => {}
+            StepOutcome::Cancelled => {
+                cleanup(&validations, &runs);
+                return;
+            }
+            StepOutcome::TimedOut => {
+                abort(format!("{} (in worktree setup)", timed_out()));
+                cleanup(&validations, &runs);
+                return;
+            }
+            // A setup that fails is an environment that couldn't be prepared, not
+            // a verdict on the work: parking at `Failed` is honest and costs no
+            // fix attempt, where feeding it to the agent would spend the budget on
+            // something the code can't fix. This matches how a preview treats its
+            // own setup failure.
+            StepOutcome::Failed(output) => {
+                abort(format!(
+                    "worktree setup failed, so validation never ran:\n{output}"
+                ));
+                cleanup(&validations, &runs);
+                return;
+            }
+            StepOutcome::Broken(message) => {
+                abort(message);
+                cleanup(&validations, &runs);
+                return;
+            }
+        }
+    }
+
+    // 2. The check itself.
+    let verdict = run_step(
+        &evt_tx,
+        &validations,
+        card_id,
+        &cmd,
+        &worktree,
+        &mut ctl_rx,
+        deadline,
+    )
+    .await;
+    // `None` passed; `Some(output)` failed with that captured tail.
+    let failure = match verdict {
+        StepOutcome::Passed => None,
+        StepOutcome::Failed(output) => Some(output),
+        StepOutcome::Cancelled => {
+            cleanup(&validations, &runs);
+            return;
+        }
+        StepOutcome::TimedOut => {
+            abort(timed_out());
+            cleanup(&validations, &runs);
+            return;
+        }
+        StepOutcome::Broken(message) => {
+            abort(format!("validation command failed to run: {message}"));
+            cleanup(&validations, &runs);
+            return;
+        }
+    };
 
     // Only route the exit if the card is still waiting on THIS check — a card
     // that moved on (cancel racing the exit, delete, …) abandoned it.
@@ -433,20 +578,15 @@ async fn validation_actor(
         return;
     }
 
-    match status {
-        Ok(s) if s.success() => {
+    match failure {
+        None => {
             let _ = apply_transition(&store, &evt_tx, card_id, Transition::ValidationPassed);
             transcript(&store, &evt_tx, card_id, "✔ validation passed".to_string());
             // The gate is done and the card parked at `ReadyForPr` —
             // light-stop the preview the pipeline brought up.
             reap_idle_preview_direct(&executor, card_id);
         }
-        Ok(s) => {
-            let mut output = lock(&tail).render();
-            if output.is_empty() {
-                output = "(no output)".to_string();
-            }
-            output.push_str(&format!("\n[{s}]"));
+        Some(output) => {
             // Effects are keyed off the resulting state (the module rule):
             // inside the budget the state machine routed to the fix run; past
             // it the card parked.
@@ -487,18 +627,6 @@ async fn validation_actor(
                     _ => {}
                 }
             }
-        }
-        Err(e) => {
-            let _ = apply_transition(
-                &store,
-                &evt_tx,
-                card_id,
-                Transition::AgentError {
-                    message: format!("validation command failed to run: {e}"),
-                },
-            );
-            // Parked at `Failed` — light-stop the preview.
-            reap_idle_preview_direct(&executor, card_id);
         }
     }
     cleanup(&validations, &runs);

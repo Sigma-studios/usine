@@ -28,7 +28,7 @@ use crate::domain::model::{PreviewStatus, PreviewUrl};
 /// Conventional setup/teardown script paths auto-detected in a worktree when the
 /// project config names no explicit command (matches what the daedalus skill
 /// generates and what `docker-compose.worktree.yml` expects).
-const SETUP_CANDIDATES: &[&str] = &["setup-worktree.sh", "scripts/setup-worktree.sh"];
+pub(super) const SETUP_CANDIDATES: &[&str] = &["setup-worktree.sh", "scripts/setup-worktree.sh"];
 const TEARDOWN_CANDIDATES: &[&str] = &["teardown-worktree.sh", "scripts/teardown-worktree.sh"];
 
 /// How long a `SIGTERM`ed preview tree gets to exit cleanly before `SIGKILL`.
@@ -785,7 +785,7 @@ fn clear_preview_info(worktree: &Path) {
 /// Resolve a setup/teardown command: the configured value wins; otherwise a
 /// conventional script committed in the worktree is auto-detected. `None` means
 /// there is no step to run.
-fn resolve_script(
+pub(super) fn resolve_script(
     configured: &Option<String>,
     worktree: &Path,
     candidates: &[&str],

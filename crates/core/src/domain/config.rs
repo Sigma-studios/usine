@@ -8,6 +8,7 @@
 //! settings.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -181,9 +182,18 @@ pub struct ProjectConfig {
     pub run_script: Option<String>,
     /// Command run in a card's worktree at the validation gate before a PR is
     /// opened (build, tests, linters). Non-zero exit means validation failed.
-    /// When unset, the gate is skipped entirely.
+    /// When unset, the gate is skipped entirely. The setup command runs first,
+    /// so the gate checks the same prepared worktree a preview would run in.
     #[serde(default)]
     pub validate_script: Option<String>,
+    /// Wall-clock ceiling for one trip through the gate — setup and validate
+    /// together — in minutes. Per-project because what counts as a hang depends
+    /// entirely on the stack: a JS suite stuck past ten minutes is wedged, while
+    /// a fresh worktree of a large native project can legitimately spend an hour
+    /// compiling dependencies before the first test runs. Read it through
+    /// [`Self::validate_timeout`] rather than directly.
+    #[serde(default = "default_validate_timeout_minutes")]
+    pub validate_timeout_minutes: u32,
     /// Command run in the worktree when a preview stops, before it's torn down
     /// (e.g. `docker compose down -v`). Auto-detected as `teardown-worktree.sh`
     /// when unset. Best-effort — a failure never blocks stopping the preview.
@@ -220,6 +230,13 @@ pub(crate) fn default_auto_preview() -> bool {
     true
 }
 
+/// Serde default for [`ProjectConfig::validate_timeout_minutes`]: the fixed
+/// ceiling the gate enforced before it was configurable, so a project record
+/// written without the field keeps exactly today's behavior.
+pub(crate) fn default_validate_timeout_minutes() -> u32 {
+    30
+}
+
 impl ProjectConfig {
     /// The base branch every git/PR operation should use: the user's pin when
     /// one is set (blank counts as unset), else the auto-detected branch.
@@ -235,6 +252,17 @@ impl ProjectConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.base_branch)
+    }
+
+    /// The gate's wall-clock ceiling. `0` — what clearing the settings field
+    /// stores — means the default, not a deadline that kills the check the
+    /// instant it starts.
+    pub fn validate_timeout(&self) -> Duration {
+        let minutes = match self.validate_timeout_minutes {
+            0 => default_validate_timeout_minutes(),
+            n => n,
+        };
+        Duration::from_secs(u64::from(minutes) * 60)
     }
 
     /// The project's screenshot command, `None` when unset or blank.
@@ -257,6 +285,7 @@ impl Default for ProjectConfig {
             worktree_setup_script: None,
             run_script: None,
             validate_script: None,
+            validate_timeout_minutes: default_validate_timeout_minutes(),
             worktree_teardown_script: None,
             preview_ports: Vec::new(),
             auto_preview: true,
@@ -424,7 +453,24 @@ mod tests {
         assert_eq!(c.validate_script, None);
         assert_eq!(c.effective_base_branch(), "main");
         assert!(c.preview_ports.is_empty());
+        // A record written before the gate's timeout was configurable keeps the
+        // ceiling it ran under, not a zero deadline.
+        assert_eq!(c.validate_timeout(), Duration::from_secs(30 * 60));
         assert_eq!(c.screenshot_command(), None);
+    }
+
+    #[test]
+    fn validate_timeout_treats_zero_as_the_default() {
+        let mut c = ProjectConfig::default();
+        assert_eq!(c.validate_timeout(), Duration::from_secs(30 * 60));
+
+        c.validate_timeout_minutes = 90;
+        assert_eq!(c.validate_timeout(), Duration::from_secs(90 * 60));
+
+        // Clearing the settings field stores 0; that must mean "the default",
+        // not a deadline that kills the check the instant it starts.
+        c.validate_timeout_minutes = 0;
+        assert_eq!(c.validate_timeout(), Duration::from_secs(30 * 60));
     }
 
     #[test]
