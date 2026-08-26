@@ -59,4 +59,13 @@ impl CoreError {
     pub fn other(msg: impl Into<String>) -> Self {
         CoreError::Other(msg.into())
     }
+
+    /// True when the database file is locked by another writer — redb allows
+    /// only one, so a second Usine (or the CLI) fails to open the store.
+    pub fn is_db_locked(&self) -> bool {
+        matches!(self, CoreError::Db(e) if matches!(
+            **e,
+            native_db::db_type::Error::RedbDatabaseError(redb::DatabaseError::DatabaseAlreadyOpen)
+        ))
+    }
 }

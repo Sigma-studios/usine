@@ -5371,6 +5371,7 @@ dependencies = [
  "git2",
  "native_db",
  "native_model",
+ "redb 2.6.3",
  "serde",
  "serde_json",
  "shlex",
