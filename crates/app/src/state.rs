@@ -66,6 +66,9 @@ pub struct AppState {
     pub transcripts: Signal<HashMap<Uuid, Vec<(i64, String)>>>,
     /// Per-project reviewer candidates (GitHub logins), fetched lazily on demand.
     pub reviewers: Signal<HashMap<Uuid, Vec<String>>>,
+    /// Per-project logins with an open PR, fetched alongside `reviewers`. These
+    /// are what surface fork contributors, who are never collaborators.
+    pub pr_authors: Signal<HashMap<Uuid, Vec<String>>>,
     /// Per-project adoptable branches (local + remote, minus base/usine/card
     /// refs), fetched when the adopt dialog opens. In-memory only.
     pub adopt_sources: Signal<HashMap<Uuid, Vec<String>>>,
@@ -221,6 +224,7 @@ impl AppState {
             selected_review: Signal::new(None),
             transcripts: Signal::new(HashMap::new()),
             reviewers: Signal::new(HashMap::new()),
+            pr_authors: Signal::new(HashMap::new()),
             adopt_sources: Signal::new(HashMap::new()),
             adopt_probes: Signal::new(HashMap::new()),
             review_tasks: Signal::new(review_tasks),
@@ -405,6 +409,10 @@ impl AppState {
                 let mut reviewers = self.reviewers;
                 reviewers.write().insert(project_id, logins);
             }
+            ExecutorEventKind::PrAuthors { project_id, logins } => {
+                let mut authors = self.pr_authors;
+                authors.write().insert(project_id, logins);
+            }
             ExecutorEventKind::AdoptSources { project_id, refs } => {
                 let mut sources = self.adopt_sources;
                 sources.write().insert(project_id, refs);
@@ -538,6 +546,12 @@ impl AppState {
     /// result arrives asynchronously as a `Reviewers` event.
     pub fn fetch_reviewers(&self, project_id: Uuid) {
         self.send(ExecutorCommand::ListReviewers { project_id });
+    }
+
+    /// Ask the executor for the logins with an open PR on a project's repo. The
+    /// result arrives asynchronously as a `PrAuthors` event.
+    pub fn fetch_pr_authors(&self, project_id: Uuid) {
+        self.send(ExecutorCommand::ListPrAuthors { project_id });
     }
 
     /// Ask the executor for a project's adoptable branches (the adopt dialog's
@@ -712,6 +726,13 @@ impl AppState {
     // dialogs in `ui` (`confirm_publish_review` / `confirm_dismiss_review`) —
     // one posts to someone else's PR, the other is a permanent dismissal — so
     // there are deliberately no bare send helpers for them here.
+
+    /// Send a committed fix back to the agent with feedback. Unlike the push and
+    /// the discard, this posts nothing and touches no branch, so it needs no
+    /// confirm of its own.
+    pub fn revise_review_fix(&self, review_id: Uuid, note: String) {
+        self.send(ExecutorCommand::ReviseReviewFix { review_id, note });
+    }
 
     /// Run the project's app from a PR's review checkout (checked out on demand).
     pub fn start_review_preview(&self, review_id: Uuid) {

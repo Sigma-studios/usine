@@ -14,8 +14,8 @@ use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, DraftComment, ExecutorCommand, ExecutorConfig,
     ExecutorEvent, ExecutorEventKind, Forge, Mergeable, PrInfo, PrReviewSub, PrSummary, Project,
-    ProjectConfig, ReviewComment, ReviewEvent, ReviewSub, ReviewSummary, ReviewThread, SimFactory,
-    SimForge, SimGit, Store,
+    ProjectConfig, ReviewComment, ReviewEvent, ReviewScope, ReviewSub, ReviewSummary, ReviewThread,
+    SimFactory, SimForge, SimGit, Store,
 };
 
 /// A forge where nothing has happened on the PR yet: no comments, no submitted
@@ -52,8 +52,12 @@ impl Forge for QuietForge {
     ) -> usine_core::Result<PrInfo> {
         SimForge.create_pr(r, t, b, base, h, rev, d).await
     }
-    async fn list_review_prs(&self, r: &Path, a: &[String]) -> usine_core::Result<Vec<PrSummary>> {
-        SimForge.list_review_prs(r, a).await
+    async fn list_review_prs(
+        &self,
+        r: &Path,
+        s: ReviewScope,
+    ) -> usine_core::Result<Vec<PrSummary>> {
+        SimForge.list_review_prs(r, s).await
     }
     async fn submit_review(
         &self,

@@ -14,8 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::model::{Effort, ModelSpec, Provider};
 
-/// The token replaced by the target directory in a configured "open in
-/// terminal/editor" command (see [`AppSettings::terminal_command`]).
+/// The token replaced by a path in the configured commands that take one: the
+/// target directory in an "open in terminal/editor" command (see
+/// [`AppSettings::terminal_command`]), and the destination image in a project's
+/// [`ProjectConfig::screenshot_script`]. One token across both so a user who has
+/// learned it once doesn't have to learn a second.
 pub const OPEN_PATH_PLACEHOLDER: &str = "{path}";
 
 /// Split a user-configured open-command template into a program + argv, with
@@ -162,6 +165,11 @@ pub struct ProjectConfig {
     /// Picked from the same collaborator list as `reviewer`.
     #[serde(default)]
     pub review_contributors: Vec<String>,
+    /// Track *every* open PR on the repo that isn't the current user's, instead
+    /// of the pinned `review_contributors` list. The list is kept while this is
+    /// on, so turning it back off restores the previous selection.
+    #[serde(default)]
+    pub review_all_contributors: bool,
     /// Command run in a freshly-created worktree to make it runnable — install
     /// deps, stand up an isolated DB, assign per-worktree ports, etc. When unset,
     /// a conventional `setup-worktree.sh` in the repo is auto-detected. It must
@@ -200,6 +208,19 @@ pub struct ProjectConfig {
     /// `agent::testing::PREVIEW_REQUEST_FILE`).
     #[serde(default = "default_auto_preview")]
     pub auto_preview: bool,
+    /// Command the *agent* runs to capture a screenshot of the running app's
+    /// window, with [`OPEN_PATH_PLACEHOLDER`] standing in for the destination
+    /// image. Only consulted for a windowed app (a project with no declared
+    /// [`Self::preview_ports`]), where a screenshot is the agent's only way to
+    /// observe its change.
+    ///
+    /// It exists because there is no portable answer: capturing one window
+    /// depends on the OS and, on Linux, on the compositor — and a project that
+    /// runs its app on a private display (a nested compositor, an Xvfb) is the
+    /// only thing that knows how to reach it. Unset falls back to per-platform
+    /// guidance, which may simply not work.
+    #[serde(default)]
+    pub screenshot_script: Option<String>,
 }
 
 /// Serde default for [`ProjectConfig::auto_preview`]: a project config stored
@@ -219,6 +240,12 @@ pub(crate) fn default_validate_timeout_minutes() -> u32 {
 impl ProjectConfig {
     /// The base branch every git/PR operation should use: the user's pin when
     /// one is set (blank counts as unset), else the auto-detected branch.
+    /// Whether the review board should poll this project at all: either the
+    /// user tracks everyone, or they pinned at least one contributor.
+    pub fn tracks_contributor_prs(&self) -> bool {
+        self.review_all_contributors || !self.review_contributors.is_empty()
+    }
+
     pub fn effective_base_branch(&self) -> &str {
         self.pinned_base_branch
             .as_deref()
@@ -237,6 +264,14 @@ impl ProjectConfig {
         };
         Duration::from_secs(u64::from(minutes) * 60)
     }
+
+    /// The project's screenshot command, `None` when unset or blank.
+    pub fn screenshot_command(&self) -> Option<&str> {
+        self.screenshot_script
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 impl Default for ProjectConfig {
@@ -246,6 +281,7 @@ impl Default for ProjectConfig {
             base_branch: "dev".to_string(),
             pinned_base_branch: None,
             review_contributors: Vec::new(),
+            review_all_contributors: false,
             worktree_setup_script: None,
             run_script: None,
             validate_script: None,
@@ -253,6 +289,7 @@ impl Default for ProjectConfig {
             worktree_teardown_script: None,
             preview_ports: Vec::new(),
             auto_preview: true,
+            screenshot_script: None,
         }
     }
 }
@@ -419,6 +456,7 @@ mod tests {
         // A record written before the gate's timeout was configurable keeps the
         // ceiling it ran under, not a zero deadline.
         assert_eq!(c.validate_timeout(), Duration::from_secs(30 * 60));
+        assert_eq!(c.screenshot_command(), None);
     }
 
     #[test]
@@ -433,6 +471,18 @@ mod tests {
         // not a deadline that kills the check the instant it starts.
         c.validate_timeout_minutes = 0;
         assert_eq!(c.validate_timeout(), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn screenshot_command_ignores_a_blank_setting() {
+        let mut c = ProjectConfig::default();
+        assert_eq!(c.screenshot_command(), None);
+
+        c.screenshot_script = Some("   ".to_string());
+        assert_eq!(c.screenshot_command(), None);
+
+        c.screenshot_script = Some("  ./shot.sh {path}  ".to_string());
+        assert_eq!(c.screenshot_command(), Some("./shot.sh {path}"));
     }
 
     #[test]

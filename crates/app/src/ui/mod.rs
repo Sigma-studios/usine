@@ -109,6 +109,73 @@ fn confirm_publish_review(
     });
 }
 
+/// Publish the drafted review *and* have an agent fix its comments, behind the
+/// same confirm as a plain publish — it posts the same review, and then some.
+///
+/// The dialog is explicit about both halves: the comments go out carrying a
+/// promise the user is making on their own behalf, and the fix that follows
+/// touches someone else's branch. It also states the part that makes this safe
+/// to accept — nothing is pushed until the diff has been approved.
+fn confirm_publish_and_fix_review(
+    state: AppState,
+    review_id: Uuid,
+    drafts: Vec<DraftComment>,
+    event: ReviewEvent,
+    body: String,
+) {
+    let n = drafts.iter().filter(|d| d.selected).count();
+    let cmd = ExecutorCommand::PublishReviewAndFix {
+        review_id,
+        drafts,
+        event,
+        body,
+    };
+    if crate::state::demo_mode() {
+        state.send(cmd);
+        finish_review_validation();
+        return;
+    }
+    request_confirm(ConfirmRequest {
+        title: "Publish & fix".into(),
+        message: format!(
+            "Submit {n} inline comment(s) as “{}”, each saying you'll fix it yourself, then have              an agent fix all {n} in the PR's checkout? Nothing is pushed until you approve the              diff.",
+            event.label()
+        ),
+        confirm_label: "Publish & fix".into(),
+        // Same buffer teardown as a plain publish: the review is posted either way.
+        action: ConfirmAction::PublishReview(cmd),
+        danger: false,
+    });
+}
+
+/// Push a committed fix onto the contributor's own PR branch. Outward-facing and
+/// not undoable from here — it rewrites what their branch points at — so it
+/// names the branch it will write to.
+pub(crate) fn confirm_push_review_fix(state: AppState, review_id: Uuid, head_ref: String) {
+    confirm_then_send(
+        state,
+        "Push the fix",
+        format!(
+            "Push the committed fix to `{head_ref}` on the contributor's pull request? It lands              under your account, and a comment on the PR will say so."
+        ),
+        "Push",
+        ExecutorCommand::PushReviewFix { review_id },
+    );
+}
+
+/// Abandon a committed fix. Destructive (the commits go with the checkout) *and*
+/// outward-facing: a retraction is posted so the author isn't left waiting.
+pub(crate) fn confirm_discard_review_fix(review_id: Uuid) {
+    request_confirm(ConfirmRequest {
+        title: "Discard the fix".into(),
+        message: "Throw away the committed fix and its checkout? A comment is posted on the PR                   telling the author the fix isn't coming, so the comments become theirs to                   address."
+            .into(),
+        confirm_label: "Discard".into(),
+        danger: true,
+        action: ConfirmAction::Send(ExecutorCommand::DiscardReviewFix { review_id }),
+    });
+}
+
 /// Approve a PR outright, skipping the review agent — for the PRs the user has
 /// already read and judged fine on their own. Same outward-facing gate as
 /// publishing a drafted review: it's the same POST, just with no comments and

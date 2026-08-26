@@ -176,6 +176,9 @@ pub enum ExecutorCommand {
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
+    /// List the GitHub logins with an open PR on a project's repo — the
+    /// contributor picker's suggestions. Result: a `PrAuthors` event.
+    ListPrAuthors { project_id: Uuid },
 
     // --- branch adoption (turning an existing branch into a card) ---------
     /// List a project's branches that could be adopted into a card (local +
@@ -220,6 +223,26 @@ pub enum ExecutorCommand {
         event: ReviewEvent,
         body: String,
     },
+    /// Publish the drafted review AND fix its comments ourselves: every selected
+    /// comment is posted carrying the pledge that the reviewer will handle it,
+    /// then a write agent implements them in the PR's own checkout. Nothing is
+    /// pushed — the run parks at the `FixReady` gate. Moves the task Awaiting
+    /// validation → Fixing.
+    PublishReviewAndFix {
+        review_id: Uuid,
+        drafts: Vec<DraftComment>,
+        event: ReviewEvent,
+        body: String,
+    },
+    /// From the fix gate: push the committed fix onto the PR's own head branch
+    /// and comment on the PR saying so. The task settles at Reviewed.
+    PushReviewFix { review_id: Uuid },
+    /// From the fix gate: send the fix back to the agent with feedback, keeping
+    /// the commits it already made.
+    ReviseReviewFix { review_id: Uuid, note: String },
+    /// From the fix gate: abandon the fix, retract the pledge on the PR, and
+    /// tear the checkout down. The task settles at Reviewed.
+    DiscardReviewFix { review_id: Uuid },
     /// Drop a review task (e.g. a stale one, or one reviewed elsewhere), cancelling
     /// any run and tearing down its worktree.
     DismissReview { review_id: Uuid },
@@ -422,6 +445,10 @@ impl ExecutorCommand {
             // entity from any card but flows through the same per-id plumbing.
             ExecutorCommand::StartReview { review_id, .. }
             | ExecutorCommand::PublishReview { review_id, .. }
+            | ExecutorCommand::PublishReviewAndFix { review_id, .. }
+            | ExecutorCommand::PushReviewFix { review_id }
+            | ExecutorCommand::ReviseReviewFix { review_id, .. }
+            | ExecutorCommand::DiscardReviewFix { review_id }
             | ExecutorCommand::DismissReview { review_id }
             | ExecutorCommand::ComputeReviewDiff { review_id }
             | ExecutorCommand::OpenReviewWorktree { review_id, .. }
@@ -430,6 +457,7 @@ impl ExecutorCommand {
             // Project-scoped / global — no single entity. `AdoptBranch`
             // creates its card mid-handler and claims it there.
             ExecutorCommand::ListReviewers { .. }
+            | ExecutorCommand::ListPrAuthors { .. }
             | ExecutorCommand::ListAdoptSources { .. }
             | ExecutorCommand::ProbeAdoptSource { .. }
             | ExecutorCommand::AdoptBranch { .. }
@@ -474,6 +502,10 @@ impl ExecutorCommand {
             ExecutorCommand::Start { .. }
                 | ExecutorCommand::StartReview { .. }
                 | ExecutorCommand::PublishReview { .. }
+                | ExecutorCommand::PublishReviewAndFix { .. }
+                | ExecutorCommand::PushReviewFix { .. }
+                | ExecutorCommand::ReviseReviewFix { .. }
+                | ExecutorCommand::DiscardReviewFix { .. }
                 | ExecutorCommand::Answer { .. }
                 | ExecutorCommand::ApprovePlan { .. }
                 | ExecutorCommand::RejectPlan { .. }
@@ -575,6 +607,11 @@ pub enum ExecutorEventKind {
     Transcript { ts: i64, line: String },
     /// The GitHub logins that can review a project's PRs (project-scoped).
     Reviewers {
+        project_id: Uuid,
+        logins: Vec<String>,
+    },
+    /// The GitHub logins with an open PR on a project's repo (project-scoped).
+    PrAuthors {
         project_id: Uuid,
         logins: Vec<String>,
     },
@@ -708,6 +745,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id: Uuid::nil(),
             kind: ExecutorEventKind::Reviewers { project_id, logins },
+        }
+    }
+    pub fn pr_authors(project_id: Uuid, logins: Vec<String>) -> Self {
+        ExecutorEvent {
+            card_id: Uuid::nil(),
+            kind: ExecutorEventKind::PrAuthors { project_id, logins },
         }
     }
     pub fn adopt_sources(project_id: Uuid, refs: Vec<String>) -> Self {

@@ -10,8 +10,10 @@
 //! the scannable index into it.
 //!
 //! Like the confirm/menu hosts, it renders once at the app root from a global
-//! signal holding what to show. It computes the diff on open (if not already
-//! cached) and offers a recompute for after a revision.
+//! signal holding what to show. It recomputes the diff on every open — the
+//! cached entry is keyed by entity id alone, and the same id can mean two
+//! different diffs (a PR, then the fix committed on top of it) — and offers a
+//! manual recompute for after a revision.
 
 use std::collections::HashSet;
 
@@ -57,6 +59,9 @@ struct DiffRequest {
     /// DOM id to scroll into view once the diff has rendered — set when the user
     /// jumped here from a specific drafted comment.
     scroll_to: Option<String>,
+    /// Fresh per open. The host computes once per token, which is what makes an
+    /// open recompute rather than re-show whatever the cache holds.
+    token: Uuid,
 }
 
 static DIFF_DIALOG: GlobalSignal<Option<DiffRequest>> = Signal::global(|| None);
@@ -66,6 +71,7 @@ pub(crate) fn open_diff_dialog(card_id: Uuid) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Card(card_id),
         scroll_to: None,
+        token: Uuid::new_v4(),
     });
 }
 
@@ -74,6 +80,7 @@ pub(crate) fn open_review_diff(review_id: Uuid) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Review(review_id),
         scroll_to: None,
+        token: Uuid::new_v4(),
     });
 }
 
@@ -83,6 +90,7 @@ pub(crate) fn open_review_diff_at(review_id: Uuid, comment_index: usize) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Review(review_id),
         scroll_to: Some(reviewdraft::anchor_id(comment_index)),
+        token: Uuid::new_v4(),
     });
 }
 
@@ -99,12 +107,16 @@ pub(crate) fn dismiss_dialog() {
 #[component]
 pub fn DiffDialogHost() -> Element {
     let state = use_context::<AppState>();
-    // Compute the diff when the dialog opens with nothing cached yet. Re-runs
-    // when the target or the diff map changes; the `is_none` guard stops it
-    // from re-firing once `Computing` lands.
+    // Compute the diff once per open. Not "when nothing is cached": the cache is
+    // keyed by entity id, so a review that has since moved to the fix gate would
+    // otherwise re-show the PR diff computed while validating it — under a hint
+    // announcing the fix. The token makes the effect fire exactly once per open,
+    // so a `Computing` landing in the map can't re-trigger it.
+    let mut computed = use_signal(|| None::<Uuid>);
     use_effect(move || {
         if let Some(req) = DIFF_DIALOG.read().as_ref() {
-            if state.diffs.read().get(&req.target.id()).is_none() {
+            if *computed.peek() != Some(req.token) {
+                computed.set(Some(req.token));
                 state.send(req.target.compute());
             }
         }
@@ -135,6 +147,23 @@ pub fn DiffDialogHost() -> Element {
         DiffTarget::Card(_) => None,
     };
 
+    // A PR whose review we published and are now fixing ourselves: the diff on
+    // screen is the agent's fix, not the contributor's PR (see
+    // `compute_review_diff`), and the dialog has to say so. `gate` additionally
+    // means the fix is committed and waiting to be pushed — the bar's actions.
+    let (fixing, gate) = match target {
+        DiffTarget::Review(review_id) => state
+            .review_task(review_id)
+            .map(|t| {
+                (
+                    t.status.fix_gate().is_some(),
+                    t.status.fix_gate_ready().then(|| t.head_ref.clone()),
+                )
+            })
+            .unwrap_or((false, None)),
+        DiffTarget::Card(_) => (false, None),
+    };
+
     let title = match target {
         DiffTarget::Card(card_id) => state
             .cards
@@ -145,7 +174,13 @@ pub fn DiffDialogHost() -> Element {
             .unwrap_or_else(|| "Diff".to_string()),
         DiffTarget::Review(review_id) => state
             .review_task(review_id)
-            .map(|t| format!("PR #{} — {}", t.pr_number, t.pr_title))
+            .map(|t| {
+                if fixing {
+                    format!("Fix for PR #{} — {}", t.pr_number, t.pr_title)
+                } else {
+                    format!("PR #{} — {}", t.pr_number, t.pr_title)
+                }
+            })
             .unwrap_or_else(|| "Pull request".to_string()),
     };
 
@@ -228,7 +263,11 @@ pub fn DiffDialogHost() -> Element {
                         Some(DiffState::Ready(data)) => rsx! {
                             if checked_out {
                                 div { class: "hint",
-                                    "Showing the PR as checked out for the review — pushes made after the review started aren't included."
+                                    if fixing {
+                                        "The fix as committed in the review checkout — not pushed yet."
+                                    } else {
+                                        "Showing the PR as checked out for the review — pushes made after the review started aren't included."
+                                    }
                                 }
                             }
                             DiffView {
@@ -241,6 +280,9 @@ pub fn DiffDialogHost() -> Element {
                 }
                 if let Some(review_id) = review_id {
                     ValidateBar { review_id }
+                }
+                if let Some(head_ref) = gate {
+                    FixBar { review_id: id, head_ref }
                 }
             }
         }
@@ -564,6 +606,56 @@ fn ValidateBar(review_id: Uuid) -> Element {
                         );
                     },
                     "{publish_label}"
+                }
+            }
+        }
+    }
+}
+
+/// The fix gate's bar, pinned under the diff: the same shape as [`ValidateBar`],
+/// but its subject is our own committed fix. Pushing from here means the last
+/// thing seen before the commit leaves the machine is the code it changes.
+#[component]
+fn FixBar(review_id: Uuid, head_ref: String) -> Element {
+    let state = use_context::<AppState>();
+    let mut note = super::drafts::use_draft(review_id, "review.fixnote", String::new);
+    let push_ref = head_ref.clone();
+
+    rsx! {
+        div { class: "review-validate-bar review-fix-bar",
+            div { class: "review-validate-summary",
+                label { class: "review-validate-label", "Send it back with feedback" }
+                textarea {
+                    class: "review-summary-edit",
+                    rows: "2",
+                    placeholder: "What should the agent do differently?",
+                    value: "{note}",
+                    oninput: move |e| note.set(e.value()),
+                }
+            }
+            div { class: "review-validate-actions",
+                button {
+                    class: "btn",
+                    title: "Run the agent again, keeping the commits it already made",
+                    onclick: move |_| {
+                        state.revise_review_fix(review_id, note.read().clone());
+                        super::drafts::forget(review_id, "review.fixnote");
+                        dismiss();
+                    },
+                    "Redo"
+                }
+                button {
+                    class: "btn subtle",
+                    title: "Abandon the fix and tell the author it isn't coming",
+                    onclick: move |_| super::confirm_discard_review_fix(review_id),
+                    "Discard"
+                }
+                button {
+                    class: "btn primary",
+                    onclick: move |_| {
+                        super::confirm_push_review_fix(state, review_id, push_ref.clone());
+                    },
+                    "Push to {head_ref}"
                 }
             }
         }

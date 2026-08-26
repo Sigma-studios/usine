@@ -3,7 +3,7 @@
 //! app-wide config (open-in commands, run cap).
 
 use dioxus::prelude::*;
-use usine_core::{CardConfig, PreviewPort};
+use usine_core::{normalize_login, CardConfig, PreviewPort, Project};
 use uuid::Uuid;
 
 use super::widgets::{
@@ -330,6 +330,61 @@ pub fn ProjectSettingsModal() -> Element {
     }
 }
 
+/// Pin one more contributor whose open PRs the review board should track, then
+/// scan straight away so the PR lands in seconds instead of at the next
+/// 5-minute poll — `SaveProject` runs inline in the dispatcher, ahead of the
+/// spawned scan, so the scan is guaranteed to see the saved config.
+///
+/// The input is normalized first (`@login` and pasted profile URLs are
+/// accepted) and rejected if it can't be a GitHub login: it ends up
+/// interpolated into a `gh --search` query, where a space would turn the rest
+/// into a free-text term and quietly empty the board. `Err` carries the message
+/// to show; an already-pinned login is a silent no-op.
+fn add_contributor(state: AppState, project: &Project, input: &str) -> Result<(), String> {
+    let Some(login) = normalize_login(input) else {
+        return Err(if input.trim().is_empty() {
+            "Enter a GitHub login.".into()
+        } else {
+            format!(
+                "“{}” isn’t a GitHub login — letters, digits and hyphens only.",
+                input.trim()
+            )
+        });
+    };
+    if project
+        .config
+        .review_contributors
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&login))
+    {
+        return Ok(());
+    }
+    let mut p = project.clone();
+    p.config.review_contributors.push(login);
+    state.save_project(p);
+    state.scan_reviews(project.id);
+    Ok(())
+}
+
+/// Submit whatever is in the manual login box: on success the box is cleared,
+/// otherwise the text stays put with the reason underneath so it can be fixed
+/// rather than retyped.
+fn submit_manual(
+    state: AppState,
+    project: &Project,
+    mut manual: Signal<String>,
+    mut manual_err: Signal<String>,
+) {
+    let input = manual.peek().clone();
+    match add_contributor(state, project, &input) {
+        Ok(()) => {
+            manual.set(String::new());
+            manual_err.set(String::new());
+        }
+        Err(msg) => manual_err.set(msg),
+    }
+}
+
 /// The "Reviews" tab: which contributors' PRs to surface on the review board, and
 /// the reviewer requested by default when opening this project's own PRs.
 #[component]
@@ -339,10 +394,13 @@ fn ReviewsTab(pid: Uuid) -> Element {
         return rsx! {};
     };
 
-    // Populate the collaborator list once on open; the refresh button re-runs it.
+    // Populate both people lists once on open; the refresh button re-runs them.
     use_hook(move || {
         if state.reviewers.peek().get(&pid).is_none() {
             state.fetch_reviewers(pid);
+        }
+        if state.pr_authors.peek().get(&pid).is_none() {
+            state.fetch_pr_authors(pid);
         }
     });
     let people = state
@@ -351,14 +409,31 @@ fn ReviewsTab(pid: Uuid) -> Element {
         .get(&pid)
         .cloned()
         .unwrap_or_default();
+    let pr_authors = state
+        .pr_authors
+        .read()
+        .get(&pid)
+        .cloned()
+        .unwrap_or_default();
     let contributors = project.config.review_contributors.clone();
+    let track_all = project.config.review_all_contributors;
     let current_reviewer = project.config.reviewer.clone().unwrap_or_default();
-    // Collaborators not yet selected — the options offered by the add dropdown.
-    let available: Vec<String> = people
+    let selected = |l: &String| contributors.iter().any(|c| c.eq_ignore_ascii_case(l));
+    // Two groups of suggestions, both minus what's already picked. PR authors
+    // lead — they're the answer to "why isn't this contributor listed?" — and a
+    // collaborator who also has an open PR is only offered once, up there.
+    let author_opts: Vec<String> = pr_authors
         .iter()
-        .filter(|l| !contributors.contains(l))
+        .filter(|l| !selected(l))
         .cloned()
         .collect();
+    let collab_opts: Vec<String> = people
+        .iter()
+        .filter(|l| !selected(l) && !author_opts.iter().any(|a| a.eq_ignore_ascii_case(l)))
+        .cloned()
+        .collect();
+    let mut manual = use_signal(String::new);
+    let mut manual_err = use_signal(String::new);
 
     rsx! {
         div { class: "section",
@@ -369,88 +444,140 @@ fn ReviewsTab(pid: Uuid) -> Element {
                 }
                 button {
                     class: "btn icon",
-                    title: "Refresh collaborators",
-                    onclick: move |_| state.fetch_reviewers(pid),
+                    title: "Refresh people",
+                    onclick: move |_| {
+                        state.fetch_reviewers(pid);
+                        state.fetch_pr_authors(pid);
+                    },
                     "↻"
                 }
             }
-            // Selected contributors as removable chips.
-            div { class: "chips",
-                if contributors.is_empty() {
-                    span { class: "chips-empty", "None selected yet." }
+            div { class: "field",
+                label { class: "adopt-choice",
+                    input {
+                        r#type: "checkbox",
+                        checked: track_all,
+                        onchange: {
+                            let project = project.clone();
+                            move |_| {
+                                let mut p = project.clone();
+                                p.config.review_all_contributors = !track_all;
+                                state.save_project(p);
+                                // Turning it on shouldn't mean waiting out the
+                                // 5-minute poll before anything shows up.
+                                if !track_all {
+                                    state.scan_reviews(pid);
+                                }
+                            }
+                        },
+                    }
+                    "Track every contributor's open PRs"
                 }
-                for login in contributors.iter() {
-                    {
-                        let login = login.clone();
-                        let project = project.clone();
-                        let login_rm = login.clone();
-                        rsx! {
-                            span { key: "{login}", class: "chip",
-                                "{login}"
-                                button {
-                                    class: "chip-remove",
-                                    title: "Remove",
-                                    "aria-label": "Remove {login}",
-                                    onclick: move |_| {
-                                        let mut p = project.clone();
-                                        p.config.review_contributors.retain(|l| l != &login_rm);
-                                        state.save_project(p);
-                                    },
-                                    "×"
+                div { class: "hint", "Every open PR that isn't yours lands on the review board. Bot PRs are skipped; dismiss anything you don't want." }
+            }
+            if track_all {
+                if !contributors.is_empty() {
+                    div { class: "hint", "{contributors.len()} pinned contributor(s) kept for when you turn this off." }
+                }
+            } else {
+                // Selected contributors as removable chips.
+                div { class: "chips",
+                    if contributors.is_empty() {
+                        span { class: "chips-empty", "None selected yet." }
+                    }
+                    for login in contributors.iter() {
+                        {
+                            let login = login.clone();
+                            let project = project.clone();
+                            let login_rm = login.clone();
+                            rsx! {
+                                span { key: "{login}", class: "chip",
+                                    "{login}"
+                                    button {
+                                        class: "chip-remove",
+                                        title: "Remove",
+                                        "aria-label": "Remove {login}",
+                                        onclick: move |_| {
+                                            let mut p = project.clone();
+                                            p.config.review_contributors.retain(|l| l != &login_rm);
+                                            state.save_project(p);
+                                        },
+                                        "×"
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            if people.is_empty() {
-                // No collaborator list to pick from — plain comma-separated entry.
-                div { class: "field",
-                    input {
-                        r#type: "text",
-                        placeholder: "octocat, hubot",
-                        value: "{contributors.join(\", \")}",
-                        onchange: {
-                            let project = project.clone();
-                            move |e: Event<FormData>| {
-                                let mut p = project.clone();
-                                p.config.review_contributors = e
-                                    .value()
-                                    .split(',')
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-                                state.save_project(p);
-                            }
-                        },
-                    }
-                }
-                div { class: "hint", "No collaborators found — enter GitHub logins separated by commas, or ↻ to fetch them." }
-            } else {
-                // Pick from the collaborator list to add.
                 select {
                     class: "add-select",
                     value: "",
                     onchange: {
                         let project = project.clone();
-                        move |e: Event<FormData>| {
-                            let login = e.value();
-                            if login.is_empty() {
-                                return;
-                            }
-                            let mut p = project.clone();
-                            if !p.config.review_contributors.contains(&login) {
-                                p.config.review_contributors.push(login);
-                                state.save_project(p);
-                            }
-                        }
+                        // Every option is a login gh gave us, so this can't fail.
+                        move |e: Event<FormData>| { let _ = add_contributor(state, &project, &e.value()); }
                     },
                     option { value: "", disabled: true, selected: true,
-                        if available.is_empty() { "All collaborators selected" } else { "+ Add contributor…" }
+                        if !author_opts.is_empty() || !collab_opts.is_empty() {
+                            "+ Add contributor…"
+                        } else if pr_authors.is_empty() && people.is_empty() {
+                            // Nothing came back at all — an unauthenticated gh, or
+                            // a repo with no open PRs. Don't claim the lists are
+                            // exhausted by what's already selected.
+                            "No one found — type a login below"
+                        } else {
+                            "Everyone found is already selected"
+                        }
                     }
-                    for login in available.iter() {
-                        option { key: "{login}", value: "{login}", "{login}" }
+                    if !author_opts.is_empty() {
+                        optgroup { label: "Open PR authors",
+                            for login in author_opts.iter() {
+                                option { key: "{login}", value: "{login}", "{login}" }
+                            }
+                        }
                     }
+                    if !collab_opts.is_empty() {
+                        optgroup { label: "Collaborators",
+                            for login in collab_opts.iter() {
+                                option { key: "{login}", value: "{login}", "{login}" }
+                            }
+                        }
+                    }
+                }
+                // Always available, not just when the lists come back empty: a
+                // fork contributor may have no open PR right now and is never a
+                // collaborator, so there has to be a way to type a login.
+                div { class: "add-row",
+                    input {
+                        r#type: "text",
+                        placeholder: "GitHub login",
+                        value: "{manual}",
+                        oninput: move |e: Event<FormData>| {
+                            manual.set(e.value());
+                            manual_err.set(String::new());
+                        },
+                        onkeydown: {
+                            let project = project.clone();
+                            move |e: Event<KeyboardData>| {
+                                if e.key() == Key::Enter {
+                                    submit_manual(state, &project, manual, manual_err);
+                                }
+                            }
+                        },
+                    }
+                    button {
+                        class: "btn",
+                        onclick: {
+                            let project = project.clone();
+                            move |_| submit_manual(state, &project, manual, manual_err)
+                        },
+                        "Add"
+                    }
+                }
+                if manual_err().is_empty() {
+                    div { class: "hint", "Not listed? Type any GitHub login — fork contributors aren't repo collaborators." }
+                } else {
+                    div { class: "hint error", "{manual_err}" }
                 }
             }
         }
@@ -565,6 +692,7 @@ fn CommandsTab(pid: Uuid) -> Element {
         0 => String::new(),
         n => n.to_string(),
     };
+    let screenshot_script = project.config.screenshot_script.clone().unwrap_or_default();
 
     rsx! {
         div { class: "section",
@@ -674,6 +802,24 @@ fn CommandsTab(pid: Uuid) -> Element {
                     "Start the app automatically during agent runs"
                 }
                 div { class: "hint", "When off, the agent can still request the app mid-run when it needs to test in it." }
+            }
+            div { class: "field",
+                label { "Screenshot command (optional)" }
+                input {
+                    r#type: "text",
+                    placeholder: "e.g. ./screenshot.sh {{path}}",
+                    value: "{screenshot_script}",
+                    onchange: {
+                        let project = project.clone();
+                        move |e: Event<FormData>| {
+                            let mut p = project.clone();
+                            let v = e.value().trim().to_string();
+                            p.config.screenshot_script = if v.is_empty() { None } else { Some(v) };
+                            state.save_project(p);
+                        }
+                    },
+                }
+                div { class: "hint", "How the agent captures the running app's window, with {{path}} standing in for the image to write. Only used when no ports are declared below — a windowed app is the case where a screenshot is the only way to see the change." }
             }
             div { class: "field",
                 label { "Preview ports" }

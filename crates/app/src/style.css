@@ -608,6 +608,10 @@ select option { background: var(--panel-2); color: var(--text); }
    script isn't driving it, and a long summary must not eat the diff. */
 .review-validate-bar .review-summary-edit { overflow-y: auto; resize: vertical; }
 .review-validate-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+/* The fix gate's bar: same layout as the publish bar, but what it pushes is our
+   own commit onto someone else's branch — the accent edge says "not the same
+   button as last time". */
+.review-fix-bar { border-top: 1px solid var(--accent); }
 .review-validate-actions select {
   background: var(--panel); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
@@ -827,6 +831,15 @@ select option { background: var(--panel-2); color: var(--text); }
   width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
 }
+/* Login box + Add button on one line. Sits outside `.field` on purpose: that
+   rule's `flex-direction: column` would stack them. */
+.add-row { display: flex; flex-direction: row; align-items: center; gap: 6px; margin-top: 6px; }
+.add-row input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+}
+.hint.error { color: var(--red); }
 
 /* Bottom usage bar: per-provider session (5h) / weekly (7d) rate-limit gauges.
    Only mounted when some window is non-zero, so it costs no space until then. */
