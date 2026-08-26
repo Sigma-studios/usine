@@ -1454,8 +1454,9 @@ impl Card {
     }
 
     /// Whether this card should light the dock badge. Delegates to
-    /// [`CardState::needs_attention`], with the two corrections the state alone
-    /// can't make because they turn on what the PR poll found.
+    /// [`CardState::needs_attention`], with three corrections the state alone
+    /// can't make: two turn on what the PR poll found, the third on a marker the
+    /// user set by hand.
     ///
     /// A PR parked in `PrReview(Idle)` only counts once a review has actually
     /// landed — either the assigned reviewer left comments
