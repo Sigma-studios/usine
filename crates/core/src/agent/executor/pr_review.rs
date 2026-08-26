@@ -337,8 +337,22 @@ impl Executor {
             let _ = self.git.remove_worktree(&project.path, &wt).await;
             let _ = std::fs::remove_dir_all(&wt);
         }
+        // A task in (or faulted out of) a fix state already has its review on
+        // GitHub — "merged without review" would be a lie. It settles as
+        // reviewed instead; only the pending fix is lost.
+        let had_fix = task.status.fix_gate().is_some();
+        if had_fix {
+            self.review_progress(
+                task.id,
+                "The PR closed on GitHub before the fix was pushed — the fix was dropped.",
+            );
+        }
         let updated = self.store.mutate_review_task(task.id, |t| {
-            t.status = ReviewStatus::MergedWithoutReview { merged };
+            t.status = if had_fix {
+                ReviewStatus::Reviewed
+            } else {
+                ReviewStatus::MergedWithoutReview { merged }
+            };
             t.worktree_path = None;
             t.updated_at = now_millis();
             Ok(())
@@ -366,6 +380,14 @@ impl Executor {
         ) {
             return Err(CoreError::IllegalTransition(
                 "this PR is already being (or has been) reviewed".into(),
+            ));
+        }
+        // A fault carried over from a *fix* run is not a review to retry: the
+        // review is already on GitHub, and re-running it would rebuild the
+        // worktree from the PR head, throwing away the fix commit with it.
+        if task.status.fix_gate().is_some() {
+            return Err(CoreError::IllegalTransition(
+                "this review is already published — retry the fix, or discard it".into(),
             ));
         }
         let updated = self.store.mutate_review_task(review_id, |t| {
@@ -418,6 +440,49 @@ impl Executor {
                 }
             }
         };
+        // A fix run (the second half of "publish & fix") is a *write* run in the
+        // PR's own checkout, so it takes a different launch path — and, once it
+        // has committed something, must not rebuild the worktree at all.
+        if let ReviewStatus::Fixing { base_sha, note, .. } =
+            self.store.get_review_task(review_id)?.status.clone()
+        {
+            let wt = if base_sha.is_empty() {
+                // First pass: rebuild from the live PR head. The drafts may be
+                // minutes old, and committing on a stale head means a rejected
+                // push. Record the sha the fix is based on as we go.
+                let _ = self.stop_review_preview(review_id).await;
+                let wt = self.prepare_review_worktree(review_id, true).await?;
+                let sha = self.git.head_sha(&wt).await.unwrap_or_default();
+                self.set_fix_base(review_id, &sha)?;
+                wt
+            } else {
+                // Redo or retry: the checkout already carries the fix commits,
+                // and `fetch_pr` force-updates the branch — it would wipe them.
+                // Reuse the tree, dropping only a crashed run's uncommitted
+                // half-edits.
+                // Deliberately NOT `prepare_review_worktree`: it re-fetches
+                // when the directory is missing, and the fetch would force the
+                // local branch back to the PR head.
+                let wt = self
+                    .store
+                    .get_review_task(review_id)?
+                    .worktree_path
+                    .filter(|p| p.exists())
+                    .ok_or_else(|| {
+                        CoreError::other(
+                            "the PR's checkout is gone — discard the fix and re-review the PR",
+                        )
+                    })?;
+                let _ = self.git.discard_changes(&wt).await;
+                wt
+            };
+            let task = self.store.get_review_task(review_id)?;
+            let project = self.store.get_project(task.project_id)?;
+            return self
+                .launch_review_fix(&task, &project, wt, &note, run_id, slot)
+                .await;
+        }
+
         // A review run always starts from a clean checkout: a retry must not
         // inherit whatever a previous attempt (or a preview's setup script) left
         // behind in the worktree.
@@ -425,6 +490,21 @@ impl Executor {
         let task = self.store.get_review_task(review_id)?;
         let project = self.store.get_project(task.project_id)?;
         self.launch_review(&task, &project, wt, run_id, slot).await
+    }
+
+    /// Record the PR head a fix run is based on, once the worktree is built.
+    fn set_fix_base(&self, review_id: Uuid, sha: &str) -> Result<()> {
+        let updated = self.store.mutate_review_task(review_id, |t| {
+            if let ReviewStatus::Fixing { base_sha, .. } = &mut t.status {
+                *base_sha = sha.to_string();
+                t.updated_at = now_millis();
+            }
+            Ok(())
+        })?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::review_task_updated(updated));
+        Ok(())
     }
 
     /// Materialize the PR's checkout, returning its path.
@@ -557,6 +637,8 @@ impl Executor {
             task.id,
             run_id,
             handle.events,
+            ReviewRunKind::Review,
+            self.self_ref.clone(),
             self.store.clone(),
             self.evt_tx.clone(),
             self.review_runs.clone(),
@@ -564,6 +646,36 @@ impl Executor {
             slot,
         ));
         Ok(())
+    }
+
+    /// Anchor the selected drafts against the PR's diff, fold whatever can't be
+    /// placed inline into the body, and POST the review. Returns how many
+    /// comments were folded, which the caller reports back to the user.
+    ///
+    /// The posting half of [`Self::publish_review`], shared with
+    /// [`Self::publish_review_and_fix`] so both surfaces post identically.
+    async fn submit_drafts(
+        &self,
+        task: &ReviewTask,
+        project: &Project,
+        selected: Vec<DraftComment>,
+        event: ReviewEvent,
+        body: &str,
+    ) -> Result<usize> {
+        let n_selected = selected.len();
+        // A draft-less publish — a direct approve from `ToReview` — has nothing
+        // to anchor, and its PR may never have been fetched at all.
+        let diff = if selected.is_empty() {
+            None
+        } else {
+            self.anchoring_diff(task, project).await
+        };
+        let (inline, body) = fold_unanchorable(diff.as_ref(), selected, body);
+        let folded = n_selected - inline.len();
+        self.forge
+            .submit_review(&project.path, task.pr_number, event, &body, &inline)
+            .await?;
+        Ok(folded)
     }
 
     /// Publish the checked, edited drafted comments as a single GitHub review, tear
@@ -586,18 +698,8 @@ impl Executor {
         let task = self.store.get_review_task(review_id)?;
         let project = self.store.get_project(task.project_id)?;
         let selected: Vec<DraftComment> = drafts.into_iter().filter(|d| d.selected).collect();
-        let n_selected = selected.len();
-        // A draft-less publish — a direct approve from `ToReview` — has nothing
-        // to anchor, and its PR may never have been fetched at all.
-        let diff = if selected.is_empty() {
-            None
-        } else {
-            self.anchoring_diff(&task, &project).await
-        };
-        let (inline, body) = fold_unanchorable(diff.as_ref(), selected, &body);
-        let folded = n_selected - inline.len();
-        self.forge
-            .submit_review(&project.path, task.pr_number, event, &body, &inline)
+        let folded = self
+            .submit_drafts(&task, &project, selected, event, &body)
             .await?;
 
         if let Some(wt) = task.worktree_path.clone() {
@@ -631,6 +733,504 @@ impl Executor {
             self.evt_tx
                 .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Success, toast));
         Ok(())
+    }
+
+    /// Publish the drafted review *and* fix it ourselves: post every selected
+    /// comment with the pledge that we'll handle it, then run a write agent in
+    /// the PR's own checkout to implement exactly those comments.
+    ///
+    /// Every fallible step happens BEFORE the post, because the pledge can't be
+    /// taken back once it's on the PR: the push target is resolved first (a fork
+    /// whose author disabled maintainer edits can't be fixed by us at all), and
+    /// the worktree is rebuilt on the live PR head, so the fix is based on what
+    /// the branch actually is today.
+    ///
+    /// Nothing is pushed here. The run commits in the checkout and parks at the
+    /// `FixReady` gate for the user to read the diff and approve.
+    pub(super) async fn publish_review_and_fix(
+        &self,
+        review_id: Uuid,
+        drafts: Vec<DraftComment>,
+        event: ReviewEvent,
+        body: String,
+    ) -> Result<()> {
+        let task = self.store.get_review_task(review_id)?;
+        if !matches!(task.status, ReviewStatus::AwaitingValidation { .. }) {
+            return Err(CoreError::IllegalTransition(
+                "this review isn't awaiting validation".into(),
+            ));
+        }
+        let selected: Vec<DraftComment> = drafts.into_iter().filter(|d| d.selected).collect();
+        // Nothing to fix — this is just a publish. Defensive: the UI hides the
+        // button with no comments checked.
+        if selected.is_empty() {
+            return self.publish_review(review_id, selected, event, body).await;
+        }
+        let project = self.store.get_project(task.project_id)?;
+
+        // Can we keep the promise? A `None` here is "the forge can't tell" (the
+        // sim, a test double), which is not a reason to refuse.
+        if let Some(target) = self
+            .forge
+            .pr_push_target(&project.path, task.pr_number)
+            .await?
+        {
+            if !target.pushable() {
+                return Err(CoreError::other(format!(
+                    "@{} hasn't allowed maintainer edits on this fork, so the fix couldn't be \
+                     pushed — publish the review without fixes, or ask them to enable it",
+                    task.author
+                )));
+            }
+        }
+
+        // The drafts may be minutes old: rebuild the checkout on the live PR
+        // head so the fix commits on top of what the branch is now.
+        let _ = self.stop_review_preview(review_id).await;
+        let wt = self.prepare_review_worktree(review_id, true).await?;
+        let base_sha = self.git.head_sha(&wt).await.unwrap_or_default();
+
+        let n = selected.len();
+        let folded = self
+            .submit_drafts(
+                &task,
+                &project,
+                crate::agent::review::pledged_drafts(&selected),
+                event,
+                &format!("{body}{}", crate::agent::review::FIX_PLEDGE_SUMMARY),
+            )
+            .await?;
+
+        let updated = self.store.mutate_review_task(review_id, |t| {
+            t.status = ReviewStatus::Fixing {
+                comments: selected.clone(),
+                base_sha: base_sha.clone(),
+                note: String::new(),
+            };
+            t.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::review_task_updated(updated));
+        self.review_progress(
+            review_id,
+            &format!(
+                "✔ review published on #{} — fixing {n} comment(s) myself",
+                task.pr_number
+            ),
+        );
+        let toast = if folded == 0 {
+            format!("Review published on PR #{} — fixing it now", task.pr_number)
+        } else {
+            format!(
+                "Review published on PR #{} ({folded} comment(s) folded into the summary) — fixing it now",
+                task.pr_number
+            )
+        };
+        let _ =
+            self.evt_tx
+                .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Success, toast));
+
+        // The worktree is already built, so `begin_review_run_admitted` takes
+        // its reuse branch (`base_sha` is set) — through the same concurrency
+        // gate, queue badge and startup recovery as every other run.
+        //
+        // A failure to start is wrapped as a fault on the task, never left as a
+        // bare toast: the review (and its pledge) is already on GitHub, and the
+        // gate's actions — redo, discard — are the only way out of it.
+        if let Err(e) = self.begin_review_run(review_id).await {
+            let msg = e.to_string();
+            self.review_progress(review_id, &format!("✗ the fix run failed to start: {msg}"));
+            let _ = self.fail_review(review_id, msg);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Build the fix run's config and spawn the write agent + actor. Mirrors
+    /// [`Self::launch_review`], but as an `ApplyFixes` write run: the comments
+    /// ride in the prompt verbatim (no session to resume — the review pass was a
+    /// different conversation, in a checkout that has since been rebuilt).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn launch_review_fix(
+        &self,
+        task: &ReviewTask,
+        project: &Project,
+        wt: PathBuf,
+        note: &str,
+        run_id: Uuid,
+        slot: super::gate::SlotGuard,
+    ) -> Result<()> {
+        let Some((comments, _)) = task.status.fix_state() else {
+            return Err(CoreError::IllegalTransition(
+                "this review has no fix to run".into(),
+            ));
+        };
+        let base = task.diff_base(project.config.effective_base_branch());
+        let prompt = format!(
+            "You are working on pull request #{} \"{}\" by @{}, checked out on its own branch. \
+             The PR targets `{base}`; its changes are the commits on this branch beyond \
+             `origin/{base}` (`git diff origin/{base}...HEAD`).",
+            task.pr_number, task.pr_title, task.author
+        );
+        let extra = format!(
+            "{}\n\n{}",
+            crate::agent::review::review_fix_prompt(task.pr_number, &task.author, comments, note),
+            crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION
+        );
+        let settings = self.store.settings()?;
+        let cfg = RunConfig {
+            provider: settings.default_provider,
+            project_dir: wt,
+            spec: settings.default_implement.clone(),
+            mode: RunMode::ApplyFixes,
+            session_id: task.session_id,
+            prompt,
+            extra_prompt: Some(extra),
+            resume_session: None,
+            attachments: Vec::new(),
+        };
+        self.review_progress(task.id, "Fixing the comments you took on…");
+        let provider = self.providers.make(settings.default_provider);
+        let interactive = provider.interactive();
+        let handle = provider.start(cfg).await?;
+        lock(&self.review_runs).insert(task.id, (run_id, handle.control));
+        tokio::spawn(run_review_actor(
+            task.id,
+            run_id,
+            handle.events,
+            ReviewRunKind::Fix,
+            self.self_ref.clone(),
+            self.store.clone(),
+            self.evt_tx.clone(),
+            self.review_runs.clone(),
+            interactive,
+            slot,
+        ));
+        Ok(())
+    }
+
+    /// A fix run finished: commit what it wrote in the PR's checkout and park at
+    /// the gate. Deliberately stops there — the push is the user's call, made
+    /// against the diff (see [`Self::push_review_fix`]).
+    pub(super) async fn finish_review_fix(&self, review_id: Uuid, result_text: String, cost: f64) {
+        let Ok(task) = self.store.get_review_task(review_id) else {
+            return;
+        };
+        // The task left the fixing state (dismissed, or its PR was retired
+        // mid-run) — the commit would land somewhere nobody is looking.
+        let ReviewStatus::Fixing {
+            comments, base_sha, ..
+        } = task.status.clone()
+        else {
+            return;
+        };
+        let Some(wt) = task.worktree_path.clone() else {
+            let _ = self.fail_review(review_id, "the PR's checkout is gone".into());
+            return;
+        };
+
+        let message = crate::agent::commit::parse_commit_message(&result_text)
+            .unwrap_or_else(|| format!("fix: address review comments on #{}", task.pr_number));
+        let committed = match self.git.commit_all(&wt, &message).await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.fail_review(review_id, format!("committing the fix failed: {e}"));
+                return;
+            }
+        };
+        if !committed {
+            // Nothing new this pass. That's a failure on the first attempt —
+            // the comments were published as ours to fix and nothing was done —
+            // but a legitimate outcome on a redo whose earlier pass already
+            // committed (the branch has moved off `base_sha`).
+            let head = self.git.head_sha(&wt).await.unwrap_or_default();
+            let already_fixed = !base_sha.is_empty() && !head.is_empty() && head != base_sha;
+            if !already_fixed {
+                let _ = self.fail_review(
+                    review_id,
+                    "the fix run changed nothing — the comments are published as yours to fix, \
+                     so redo it with guidance or discard the fix"
+                        .into(),
+                );
+                return;
+            }
+        }
+
+        let summary = crate::agent::commit::strip_commit_block(&result_text);
+        let updated = self.store.mutate_review_task(review_id, |t| {
+            t.cost += crate::Cost::from_usd(cost);
+            t.status = ReviewStatus::FixReady {
+                comments: comments.clone(),
+                base_sha: base_sha.clone(),
+                summary: summary.trim().to_string(),
+            };
+            t.updated_at = now_millis();
+            Ok(())
+        });
+        match updated {
+            Ok(updated) => {
+                let _ = self
+                    .evt_tx
+                    .unbounded_send(ExecutorEvent::review_task_updated(updated));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "review fix #{}: recording the gate failed: {e}",
+                    task.pr_number
+                );
+                return;
+            }
+        }
+        self.review_progress(
+            review_id,
+            "✔ fix committed in the PR's checkout — nothing pushed yet",
+        );
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            Uuid::nil(),
+            Severity::Success,
+            format!(
+                "Fix ready for PR #{} — review the diff before it's pushed",
+                task.pr_number
+            ),
+        ));
+    }
+
+    /// The gate's exit: push the committed fix onto the PR's own head branch,
+    /// tell the author, and settle the task. Accepted from `FixReady` and from
+    /// a `Failed` wrapping it, so a rejected push retries in place with the
+    /// commits intact.
+    pub(super) async fn push_review_fix(&self, review_id: Uuid) -> Result<()> {
+        let task = self.store.get_review_task(review_id)?;
+        let Some((comments, _)) = task
+            .status
+            .fix_gate()
+            .filter(|_| task.status.fix_gate_ready())
+        else {
+            return Err(CoreError::IllegalTransition(
+                "there's no committed fix waiting to be pushed".into(),
+            ));
+        };
+        let n = comments.len();
+        let project = self.store.get_project(task.project_id)?;
+        let Some(wt) = task.worktree_path.clone().filter(|p| p.exists()) else {
+            return Err(CoreError::other(
+                "the PR's checkout is gone — the fix can't be pushed from here",
+            ));
+        };
+
+        // Re-read the target: it's one cheap call, and the author may have
+        // revoked maintainer edits (or renamed the branch) since the review. A
+        // failure here is fatal on purpose — guessing "same repo" would push the
+        // fix onto a branch of *our* repo, which is nobody's PR.
+        let target = self
+            .forge
+            .pr_push_target(&project.path, task.pr_number)
+            .await
+            .map_err(|e| {
+                CoreError::other(format!(
+                    "couldn't re-read where PR #{} wants its push ({e}) — the fix is still \
+                     committed in the checkout, so try again",
+                    task.pr_number
+                ))
+            })?;
+        let head_ref = target
+            .as_ref()
+            .map(|t| t.head_ref.clone())
+            .unwrap_or_else(|| task.head_ref.clone());
+        let remote = match &target {
+            // A fork: never fall back to `origin` — that would push someone
+            // else's branch name into the maintainer's own repo.
+            Some(t) if t.cross_repo => {
+                if !t.pushable() {
+                    return Err(CoreError::other(format!(
+                        "@{} has since disabled maintainer edits on this fork — the fix can't be \
+                         pushed. Discard it and reply on the PR instead.",
+                        task.author
+                    )));
+                }
+                if t.head_repo.is_empty() {
+                    return Err(CoreError::other(format!(
+                        "PR #{}'s fork is gone from GitHub, so there's nowhere to push the fix. \
+                         Discard it and reply on the PR instead.",
+                        task.pr_number
+                    )));
+                }
+                let origin = self
+                    .git
+                    .remote_url(&project.path, "origin")
+                    .await
+                    .unwrap_or_default();
+                crate::infra::git::fork_push_url(&origin, &t.head_repo)
+            }
+            _ => "origin".to_string(),
+        };
+
+        let refspec = format!("{}:{head_ref}", task.local_branch());
+        if let Err(e) = self.git.push_refspec(&wt, &remote, &refspec).await {
+            // Usually a non-fast-forward: the author pushed while the fix sat at
+            // the gate. The worktree and its commits stay put, so a redo (which
+            // can rebase onto the new head) or a retried push both still work.
+            let msg = format!(
+                "pushing the fix to `{head_ref}` failed: {e}. Push again if that was transient — \
+                 the commits are still in the checkout. If the author pushed meanwhile, redoing \
+                 won't help (the checkout is deliberately never re-fetched, so the fix stays on \
+                 the head it was written against): discard the fix, which retracts the pledge, \
+                 and take it up on the PR."
+            );
+            self.review_progress(review_id, &format!("✗ {msg}"));
+            let _ = self.fail_review(review_id, msg.clone());
+            let _ =
+                self.evt_tx
+                    .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Error, msg));
+            return Ok(());
+        }
+
+        // Best-effort: the commits are already on the branch, so a failed
+        // comment is a missing courtesy, not a failed push.
+        let sha = self.git.head_sha(&wt).await.unwrap_or_default();
+        let note = if sha.is_empty() {
+            format!("Pushed a fix — I've addressed the {n} comment(s) I said I'd handle.")
+        } else {
+            format!("Pushed `{sha}` — I've addressed the {n} comment(s) I said I'd handle.")
+        };
+        if let Err(e) = self
+            .forge
+            .comment_on_pr(&project.path, task.pr_number, &note)
+            .await
+        {
+            tracing::warn!(
+                "review fix #{}: the follow-up comment failed: {e}",
+                task.pr_number
+            );
+        }
+
+        self.teardown_review_checkout(review_id, &task, &project)
+            .await;
+        let updated = self.store.mutate_review_task(review_id, |t| {
+            t.status = ReviewStatus::Reviewed;
+            t.worktree_path = None;
+            t.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::review_task_updated(updated));
+        self.review_progress(review_id, &format!("✔ fix pushed to {head_ref}"));
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            Uuid::nil(),
+            Severity::Success,
+            format!("Fix pushed to {head_ref} on PR #{}", task.pr_number),
+        ));
+        Ok(())
+    }
+
+    /// Send the fix back to the agent with feedback, keeping the commits it has
+    /// already made (so the gate's diff stays cumulative over the same base).
+    pub(super) async fn revise_review_fix(&self, review_id: Uuid, note: String) -> Result<()> {
+        let task = self.store.get_review_task(review_id)?;
+        let Some((comments, base_sha)) = task.status.fix_gate() else {
+            return Err(CoreError::IllegalTransition(
+                "there's no fix to redo on this review".into(),
+            ));
+        };
+        let (comments, base_sha) = (comments.to_vec(), base_sha.to_string());
+        let updated = self.store.mutate_review_task(review_id, |t| {
+            t.status = ReviewStatus::Fixing {
+                comments: comments.clone(),
+                base_sha: base_sha.clone(),
+                note: note.trim().to_string(),
+            };
+            t.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::review_task_updated(updated));
+        self.review_progress(review_id, "Redoing the fix with your feedback…");
+        if let Err(e) = self.begin_review_run(review_id).await {
+            let msg = e.to_string();
+            self.review_progress(review_id, &format!("✗ the fix run failed to start: {msg}"));
+            let _ = self.fail_review(review_id, msg.clone());
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Abandon the fix: tear the checkout down and retract the pledge on the PR,
+    /// so the author isn't left waiting for a change that isn't coming.
+    ///
+    /// Accepted while the fix run is still going too (that's the way out offered
+    /// from the card menu, where "dismiss" would drop the pledge silently *and*
+    /// blacklist the PR): the run is cancelled first, because the checkout it
+    /// works in is about to be removed.
+    pub(super) async fn discard_review_fix(&self, review_id: Uuid) -> Result<()> {
+        let task = self.store.get_review_task(review_id)?;
+        if task.status.fix_gate().is_none() {
+            return Err(CoreError::IllegalTransition(
+                "there's no fix to discard on this review".into(),
+            ));
+        }
+        self.purge_queued(review_id);
+        if let Some((_, control)) = lock(&self.review_runs).get(&review_id) {
+            let _ = control.unbounded_send(RunControl::Cancel);
+        }
+        let project = self.store.get_project(task.project_id)?;
+        self.retract_fix_pledge(&task, &project).await;
+        self.teardown_review_checkout(review_id, &task, &project)
+            .await;
+        let updated = self.store.mutate_review_task(review_id, |t| {
+            t.status = ReviewStatus::Reviewed;
+            t.worktree_path = None;
+            t.updated_at = now_millis();
+            Ok(())
+        })?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::review_task_updated(updated));
+        self.review_progress(
+            review_id,
+            "✔ fix abandoned — the pledge was retracted on the PR",
+        );
+        Ok(())
+    }
+
+    /// Take back the "I'll fix this myself" promise on the PR, so the author
+    /// isn't left waiting for a change that isn't coming. Best-effort: the
+    /// abandonment is local and already decided; a failed comment is a missing
+    /// courtesy, not a reason to keep the fix alive.
+    async fn retract_fix_pledge(&self, task: &ReviewTask, project: &Project) {
+        if let Err(e) = self
+            .forge
+            .comment_on_pr(
+                &project.path,
+                task.pr_number,
+                "On reflection I'm leaving these to you — no fix is coming from my side.",
+            )
+            .await
+        {
+            tracing::warn!(
+                "review fix #{}: the retraction comment failed: {e}",
+                task.pr_number
+            );
+        }
+    }
+
+    /// Reap a review's checkout: stop its preview first (its processes live
+    /// inside the directory — pulling the directory out from under them is the
+    /// "Directory not empty" failure), then remove the worktree and the dir.
+    async fn teardown_review_checkout(
+        &self,
+        review_id: Uuid,
+        task: &ReviewTask,
+        project: &Project,
+    ) {
+        if let Some(wt) = task.worktree_path.clone() {
+            let _ = self.stop_review_preview(review_id).await;
+            let _ = self.git.remove_worktree(&project.path, &wt).await;
+            let _ = std::fs::remove_dir_all(&wt);
+        }
     }
 
     /// The PR's diff, recomputed for anchoring at publish time. Best-effort by
@@ -686,15 +1286,22 @@ impl Executor {
             let _ = self
                 .store
                 .add_dismissed_review(task.project_id, task.pr_number);
-            if let (Some(wt), Ok(project)) = (
-                task.worktree_path.clone(),
-                self.store.get_project(task.project_id),
-            ) {
-                // Same ordering as `publish_review`: reap the preview's process
-                // tree before pulling the directory out from under it.
-                let _ = self.stop_review_preview(review_id).await;
-                let _ = self.git.remove_worktree(&project.path, &wt).await;
-                let _ = std::fs::remove_dir_all(&wt);
+            if let Ok(project) = self.store.get_project(task.project_id) {
+                // Dropping a task whose review pledged a fix leaves that promise
+                // standing on someone else's PR — retract it, exactly as
+                // `discard_review_fix` does. (The UI steers the user to the
+                // discard instead; this is the same courtesy for the dismissal
+                // that gets here anyway.)
+                if task.status.fix_gate().is_some() {
+                    self.retract_fix_pledge(task, &project).await;
+                }
+                if let Some(wt) = task.worktree_path.clone() {
+                    // Same ordering as `publish_review`: reap the preview's
+                    // process tree before pulling the directory out from under it.
+                    let _ = self.stop_review_preview(review_id).await;
+                    let _ = self.git.remove_worktree(&project.path, &wt).await;
+                    let _ = std::fs::remove_dir_all(&wt);
+                }
             }
         }
         self.store.delete_review_task(review_id)?;
@@ -719,14 +1326,30 @@ impl Executor {
     }
 }
 
-/// Pump a read-only PR-review run: stream progress to the review transcript and,
-/// on completion, parse the drafted comments and park the task for validation.
-/// Errors mark the task `Failed` (retryable). Keyed by review id, not card id.
+/// Which run an actor is pumping for a review task: the read-only review pass,
+/// or the write run that fixes the comments the reviewer pledged to handle. The
+/// two share every event but `Done`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReviewRunKind {
+    Review,
+    Fix,
+}
+
+/// Pump a PR-review run: stream progress to the review transcript and, on
+/// completion, either park the drafted comments for validation (a review pass)
+/// or commit the fix and park it at the push gate (a fix run). Errors mark the
+/// task `Failed` (retryable). Keyed by review id, not card id.
 #[allow(clippy::too_many_arguments)]
 async fn run_review_actor(
     review_id: Uuid,
     run_id: Uuid,
     mut events: BoxStream<'static, AgentEvent>,
+    kind: ReviewRunKind,
+    // The executor, for the fix run's continuation. A `Weak` upgrade, never a
+    // command through `cmd_tx`: the dispatcher's per-id exclusive claim is still
+    // held by the command that started this run, so a queued command would be
+    // dropped (see `finalize_run`).
+    executor: Weak<Executor>,
     store: Store,
     evt_tx: UnboundedSender<ExecutorEvent>,
     review_runs: RunMap,
@@ -756,8 +1379,22 @@ async fn run_review_actor(
                 }
             }
         };
-        let result = match &evt {
-            AgentEvent::Done { .. } => finalize_review(&store, &evt_tx, review_id, evt),
+        let result = match (&evt, kind) {
+            (AgentEvent::Done { .. }, ReviewRunKind::Review) => {
+                finalize_review(&store, &evt_tx, review_id, evt)
+            }
+            (
+                AgentEvent::Done {
+                    result, cost_usd, ..
+                },
+                ReviewRunKind::Fix,
+            ) => {
+                if let Some(exec) = executor.upgrade() {
+                    exec.finish_review_fix(review_id, result.clone(), *cost_usd)
+                        .await;
+                }
+                Ok(())
+            }
             _ => handle_review_event(&store, &evt_tx, review_id, evt),
         };
         match result {

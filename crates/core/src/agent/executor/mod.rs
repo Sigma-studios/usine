@@ -475,6 +475,22 @@ impl Executor {
                 event,
                 body,
             } => self.publish_review(review_id, drafts, event, body).await,
+            ExecutorCommand::PublishReviewAndFix {
+                review_id,
+                drafts,
+                event,
+                body,
+            } => {
+                self.publish_review_and_fix(review_id, drafts, event, body)
+                    .await
+            }
+            ExecutorCommand::PushReviewFix { review_id } => self.push_review_fix(review_id).await,
+            ExecutorCommand::ReviseReviewFix { review_id, note } => {
+                self.revise_review_fix(review_id, note).await
+            }
+            ExecutorCommand::DiscardReviewFix { review_id } => {
+                self.discard_review_fix(review_id).await
+            }
             ExecutorCommand::DismissReview { review_id } => self.dismiss_review(review_id).await,
             ExecutorCommand::ComputeReviewDiff { review_id } => {
                 self.compute_review_diff(review_id).await

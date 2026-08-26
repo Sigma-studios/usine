@@ -211,6 +211,25 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     div { class: "hint", "This review was submitted to GitHub." }
                 }
             },
+            ReviewStatus::Fixing { comments, .. } => rsx! {
+                div { class: "section",
+                    h3 { "Fixing" }
+                    div { class: "reviewed-tag", "✓ published" }
+                    div { class: "hint",
+                        "The review is already on GitHub — each comment says you'll fix it yourself.                          An agent is applying the {comments.len()} comment(s) you took on, in the PR's                          own checkout. Nothing is pushed until you've read the diff."
+                    }
+                }
+            },
+            ReviewStatus::FixReady { comments, summary, .. } => rsx! {
+                FixGate {
+                    review_id: id,
+                    head_ref: task.head_ref.clone(),
+                    comment_count: comments.len(),
+                    summary: summary.clone(),
+                    pushable: true,
+                    failure: None,
+                }
+            },
             ReviewStatus::MergedWithoutReview { merged } => rsx! {
                 div { class: "section",
                     h3 { "Review" }
@@ -226,6 +245,25 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                         title: "Dismiss this PR from the review board",
                         onclick: move |_| crate::ui::confirm_dismiss_review(id, task.pr_number),
                         "Dismiss"
+                    }
+                }
+            },
+            // A fault carried over from a fix run is not a review to retry: the
+            // review is published, and the checkout (with any commits already
+            // made) is still there. Offer the gate's actions instead.
+            ReviewStatus::Failed { message, previous } if previous.fix_gate().is_some() => {
+                let (comments, _) = previous.fix_gate().unwrap();
+                rsx! {
+                    FixGate {
+                        review_id: id,
+                        head_ref: task.head_ref.clone(),
+                        comment_count: comments.len(),
+                        summary: String::new(),
+                        // Only a fix that got as far as committing can be
+                        // pushed; a run that faulted before that has nothing
+                        // on the branch, so Redo is the way out.
+                        pushable: previous.fix_gate_ready(),
+                        failure: Some(message.clone()),
                     }
                 }
             },
@@ -298,6 +336,8 @@ fn DraftSelection(
     let verdict = edits.verdict;
     let comments_for_publish = edits.comments.clone();
     let summary_for_publish = edits.summary.clone();
+    let comments_for_fix = edits.comments.clone();
+    let summary_for_fix = edits.summary.clone();
 
     // Grow each comment box to fit its text: a review comment is meant to be read
     // in full, not scrolled inside a two-row window. Runs once after mount (the
@@ -424,11 +464,109 @@ fn DraftSelection(
                     },
                     "{publish_label}"
                 }
+                if checked_count > 0 {
+                    button {
+                        class: "btn",
+                        title: "Post the review saying you'll fix these yourself, then have an agent do it",
+                        onclick: move |_| {
+                            crate::ui::confirm_publish_and_fix_review(
+                                state,
+                                review_id,
+                                comments_for_fix.clone(),
+                                verdict,
+                                summary_for_fix.clone(),
+                            );
+                        },
+                        "Publish & fix"
+                    }
+                }
                 button {
                     class: "btn subtle",
                     title: "Discard this review",
                     onclick: move |_| crate::ui::confirm_discard_review(review_id),
                     "Discard"
+                }
+            }
+        }
+    }
+}
+
+/// The fix gate: the fix is committed in the PR's checkout and nothing has been
+/// pushed. Read the diff, then push it, send it back with feedback, or abandon
+/// it (which retracts the pledge on the PR).
+///
+/// `failure` is set when a fix run or a push faulted: the gate stays open, since
+/// the checkout and any commits it already carries are still there.
+#[component]
+fn FixGate(
+    review_id: Uuid,
+    head_ref: String,
+    comment_count: usize,
+    summary: String,
+    /// Whether a commit is actually waiting to be pushed (see the `Failed` arm).
+    pushable: bool,
+    failure: Option<String>,
+) -> Element {
+    let state = use_context::<AppState>();
+    // The redo note. A draft so a half-typed instruction survives a deselect;
+    // the panel remounts (and so reseeds this to empty) when the status changes.
+    let mut note = crate::ui::drafts::use_draft(review_id, "review.fixnote", String::new);
+    let push_ref = head_ref.clone();
+
+    rsx! {
+        div { class: "section",
+            h3 { "Fix" }
+            div { class: "reviewed-tag", "✓ published" }
+            if let Some(message) = failure.clone() {
+                div { class: "question", "The fix run failed: {message}" }
+            }
+            div { class: "hint",
+                "The review is on GitHub and says you'll fix these {comment_count} comment(s)                  yourself. The fix is committed in the PR's checkout — nothing has been pushed."
+            }
+            if !summary.trim().is_empty() {
+                div { class: "pr-body", "{summary}" }
+            }
+            div { class: "row",
+                button {
+                    class: "btn primary",
+                    title: "Read the fix as committed, before it's pushed",
+                    onclick: move |_| open_review_diff(review_id),
+                    "Review the fix"
+                }
+                if pushable {
+                    button {
+                        class: "btn",
+                        title: "Push the fix onto the contributor's PR branch",
+                        onclick: move |_| {
+                            crate::ui::confirm_push_review_fix(state, review_id, push_ref.clone());
+                        },
+                        "Push to {head_ref}"
+                    }
+                }
+            }
+            div { class: "field",
+                label { "Send it back with feedback" }
+                textarea {
+                    placeholder: "What should the agent do differently? e.g. \"keep the helper private\"",
+                    value: "{note}",
+                    oninput: move |e| note.set(e.value()),
+                }
+            }
+            div { class: "row",
+                button {
+                    class: "btn",
+                    title: "Run the agent again, keeping the commits it already made",
+                    onclick: move |_| {
+                        state.revise_review_fix(review_id, note.read().clone());
+                        crate::ui::drafts::forget(review_id, "review.fixnote");
+                    },
+                    "Redo with feedback"
+                }
+                button {
+                    class: "btn subtle",
+                    title: "Abandon the fix and tell the author it isn't coming",
+                    onclick: move |_| crate::ui::confirm_discard_review_fix(review_id),
+                    "Discard the fix"
                 }
             }
         }
@@ -450,6 +588,8 @@ fn status_discriminant(s: &ReviewStatus) -> &'static str {
         ReviewStatus::Reviewing => "reviewing",
         ReviewStatus::AwaitingValidation { .. } => "validate",
         ReviewStatus::Reviewed => "reviewed",
+        ReviewStatus::Fixing { .. } => "fixing",
+        ReviewStatus::FixReady { .. } => "fix-ready",
         ReviewStatus::MergedWithoutReview { merged: true } => "ext-merged",
         ReviewStatus::MergedWithoutReview { merged: false } => "ext-closed",
         ReviewStatus::Failed { .. } => "failed",
