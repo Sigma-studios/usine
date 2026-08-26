@@ -2,7 +2,7 @@
 //! settings panel.
 
 use dioxus::prelude::*;
-use usine_core::{supported_efforts, Effort, ModelSpec, Provider};
+use usine_core::{supported_efforts, Effort, ModelSpec, Provider, SEVERITY_LEVELS};
 
 /// Selectable model ids per provider.
 pub(crate) fn models_for(provider: Provider) -> &'static [&'static str] {
@@ -44,6 +44,35 @@ pub(crate) fn parse_effort(s: &str) -> Effort {
         "max" => Effort::Max,
         "ultra" => Effort::Ultra,
         _ => Effort::Medium,
+    }
+}
+
+/// The criticality of a drafted review comment, as an editable pill. The
+/// maintainer owns this rating — it is published to the contributor alongside
+/// the comment, so they can correct one they disagree with, or pick `\u{2014}`
+/// to clear it and post the comment untagged.
+///
+/// One component for both validation surfaces (the detail panel's list and the
+/// diff viewer's inline thread) so the two never drift apart.
+#[component]
+pub(crate) fn SeverityPicker(severity: String, on_change: EventHandler<String>) -> Element {
+    let class = if severity.is_empty() {
+        "sev".to_string()
+    } else {
+        format!("sev sev-{severity}")
+    };
+    rsx! {
+        select {
+            class: "{class}",
+            value: "{severity}",
+            title: "Criticality published with this comment",
+            "aria-label": "Criticality",
+            onchange: move |e: Event<FormData>| on_change.call(e.value()),
+            option { value: "", selected: severity.is_empty(), "\u{2014}" }
+            for level in SEVERITY_LEVELS.iter() {
+                option { value: "{level}", selected: severity.as_str() == *level, "{level}" }
+            }
+        }
     }
 }
 
