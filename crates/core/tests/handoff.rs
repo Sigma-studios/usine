@@ -199,6 +199,7 @@ async fn only_implement_runs_are_asked_for_a_hand_off() {
         card_id,
         verdicts,
         note: String::new(),
+        prompt: None,
     });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c)

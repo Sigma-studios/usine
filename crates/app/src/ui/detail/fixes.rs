@@ -1,8 +1,10 @@
 //! The fix-selection panel, shared by PR-comment triage and self-review: lets
 //! the user pick which findings to apply — editing the AI's proposed text
 //! first, since that text is exactly what the fix run (or the GitHub reply)
-//! receives — and add a free-form comment of their own, which the fix run
-//! addresses alongside them.
+//! receives — say per finding *how* it should be fixed, and add a free-form
+//! comment of their own, which the fix run addresses alongside them. The
+//! composed task is shown at the bottom and is itself editable: touch it and
+//! that text is what the agent receives, verbatim.
 
 use dioxus::prelude::*;
 use usine_core::{ExecutorCommand, FixVerdict};
@@ -33,12 +35,38 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     // moving to merge for PR triage), so it says that instead.
     let has_note = !note.read().trim().is_empty();
     let any_selected = edits.read().iter().any(|v| v.selected);
-    let apply_label = match (any_selected, has_note) {
-        (true, true) => "Apply selected fixes & note",
-        (true, false) => "Apply selected fixes",
-        (false, true) => "Apply your note",
-        (false, false) if self_review => "Continue without fixes",
-        (false, false) => "Ignore comments and continue",
+
+    // The task exactly as the agent will get it. `None` = untouched, so the box
+    // mirrors the composed task live; `Some` = the user's own wording, sent
+    // verbatim (even blank, which means "run nothing"). Origin-keyed on the
+    // verdicts like `fixes.verdicts`, so a re-run's picker reseeds.
+    let mut task = drafts::use_draft_of(card_id, "fixes.task", &verdicts, || None::<String>);
+    let selected: Vec<FixVerdict> = edits
+        .read()
+        .iter()
+        .filter(|v| v.selected)
+        .cloned()
+        .collect();
+    let generated = usine_core::fix_prompt(&selected, note.read().trim());
+    let edited = task.read().clone();
+    let shown = edited.clone().unwrap_or_else(|| generated.clone());
+    let will_run = !shown.trim().is_empty();
+    let task_rows = fallback_rows(&shown);
+
+    let apply_label = if !will_run {
+        if self_review {
+            "Continue without fixes"
+        } else {
+            "Ignore comments and continue"
+        }
+    } else if edited.is_some() {
+        "Apply your edited task"
+    } else {
+        match (any_selected, has_note) {
+            (true, true) => "Apply selected fixes & note",
+            (true, false) => "Apply selected fixes",
+            _ => "Apply your note",
+        }
     };
 
     // Grow each edit box to fit its text (same script as the review drafts
@@ -94,6 +122,12 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     // review body, so a typed reply would be silently discarded.
                     let reply = v.reply.clone();
                     let show_reply = !self_review && !checked && !is_review_body;
+                    // Checked means "fix it"; this is where the user says how —
+                    // the counterpart of the reply box, which shows when the row
+                    // is unchecked. An instruction typed then unchecked stays in
+                    // the draft and is simply ignored, as replies already are.
+                    let instruction = v.instruction.clone();
+                    let show_steer = checked;
                     rsx! {
                         div { key: "{cid}", class: "comment",
                             input {
@@ -114,6 +148,7 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                 if self_review {
                                     // The finding text IS the fix instruction the
                                     // agent receives — let the user reword it.
+                                    label { class: "reply-label", "finding — edit to reword it" }
                                     textarea {
                                         class: "review-comment-edit autogrow",
                                         rows: "{fallback_rows(&body)}",
@@ -121,11 +156,24 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                         oninput: move |e| edits.write()[i].comment.body = e.value(),
                                     }
                                 } else {
-                                    // A reviewer's comment isn't ours to edit; the
-                                    // free-form note below steers how it gets fixed.
+                                    // A reviewer's comment isn't ours to edit — it's
+                                    // shown verbatim; the steering box below says how
+                                    // this one gets fixed.
                                     details { class: "orig",
                                         summary { "original comment" }
                                         div { class: "orig-body", "{body}" }
+                                    }
+                                }
+                                if show_steer {
+                                    div { class: "steer-edit",
+                                        label { class: "reply-label", "↳ how to fix it (optional)" }
+                                        textarea {
+                                            class: "review-comment-edit autogrow",
+                                            rows: "{fallback_rows(&instruction)}",
+                                            placeholder: "Steer this fix — e.g. \"do it in the extractor, not the caller\".",
+                                            value: "{instruction}",
+                                            oninput: move |e| edits.write()[i].instruction = e.value(),
+                                        }
                                     }
                                 }
                                 if show_reply {
@@ -158,21 +206,46 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     oninput: move |e| note.set(e.value()),
                 }
             }
+            details { class: "fix-task",
+                summary { "Task sent to the agent — edit to send your own wording" }
+                textarea {
+                    class: "review-comment-edit task-edit",
+                    rows: "{task_rows}",
+                    placeholder: "Nothing to do — check a finding, add a note, or write the task yourself.",
+                    value: "{shown}",
+                    oninput: move |e| task.set(Some(e.value())),
+                }
+                if edited.is_some() {
+                    div { class: "hint",
+                        "edited — the rows and note above no longer update this text; the checkboxes still control replies and thread resolution"
+                    }
+                    button {
+                        class: "btn subtle",
+                        onclick: move |_| task.set(None),
+                        "Reset to generated"
+                    }
+                }
+                div { class: "hint",
+                    "The run also receives the card description and its worktree context ahead of this text."
+                }
+            }
             div { class: "row",
                 button {
                     class: "btn primary",
                     onclick: move |_| {
                         let verdicts = edits.read().clone();
                         let text = note.read().trim().to_string();
+                        let prompt = task.read().clone();
                         if self_review {
-                            state.send(ExecutorCommand::ApplySelfFixes { card_id, verdicts, note: text });
+                            state.send(ExecutorCommand::ApplySelfFixes { card_id, verdicts, note: text, prompt });
                         } else {
-                            state.send(ExecutorCommand::ApplyFixes { card_id, verdicts, note: text });
+                            state.send(ExecutorCommand::ApplyFixes { card_id, verdicts, note: text, prompt });
                         }
                         // The drafts were consumed by the send; a later
                         // re-analysis can legitimately produce identical
                         // verdicts, so the origin rule alone wouldn't clear.
                         drafts::forget(card_id, "fixes.verdicts");
+                        drafts::forget(card_id, "fixes.task");
                         note.set(String::new());
                     },
                     "{apply_label}"
@@ -200,6 +273,9 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                             // before the mirror effect sees the reset.
                             note.set(String::new());
                             drafts::forget(card_id, "fixes.note");
+                            // The composed task mirrored that note; nothing was
+                            // sent, so don't keep an edit of it either.
+                            drafts::forget(card_id, "fixes.task");
                         },
                         "Skip to PR"
                     }

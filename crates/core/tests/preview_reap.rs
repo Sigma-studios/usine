@@ -147,6 +147,7 @@ async fn validation_pass_reap_tears_down_the_worktree_infra() {
         card_id,
         verdicts: Vec::new(),
         note: "tweak".into(),
+        prompt: None,
     });
 
     wait_for_preview(&mut rx, card_id, PreviewStatus::Running).await;
@@ -250,6 +251,7 @@ async fn exhausted_validation_budget_reaps_the_preview() {
         card_id,
         verdicts: Vec::new(),
         note: "tweak".into(),
+        prompt: None,
     });
 
     wait_for_preview(&mut rx, card_id, PreviewStatus::Running).await;

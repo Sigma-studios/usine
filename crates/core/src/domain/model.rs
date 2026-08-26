@@ -729,6 +729,13 @@ pub struct FixVerdict {
     /// there are real GitHub comments); empty for local self-review verdicts.
     #[serde(default)]
     pub reply: String,
+    /// How the user wants this one addressed — free-form steering typed in the
+    /// fix picker, sent alongside the comment it belongs to. Empty when they
+    /// just checked the row (the agent never proposes it). `#[serde(default)]`
+    /// keeps older records loadable: verdicts live inside the persisted card
+    /// state.
+    #[serde(default)]
+    pub instruction: String,
 }
 
 /// One review thread on a PR: the root comment plus its replies, with the
