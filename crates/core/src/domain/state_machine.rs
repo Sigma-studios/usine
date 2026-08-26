@@ -451,6 +451,7 @@ mod tests {
             rationale: "valid".into(),
             selected: false,
             reply: String::new(),
+            instruction: String::new(),
         }]
     }
 
@@ -1139,6 +1140,7 @@ mod tests {
             rationale: "minor".into(),
             selected: false,
             reply: String::new(),
+            instruction: String::new(),
         }];
         let s = transition(&reviewing, Transition::SelfReviewReady { verdicts: nit }).unwrap();
         assert!(matches!(

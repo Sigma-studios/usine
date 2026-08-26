@@ -73,6 +73,7 @@ impl Executor {
         card_id: Uuid,
         verdicts: Vec<FixVerdict>,
         note: String,
+        prompt: Option<String>,
     ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         if !matches!(
@@ -85,7 +86,15 @@ impl Executor {
         }
         let selected: Vec<FixVerdict> = verdicts.into_iter().filter(|v| v.selected).collect();
         let note = note.trim().to_string();
-        if selected.is_empty() && note.is_empty() {
+        // The user may have hand-edited the task in the picker; that text is
+        // what the agent gets, verbatim. Its emptiness — not the checkboxes —
+        // is what decides whether there is anything to run (with `None` this is
+        // exactly the old "nothing checked and no note" condition).
+        let extra = match &prompt {
+            Some(p) => p.trim().to_string(),
+            None => fix_prompt(&selected, &note),
+        };
+        if extra.trim().is_empty() {
             // Nothing to fix — go straight to the PR (through the validation
             // gate, like every road to `ReadyForPr`).
             self.apply(card_id, Transition::SkipToPr)?;
@@ -99,9 +108,17 @@ impl Executor {
         if !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
         }
-        let fix_qa: Vec<String> = selected.iter().map(fixed_comment_qa).collect();
+        // The bookkeeping deliberately follows the CHECKBOXES, not the edited
+        // text: a hand-written task that drops a finding must not leave the log
+        // claiming something else was fixed than what the rows said.
+        let mut fix_qa: Vec<String> = selected.iter().map(fixed_comment_qa).collect();
+        if prompt.is_some() {
+            fix_qa.push(format!(
+                "Fix task as sent (edited by the user): {}",
+                one_line_capped(&extra, 400)
+            ));
+        }
         self.store.set_pending_fix_qa(card_id, &fix_qa)?;
-        let extra = fix_prompt(&selected, &note);
         // Isolate before the running-state transition, so a failure (e.g. a dirty
         // main repo) leaves the card recoverable in the fix picker.
         self.ensure_branch_worktree(card_id).await?;

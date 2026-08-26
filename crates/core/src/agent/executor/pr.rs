@@ -272,6 +272,7 @@ impl Executor {
         card_id: Uuid,
         verdicts: Vec<FixVerdict>,
         note: String,
+        prompt: Option<String>,
     ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
@@ -341,7 +342,17 @@ impl Executor {
         }
 
         let note = note.trim().to_string();
-        if checked.is_empty() && note.is_empty() {
+        // The user may have hand-edited the task in the picker; that text is
+        // what the agent gets, verbatim. Its emptiness — not the checkboxes —
+        // is what decides whether there is anything to run (with `None` this is
+        // exactly the old "nothing checked and no note" condition). Computed
+        // after the decline replies above: those follow the checkboxes and are
+        // independent of the task text.
+        let extra = match &prompt {
+            Some(p) => p.trim().to_string(),
+            None => fix_prompt(&checked, &note),
+        };
+        if extra.trim().is_empty() {
             // Nothing to fix — record a recap and advance straight to merge.
             self.apply(card_id, Transition::SelectFixes)?;
             let replied = ignored
@@ -370,7 +381,17 @@ impl Executor {
         if !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
         }
-        let fix_qa: Vec<String> = checked.iter().map(fixed_comment_qa).collect();
+        // The bookkeeping below deliberately follows the CHECKBOXES, not the
+        // edited text: an edited task that drops a comment while its row stays
+        // checked must not leave the log — or a resolved GitHub thread —
+        // claiming otherwise than what the rows said.
+        let mut fix_qa: Vec<String> = checked.iter().map(fixed_comment_qa).collect();
+        if prompt.is_some() {
+            fix_qa.push(format!(
+                "Fix task as sent (edited by the user): {}",
+                one_line_capped(&extra, 400)
+            ));
+        }
         self.store.set_pending_fix_qa(card_id, &fix_qa)?;
         // Remember which comments this run addresses so their GitHub review
         // threads can be marked resolved once the fix lands (see `finalize_run`,
@@ -389,7 +410,6 @@ impl Executor {
         // Done before the running-state transition so a failure (e.g. a dirty main
         // repo) leaves the card in the recoverable fix picker.
         self.ensure_branch_worktree(card_id).await?;
-        let extra = fix_prompt(&checked, &note);
         // Stash the task before entering the running state, so a retry of a
         // faulted run can restate it (see `relaunch`).
         self.store.set_fix_extra(card_id, Some(&extra))?;

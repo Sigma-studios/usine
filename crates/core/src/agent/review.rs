@@ -230,6 +230,7 @@ pub fn parse_self_review(text: &str) -> Vec<FixVerdict> {
             severity: normalize_severity(&r.severity),
             rationale: r.opinion,
             reply: String::new(),
+            instruction: String::new(),
         })
         .collect()
 }
@@ -255,6 +256,7 @@ pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
                 } else {
                     r.reply.clone()
                 },
+                instruction: String::new(),
             },
             None => FixVerdict {
                 comment: c.clone(),
@@ -263,6 +265,7 @@ pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
                 severity: String::new(),
                 rationale: "No verdict returned — review this one manually.".into(),
                 reply: String::new(),
+                instruction: String::new(),
             },
         })
         .collect()

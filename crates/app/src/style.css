@@ -492,6 +492,18 @@ select option { background: var(--panel-2); color: var(--text); }
 .comment .orig > summary:hover { color: var(--text); }
 .comment .orig-body { margin-top: 4px; padding-left: 12px; color: var(--muted); font-size: 12px; white-space: pre-wrap; border-left: 2px solid var(--border); }
 
+/* The fix task itself, collapsed under the picker: what the agent will receive,
+   editable. Monospace and scrollable — unlike the autogrown edit boxes, a long
+   composed task must not push the buttons off the panel. */
+.fix-task > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; }
+.fix-task > summary::before { content: "▸ "; }
+.fix-task[open] > summary::before { content: "▾ "; }
+.fix-task > summary:hover { color: var(--text); }
+.fix-task .task-edit {
+  margin-top: 6px; font-family: ui-monospace, monospace;
+  max-height: 40vh; overflow-y: auto; resize: vertical;
+}
+
 /* Severity + verdict pills */
 .sev, .verdict-tag { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); white-space: nowrap; }
 .sev { color: var(--muted); background: var(--panel); }
@@ -793,8 +805,9 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
   border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
   width: 100%; resize: none; overflow-y: hidden; line-height: 1.5;
 }
-/* The editable "reply if ignored" box under an unchecked triage comment. */
-.comment .reply-edit { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+/* The editable "reply if ignored" box under an unchecked triage comment, and
+   its mirror: the "how to fix it" steering box under a checked one. */
+.comment .reply-edit, .comment .steer-edit { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
 .comment .reply-label { font-size: 12px; color: var(--muted); }
 
 /* A drafted comment is collapsible and starts open: the body is the thing being

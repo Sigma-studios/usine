@@ -135,12 +135,17 @@ pub enum ExecutorCommand {
     /// Apply the (edited, checked) review-comment fixes — the verdicts as the
     /// user left them, edits included: checked bodies go to the fix run,
     /// unchecked replies get posted on GitHub. `note` is the user's own
-    /// free-form instruction, applied alongside the checked comments; a run
-    /// happens when either is non-empty.
+    /// free-form instruction, applied alongside the checked comments. `prompt`
+    /// (below) is what actually decides whether a run happens.
     ApplyFixes {
         card_id: Uuid,
         verdicts: Vec<FixVerdict>,
         note: String,
+        /// The fix task exactly as the user left it in the picker's editable
+        /// preview — sent to the agent verbatim. `None` means they didn't touch it:
+        /// build the task from `verdicts` + `note` as before. An override that is
+        /// blank means "nothing to run" even with rows checked.
+        prompt: Option<String>,
     },
     /// Create the pull request with the (already confirmed) fields. `branch` is
     /// the final head branch name; if it differs from the card's current branch
@@ -285,11 +290,17 @@ pub enum ExecutorCommand {
     /// Apply the (edited, checked) self-review fixes — the verdicts as the user
     /// left them, edits included; the checked bodies are what the fix run
     /// receives. `note` is the user's own free-form instruction, applied
-    /// alongside the checked findings; a run happens when either is non-empty.
+    /// alongside the checked findings. `prompt` (below) is what actually
+    /// decides whether a run happens.
     ApplySelfFixes {
         card_id: Uuid,
         verdicts: Vec<FixVerdict>,
         note: String,
+        /// The fix task exactly as the user left it in the picker's editable
+        /// preview — sent to the agent verbatim. `None` means they didn't touch it:
+        /// build the task from `verdicts` + `note` as before. An override that is
+        /// blank means "nothing to run" even with rows checked.
+        prompt: Option<String>,
     },
     /// From the self-review fix picker: skip applying fixes and open the PR.
     SkipToPr { card_id: Uuid },

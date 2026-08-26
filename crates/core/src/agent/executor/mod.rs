@@ -409,7 +409,8 @@ impl Executor {
                 card_id,
                 verdicts,
                 note,
-            } => self.apply_fixes(card_id, verdicts, note).await,
+                prompt,
+            } => self.apply_fixes(card_id, verdicts, note, prompt).await,
             ExecutorCommand::CreatePr {
                 card_id,
                 branch,
@@ -517,7 +518,8 @@ impl Executor {
                 card_id,
                 verdicts,
                 note,
-            } => self.apply_self_fixes(card_id, verdicts, note).await,
+                prompt,
+            } => self.apply_self_fixes(card_id, verdicts, note, prompt).await,
             ExecutorCommand::SkipToPr { card_id } => self.skip_to_pr(card_id).await,
             ExecutorCommand::RunValidation { card_id } => self.run_validation(card_id).await,
             ExecutorCommand::FixValidation { card_id } => self.fix_validation(card_id).await,
@@ -1108,20 +1110,30 @@ fn one_line_capped(s: &str, max: usize) -> String {
 /// The restart-log line for a review comment the user checked for fixing —
 /// shared by the PR-comment and self-review fix paths.
 fn fixed_comment_qa(v: &FixVerdict) -> String {
-    if v.comment.review_body_of.is_some() {
-        return format!(
+    let mut s = if v.comment.review_body_of.is_some() {
+        format!(
             "Fix applied per PR review summary (@{}): {}",
             v.comment.author,
             one_line_capped(&v.comment.body, 200)
-        );
+        )
+    } else {
+        let line = v.comment.line.map(|l| format!(":{l}")).unwrap_or_default();
+        format!(
+            "Fix applied per review comment: {}{} — {}",
+            v.comment.path,
+            line,
+            one_line_capped(&v.comment.body, 200)
+        )
+    };
+    // The user's steering is part of what was asked for, so a restart that
+    // folds the log into its prompt restates it too.
+    if !v.instruction.trim().is_empty() {
+        s.push_str(&format!(
+            " — as instructed: {}",
+            one_line_capped(&v.instruction, 200)
+        ));
     }
-    let line = v.comment.line.map(|l| format!(":{l}")).unwrap_or_default();
-    format!(
-        "Fix applied per review comment: {}{} — {}",
-        v.comment.path,
-        line,
-        one_line_capped(&v.comment.body, 200)
-    )
+    s
 }
 
 /// Derive the stage sentence and plan for a question run from the state the
@@ -1186,7 +1198,10 @@ fn question_extra(stage: &str, plan: Option<&str>, question: &str) -> String {
 /// Build the fix-run prompt from the comments the user checked plus the
 /// free-form note they typed. Either side may be empty (the callers only launch
 /// a run when at least one is non-empty), so both headers are conditional.
-fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
+///
+/// Public so the fix picker can show — and let the user edit — the exact text
+/// the run will receive, instead of duplicating this format.
+pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
     let mut out = String::new();
     if !selected.is_empty() {
         out.push_str("Address the following review comments:\n");
@@ -1204,6 +1219,16 @@ fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
                 "- [{loc}] {}\n",
                 v.comment.body.trim().replace('\n', "\n  ")
             ));
+            // The user's own steering for this one, indented into the same
+            // bullet so a multi-line instruction stays attached to its comment.
+            let steer = v.instruction.trim();
+            if !steer.is_empty() {
+                out.push_str(&format!(
+                    "  → How the reviewer wants this addressed (their instruction wins over the \
+                     comment's own wording): {}\n",
+                    steer.replace('\n', "\n  ")
+                ));
+            }
         }
     }
     let note = note.trim();
@@ -1505,6 +1530,7 @@ mod tests {
             rationale: "x".into(),
             selected: true,
             reply: String::new(),
+            instruction: String::new(),
         }
     }
 
@@ -1513,6 +1539,31 @@ mod tests {
         let p = fix_prompt(&[verdict()], "");
         assert!(p.contains("src/a.rs:9"));
         assert!(p.contains("fix this"));
+        // No steering typed: no sub-bullet at all.
+        assert!(!p.contains("How the reviewer wants this addressed"));
+    }
+
+    /// A per-finding instruction rides with its own comment, so the agent can
+    /// tell which of several comments the steering belongs to.
+    #[test]
+    fn fix_prompt_carries_the_per_finding_instruction() {
+        let mut v = verdict();
+        v.instruction = "do it in the extractor, not the caller".into();
+        let p = fix_prompt(&[v], "");
+        assert!(p.contains("fix this"));
+        assert!(p.contains("How the reviewer wants this addressed"));
+        assert!(p.contains("do it in the extractor, not the caller"));
+    }
+
+    /// The restart log keeps the steering too — collapsed to one line, like
+    /// everything else that may be folded into a later prompt.
+    #[test]
+    fn fixed_comment_qa_carries_the_instruction_on_one_line() {
+        let mut v = verdict();
+        v.instruction = "in the\nextractor".into();
+        let line = fixed_comment_qa(&v);
+        assert!(line.contains("as instructed: in the extractor"));
+        assert!(!line.contains('\n'));
     }
 
     /// The checks-fix prompt must name the failures, embed the logs, and carry
