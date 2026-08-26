@@ -1403,6 +1403,13 @@ pub struct Card {
     /// records loadable.
     #[serde(default)]
     pub mergeable: Mergeable,
+    /// A user-set "waiting on something outside Usine" marker. Purely cosmetic:
+    /// the board tints the card and shows a "blocked" chip, and the card stops
+    /// counting toward the attention badges — no run, poll, or transition looks
+    /// at it. Only the user toggles it (it survives `BackToStart` / `MarkDone`).
+    /// `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub blocked: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1436,6 +1443,7 @@ impl Card {
             triaged_review_bodies: Vec::new(),
             checks: CheckStatus::None,
             mergeable: Mergeable::Unknown,
+            blocked: false,
             created_at: now,
             updated_at: now,
         }
@@ -1462,8 +1470,12 @@ impl Card {
     ///
     /// And a card at the merge gate stops counting while its build is in flight —
     /// see [`Self::merge_gate_waits_on_ci`].
+    ///
+    /// A card the user marked [`blocked`](Self::blocked) never counts, whatever
+    /// its state: the marker means "waiting on something outside Usine", so
+    /// nagging about it would be nagging for an action nobody can take here.
     pub fn needs_attention(&self) -> bool {
-        if self.merge_gate_waits_on_ci() {
+        if self.blocked || self.merge_gate_waits_on_ci() {
             return false;
         }
         self.state.needs_attention()
@@ -1501,11 +1513,13 @@ impl Card {
             && !self.mergeable.is_conflicting()
     }
 
-    /// The urgent slice of [`Self::needs_attention`]. Pure delegation to
+    /// The urgent slice of [`Self::needs_attention`]. Delegates to
     /// [`CardState::needs_urgent_attention`]: a landed review on a parked PR is
-    /// "waiting", never urgent.
+    /// "waiting", never urgent. A [`blocked`](Self::blocked) card is never
+    /// urgent either, keeping urgent a subset of attention here rather than
+    /// relying on every caller to check both.
     pub fn needs_urgent_attention(&self) -> bool {
-        self.state.needs_urgent_attention()
+        !self.blocked && self.state.needs_urgent_attention()
     }
 
     /// Whether an approval has landed with nothing left to triage, so the card
@@ -1825,6 +1839,31 @@ mod tests {
             let json = serde_json::to_string(&s).unwrap();
             assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
         }
+    }
+
+    #[test]
+    fn blocked_card_never_badges() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() });
+        assert!(card.needs_attention());
+        assert!(!card.needs_urgent_attention());
+
+        // The marker silences a waiting card…
+        card.blocked = true;
+        assert!(!card.needs_attention());
+
+        // …and an urgent one, keeping urgent a subset of attention.
+        card.state = CardState::Failed {
+            previous: Box::new(CardState::Implementing(RunSub::Running)),
+            message: "boom".into(),
+        };
+        assert!(!card.needs_attention());
+        assert!(!card.needs_urgent_attention());
+
+        // Purely cosmetic and reversible: unmarking restores both.
+        card.blocked = false;
+        assert!(card.needs_attention());
+        assert!(card.needs_urgent_attention());
     }
 
     #[test]

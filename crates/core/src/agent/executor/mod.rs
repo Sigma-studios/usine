@@ -672,6 +672,16 @@ impl Executor {
                     .unbounded_send(ExecutorEvent::auto_review_changed(card_id, auto));
                 Ok(())
             }
+            ExecutorCommand::SetBlocked { card_id, blocked } => {
+                // Deliberately don't bump `updated_at`: an annotation isn't
+                // progress, and Done sorts on it (see `column_cards`).
+                let updated = self.store.mutate_card(card_id, |c| {
+                    c.blocked = blocked;
+                    Ok(())
+                })?;
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                Ok(())
+            }
             ExecutorCommand::AttachImage { card_id, src } => {
                 let dest = copy_attachment(card_id, &src)?;
                 let mut paths = self.store.get_attachments(card_id).unwrap_or_default();
