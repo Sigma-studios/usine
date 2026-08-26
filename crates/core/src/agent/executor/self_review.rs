@@ -100,12 +100,14 @@ impl Executor {
             self.apply(card_id, Transition::SkipToPr)?;
             return self.run_validation(card_id).await;
         }
-        // Keep the note so a later "back to start" folds it into the prompt.
-        // The checked findings are only STASHED: their "Fix applied" lines go
-        // on the log when the run lands its commit (see `finalize_run`) — a
-        // cancelled or faulted run must not leave a durable claim it fixed
-        // anything.
-        if !note.is_empty() {
+        // Keep the note so a later "back to start" folds it into the prompt —
+        // but only when it actually reached the agent: an edited task replaces
+        // the composed text wholesale, so the note never got sent and must not
+        // be logged as a request. The checked findings are only STASHED: their
+        // "Fix applied" lines go on the log when the run lands its commit (see
+        // `finalize_run`) — a cancelled or faulted run must not leave a durable
+        // claim it fixed anything.
+        if prompt.is_none() && !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
         }
         // The bookkeeping deliberately follows the CHECKBOXES, not the edited

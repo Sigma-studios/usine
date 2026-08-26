@@ -372,3 +372,49 @@ async fn a_blank_edited_task_runs_nothing() {
 
     assert!(store.get_card(card_id).unwrap().qa_log.is_empty());
 }
+
+#[tokio::test]
+async fn an_edited_task_does_not_log_the_dropped_note() {
+    let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    // The user typed a note AND then hand-wrote the task: the note is replaced
+    // wholesale, so it never reaches the agent — and must not be recorded as a
+    // request either, or a later "back to start" would restate it.
+    verdicts[0].selected = true;
+    for v in &mut verdicts[1..] {
+        v.selected = false;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: "also rename `x` to `count`".into(),
+        prompt: Some("Do exactly this: rename the log field and nothing else.".into()),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let fixes = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run");
+    assert!(
+        !fixes.contains("also rename `x` to `count`"),
+        "the note is not part of the hand-written task:\n{fixes}"
+    );
+
+    let qa = store.get_card(card_id).unwrap().qa_log;
+    assert!(
+        !qa.iter().any(|l| l.starts_with("Requested change:")),
+        "a note the agent never saw must not be logged as a request: {qa:?}"
+    );
+}

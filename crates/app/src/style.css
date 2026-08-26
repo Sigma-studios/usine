@@ -485,20 +485,21 @@ select option { background: var(--panel-2); color: var(--text); }
 .comment .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
 /* Lead with the analysis: rationale is the prominent line. */
 .comment .rationale { color: var(--text); font-size: 13px; line-height: 1.45; }
-/* Original comment is tucked into a collapsible, muted by default. */
-.comment .orig > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; }
-.comment .orig > summary::before { content: "▸ "; }
-.comment .orig[open] > summary::before { content: "▾ "; }
-.comment .orig > summary:hover { color: var(--text); }
+/* Collapsibles in the fix picker — the original comment and the composed task —
+   are tucked away behind the same muted, caret-prefixed summary. */
+.comment .orig > summary,
+.fix-task > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; }
+.comment .orig > summary::before,
+.fix-task > summary::before { content: "▸ "; }
+.comment .orig[open] > summary::before,
+.fix-task[open] > summary::before { content: "▾ "; }
+.comment .orig > summary:hover,
+.fix-task > summary:hover { color: var(--text); }
 .comment .orig-body { margin-top: 4px; padding-left: 12px; color: var(--muted); font-size: 12px; white-space: pre-wrap; border-left: 2px solid var(--border); }
 
 /* The fix task itself, collapsed under the picker: what the agent will receive,
    editable. Monospace and scrollable — unlike the autogrown edit boxes, a long
    composed task must not push the buttons off the panel. */
-.fix-task > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; }
-.fix-task > summary::before { content: "▸ "; }
-.fix-task[open] > summary::before { content: "▾ "; }
-.fix-task > summary:hover { color: var(--text); }
 .fix-task .task-edit {
   margin-top: 6px; font-family: ui-monospace, monospace;
   max-height: 40vh; overflow-y: auto; resize: vertical;

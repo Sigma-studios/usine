@@ -156,8 +156,9 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                         oninput: move |e| edits.write()[i].comment.body = e.value(),
                                     }
                                 } else {
-                                    // A reviewer's comment isn't ours to edit; the
-                                    // free-form note below steers how it gets fixed.
+                                    // A reviewer's comment isn't ours to edit — it's
+                                    // shown verbatim; the steering box below says how
+                                    // this one gets fixed.
                                     details { class: "orig",
                                         summary { "original comment" }
                                         div { class: "orig-body", "{body}" }

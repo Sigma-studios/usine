@@ -374,11 +374,14 @@ impl Executor {
             return Ok(());
         }
         // Keep the note so a later "back to start" folds it into the prompt,
-        // just like a post-PR change request. The checked comments are only
-        // STASHED here: their "Fix applied" lines go on the log when the run
-        // lands its commit (see `finalize_run`), not at launch — a cancelled
-        // or faulted run must not leave a durable claim that it fixed anything.
-        if !note.is_empty() {
+        // just like a post-PR change request — but only when it actually
+        // reached the agent: an edited task replaces the composed text wholesale,
+        // so the note never got sent and must not be logged as a request. The
+        // checked comments are only STASHED here: their "Fix applied" lines go on
+        // the log when the run lands its commit (see `finalize_run`), not at
+        // launch — a cancelled or faulted run must not leave a durable claim that
+        // it fixed anything.
+        if prompt.is_none() && !note.is_empty() {
             self.record_qa(card_id, format!("Requested change: {note}"));
         }
         // The bookkeeping below deliberately follows the CHECKBOXES, not the
