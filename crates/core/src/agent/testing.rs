@@ -41,7 +41,8 @@ pub const PREVIEW_REQUEST_FILE: &str = ".usine-preview-request";
 /// like its siblings in [`crate::agent::commit`] and [`crate::agent::handoff`].
 /// `has_ports` picks the observation route: declared preview ports mean the
 /// agent exercises URLs; none means a windowed app it should screenshot, using
-/// the project's `screenshot` command when it has one.
+/// the project's `screenshot` command when it has one — which a ported project
+/// is offered too, for the windowed app that fronts its own dev server.
 pub fn testing_instruction(run_script: &str, has_ports: bool, screenshot: Option<&str>) -> String {
     format!(
         "The project's app is being started for you in this worktree (its command: `{run_script}`), \
@@ -97,10 +98,28 @@ const PLATFORM_CAPTURE: &str = "On this machine (Linux) it depends on the sessio
 const PLATFORM_CAPTURE: &str = "On this machine (Windows): capture the window's rect via \
      PowerShell (`GetWindowRect` plus `Graphics.CopyFromScreen`), never the whole desktop.";
 
+/// The configured screenshot command, spelled out for the agent: where the
+/// destination path goes (including when the template has no
+/// [`OPEN_PATH_PLACEHOLDER`] — same trailing-argument rule as
+/// [`crate::domain::config::resolve_open_command`]) and, crucially, that the
+/// image must land outside the worktree: finalize's auto-commit is a
+/// `git add -A`, and unlike the runtime artifacts in `PREVIEW_EXCLUDES` a
+/// screenshot has no fixed name to exclude, so keeping it out of the tree is
+/// the only guard.
+fn configured_capture(cmd: &str) -> String {
+    format!(
+        "run `{cmd}` with `{OPEN_PATH_PLACEHOLDER}` replaced by a .png path outside the worktree \
+         (e.g. under `$TMPDIR`) — if the command has no `{OPEN_PATH_PLACEHOLDER}`, pass that path \
+         as its last argument instead — then read that image. Do not write it inside the worktree: \
+         it would be swept into the commit"
+    )
+}
+
 /// How the agent should actually observe its change in the running app, shared
 /// by both instruction variants.
 ///
-/// With declared preview ports the app is URL-reachable. Without them it's a
+/// With declared preview ports the app is URL-reachable — plus its window, when
+/// the project configured a command for that. Without them it's a
 /// windowed program, so the only observation is a screenshot — of the app's
 /// window ONLY, never the full display: the rest of the screen is the user's
 /// other windows (mail, chats, secrets), which must not enter the agent's
@@ -112,18 +131,29 @@ const PLATFORM_CAPTURE: &str = "On this machine (Windows): capture the window's 
 /// worked around with a full-screen grab.
 fn observation_route(has_ports: bool, screenshot: Option<&str>) -> String {
     if has_ports {
-        return "After implementing, if the change has behaviour observable in the running app, \
-                verify it there before you finish: exercise those URLs (curl, or the project's own \
-                scripts), check the change works end to end, fix what you find, and re-verify. If \
-                the app never comes up, or the change is not observable this way, skip the in-app \
-                check and say so in your hand-off."
-            .to_string();
+        let urls = "After implementing, if the change has behaviour observable in the running \
+                    app, verify it there before you finish: exercise those URLs (curl, or the \
+                    project's own scripts), check the change works end to end, fix what you find, \
+                    and re-verify. If the app never comes up, or the change is not observable this \
+                    way, skip the in-app check and say so in your hand-off.";
+        // A project can declare ports *and* a screenshot command — a windowed
+        // app fronting its own dev server. The command was configured
+        // deliberately, so offer it alongside the URLs rather than dropping it.
+        return match screenshot {
+            Some(cmd) => format!(
+                "{urls} If the change is also visible in a window, screenshot the app's window \
+                 ONLY and read the image: {}. NEVER capture the full display: the rest of the \
+                 screen is the user's other windows and their contents, which must not enter your \
+                 context.",
+                configured_capture(cmd)
+            ),
+            None => urls.to_string(),
+        };
     }
     let capture = match screenshot {
         Some(cmd) => format!(
-            "This project provides the command for it: run `{cmd}` with \
-             `{OPEN_PATH_PLACEHOLDER}` replaced by a temporary .png path of your choosing, then \
-             read that image."
+            "This project provides the command for it: {}.",
+            configured_capture(cmd)
         ),
         None => PLATFORM_CAPTURE.to_string(),
     };
@@ -190,13 +220,30 @@ mod tests {
         assert!(s.contains("NEVER capture the full display"));
     }
 
-    /// A project with URLs is unaffected by a screenshot command being set:
-    /// exercising the app is a better check than looking at it.
+    /// A project with URLs leads with them — exercising the app is a better
+    /// check than looking at it — but a screenshot command it deliberately
+    /// configured is still offered: a windowed app can front a dev server.
     #[test]
-    fn declared_ports_still_win_over_a_screenshot_command() {
+    fn declared_ports_keep_an_offered_screenshot_command() {
         let s = testing_instruction("pnpm dev", true, Some("./shot.sh {path}"));
         assert!(s.contains("curl"));
-        assert!(!s.contains("screenshot"));
+        assert!(s.contains("`./shot.sh {path}`"));
+        assert!(s.contains("NEVER capture the full display"));
+    }
+
+    /// Wherever the capture command is offered, the image goes outside the
+    /// worktree (finalize's `git add -A` would otherwise commit it) and a
+    /// command without the placeholder still learns where the path goes.
+    #[test]
+    fn capture_keeps_the_image_out_of_the_worktree() {
+        for s in [
+            testing_instruction("cargo run", false, Some("./shot.sh")),
+            testing_instruction("pnpm dev", true, Some("./shot.sh")),
+        ] {
+            assert!(s.contains("outside the worktree"));
+            assert!(s.contains("$TMPDIR"));
+            assert!(s.contains("as its last argument"));
+        }
     }
 
     #[test]
