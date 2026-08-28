@@ -1,9 +1,12 @@
 //! The per-entity actions dropdown (opened from the "⌄" chevron on a board card).
 //!
 //! Serves both boards: a card's lifecycle actions, and a PR-under-review's. The
-//! three that mean the same thing on both — show the diff, open in terminal, open
+//! ones that mean the same thing on both — show the diff, open in terminal, open
 //! in editor — are shared verbatim, which is the point: "open this in my editor"
 //! shouldn't be a card-only privilege just because review mode was built later.
+//! "Bump to front of queue" goes one step further: nothing about it differs per
+//! kind (the queue is global and keyed by entity id), so the host renders it
+//! itself, above whichever per-kind list follows.
 //!
 //! Like the confirm and toast hosts, it renders once at the app root from a
 //! global signal: an entity's overflow-clipping scroll column would otherwise cut
@@ -76,6 +79,9 @@ fn dismiss() {
 
 #[component]
 pub fn CardMenuHost() -> Element {
+    // Before the early return: the host re-renders as the menu opens and closes,
+    // and a hook that only runs on one of those paths is a hook-order break.
+    let state = use_context::<AppState>();
     let req = CARD_MENU.read().clone();
     let Some(req) = req else {
         return rsx! {};
@@ -90,6 +96,21 @@ pub fn CardMenuHost() -> Element {
                 class: "card-menu",
                 style: "{pos}",
                 onclick: move |e| e.stop_propagation(),
+                // Read live rather than via `MenuKind` (which is snapshotted at
+                // click time): queue position moves under an open menu, and
+                // reading `run_queue` here subscribes the host, so the entry
+                // disappears the moment the run launches. Hidden at position 1 —
+                // bumping the head is a no-op.
+                if state.queue_position(id).is_some_and(|n| n > 1) {
+                    button {
+                        class: "menu-item",
+                        onclick: move |_| {
+                            dismiss();
+                            state.send(ExecutorCommand::BumpQueued { id });
+                        },
+                        "Bump to front of queue"
+                    }
+                }
                 match req.kind.clone() {
                     MenuKind::Card { can_reset, can_done, can_diff, can_open, blocked } => rsx! {
                         CardMenuItems {
@@ -136,21 +157,6 @@ fn CardMenuItems(
     let del_title = title.clone();
 
     rsx! {
-        // Read live rather than via `MenuKind` (which is snapshotted at click
-        // time): queue position moves under an open menu, and reading
-        // `run_queue` here subscribes the component, so the entry disappears the
-        // moment the run launches. Hidden at position 1 — bumping the head is a
-        // no-op.
-        if state.queue_position(id).is_some_and(|n| n > 1) {
-            button {
-                class: "menu-item",
-                onclick: move |_| {
-                    dismiss();
-                    state.send(ExecutorCommand::BumpQueued { id });
-                },
-                "Bump to front of queue"
-            }
-        }
         if can_diff {
             button {
                 class: "menu-item",
@@ -253,21 +259,6 @@ fn ReviewMenuItems(review_id: Uuid, pr_number: u64, has_checkout: bool, has_fix:
     let id = review_id;
 
     rsx! {
-        // Read live rather than via `MenuKind` (which is snapshotted at click
-        // time): queue position moves under an open menu, and reading
-        // `run_queue` here subscribes the component, so the entry disappears the
-        // moment the run launches. Hidden at position 1 — bumping the head is a
-        // no-op.
-        if state.queue_position(id).is_some_and(|n| n > 1) {
-            button {
-                class: "menu-item",
-                onclick: move |_| {
-                    dismiss();
-                    state.send(ExecutorCommand::BumpQueued { id });
-                },
-                "Bump to front of queue"
-            }
-        }
         button {
             class: "menu-item",
             onclick: move |_| {
