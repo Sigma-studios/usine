@@ -891,6 +891,16 @@ impl Executor {
                 return Err(e);
             }
         }
+        // The PR is merged on the forge at this point; stamp the record so the
+        // card's own panel doesn't read "open" forever (the poll never revisits
+        // a `Done` card, so nothing else would). Before `apply` so the
+        // transition's `CardUpdated` carries both changes in one event.
+        self.store.mutate_card(card_id, |c| {
+            if let Some(p) = &mut c.pr {
+                p.state = "merged".into();
+            }
+            Ok(())
+        })?;
         self.apply(card_id, Transition::Merge)?;
 
         // Past this point the PR is merged: report cleanup problems, never raise
