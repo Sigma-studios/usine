@@ -345,6 +345,11 @@ pub enum ExecutorCommand {
     /// viewer). Read-only; no effect on the card's lifecycle state. The result
     /// comes back as a `DiffUpdated` event.
     ComputeDiff { card_id: Uuid },
+    /// Read the card's (or review task's) persisted transcript back from the
+    /// store, for the activity feed of an entity whose run happened in an
+    /// earlier session. Read-only; no effect on the lifecycle state. The result
+    /// comes back as a `TranscriptLoaded` event.
+    LoadTranscript { card_id: Uuid },
     /// From `ReadyToMerge`: send another change to the agent (a reviewer follow-up
     /// or an unsatisfying fix) and loop back through applying fixes.
     RequestPostPrChange { card_id: Uuid, feedback: String },
@@ -450,6 +455,7 @@ impl ExecutorCommand {
             | ExecutorCommand::EnsurePreview { card_id }
             | ExecutorCommand::OpenWorktree { card_id, .. }
             | ExecutorCommand::ComputeDiff { card_id }
+            | ExecutorCommand::LoadTranscript { card_id }
             | ExecutorCommand::Cancel { card_id }
             | ExecutorCommand::BackToStart { card_id }
             | ExecutorCommand::MarkDone { card_id }
@@ -631,6 +637,9 @@ pub enum ExecutorEventKind {
     AttachmentsChanged { paths: Vec<PathBuf> },
     /// Append a line to the card's live transcript (`ts` = unix millis).
     Transcript { ts: i64, line: String },
+    /// The card's transcript as persisted, in append order — the answer to
+    /// `ExecutorCommand::LoadTranscript`. Empty when nothing was stored.
+    TranscriptLoaded { lines: Vec<(i64, String)> },
     /// The GitHub logins that can review a project's PRs (project-scoped).
     Reviewers {
         project_id: Uuid,
@@ -765,6 +774,12 @@ impl ExecutorEvent {
                 ts,
                 line: line.into(),
             },
+        }
+    }
+    pub fn transcript_loaded(card_id: Uuid, lines: Vec<(i64, String)>) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::TranscriptLoaded { lines },
         }
     }
     pub fn reviewers(project_id: Uuid, logins: Vec<String>) -> Self {

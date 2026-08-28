@@ -5,7 +5,7 @@
 //! branch out into the main working copy.
 
 use dioxus::prelude::*;
-use usine_core::{Card, CardState, ExecutorCommand, Handoff, ReviewSub, MAX_VALIDATION_ATTEMPTS};
+use usine_core::{Card, CardState, ExecutorCommand, ReviewSub, MAX_VALIDATION_ATTEMPTS};
 
 use crate::state::AppState;
 use crate::ui::drafts;
@@ -100,7 +100,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
     rsx! {
         if let Some(handoff) = handoff {
-            HandoffPanel { handoff }
+            super::HandoffPanel { handoff }
         }
 
         if has_branch {
@@ -383,38 +383,6 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },
-            }
-        }
-    }
-}
-
-/// The implement run's note to whoever reviews it: a recap of the work done,
-/// what it wasn't sure about, and what's worth exercising by hand before the
-/// PR. Each part is omitted when the agent had nothing to say for it. Purely
-/// informative — to weigh in on an open question, use the Agent Chat.
-#[component]
-fn HandoffPanel(handoff: Handoff) -> Element {
-    rsx! {
-        div { class: "section",
-            h3 { "What was done" }
-            if !handoff.summary.is_empty() {
-                div { class: "plan-box", "{handoff.summary}" }
-            }
-            if !handoff.questions.is_empty() {
-                div { class: "hint", "Open questions" }
-                ul { class: "handoff-list",
-                    for (i, q) in handoff.questions.iter().enumerate() {
-                        li { key: "{i}", "{q}" }
-                    }
-                }
-            }
-            if !handoff.tests.is_empty() {
-                div { class: "hint", "Worth testing" }
-                ul { class: "handoff-list",
-                    for (i, t) in handoff.tests.iter().enumerate() {
-                        li { key: "{i}", "{t}" }
-                    }
-                }
             }
         }
     }

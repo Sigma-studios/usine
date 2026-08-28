@@ -480,3 +480,91 @@ async fn an_already_merged_pr_still_completes_the_card() {
         CardState::Done
     ));
 }
+
+/// The Done panel reads its outcome off the card's own PR record, so our own
+/// merge has to stamp it — nothing else will: the reconcile poll skips a card
+/// that already reached `Done`. The hand-off has to survive too; it's the only
+/// account of what the run did once every earlier panel is gone.
+#[tokio::test]
+async fn merging_stamps_the_pr_record_and_keeps_the_handoff() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-cleanup"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = ready_to_merge_card(&store, project.id);
+    store
+        .set_handoff(
+            card.id,
+            &usine_core::Handoff {
+                summary: "did the thing".into(),
+                questions: vec![],
+                tests: vec!["press the button".into()],
+            },
+        )
+        .unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::Merge {
+        card_id: card.id,
+        delete_branch: false,
+        force: false,
+    });
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id => {
+            matches!(c.state, CardState::Done).then_some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let stored = store.get_card(card.id).unwrap();
+    assert!(matches!(stored.state, CardState::Done));
+    assert_eq!(stored.pr.unwrap().state, "merged");
+    let handoff = store.get_handoff(card.id).unwrap().expect("handoff kept");
+    assert_eq!(handoff.summary, "did the thing");
+}
+
+/// The activity feed is rebuilt from disk on demand — a card whose run happened
+/// in an earlier session has nothing in memory to show.
+#[tokio::test]
+async fn load_transcript_returns_the_stored_lines_in_order() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-cleanup"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = ready_to_merge_card(&store, project.id);
+    store.append_transcript(card.id, 1, "first").unwrap();
+    store.append_transcript(card.id, 2, "second").unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::LoadTranscript { card_id: card.id });
+
+    let lines = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::TranscriptLoaded { lines } if e.card_id == card.id => {
+            Some(lines.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        lines,
+        vec![(1, "first".to_string()), (2, "second".to_string())]
+    );
+}

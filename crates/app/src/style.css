@@ -773,6 +773,7 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 
 /* CI rollup + mergeability, on both the review card and its detail header. */
 .badge.check-pass { color: var(--green); background: var(--green-wash); }
+.badge.merged { color: var(--green); background: var(--green-wash); font-weight: 600; }
 .badge.check-fail { color: var(--red); background: var(--red-wash); }
 .badge.check-pending { color: var(--amber); background: var(--amber-wash); }
 .badge.conflict { color: var(--red); background: var(--red-wash); font-weight: 600; }

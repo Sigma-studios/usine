@@ -542,6 +542,7 @@ impl Executor {
                 self.open_worktree(card_id, target).await
             }
             ExecutorCommand::ComputeDiff { card_id } => self.compute_diff(card_id).await,
+            ExecutorCommand::LoadTranscript { card_id } => self.load_transcript(card_id).await,
             ExecutorCommand::Cancel { card_id } => self.cancel(card_id).await,
             ExecutorCommand::BumpQueued { id } => {
                 self.bump_queued(id);
@@ -729,6 +730,24 @@ impl Executor {
     /// Emit a progress line to the card's activity transcript.
     pub(super) fn progress(&self, card_id: Uuid, line: &str) {
         transcript(&self.store, &self.evt_tx, card_id, line.to_string());
+    }
+
+    /// Read a card's (or review task's) persisted transcript back and emit it,
+    /// so the UI can show the activity of a run from an earlier session. The
+    /// transcript table has no `card_id` index, so the read is a full scan and
+    /// goes to the blocking pool. Emits even when empty — the UI uses the event
+    /// to remember it has already asked, so a store error must propagate (it
+    /// surfaces as a toast) rather than be reported as an empty transcript the
+    /// UI would then cache as loaded.
+    async fn load_transcript(&self, card_id: Uuid) -> Result<()> {
+        let store = self.store.clone();
+        let lines = tokio::task::spawn_blocking(move || store.load_transcript_entries(card_id))
+            .await
+            .map_err(|e| CoreError::other(format!("transcript load task panicked: {e}")))??;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::transcript_loaded(card_id, lines));
+        Ok(())
     }
 }
 

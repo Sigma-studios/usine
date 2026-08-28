@@ -5,7 +5,7 @@
 
 use dioxus::prelude::*;
 use usine_core::{
-    Card, CardState, CheckStatus, DesignSub, ExecutorCommand, PrReviewSub, ReviewSub,
+    Card, CardState, CheckStatus, DesignSub, ExecutorCommand, Handoff, PrReviewSub, ReviewSub,
 };
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ use crate::ui::widgets::provider_value;
 
 mod chat;
 mod conclusion;
+mod done;
 mod edit;
 mod fixes;
 mod plan;
@@ -27,6 +28,7 @@ mod transcript;
 
 use chat::AgentChatSection;
 use conclusion::ConclusionPanel;
+use done::{DonePanel, OutcomeArtifacts};
 use edit::{Attachments, ConfigForm, EditableTask};
 use fixes::FixSelection;
 use plan::PlanApproval;
@@ -566,6 +568,12 @@ fn CardPanel(card: Card) -> Element {
                     }
                 }
             }
+            // Terminal too, and just as bare — show what the run produced.
+            OutcomeArtifacts { card_id: id }
+        }
+
+        if matches!(card.state, CardState::Done) {
+            DonePanel { card: card.clone() }
         }
 
         if let Some(msg) = fail_display.clone() {
@@ -668,6 +676,38 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                             }
                         },
                         "Send answer"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The implement run's note to whoever reviews it: a recap of the work done,
+/// what it wasn't sure about, and what's worth exercising by hand before the
+/// PR. Each part is omitted when the agent had nothing to say for it. Purely
+/// informative — to weigh in on an open question, use the Agent Chat.
+#[component]
+pub(super) fn HandoffPanel(handoff: Handoff) -> Element {
+    rsx! {
+        div { class: "section",
+            h3 { "What was done" }
+            if !handoff.summary.is_empty() {
+                div { class: "plan-box", "{handoff.summary}" }
+            }
+            if !handoff.questions.is_empty() {
+                div { class: "hint", "Open questions" }
+                ul { class: "handoff-list",
+                    for (i, q) in handoff.questions.iter().enumerate() {
+                        li { key: "{i}", "{q}" }
+                    }
+                }
+            }
+            if !handoff.tests.is_empty() {
+                div { class: "hint", "Worth testing" }
+                ul { class: "handoff-list",
+                    for (i, t) in handoff.tests.iter().enumerate() {
+                        li { key: "{i}", "{t}" }
                     }
                 }
             }
