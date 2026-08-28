@@ -220,6 +220,17 @@ pub fn push_refspec_args(remote: &str, refspec: &str) -> Vec<String> {
     vec!["push".into(), remote.into(), refspec.into()]
 }
 
+/// How many commits `branch` carries that its remote-tracking ref doesn't —
+/// i.e. what a push would send. Purely local: whatever the last fetch or push
+/// left in `origin/<branch>`, no network round-trip.
+pub fn unpushed_count_args(branch: &str) -> Vec<String> {
+    vec![
+        "rev-list".into(),
+        "--count".into(),
+        format!("origin/{branch}..HEAD"),
+    ]
+}
+
 /// The checked-out commit, abbreviated — the sha a fix's diff is based on, and
 /// the one named back to the author once it's pushed.
 pub fn head_sha_args() -> Vec<String> {
@@ -402,6 +413,14 @@ pub trait GitOps: Send + Sync {
     /// A remote's configured URL (empty when unknown — see [`Self::head_sha`]).
     async fn remote_url(&self, _dir: &Path, _remote: &str) -> Result<String> {
         Ok(String::new())
+    }
+    /// Whether `branch` holds commits the remote doesn't have, so a push would
+    /// actually send something (and re-trigger CI). Backends that don't model
+    /// remotes report `false`, and so does a repo whose remote-tracking ref is
+    /// missing: callers use this to decide whether to *invalidate* a known-good
+    /// state, and guessing "yes" there costs more than guessing "no".
+    async fn branch_ahead_of_remote(&self, _dir: &Path, _branch: &str) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -620,6 +639,13 @@ impl GitOps for RealGit {
 
     async fn head_sha(&self, dir: &Path) -> Result<String> {
         Ok(run_git(dir, &head_sha_args()).await?.trim().to_string())
+    }
+
+    async fn branch_ahead_of_remote(&self, dir: &Path, branch: &str) -> Result<bool> {
+        // No remote-tracking ref (never pushed, or pruned) fails the rev-list;
+        // the documented `false` is what the caller wants there.
+        let out = run_git(dir, &unpushed_count_args(branch)).await?;
+        Ok(out.trim().parse::<u64>().unwrap_or(0) > 0)
     }
 
     async fn remote_url(&self, dir: &Path, remote: &str) -> Result<String> {

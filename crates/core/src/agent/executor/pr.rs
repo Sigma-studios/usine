@@ -11,6 +11,35 @@ use crate::infra::git::is_dirty;
 /// doesn't even fit a u64.
 const SYNTHETIC_BODY_ID_BASE: u64 = 9_000_000_000_000_000;
 
+/// Whether the CI poll should re-read this card's checks: it's parked at the PR
+/// or merge gate with a build we believe is in flight. Everything else either
+/// has no PR to read or has already settled.
+fn ci_polled(card: &Card) -> bool {
+    matches!(
+        card.state,
+        CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge
+    ) && card.checks == CheckStatus::Pending
+}
+
+/// Record that a push just (re)started this card's PR build. On a project whose
+/// PRs get CI this is unconditional; on a project we believe has no CI, only a
+/// card that has actually seen a status before is re-armed — a card that never
+/// had one keeps its honest `None`.
+///
+/// Either way the re-arm stamps the registration grace, so the seconds before
+/// GitHub registers the run read as "still running" rather than as "no checks"
+/// — the empty rollup that used to turn a fresh PR green. Without the stamp on
+/// the second branch the re-arm was worthless: the very next rollup read (empty,
+/// because the run isn't registered yet) settled straight back to `None`, and
+/// the card went green — badge and all — on a build that had just started.
+pub(super) fn mark_ci_in_flight(card: &mut Card, expects_ci: bool) {
+    if !expects_ci && card.checks == CheckStatus::None {
+        return;
+    }
+    card.checks = CheckStatus::Pending;
+    card.ci_awaited_since = Some(now_millis());
+}
+
 impl Executor {
     pub(super) async fn create_pr(
         &self,
@@ -116,6 +145,7 @@ impl Executor {
             .await?;
 
         let number = pr.number;
+        let expects_ci = project.expects_ci();
         self.store.mutate_card(card_id, |c| {
             c.pr = Some(pr.clone());
             // A brand-new PR has no feedback or check results yet — clear the
@@ -127,6 +157,13 @@ impl Executor {
             c.reviews.clear();
             c.triaged_review_bodies.clear();
             c.checks = CheckStatus::None;
+            c.ci_awaited_since = None;
+            // …and on a project whose PRs get CI, say so *now*. This PR's build
+            // is about to start, and GitHub needs a few seconds to register it;
+            // reporting `None` in the meantime is what let a card that advances
+            // straight to the merge gate (no reviewer) show a green Merge button
+            // and light the dock badge before its build existed.
+            mark_ci_in_flight(c, expects_ci);
             c.mergeable = Mergeable::Unknown;
             c.updated_at = now_millis();
             Ok(())
@@ -666,7 +703,18 @@ impl Executor {
         // A failed thread listing keeps the previous count (see fetch_review_status);
         // a failed checks or mergeability read likewise keeps the previous value.
         let unanswered = unanswered.unwrap_or(card.unanswered_count);
-        let checks = checks.unwrap_or(card.checks);
+        let settled = checks.map(|read| {
+            let settled = card.settle_checks(read, now_millis());
+            self.learn_ci_on_prs(&project, read, settled);
+            settled
+        });
+        let checks = settled.unwrap_or(card.checks);
+        // The rollup answered (or the grace ran out): stop treating a future
+        // empty read as "not registered yet", same as the polls and
+        // [`Self::persist_checks`]. A failed read says nothing, so it leaves
+        // the stamp alone.
+        let clear_awaited =
+            settled.is_some_and(|s| s != CheckStatus::Pending) && card.ci_awaited_since.is_some();
         let mergeable = mergeable.unwrap_or(card.mergeable);
         let card = if reviews != card.reviews
             || by_reviewer != card.reviewer_comment_count
@@ -674,6 +722,7 @@ impl Executor {
             || unanswered != card.unanswered_count
             || checks != card.checks
             || mergeable != card.mergeable
+            || clear_awaited
         {
             let updated = self.store.mutate_card(card_id, |c| {
                 c.reviews = reviews;
@@ -682,6 +731,9 @@ impl Executor {
                 c.unanswered_count = unanswered;
                 c.checks = checks;
                 c.mergeable = mergeable;
+                if clear_awaited {
+                    c.ci_awaited_since = None;
+                }
                 Ok(())
             })?;
             let _ = self
@@ -825,8 +877,14 @@ impl Executor {
             .ok_or_else(|| CoreError::other("card has no PR to merge"))?;
 
         if !force {
-            if let Ok((status, failed)) = self.forge.pr_checks(&project.path, pr_number).await {
+            if let Ok((read, failed)) = self.forge.pr_checks(&project.path, pr_number).await {
+                // An empty rollup inside the registration grace still means "the
+                // build is starting", so a merge asked for in that window is
+                // refused with the usual "still running" toast rather than
+                // landing ahead of CI. `force` (Merge anyway) never gets here.
+                let status = card.settle_checks(read, now_millis());
                 self.persist_checks(card_id, status);
+                self.learn_ci_on_prs(&project, read, status);
                 // Red or pending checks gate the merge — but only a PR that
                 // still NEEDS merging. One merged on GitHub directly while its
                 // checks were red (or still running) must fall through to the
@@ -1184,11 +1242,10 @@ impl Executor {
                 // are the checks: the push re-triggers CI, and a leftover
                 // `Passing` would re-show Merge only for the executor to refuse
                 // it with "CI checks are still running".
-                let has_checks = card.checks != CheckStatus::None;
+                let expects_ci = project.expects_ci();
+                let has_checks = expects_ci || card.checks != CheckStatus::None;
                 if let Ok(updated) = self.store.mutate_card(card_id, |c| {
-                    if c.checks != CheckStatus::None {
-                        c.checks = CheckStatus::Pending;
-                    }
+                    mark_ci_in_flight(c, expects_ci);
                     c.mergeable = Mergeable::Unknown;
                     Ok(())
                 }) {
@@ -1242,10 +1299,133 @@ impl Executor {
         }
         if let Ok(updated) = self.store.mutate_card(card_id, |c| {
             c.checks = status;
+            if status != CheckStatus::Pending {
+                // The rollup answered (or the grace ran out): stop treating a
+                // future empty read as "not registered yet".
+                c.ci_awaited_since = None;
+            }
             Ok(())
         }) {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
         }
+    }
+
+    /// Remember whether this project's PRs get CI checks (see
+    /// [`ProjectConfig::ci_checks`](crate::domain::config::ProjectConfig::ci_checks)),
+    /// from what a rollup read just showed. A reported status proves yes. An
+    /// empty rollup that *settled* empty — i.e. survived the registration grace —
+    /// proves no, but only while we had no better evidence: a project that has
+    /// produced checks before stays `Some(true)`, since one PR touching no
+    /// workflow's paths doesn't mean the project has no CI. Best-effort and
+    /// silent: this only sharpens an optimistic guess.
+    pub(super) fn learn_ci_on_prs(
+        &self,
+        project: &Project,
+        read: CheckStatus,
+        settled: CheckStatus,
+    ) {
+        let want = if read != CheckStatus::None {
+            Some(true)
+        } else if settled == CheckStatus::None && project.config.ci_checks.is_none() {
+            Some(false)
+        } else {
+            return;
+        };
+        let Ok(mut stored) = self.store.get_project(project.id) else {
+            return;
+        };
+        if stored.config.ci_checks == want {
+            return;
+        }
+        stored.config.ci_checks = want;
+        if self.store.upsert_project(&stored).is_ok() {
+            let _ = self
+                .evt_tx
+                .unbounded_send(ExecutorEvent::project_upserted(stored));
+        }
+    }
+
+    /// Background loop: every [`CI_POLL_INTERVAL`], re-read the rollup of every
+    /// card whose build is in flight at the PR or merge gate. The 5-minute
+    /// review poll already refreshes checks, but that is far too slow for the
+    /// thing this gates — a card at the merge gate stays badge-less and
+    /// Merge-button-less while `checks == Pending`, so the wait to learn the
+    /// build went green *is* the wait to be told the card is ready.
+    ///
+    /// Costs nothing at rest: a tick with no in-flight card makes no `gh` call.
+    /// The first tick fires immediately, so a card left `Pending` across a
+    /// restart settles right away.
+    pub(super) async fn ci_poll_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(CI_POLL_INTERVAL);
+        loop {
+            interval.tick().await;
+            let projects = match self.store.list_projects() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("CI poll: could not list projects: {e}");
+                    continue;
+                }
+            };
+            for project in projects {
+                if let Err(e) = self.poll_ci(&project).await {
+                    tracing::warn!("CI poll for {} failed: {e}", project.name);
+                }
+            }
+        }
+    }
+
+    /// One CI-poll tick for one project. Best-effort per card, like the
+    /// comment poll: a forge error skips the card and keeps its last known
+    /// status, so a broken `gh` can't flip a gate.
+    async fn poll_ci(&self, project: &Project) -> Result<()> {
+        for card in self.store.list_cards_for_project(project.id)? {
+            if !ci_polled(&card) {
+                continue;
+            }
+            let Some(pr_number) = card.pr.as_ref().map(|p| p.number) else {
+                continue;
+            };
+            let read = match self.forge.pr_checks(&project.path, pr_number).await {
+                Ok((status, _)) => status,
+                Err(e) => {
+                    tracing::warn!("CI poll: reading checks of #{pr_number} failed: {e}");
+                    continue;
+                }
+            };
+            let settled = card.settle_checks(read, now_millis());
+            self.learn_ci_on_prs(project, read, settled);
+            // Still in flight (or still inside the grace) — nothing to write.
+            if settled == card.checks {
+                continue;
+            }
+            // The read above ran unlocked, so the executor may have rewritten
+            // the card meanwhile (a push re-armed `Pending`, Back to Start
+            // cleared the PR). Same discipline as the comment poll: inside the
+            // atomic mutate, skip a card that left the polled states, swapped
+            // PRs, or had its checks touched since the snapshot — and don't bump
+            // `updated_at`, observing CI isn't a user-facing edit.
+            let mut changed = false;
+            let updated = self.store.mutate_card(card.id, |c| {
+                if c.pr.as_ref().map(|p| p.number) != Some(pr_number)
+                    || !ci_polled(c)
+                    || c.checks != card.checks
+                    || c.ci_awaited_since != card.ci_awaited_since
+                {
+                    return Ok(());
+                }
+                changed = c.checks != settled;
+                c.checks = settled;
+                if settled != CheckStatus::Pending {
+                    changed |= c.ci_awaited_since.is_some();
+                    c.ci_awaited_since = None;
+                }
+                Ok(())
+            })?;
+            if changed {
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+            }
+        }
+        Ok(())
     }
 
     /// Record a freshly-learned mergeability on the card. Same contract as
@@ -1342,5 +1522,68 @@ impl Executor {
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::config::CardConfig;
+    use uuid::Uuid;
+
+    fn card_with(checks: CheckStatus) -> Card {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::ReadyToMerge;
+        card.checks = checks;
+        card
+    }
+
+    /// A push on a CI project always re-arms the gate, grace stamped.
+    #[test]
+    fn a_ci_project_is_always_re_armed_with_the_grace() {
+        for seen in [
+            CheckStatus::None,
+            CheckStatus::Passing,
+            CheckStatus::Failing,
+        ] {
+            let mut card = card_with(seen);
+            mark_ci_in_flight(&mut card, true);
+            assert_eq!(card.checks, CheckStatus::Pending, "from {seen:?}");
+            assert!(card.ci_awaited_since.is_some(), "from {seen:?}");
+        }
+    }
+
+    /// A project we believe has no CI, on a card that has nonetheless seen a
+    /// status: the re-arm must stamp the grace too, or the next empty rollup
+    /// settles it straight back to green while the build is still registering.
+    #[test]
+    fn a_re_armed_card_without_a_ci_project_still_gets_the_grace() {
+        let mut card = card_with(CheckStatus::Passing);
+        mark_ci_in_flight(&mut card, false);
+        assert_eq!(card.checks, CheckStatus::Pending);
+        let stamped = card.ci_awaited_since.expect("the grace must be stamped");
+        assert_eq!(
+            card.settle_checks(CheckStatus::None, stamped + 1),
+            CheckStatus::Pending,
+            "an empty rollup inside the grace still means the build is starting"
+        );
+        assert_eq!(
+            card.settle_checks(
+                CheckStatus::None,
+                stamped + crate::CI_REGISTER_GRACE.as_millis() as i64 + 1
+            ),
+            CheckStatus::None,
+            "…and past it, the honest answer returns"
+        );
+    }
+
+    /// A card that has never seen a check on a project without CI keeps its
+    /// honest `None`: nothing to wait for, so no grace either.
+    #[test]
+    fn a_card_that_never_had_checks_is_left_alone() {
+        let mut card = card_with(CheckStatus::None);
+        mark_ci_in_flight(&mut card, false);
+        assert_eq!(card.checks, CheckStatus::None);
+        assert_eq!(card.ci_awaited_since, None);
     }
 }

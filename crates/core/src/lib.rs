@@ -53,6 +53,7 @@ pub use domain::model::{
     DraftComment, Effort, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo, PrReviewSub,
     PreviewStatus, PreviewUrl, Project, Provider, ReviewColumn, ReviewComment, ReviewEvent,
     ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub, Usage,
+    CI_REGISTER_GRACE,
 };
 pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
 pub use error::{CoreError, Result};
