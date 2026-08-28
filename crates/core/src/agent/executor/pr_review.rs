@@ -95,7 +95,16 @@ impl Executor {
             // A failed thread listing keeps the previous count (see fetch_review_status);
             // a failed checks or mergeability read likewise keeps the previous value.
             let unanswered = unanswered.unwrap_or(card.unanswered_count);
-            let checks = checks.unwrap_or(card.checks);
+            // An empty rollup on a PR whose build hasn't been registered yet
+            // still reads as "running" — see `Card::settle_checks`.
+            let checks = match checks {
+                Some(read) => {
+                    let settled = card.settle_checks(read, now_millis());
+                    self.learn_ci_on_prs(project, read, settled);
+                    settled
+                }
+                None => card.checks,
+            };
             let mergeable = mergeable.unwrap_or(card.mergeable);
             let card = if by_reviewer != card.reviewer_comment_count
                 || total != card.comment_count
@@ -144,6 +153,9 @@ impl Executor {
                     if c.checks == card.checks {
                         changed |= c.checks != checks;
                         c.checks = checks;
+                        if checks != CheckStatus::Pending {
+                            c.ci_awaited_since = None;
+                        }
                     }
                     if c.mergeable == card.mergeable {
                         changed |= c.mergeable != mergeable;

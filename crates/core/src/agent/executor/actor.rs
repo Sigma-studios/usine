@@ -311,7 +311,8 @@ async fn finalize_run(
                                     Severity::Warning,
                                     format!("push failed: {e}"),
                                 ));
-                            } else if card.checks != CheckStatus::None
+                            } else if project.expects_ci()
+                                || card.checks != CheckStatus::None
                                 || card.mergeable != Mergeable::Unknown
                             {
                                 // The push re-triggers CI, so whatever status the
@@ -323,10 +324,9 @@ async fn finalize_run(
                                 // conflict-resolve run's merge commit just cured
                                 // the `Conflicting` the card shows), and needs the
                                 // reset even on a no-CI repo.
+                                let expects_ci = project.expects_ci();
                                 if let Ok(updated) = store.mutate_card(card_id, |c| {
-                                    if c.checks != CheckStatus::None {
-                                        c.checks = CheckStatus::Pending;
-                                    }
+                                    super::pr::mark_ci_in_flight(c, expects_ci);
                                     c.mergeable = Mergeable::Unknown;
                                     Ok(())
                                 }) {
@@ -437,12 +437,34 @@ async fn finalize_run(
                     card.branch.clone(),
                     card.worktree_path.clone().filter(|d| *d != project.path),
                 ) {
+                    // Asked *before* the push, while the remote-tracking ref
+                    // still describes what the forge has. `push` reports only
+                    // success, and on this path it usually sends nothing at all
+                    // — so without this a green card would be flipped to
+                    // `Pending`, with a fresh registration grace, for a build
+                    // that never starts.
+                    let sends_commits = git
+                        .branch_ahead_of_remote(&dir, &branch)
+                        .await
+                        .unwrap_or(false);
                     if let Err(e) = git.push(&dir, &branch).await {
                         let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
                             card_id,
                             Severity::Warning,
                             format!("push failed: {e}"),
                         ));
+                    } else if sends_commits {
+                        // Commits did go out, so they re-trigger CI: mirror the
+                        // committed path's reset rather than leaving this one
+                        // catch-up path claiming a green the build has just
+                        // invalidated.
+                        let expects_ci = project.expects_ci();
+                        if let Ok(updated) = store.mutate_card(card_id, |c| {
+                            super::pr::mark_ci_in_flight(c, expects_ci);
+                            Ok(())
+                        }) {
+                            let _ = evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                        }
                     }
                 }
             }

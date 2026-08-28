@@ -161,6 +161,15 @@ pub struct ProjectConfig {
     /// conflict resolution, diffs. `None` or blank means auto-detect.
     #[serde(default)]
     pub pinned_base_branch: Option<String>,
+    /// Whether this project's pull requests get CI checks, *learned* rather than
+    /// configured: `Some(true)` once any check status has been observed on one of
+    /// its PRs, `Some(false)` once a PR went a whole grace window with an empty
+    /// rollup, `None` until either happens (fall back to
+    /// [`crate::infra::forge::repo_has_workflows`]). Not user-editable — it
+    /// exists so the merge gate can say "waiting on CI" in the seconds after a
+    /// push, before GitHub has registered the run.
+    #[serde(default)]
+    pub ci_checks: Option<bool>,
     /// GitHub logins whose open PRs should surface in the PR-review workflow.
     /// Picked from the same collaborator list as `reviewer`.
     #[serde(default)]
@@ -280,6 +289,7 @@ impl Default for ProjectConfig {
             reviewer: None,
             base_branch: "dev".to_string(),
             pinned_base_branch: None,
+            ci_checks: None,
             review_contributors: Vec::new(),
             review_all_contributors: false,
             worktree_setup_script: None,

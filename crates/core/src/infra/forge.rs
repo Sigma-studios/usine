@@ -616,6 +616,27 @@ pub fn rollup_status(rollup: &Value) -> CheckStatus {
     }
 }
 
+/// Whether `repo` has GitHub Actions workflows at all. A repo with any workflow
+/// gets check runs on a PR's head SHA — whether the workflow triggers on
+/// `pull_request` or just on `push`, both land in the PR's `statusCheckRollup` —
+/// so file existence is the right question to ask offline. Only a fallback: a
+/// real observation ([`crate::ProjectConfig::ci_checks`]) always wins.
+pub fn repo_has_workflows(repo: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(repo.join(".github/workflows")) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        matches!(
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("yml") | Some("yaml")
+        )
+    })
+}
+
 /// Read one PR's `statusCheckRollup`. Deliberately `gh pr view` and not
 /// `gh pr checks`: the latter exits non-zero when checks are failing or still
 /// running — exactly the states this call exists to observe — which would trip
