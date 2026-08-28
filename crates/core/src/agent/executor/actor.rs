@@ -437,17 +437,27 @@ async fn finalize_run(
                     card.branch.clone(),
                     card.worktree_path.clone().filter(|d| *d != project.path),
                 ) {
+                    // Asked *before* the push, while the remote-tracking ref
+                    // still describes what the forge has. `push` reports only
+                    // success, and on this path it usually sends nothing at all
+                    // — so without this a green card would be flipped to
+                    // `Pending`, with a fresh registration grace, for a build
+                    // that never starts.
+                    let sends_commits = git
+                        .branch_ahead_of_remote(&dir, &branch)
+                        .await
+                        .unwrap_or(false);
                     if let Err(e) = git.push(&dir, &branch).await {
                         let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
                             card_id,
                             Severity::Warning,
                             format!("push failed: {e}"),
                         ));
-                    } else {
-                        // A push that actually sent something re-triggers CI, so
-                        // mirror the committed path's reset — otherwise this one
-                        // catch-up path is left claiming a green the build has
-                        // just invalidated.
+                    } else if sends_commits {
+                        // Commits did go out, so they re-trigger CI: mirror the
+                        // committed path's reset rather than leaving this one
+                        // catch-up path claiming a green the build has just
+                        // invalidated.
                         let expects_ci = project.expects_ci();
                         if let Ok(updated) = store.mutate_card(card_id, |c| {
                             super::pr::mark_ci_in_flight(c, expects_ci);

@@ -1544,6 +1544,13 @@ impl Card {
     /// catch. And a known merge conflict keeps it lit too: resolving is
     /// user-actionable while CI runs (the board's "Resolve conflicts" offer),
     /// and no green build will make a conflicting PR mergeable.
+    fn merge_gate_waits_on_ci(&self) -> bool {
+        matches!(self.state, CardState::ReadyToMerge)
+            && self.checks == CheckStatus::Pending
+            && self.unanswered_count == 0
+            && !self.mergeable.is_conflicting()
+    }
+
     /// What a freshly-read rollup means for this card. A *reported* status is
     /// always the truth. An **empty** rollup only means "this PR has no checks"
     /// once the registration grace has passed — inside it, a PR we know is on a
@@ -1559,13 +1566,6 @@ impl Card {
             }
             _ => CheckStatus::None,
         }
-    }
-
-    fn merge_gate_waits_on_ci(&self) -> bool {
-        matches!(self.state, CardState::ReadyToMerge)
-            && self.checks == CheckStatus::Pending
-            && self.unanswered_count == 0
-            && !self.mergeable.is_conflicting()
     }
 
     /// The urgent slice of [`Self::needs_attention`]. Delegates to

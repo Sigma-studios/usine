@@ -699,14 +699,18 @@ impl Executor {
         // A failed thread listing keeps the previous count (see fetch_review_status);
         // a failed checks or mergeability read likewise keeps the previous value.
         let unanswered = unanswered.unwrap_or(card.unanswered_count);
-        let checks = match checks {
-            Some(read) => {
-                let settled = card.settle_checks(read, now_millis());
-                self.learn_ci_on_prs(&project, read, settled);
-                settled
-            }
-            None => card.checks,
-        };
+        let settled = checks.map(|read| {
+            let settled = card.settle_checks(read, now_millis());
+            self.learn_ci_on_prs(&project, read, settled);
+            settled
+        });
+        let checks = settled.unwrap_or(card.checks);
+        // The rollup answered (or the grace ran out): stop treating a future
+        // empty read as "not registered yet", same as the polls and
+        // [`Self::persist_checks`]. A failed read says nothing, so it leaves
+        // the stamp alone.
+        let clear_awaited =
+            settled.is_some_and(|s| s != CheckStatus::Pending) && card.ci_awaited_since.is_some();
         let mergeable = mergeable.unwrap_or(card.mergeable);
         let card = if reviews != card.reviews
             || by_reviewer != card.reviewer_comment_count
@@ -714,6 +718,7 @@ impl Executor {
             || unanswered != card.unanswered_count
             || checks != card.checks
             || mergeable != card.mergeable
+            || clear_awaited
         {
             let updated = self.store.mutate_card(card_id, |c| {
                 c.reviews = reviews;
@@ -722,6 +727,9 @@ impl Executor {
                 c.unanswered_count = unanswered;
                 c.checks = checks;
                 c.mergeable = mergeable;
+                if clear_awaited {
+                    c.ci_awaited_since = None;
+                }
                 Ok(())
             })?;
             let _ = self

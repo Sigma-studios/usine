@@ -25,8 +25,16 @@ use usine_core::{
 /// A quiet PR (no comments, no reviews, no threads) whose rollup reports
 /// `checks`. `CheckStatus::None` stands for the empty rollup a just-pushed PR
 /// answers with.
+///
+/// `comments_fail` breaks `fetch_comments`, which is the first call of
+/// `fetch_review_status` and therefore fatal to a 5-minute review-poll tick —
+/// that card is logged and skipped. The 20s CI poll reads nothing but the
+/// rollup, so it still settles. That asymmetry is what lets a test pin a settle
+/// on the CI poll specifically: both loops fire their first tick on spawn and
+/// cover the same cards, so without it either one could be the mover.
 struct CiForge {
     checks: CheckStatus,
+    comments_fail: bool,
 }
 
 #[async_trait]
@@ -39,6 +47,9 @@ impl Forge for CiForge {
         Ok((self.checks, Vec::new()))
     }
     async fn fetch_comments(&self, _: &Path, _: u64) -> usine_core::Result<Vec<ReviewComment>> {
+        if self.comments_fail {
+            return Err(usine_core::CoreError::other("gh comment listing is down"));
+        }
         Ok(vec![])
     }
     async fn list_submitted_reviews(
@@ -139,10 +150,30 @@ fn executor(
     store: &Store,
     checks: CheckStatus,
 ) -> (usine_core::ExecutorHandle, UnboundedReceiver<ExecutorEvent>) {
+    spawn_with(store, checks, false)
+}
+
+/// An executor whose review poll can't get past `fetch_comments`, so anything
+/// that settles a card's checks came from the CI poll (see [`CiForge`]).
+fn ci_poll_only_executor(
+    store: &Store,
+    checks: CheckStatus,
+) -> (usine_core::ExecutorHandle, UnboundedReceiver<ExecutorEvent>) {
+    spawn_with(store, checks, true)
+}
+
+fn spawn_with(
+    store: &Store,
+    checks: CheckStatus,
+    comments_fail: bool,
+) -> (usine_core::ExecutorHandle, UnboundedReceiver<ExecutorEvent>) {
     spawn_executor(ExecutorConfig {
         store: store.clone(),
         providers: Arc::new(SimFactory),
-        forge: Arc::new(CiForge { checks }),
+        forge: Arc::new(CiForge {
+            checks,
+            comments_fail,
+        }),
         git: Arc::new(SimGit),
     })
 }
@@ -248,12 +279,13 @@ async fn a_pr_opened_on_a_project_without_ci_is_ready_immediately() {
 }
 
 /// The build reports: the fast CI poll picks it up (its first tick fires on
-/// spawn) and the project learns that its PRs do get checks.
+/// spawn) and the project learns that its PRs do get checks. The review poll is
+/// broken here, so only the CI poll can be the one that moved this.
 #[tokio::test]
 async fn a_reported_status_settles_the_gate_and_teaches_the_project() {
     let (store, project) = seeded_project(None);
     let card_id = merge_gate_card(&store, project.id, now_millis());
-    let (_handle, mut rx) = executor(&store, CheckStatus::Passing);
+    let (_handle, mut rx) = ci_poll_only_executor(&store, CheckStatus::Passing);
 
     let card = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => {
@@ -272,12 +304,13 @@ async fn a_reported_status_settles_the_gate_and_teaches_the_project() {
 }
 
 /// A PR that really has no checks: once the grace expires the empty rollup is
-/// taken at face value, the gate opens, and the project learns it has no CI.
+/// taken at face value, the gate opens, and the project learns it has no CI —
+/// again on the CI poll alone.
 #[tokio::test]
 async fn an_empty_rollup_past_the_grace_opens_the_gate() {
     let (store, project) = seeded_project(None);
     let card_id = merge_gate_card(&store, project.id, now_millis() - 120_000);
-    let (_handle, mut rx) = executor(&store, CheckStatus::None);
+    let (_handle, mut rx) = ci_poll_only_executor(&store, CheckStatus::None);
 
     let card = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if e.card_id == card_id => {
