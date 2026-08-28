@@ -22,18 +22,22 @@ fn ci_polled(card: &Card) -> bool {
 }
 
 /// Record that a push just (re)started this card's PR build. On a project whose
-/// PRs get CI this is unconditional and stamps the registration grace, so the
-/// seconds before GitHub registers the run read as "still running" rather than
-/// as "no checks" — the empty rollup that used to turn a fresh PR green. On a
-/// project we believe has no CI, only a card that has actually seen a status
-/// before is re-armed; a card that never had one keeps its honest `None`.
+/// PRs get CI this is unconditional; on a project we believe has no CI, only a
+/// card that has actually seen a status before is re-armed — a card that never
+/// had one keeps its honest `None`.
+///
+/// Either way the re-arm stamps the registration grace, so the seconds before
+/// GitHub registers the run read as "still running" rather than as "no checks"
+/// — the empty rollup that used to turn a fresh PR green. Without the stamp on
+/// the second branch the re-arm was worthless: the very next rollup read (empty,
+/// because the run isn't registered yet) settled straight back to `None`, and
+/// the card went green — badge and all — on a build that had just started.
 pub(super) fn mark_ci_in_flight(card: &mut Card, expects_ci: bool) {
-    if expects_ci {
-        card.checks = CheckStatus::Pending;
-        card.ci_awaited_since = Some(now_millis());
-    } else if card.checks != CheckStatus::None {
-        card.checks = CheckStatus::Pending;
+    if !expects_ci && card.checks == CheckStatus::None {
+        return;
     }
+    card.checks = CheckStatus::Pending;
+    card.ci_awaited_since = Some(now_millis());
 }
 
 impl Executor {
@@ -1508,5 +1512,68 @@ impl Executor {
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::config::CardConfig;
+    use uuid::Uuid;
+
+    fn card_with(checks: CheckStatus) -> Card {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::ReadyToMerge;
+        card.checks = checks;
+        card
+    }
+
+    /// A push on a CI project always re-arms the gate, grace stamped.
+    #[test]
+    fn a_ci_project_is_always_re_armed_with_the_grace() {
+        for seen in [
+            CheckStatus::None,
+            CheckStatus::Passing,
+            CheckStatus::Failing,
+        ] {
+            let mut card = card_with(seen);
+            mark_ci_in_flight(&mut card, true);
+            assert_eq!(card.checks, CheckStatus::Pending, "from {seen:?}");
+            assert!(card.ci_awaited_since.is_some(), "from {seen:?}");
+        }
+    }
+
+    /// A project we believe has no CI, on a card that has nonetheless seen a
+    /// status: the re-arm must stamp the grace too, or the next empty rollup
+    /// settles it straight back to green while the build is still registering.
+    #[test]
+    fn a_re_armed_card_without_a_ci_project_still_gets_the_grace() {
+        let mut card = card_with(CheckStatus::Passing);
+        mark_ci_in_flight(&mut card, false);
+        assert_eq!(card.checks, CheckStatus::Pending);
+        let stamped = card.ci_awaited_since.expect("the grace must be stamped");
+        assert_eq!(
+            card.settle_checks(CheckStatus::None, stamped + 1),
+            CheckStatus::Pending,
+            "an empty rollup inside the grace still means the build is starting"
+        );
+        assert_eq!(
+            card.settle_checks(
+                CheckStatus::None,
+                stamped + crate::CI_REGISTER_GRACE.as_millis() as i64 + 1
+            ),
+            CheckStatus::None,
+            "…and past it, the honest answer returns"
+        );
+    }
+
+    /// A card that has never seen a check on a project without CI keeps its
+    /// honest `None`: nothing to wait for, so no grace either.
+    #[test]
+    fn a_card_that_never_had_checks_is_left_alone() {
+        let mut card = card_with(CheckStatus::None);
+        mark_ci_in_flight(&mut card, false);
+        assert_eq!(card.checks, CheckStatus::None);
+        assert_eq!(card.ci_awaited_since, None);
     }
 }
