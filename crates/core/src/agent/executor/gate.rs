@@ -194,6 +194,36 @@ impl Executor {
         }
     }
 
+    /// Move `id`'s queued entry to the front of the queue, so the next freed
+    /// slot goes to it (the "bump to front" action). Purely a reorder of the
+    /// waiting deque — no card state, no run, nothing persisted — and no pump
+    /// kick: bumping frees no slot, and the pump re-reads the queue when one
+    /// frees.
+    pub(super) fn bump_queued(&self, id: Uuid) {
+        let moved = {
+            let mut gate = lock(&self.gate);
+            match gate.queue.iter().position(|e| e.id() == id) {
+                // Already at the head, or gone (launched/purged between the
+                // click and here): nothing to reorder, nothing to announce.
+                None | Some(0) => false,
+                Some(pos) => {
+                    let entry = gate.queue.remove(pos).expect("position() is in range");
+                    gate.queue.push_front(entry);
+                    true
+                }
+            }
+        };
+        if moved {
+            self.emit_queue_changed();
+            transcript(
+                &self.store,
+                &self.evt_tx,
+                id,
+                "⏫ bumped to the front of the run queue".into(),
+            );
+        }
+    }
+
     /// Kick the pump on its own task (callable from sync contexts, e.g. a
     /// `SlotGuard` drop or the SaveSettings handler).
     pub(super) fn spawn_pump(&self) {

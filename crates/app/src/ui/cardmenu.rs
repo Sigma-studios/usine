@@ -136,6 +136,21 @@ fn CardMenuItems(
     let del_title = title.clone();
 
     rsx! {
+        // Read live rather than via `MenuKind` (which is snapshotted at click
+        // time): queue position moves under an open menu, and reading
+        // `run_queue` here subscribes the component, so the entry disappears the
+        // moment the run launches. Hidden at position 1 — bumping the head is a
+        // no-op.
+        if state.queue_position(id).is_some_and(|n| n > 1) {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    state.send(ExecutorCommand::BumpQueued { id });
+                },
+                "Bump to front of queue"
+            }
+        }
         if can_diff {
             button {
                 class: "menu-item",
@@ -238,6 +253,21 @@ fn ReviewMenuItems(review_id: Uuid, pr_number: u64, has_checkout: bool, has_fix:
     let id = review_id;
 
     rsx! {
+        // Read live rather than via `MenuKind` (which is snapshotted at click
+        // time): queue position moves under an open menu, and reading
+        // `run_queue` here subscribes the component, so the entry disappears the
+        // moment the run launches. Hidden at position 1 — bumping the head is a
+        // no-op.
+        if state.queue_position(id).is_some_and(|n| n > 1) {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    state.send(ExecutorCommand::BumpQueued { id });
+                },
+                "Bump to front of queue"
+            }
+        }
         button {
             class: "menu-item",
             onclick: move |_| {
