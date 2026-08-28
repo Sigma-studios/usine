@@ -354,6 +354,12 @@ pub enum ExecutorCommand {
     ResolveFixedComments { card_id: Uuid },
     /// Cancel the active run.
     Cancel { card_id: Uuid },
+    /// Move a waiting launch to the front of the run queue, so the next freed
+    /// slot goes to it. `id` is the slot-holder id — a card id or a review-task
+    /// id, like `QueuedTarget::id` — since both kinds share the one queue. A
+    /// no-op when the target isn't queued (it already launched, or was
+    /// cancelled).
+    BumpQueued { id: Uuid },
     /// Send the card back to the starting block (a "do-over"): cancel any run,
     /// clear its execution artifacts, and fold any clarifying Q&A / change
     /// requests into the prompt so the re-run keeps that context.
@@ -457,6 +463,9 @@ impl ExecutorCommand {
             | ExecutorCommand::AttachImageBytes { card_id, .. }
             | ExecutorCommand::DetachImage { card_id, .. } => *card_id,
             ExecutorCommand::CreateCard { card } | ExecutorCommand::SaveCard { card } => card.id,
+            // Either entity kind: the queue is keyed by slot-holder id, and the
+            // id-keyed toast / busy plumbing doesn't care which it is.
+            ExecutorCommand::BumpQueued { id } => *id,
             // PR-review workflow: keyed by the review task, which is a separate
             // entity from any card but flows through the same per-id plumbing.
             ExecutorCommand::StartReview { review_id, .. }

@@ -543,6 +543,10 @@ impl Executor {
             }
             ExecutorCommand::ComputeDiff { card_id } => self.compute_diff(card_id).await,
             ExecutorCommand::Cancel { card_id } => self.cancel(card_id).await,
+            ExecutorCommand::BumpQueued { id } => {
+                self.bump_queued(id);
+                Ok(())
+            }
             ExecutorCommand::BackToStart { card_id } => self.back_to_start(card_id).await,
             ExecutorCommand::MarkDone { card_id } => self.mark_done(card_id).await,
             ExecutorCommand::Retry { card_id } => self.retry(card_id).await,

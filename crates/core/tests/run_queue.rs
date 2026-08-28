@@ -368,3 +368,58 @@ async fn agent_chat_questions_bypass_a_saturated_cap() {
         CardState::Designing(DesignSub::Intervention(_))
     ));
 }
+
+#[tokio::test]
+async fn bumping_a_queued_card_jumps_the_line() {
+    let store = store_with_cap(1);
+    let project_id = seed_project(&store, "/tmp/run-queue-bump");
+    let a = seed_card(&store, project_id, "a");
+    let b = seed_card(&store, project_id, "b");
+    let c = seed_card(&store, project_id, "c");
+    let (handle, mut rx) = spawn_with(&store);
+
+    park_holding_slot(&handle, &mut rx, a).await;
+    handle.send(ExecutorCommand::Start { card_id: b });
+    handle.send(ExecutorCommand::Start { card_id: c });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::RunQueueChanged { entries }
+            if entries == &[QueuedTarget::Card(b), QueuedTarget::Card(c)] =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // The bump reorders the waiting deque and says so.
+    handle.send(ExecutorCommand::BumpQueued { id: c });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::RunQueueChanged { entries }
+            if entries == &[QueuedTarget::Card(c), QueuedTarget::Card(b)] =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    // …so the freed slot goes to c, and b — the earlier arrival — waits.
+    handle.send(ExecutorCommand::Answer {
+        card_id: a,
+        text: "Simplicity".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(card)
+            if card.id == c
+                && matches!(card.state, CardState::Designing(DesignSub::Intervention(_))) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert!(matches!(
+        store.get_card(b).unwrap().state,
+        CardState::Designing(DesignSub::Running)
+    ));
+}
