@@ -405,6 +405,16 @@ impl AppState {
                     .or_default()
                     .push((ts, line));
             }
+            ExecutorEventKind::TranscriptLoaded { lines } => {
+                let mut transcripts = self.transcripts;
+                // Only into a vacant entry: a live run's streamed lines must not
+                // be clobbered by a load that started before them. The empty
+                // insert is deliberate — it's what marks the id as loaded.
+                let mut map = transcripts.write();
+                if let std::collections::hash_map::Entry::Vacant(v) = map.entry(evt.card_id) {
+                    v.insert(lines);
+                }
+            }
             ExecutorEventKind::Reviewers { project_id, logins } => {
                 let mut reviewers = self.reviewers;
                 reviewers.write().insert(project_id, logins);
@@ -1028,6 +1038,39 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
         reviewer_recorded: true,
     });
 
+    // A finished card, so the Done column (and its outcome panel) isn't empty on
+    // a first run.
+    let mut done = mk(
+        "Cache the avatar images",
+        "Avatars are refetched on every board render — cache them on disk.",
+        CardState::Done,
+    );
+    done.branch = Some("usine/cache-avatar-images".into());
+    done.pr = Some(PrInfo {
+        number: 12,
+        url: "https://github.com/example/repo/pull/12".into(),
+        title: "Cache the avatar images".into(),
+        state: "merged".into(),
+        reviewer: Some("hubot".into()),
+        reviewer_recorded: true,
+    });
+    store.set_handoff(
+        done.id,
+        &Handoff {
+            summary: "Avatars now land in the app's cache dir keyed by their URL hash, with a \
+                      7-day TTL. The board render reads from the cache and only fetches on a \
+                      miss, so a warm launch makes no network calls at all."
+                .into(),
+            questions: vec![],
+            tests: vec!["Relaunch with the network off — avatars should still render".into()],
+        },
+    )?;
+    store.set_review_recap(
+        done.id,
+        "Fixed 2 of 3 review comments: the missing TTL and the unbounded cache dir. Skipped the \
+         suggestion to move the cache into the database — the files are large and binary.",
+    )?;
+
     let cards = vec![
         mk(
             "Add dark mode",
@@ -1049,6 +1092,7 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
         ),
         awaiting,
         ready,
+        done,
     ];
     for card in &cards {
         store.upsert_card(card)?;

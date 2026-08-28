@@ -2,6 +2,7 @@
 //! is keyed by either entity's id), with bottom-stick autoscroll.
 
 use dioxus::prelude::*;
+use usine_core::ExecutorCommand;
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -9,6 +10,17 @@ use crate::state::AppState;
 #[component]
 pub(super) fn TranscriptView(id: Uuid) -> Element {
     let state = use_context::<AppState>();
+
+    // Lines are persisted but only streamed to the UI while a run is live, so a
+    // card from an earlier session starts with nothing here. Ask for the stored
+    // ones once; `TranscriptLoaded` fills the entry (even when empty), which is
+    // what stops this from re-firing on the panel's per-state remounts. `peek`
+    // rather than `read`: this must not subscribe the feed to the whole map.
+    use_hook(move || {
+        if !state.transcripts.peek().contains_key(&id) {
+            state.send(ExecutorCommand::LoadTranscript { card_id: id });
+        }
+    });
 
     // Keep the feed pinned to the bottom as new lines arrive, unless the user has
     // scrolled up. A small bit of JS tracks "at bottom" on scroll and tails the

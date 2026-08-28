@@ -1144,7 +1144,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn load_transcript(&self, card_id: Uuid) -> Result<Vec<String>> {
+    /// The stored lines with their timestamps, in append order — what the UI's
+    /// activity feed needs to rebuild a card's transcript after a restart. The
+    /// table has no `card_id` secondary key, so this is a full scan: call it off
+    /// the async worker.
+    pub fn load_transcript_entries(&self, card_id: Uuid) -> Result<Vec<(i64, String)>> {
         let r = self.db.r_transaction()?;
         let mut rows: Vec<TranscriptRecord> = Vec::new();
         for rec in r.scan().primary::<TranscriptRecord>()?.all()? {
@@ -1155,7 +1159,15 @@ impl Store {
         }
         // (ts, seq): seq breaks ties so same-millisecond lines keep append order.
         rows.sort_by_key(|t| (t.ts, t.seq));
-        Ok(rows.into_iter().map(|t| t.line).collect())
+        Ok(rows.into_iter().map(|t| (t.ts, t.line)).collect())
+    }
+
+    pub fn load_transcript(&self, card_id: Uuid) -> Result<Vec<String>> {
+        Ok(self
+            .load_transcript_entries(card_id)?
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect())
     }
 }
 
@@ -1384,6 +1396,25 @@ mod tests {
             store.append_transcript(id, 42, line).unwrap();
         }
         assert_eq!(store.load_transcript(id).unwrap(), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn transcript_entries_carry_timestamps_in_order() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        // Written out of order: the feed must still read chronologically.
+        store.append_transcript(id, 20, "second").unwrap();
+        store.append_transcript(id, 10, "first").unwrap();
+        assert_eq!(
+            store.load_transcript_entries(id).unwrap(),
+            vec![(10, "first".to_string()), (20, "second".to_string())]
+        );
+        // An entity that never ran (or whose rows were deleted) reads empty
+        // rather than erroring — the UI asks for every selected card.
+        assert!(store
+            .load_transcript_entries(Uuid::new_v4())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
