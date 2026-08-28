@@ -1150,10 +1150,11 @@ impl Store {
     /// the async worker.
     pub fn load_transcript_entries(&self, card_id: Uuid) -> Result<Vec<(i64, String)>> {
         let r = self.db.r_transaction()?;
+        let wanted = card_id.to_string();
         let mut rows: Vec<TranscriptRecord> = Vec::new();
         for rec in r.scan().primary::<TranscriptRecord>()?.all()? {
             let rec = rec?;
-            if rec.card_id == card_id.to_string() {
+            if rec.card_id == wanted {
                 rows.push(rec);
             }
         }

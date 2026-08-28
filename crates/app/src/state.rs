@@ -64,6 +64,11 @@ pub struct AppState {
     /// the review-mode counterpart of `selected_card`.
     pub selected_review: Signal<Option<Uuid>>,
     pub transcripts: Signal<HashMap<Uuid, Vec<(i64, String)>>>,
+    /// Ids whose persisted transcript has been read back this session. Kept
+    /// apart from `transcripts` because a live run's streamed lines create an
+    /// entry there without the earlier sessions' history ever being loaded —
+    /// only a `TranscriptLoaded` event marks an id here.
+    pub transcripts_loaded: Signal<HashSet<Uuid>>,
     /// Per-project reviewer candidates (GitHub logins), fetched lazily on demand.
     pub reviewers: Signal<HashMap<Uuid, Vec<String>>>,
     /// Per-project logins with an open PR, fetched alongside `reviewers`. These
@@ -223,6 +228,7 @@ impl AppState {
             selected_card: Signal::new(None),
             selected_review: Signal::new(None),
             transcripts: Signal::new(HashMap::new()),
+            transcripts_loaded: Signal::new(HashSet::new()),
             reviewers: Signal::new(HashMap::new()),
             pr_authors: Signal::new(HashMap::new()),
             adopt_sources: Signal::new(HashMap::new()),
@@ -299,6 +305,8 @@ impl AppState {
                 cards.write().retain(|c| c.id != id);
                 let mut transcripts = self.transcripts;
                 transcripts.write().remove(&id);
+                let mut loaded = self.transcripts_loaded;
+                loaded.write().remove(&id);
                 let mut attachments = self.attachments;
                 attachments.write().remove(&id);
                 let mut answers = self.answers;
@@ -407,13 +415,11 @@ impl AppState {
             }
             ExecutorEventKind::TranscriptLoaded { lines } => {
                 let mut transcripts = self.transcripts;
-                // Only into a vacant entry: a live run's streamed lines must not
-                // be clobbered by a load that started before them. The empty
-                // insert is deliberate — it's what marks the id as loaded.
                 let mut map = transcripts.write();
-                if let std::collections::hash_map::Entry::Vacant(v) = map.entry(evt.card_id) {
-                    v.insert(lines);
-                }
+                merge_loaded_transcript(map.entry(evt.card_id).or_default(), lines);
+                drop(map);
+                let mut loaded = self.transcripts_loaded;
+                loaded.write().insert(evt.card_id);
             }
             ExecutorEventKind::Reviewers { project_id, logins } => {
                 let mut reviewers = self.reviewers;
@@ -1098,4 +1104,105 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
         store.upsert_card(card)?;
     }
     Ok(())
+}
+
+/// Fold a card's stored transcript into whatever the UI already holds for it.
+///
+/// The usual case is a vacant/empty entry and a straight move. The case that
+/// matters is a card whose run streamed lines before it was ever opened: the
+/// entry then holds only that run's tail, and the load carries the earlier
+/// sessions' history *plus* the streamed lines (they are persisted as they are
+/// emitted). Stored lines already in `live` are matched off on (ts, line) so an
+/// overlap isn't shown twice; the rest are spliced in, keeping the feed in
+/// timestamp order. Both inputs are already ordered by timestamp.
+fn merge_loaded_transcript(live: &mut Vec<(i64, String)>, loaded: Vec<(i64, String)>) {
+    if live.is_empty() {
+        *live = loaded;
+        return;
+    }
+    let mut by_ts: HashMap<i64, Vec<&str>> = HashMap::new();
+    for (ts, line) in live.iter() {
+        by_ts.entry(*ts).or_default().push(line.as_str());
+    }
+    let mut missing: Vec<(i64, String)> = Vec::new();
+    for (ts, line) in loaded {
+        // Each match is consumed, so n copies of a repeated line stay n copies.
+        let already_shown = match by_ts.get_mut(&ts) {
+            Some(seen) => match seen.iter().position(|s| *s == line) {
+                Some(i) => {
+                    seen.swap_remove(i);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if !already_shown {
+            missing.push((ts, line));
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    drop(by_ts);
+    let mut streamed = std::mem::take(live).into_iter().peekable();
+    let mut merged = Vec::with_capacity(streamed.len() + missing.len());
+    for entry in missing {
+        while streamed.peek().is_some_and(|(ts, _)| *ts < entry.0) {
+            merged.push(streamed.next().expect("peeked"));
+        }
+        merged.push(entry);
+    }
+    merged.extend(streamed);
+    *live = merged;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_loaded_transcript;
+
+    fn entries(v: &[(i64, &str)]) -> Vec<(i64, String)> {
+        v.iter().map(|(ts, l)| (*ts, (*l).to_string())).collect()
+    }
+
+    #[test]
+    fn fills_an_empty_entry() {
+        let mut live = vec![];
+        merge_loaded_transcript(&mut live, entries(&[(1, "a"), (2, "b")]));
+        assert_eq!(live, entries(&[(1, "a"), (2, "b")]));
+    }
+
+    #[test]
+    fn splices_earlier_history_before_streamed_lines() {
+        // The card streamed "c"/"d" before it was ever opened; the load brings
+        // back the earlier session's "a"/"b" plus those same two lines.
+        let mut live = entries(&[(3, "c"), (4, "d")]);
+        merge_loaded_transcript(
+            &mut live,
+            entries(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
+        );
+        assert_eq!(live, entries(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")]));
+    }
+
+    #[test]
+    fn keeps_lines_the_load_missed() {
+        // The load raced the run: it read the store before "e" was appended.
+        let mut live = entries(&[(3, "c"), (5, "e")]);
+        merge_loaded_transcript(&mut live, entries(&[(1, "a"), (3, "c"), (4, "d")]));
+        assert_eq!(live, entries(&[(1, "a"), (3, "c"), (4, "d"), (5, "e")]));
+    }
+
+    #[test]
+    fn keeps_repeated_lines_at_the_same_timestamp() {
+        let mut live = entries(&[(2, "x"), (2, "x")]);
+        merge_loaded_transcript(&mut live, entries(&[(2, "x"), (2, "x"), (2, "x")]));
+        assert_eq!(live, entries(&[(2, "x"), (2, "x"), (2, "x")]));
+    }
+
+    #[test]
+    fn an_empty_load_leaves_a_live_feed_alone() {
+        let mut live = entries(&[(1, "a")]);
+        merge_loaded_transcript(&mut live, vec![]);
+        assert_eq!(live, entries(&[(1, "a")]));
+    }
 }

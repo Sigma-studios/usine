@@ -732,13 +732,14 @@ impl Executor {
     /// so the UI can show the activity of a run from an earlier session. The
     /// transcript table has no `card_id` index, so the read is a full scan and
     /// goes to the blocking pool. Emits even when empty — the UI uses the event
-    /// to remember it has already asked.
+    /// to remember it has already asked, so a store error must propagate (it
+    /// surfaces as a toast) rather than be reported as an empty transcript the
+    /// UI would then cache as loaded.
     async fn load_transcript(&self, card_id: Uuid) -> Result<()> {
         let store = self.store.clone();
         let lines = tokio::task::spawn_blocking(move || store.load_transcript_entries(card_id))
             .await
-            .map_err(|e| CoreError::other(format!("transcript load task panicked: {e}")))?
-            .unwrap_or_default();
+            .map_err(|e| CoreError::other(format!("transcript load task panicked: {e}")))??;
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::transcript_loaded(card_id, lines));
