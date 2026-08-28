@@ -752,6 +752,7 @@ impl Executor {
             c.reviews.clear();
             c.triaged_review_bodies.clear();
             c.checks = CheckStatus::None;
+            c.ci_awaited_since = None;
             c.mergeable = Mergeable::Unknown;
             c.cost = crate::Cost::ZERO;
             // Only forget the worktree/branch once they're actually gone, so a

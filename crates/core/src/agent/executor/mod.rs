@@ -147,6 +147,11 @@ pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<Execu
                 // (Reviews and comment triage are always launched manually.)
                 let poller = Arc::clone(&executor);
                 tokio::spawn(async move { poller.review_poll_loop().await });
+                // Background poll: re-read CI on the cards whose build is in
+                // flight, on a much shorter interval than the review poll —
+                // it's what un-suppresses the merge gate once the build lands.
+                let poller = Arc::clone(&executor);
+                tokio::spawn(async move { poller.ci_poll_loop().await });
                 // Background poll: refresh the providers' account rate-limit
                 // usage for the bottom bar. Real CLIs only — the simulator
                 // promises no network, and tests must not shell out.
@@ -226,6 +231,14 @@ const RUN_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How often the background poll looks for new PRs to review and refreshes the
 /// reviewer-comment counts on our open PRs.
 const REVIEW_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How often to re-read CI on cards whose build is in flight at the PR or merge
+/// gate. Much shorter than [`REVIEW_POLL_INTERVAL`] because it is one cheap call
+/// (`gh pr view --json statusCheckRollup`) per in-flight card and nothing at all
+/// when none is, and because it is what lifts the merge gate's "waiting on CI"
+/// suppression — the badge and the Merge button should come back seconds after
+/// the build settles, not up to five minutes later.
+const CI_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// How often the usage bar's rate-limit data is refreshed in the background;
 /// the bar's refresh button can trigger one at any time in between.
@@ -612,6 +625,16 @@ impl Executor {
                 Ok(())
             }
             ExecutorCommand::SaveProject { project } => {
+                let mut project = project;
+                // `ci_checks` is learned by the executor, not edited in settings,
+                // and the settings form round-trips a whole `Project` cloned from
+                // a signal that may pre-date the last thing we learned. Never let
+                // a save erase it.
+                if project.config.ci_checks.is_none() {
+                    if let Ok(stored) = self.store.get_project(project.id) {
+                        project.config.ci_checks = stored.config.ci_checks;
+                    }
+                }
                 self.store.upsert_project(&project)?;
                 let _ = self
                     .evt_tx

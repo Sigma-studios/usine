@@ -1312,6 +1312,19 @@ pub struct Project {
 }
 
 impl Project {
+    /// Whether a PR opened on this project will get CI checks. Prefers what has
+    /// actually been observed on this project's PRs
+    /// ([`ProjectConfig::ci_checks`](crate::domain::config::ProjectConfig::ci_checks));
+    /// until anything has been, falls back to asking the checkout whether it has
+    /// any GitHub Actions workflow at all. Drives the optimistic "CI is in
+    /// flight" the merge gate needs in the seconds after a push, before GitHub
+    /// has registered the run.
+    pub fn expects_ci(&self) -> bool {
+        self.config
+            .ci_checks
+            .unwrap_or_else(|| crate::infra::forge::repo_has_workflows(&self.path))
+    }
+
     pub fn new(
         name: impl Into<String>,
         path: PathBuf,
@@ -1325,6 +1338,12 @@ impl Project {
         }
     }
 }
+
+/// How long an optimistic "CI is in flight" survives an empty `statusCheckRollup`
+/// before it is taken at face value. GitHub registers a push's workflow runs
+/// within seconds, so this is generous — it only has to outlast the race, and a
+/// real status landing clears it early either way.
+pub const CI_REGISTER_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// A unit of work moving across the board.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1403,6 +1422,16 @@ pub struct Card {
     /// one offers an agent fix. `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub checks: CheckStatus,
+    /// When this card's PR last had CI optimistically marked in flight (the PR
+    /// was opened, or a push landed, on a project that runs CI), in epoch
+    /// millis. GitHub takes a few seconds to register a push's workflow runs,
+    /// and taking that empty rollup at face value is what made a freshly-opened
+    /// PR go green — and badge — before its build existed. Cleared as soon as a
+    /// real status lands, or once [`CI_REGISTER_GRACE`] has passed with nothing
+    /// reported (see [`Card::settle_checks`]). `#[serde(default)]` keeps older
+    /// records loadable.
+    #[serde(default)]
+    pub ci_awaited_since: Option<i64>,
     /// Whether this card's PR merges cleanly into its base, as of the last
     /// background poll or manual refresh. Gates the merge button: a conflicting
     /// PR can't be merged server-side at all, so the board offers a resolve run
@@ -1449,6 +1478,7 @@ impl Card {
             reviews: Vec::new(),
             triaged_review_bodies: Vec::new(),
             checks: CheckStatus::None,
+            ci_awaited_since: None,
             mergeable: Mergeable::Unknown,
             blocked: false,
             created_at: now,
@@ -1514,6 +1544,23 @@ impl Card {
     /// catch. And a known merge conflict keeps it lit too: resolving is
     /// user-actionable while CI runs (the board's "Resolve conflicts" offer),
     /// and no green build will make a conflicting PR mergeable.
+    /// What a freshly-read rollup means for this card. A *reported* status is
+    /// always the truth. An **empty** rollup only means "this PR has no checks"
+    /// once the registration grace has passed — inside it, a PR we know is on a
+    /// CI project has simply not had its runs registered yet, so keep saying the
+    /// build is in flight rather than flipping the card green and badging it.
+    pub fn settle_checks(&self, read: CheckStatus, now: i64) -> CheckStatus {
+        if read != CheckStatus::None {
+            return read;
+        }
+        match self.ci_awaited_since {
+            Some(t) if now.saturating_sub(t) < CI_REGISTER_GRACE.as_millis() as i64 => {
+                CheckStatus::Pending
+            }
+            _ => CheckStatus::None,
+        }
+    }
+
     fn merge_gate_waits_on_ci(&self) -> bool {
         matches!(self.state, CardState::ReadyToMerge)
             && self.checks == CheckStatus::Pending
@@ -1994,6 +2041,64 @@ mod tests {
         // Suppressed or not, the merge gate is never the urgent tier.
         card.unanswered_count = 0;
         assert!(!card.needs_urgent_attention());
+    }
+
+    #[test]
+    fn an_empty_rollup_only_means_no_ci_once_the_grace_expires() {
+        let now = now_millis();
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+
+        // Nothing is awaited: an empty rollup is the honest "no checks here".
+        assert_eq!(card.ci_awaited_since, None);
+        assert_eq!(
+            card.settle_checks(CheckStatus::None, now),
+            CheckStatus::None
+        );
+
+        // A PR whose build was just marked in flight: GitHub hasn't registered
+        // the run yet, so an empty rollup must not turn the card green.
+        card.ci_awaited_since = Some(now);
+        assert_eq!(
+            card.settle_checks(CheckStatus::None, now),
+            CheckStatus::Pending
+        );
+        // A *reported* status is always the truth, grace or not.
+        for status in [
+            CheckStatus::Pending,
+            CheckStatus::Passing,
+            CheckStatus::Failing,
+        ] {
+            assert_eq!(card.settle_checks(status, now), status);
+        }
+
+        // Past the grace with still nothing reported: this PR really has no
+        // checks, so stop waiting on a build that will never appear.
+        let late = now + CI_REGISTER_GRACE.as_millis() as i64 + 1;
+        assert_eq!(
+            card.settle_checks(CheckStatus::None, late),
+            CheckStatus::None
+        );
+        assert_eq!(
+            card.settle_checks(CheckStatus::Passing, late),
+            CheckStatus::Passing
+        );
+    }
+
+    #[test]
+    fn a_project_expects_ci_from_what_it_learned_before_the_workflow_probe() {
+        // No workflows on a path that doesn't exist, and nothing learned yet.
+        let mut project = Project::new(
+            "p",
+            PathBuf::from("/nonexistent/usine-expects-ci"),
+            crate::domain::config::ProjectConfig::default(),
+        );
+        assert!(!project.expects_ci());
+
+        // A learned answer wins over the probe in both directions.
+        project.config.ci_checks = Some(true);
+        assert!(project.expects_ci());
+        project.config.ci_checks = Some(false);
+        assert!(!project.expects_ci());
     }
 
     #[test]

@@ -311,7 +311,8 @@ async fn finalize_run(
                                     Severity::Warning,
                                     format!("push failed: {e}"),
                                 ));
-                            } else if card.checks != CheckStatus::None
+                            } else if project.expects_ci()
+                                || card.checks != CheckStatus::None
                                 || card.mergeable != Mergeable::Unknown
                             {
                                 // The push re-triggers CI, so whatever status the
@@ -323,10 +324,9 @@ async fn finalize_run(
                                 // conflict-resolve run's merge commit just cured
                                 // the `Conflicting` the card shows), and needs the
                                 // reset even on a no-CI repo.
+                                let expects_ci = project.expects_ci();
                                 if let Ok(updated) = store.mutate_card(card_id, |c| {
-                                    if c.checks != CheckStatus::None {
-                                        c.checks = CheckStatus::Pending;
-                                    }
+                                    super::pr::mark_ci_in_flight(c, expects_ci);
                                     c.mergeable = Mergeable::Unknown;
                                     Ok(())
                                 }) {
@@ -443,6 +443,18 @@ async fn finalize_run(
                             Severity::Warning,
                             format!("push failed: {e}"),
                         ));
+                    } else {
+                        // A push that actually sent something re-triggers CI, so
+                        // mirror the committed path's reset — otherwise this one
+                        // catch-up path is left claiming a green the build has
+                        // just invalidated.
+                        let expects_ci = project.expects_ci();
+                        if let Ok(updated) = store.mutate_card(card_id, |c| {
+                            super::pr::mark_ci_in_flight(c, expects_ci);
+                            Ok(())
+                        }) {
+                            let _ = evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                        }
                     }
                 }
             }
