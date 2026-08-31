@@ -55,6 +55,10 @@ pub enum Transition {
     /// `PrReview(Idle)` (the freshly-opened PR, before any comment triage) it
     /// applies the change in place and returns to `Idle`.
     RequestPostPrChange,
+    /// Merge the open PR. Legal from the two parked PR gates: `ReadyToMerge`
+    /// (the review cleared it) and `PrReview(Idle)` (the last-resort "merge
+    /// without review", when no reviewer is coming). Either way the card lands
+    /// in `Done`.
     Merge,
     Cancel,
     Retry,
@@ -312,6 +316,16 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         // `Idle`: mid-triage the chain is already carrying the card to merge, and
         // a late poll tick must not yank it out from under a running fix.
         (S::PrReview(PrReviewSub::Idle), T::ReviewApproved) => S::ReadyToMerge,
+
+        // Last resort: the user merges straight from the PR gate, skipping the
+        // review the card was waiting on (an absent reviewer, a comment nobody
+        // wants triaged). Lands in `Done`, exactly like the merge gate's
+        // `Merge` — the user asked for it deliberately, unlike the poll's
+        // `PrMergedExternally` park below, which exists to make an *external*
+        // merge noticeable. Only legal from `Idle`: mid-triage the chain is
+        // already carrying the card, and a stale panel must not merge behind a
+        // running fix (the executor guards this too).
+        (S::PrReview(PrReviewSub::Idle), T::Merge) => S::Done,
 
         // A card whose PR is already open can be reprompted directly from the PR
         // gate — before any reviewer-comment triage — to tweak the branch. The fix
@@ -594,6 +608,33 @@ mod tests {
 
         let recovered = transition(&failed, Transition::Retry).unwrap();
         assert_eq!(recovered, running);
+    }
+
+    /// The last-resort "merge without review": the PR gate can merge straight
+    /// to `Done`, but only from `Idle` — mid-triage the chain owns the card.
+    #[test]
+    fn the_pr_gate_can_merge_without_a_review() {
+        assert_eq!(
+            transition(&CardState::PrReview(PrReviewSub::Idle), Transition::Merge).unwrap(),
+            CardState::Done
+        );
+        for sub in [
+            PrReviewSub::FetchingComments,
+            PrReviewSub::ApplyingFixes,
+            PrReviewSub::ApplyingChange,
+        ] {
+            assert!(
+                transition(&CardState::PrReview(sub), Transition::Merge).is_err(),
+                "only the parked gate merges"
+            );
+        }
+        assert!(transition(
+            &CardState::PrReview(PrReviewSub::SelectingFixes {
+                verdicts: verdicts()
+            }),
+            Transition::Merge
+        )
+        .is_err());
     }
 
     #[test]
