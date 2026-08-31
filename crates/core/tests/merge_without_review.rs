@@ -15,9 +15,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardConfig, CardState, CheckStatus, DraftComment, ExecutorCommand,
-    ExecutorConfig, ExecutorEvent, ExecutorEventKind, FailedCheck, Forge,
-    Mergeable, PrInfo, PrReviewSub, PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent,
-    ReviewScope, ReviewSummary, Severity, SimFactory, SimForge, SimGit, Store,
+    ExecutorConfig, ExecutorEvent, ExecutorEventKind, FailedCheck, Forge, Mergeable, PrInfo,
+    PrReviewSub, PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent, ReviewScope,
+    ReviewSummary, Severity, SimFactory, SimForge, SimGit, Store,
 };
 
 /// A forge whose PR reports `checks`, merges cleanly, and records whether
