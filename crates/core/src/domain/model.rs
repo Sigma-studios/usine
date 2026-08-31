@@ -1954,6 +1954,12 @@ mod tests {
         assert_eq!(card.blocked_note.as_deref(), Some("waiting on design"));
         assert!(!card.needs_attention());
 
+        // Re-marking an already-blocked card replaces the message in place —
+        // that's the "edit blocked message" path from the card menu.
+        card.set_blocked(true, Some("waiting on review".into()));
+        assert!(card.blocked);
+        assert_eq!(card.blocked_note.as_deref(), Some("waiting on review"));
+
         // Blank is the same as none.
         card.set_blocked(true, Some("   ".into()));
         assert!(card.blocked);

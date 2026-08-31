@@ -16,7 +16,7 @@ use dioxus::prelude::*;
 use usine_core::{ExecutorCommand, OpenTarget};
 use uuid::Uuid;
 
-use super::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
+use super::confirm::{request_confirm, request_confirm_with_note, ConfirmAction, ConfirmRequest};
 use super::diffdialog::{open_diff_dialog, open_review_diff};
 use crate::state::AppState;
 
@@ -38,6 +38,10 @@ pub(crate) enum MenuKind {
         /// The card's cosmetic "blocked" marker — decides which way the
         /// mark/unmark entry reads. Offered in every state.
         blocked: bool,
+        /// The message currently stored on a blocked card, used to prefill the
+        /// edit dialog and to label it. Separate from `blocked`: a card can be
+        /// blocked with nothing written down.
+        blocked_note: Option<String>,
     },
     Review {
         pr_number: u64,
@@ -112,7 +116,7 @@ pub fn CardMenuHost() -> Element {
                     }
                 }
                 match req.kind.clone() {
-                    MenuKind::Card { can_reset, can_done, can_diff, can_open, blocked } => rsx! {
+                    MenuKind::Card { can_reset, can_done, can_diff, can_open, blocked, blocked_note } => rsx! {
                         CardMenuItems {
                             card_id: id,
                             title: req.title.clone(),
@@ -121,6 +125,7 @@ pub fn CardMenuHost() -> Element {
                             can_diff,
                             can_open,
                             blocked,
+                            blocked_note,
                         }
                     },
                     MenuKind::Review { pr_number, has_checkout, has_fix } => rsx! {
@@ -141,22 +146,32 @@ fn CardMenuItems(
     can_diff: bool,
     can_open: bool,
     blocked: bool,
+    blocked_note: Option<String>,
 ) -> Element {
     let state = use_context::<AppState>();
     let id = card_id;
     // Marking asks for an optional message (a card that waits on something
     // outside Usine should say what); unmarking is a plain one-click send —
     // there's nothing to say about a card that no longer waits on anything.
+    // Editing reopens the same dialog prefilled, below the toggle.
     let block_label = if blocked {
         "Mark unblocked"
     } else {
         "Mark blocked"
+    };
+    // A card blocked before this existed — or blocked without typing anything —
+    // has nothing to "edit".
+    let note_label = if blocked_note.is_some() {
+        "Edit blocked message"
+    } else {
+        "Add blocked message"
     };
     // One title clone per handler (each closure moves its own copy).
     let reset_title = title.clone();
     let done_title = title.clone();
     let del_title = title.clone();
     let block_title = title.clone();
+    let edit_title = title.clone();
 
     rsx! {
         if can_diff {
@@ -247,6 +262,31 @@ fn CardMenuItems(
                 }
             },
             "{block_label}"
+        }
+        // A blocked card's message is only editable here: unmarking drops it
+        // (`Card::set_blocked`), so "unblock, re-block, retype" used to be the
+        // only way to fix a typo. Saving blank clears the message and leaves the
+        // card blocked.
+        if blocked {
+            button {
+                class: "menu-item",
+                onclick: move |_| {
+                    dismiss();
+                    request_confirm_with_note(
+                        ConfirmRequest {
+                            title: note_label.into(),
+                            message: format!(
+                                "Message shown on “{edit_title}” while it stays blocked. Leave it empty to drop the message.",
+                            ),
+                            confirm_label: "Save".into(),
+                            danger: false,
+                            action: ConfirmAction::BlockCard(id),
+                        },
+                        blocked_note.clone().unwrap_or_default(),
+                    );
+                },
+                "{note_label}"
+            }
         }
         button {
             class: "menu-item danger",

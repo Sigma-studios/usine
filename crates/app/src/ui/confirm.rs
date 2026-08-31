@@ -19,7 +19,8 @@ pub(crate) enum ConfirmAction {
     /// review that has already been posted invites a double submission.
     PublishReview(ExecutorCommand),
     /// Mark a card blocked, carrying the optional message typed in the dialog.
-    /// Only ever raised for *marking* — unmarking doesn't ask.
+    /// Raised for *marking* and for editing an already-blocked card's message —
+    /// both send `blocked: true`. Unmarking doesn't ask.
     BlockCard(Uuid),
 }
 
@@ -42,6 +43,14 @@ static NOTE: GlobalSignal<String> = Signal::global(String::new);
 pub(crate) fn request_confirm(req: ConfirmRequest) {
     *NOTE.write() = String::new();
     *CONFIRM.write() = Some(req);
+}
+
+/// Same as [`request_confirm`], but starts the message field from `note` —
+/// "Edit blocked message" edits what's already on the card rather than making
+/// you type it again.
+pub(crate) fn request_confirm_with_note(req: ConfirmRequest, note: String) {
+    request_confirm(req);
+    *NOTE.write() = note;
 }
 
 fn dismiss() {
