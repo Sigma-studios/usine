@@ -67,6 +67,15 @@ fn CardDetail() -> Element {
             let provider_class = provider_value(card.config.provider);
             let status = card.state.status_label();
             let cost = card.cost;
+            // Kept in step with the marker by `Card::set_blocked`: a note only
+            // exists while the card is blocked.
+            let blocked_note = card.blocked_note.clone();
+            // Only point at the note when there is one to read.
+            let blocked_title = if blocked_note.is_some() {
+                "Marked blocked — this card doesn't count toward the attention badge; the message below is the user's own note"
+            } else {
+                "Marked blocked — this card doesn't count toward the attention badge"
+            };
             let state_key = state_discriminant(&card.state);
             // Same gap the board card covers: a lifecycle command is working but
             // hasn't transitioned the card yet, so the panel still shows the
@@ -126,13 +135,18 @@ fn CardDetail() -> Element {
                             if card.blocked {
                                 span {
                                     class: "badge blocked",
-                                    title: "Marked blocked — this card doesn't count toward the attention badge",
+                                    title: "{blocked_title}",
                                     "blocked"
                                 }
                             }
                             if !cost.is_zero() {
                                 span { class: "badge cost", "{cost}" }
                             }
+                        }
+                        // The reason left when marking the card blocked, in full
+                        // (the board card clamps it).
+                        if let Some(note) = blocked_note {
+                            div { class: "blocked-note", "{note}" }
                         }
                     }
                     // Remount the panel whenever the selected card or its state

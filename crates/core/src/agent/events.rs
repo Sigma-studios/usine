@@ -398,8 +398,14 @@ pub enum ExecutorCommand {
     SetAutoReview { card_id: Uuid, auto: bool },
     /// Set a card's cosmetic "blocked" marker: tints the card on the board and
     /// silences its attention badge. Purely an annotation — no lifecycle effect,
-    /// and nothing but the user toggles it.
-    SetBlocked { card_id: Uuid, blocked: bool },
+    /// and nothing but the user toggles it. `note` is the optional message the
+    /// user typed when marking; it is ignored (and any stored note dropped) when
+    /// `blocked` is false.
+    SetBlocked {
+        card_id: Uuid,
+        blocked: bool,
+        note: Option<String>,
+    },
     /// Copy an image into the card's managed attachments dir (`src` = the file
     /// the user picked). Claude-only; the path is injected into the prompt.
     AttachImage { card_id: Uuid, src: PathBuf },

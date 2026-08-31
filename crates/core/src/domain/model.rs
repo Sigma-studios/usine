@@ -1446,6 +1446,13 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub blocked: bool,
+    /// The optional message the user typed when marking the card blocked
+    /// ("waiting on the design review"). Shown on the board card and in the
+    /// panel header; `None` when they didn't type one. Cleared with the marker,
+    /// so a stale reason can't outlive the block. `#[serde(default)]` keeps
+    /// older records loadable.
+    #[serde(default)]
+    pub blocked_note: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1481,9 +1488,24 @@ impl Card {
             ci_awaited_since: None,
             mergeable: Mergeable::Unknown,
             blocked: false,
+            blocked_note: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Set (or clear) the user's blocked marker and its message. A blank message
+    /// is the same as none, and unmarking always drops it.
+    pub fn set_blocked(&mut self, blocked: bool, note: Option<String>) {
+        self.blocked = blocked;
+        self.blocked_note = blocked
+            .then(|| {
+                note.as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .flatten();
     }
 
     pub fn column(&self) -> Column {
@@ -1919,6 +1941,33 @@ mod tests {
         card.blocked = false;
         assert!(card.needs_attention());
         assert!(card.needs_urgent_attention());
+    }
+
+    #[test]
+    fn set_blocked_normalizes_and_clears_the_note() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() });
+
+        // A real message is kept, trimmed.
+        card.set_blocked(true, Some("  waiting on design  ".into()));
+        assert!(card.blocked);
+        assert_eq!(card.blocked_note.as_deref(), Some("waiting on design"));
+        assert!(!card.needs_attention());
+
+        // Blank is the same as none.
+        card.set_blocked(true, Some("   ".into()));
+        assert!(card.blocked);
+        assert_eq!(card.blocked_note, None);
+
+        card.set_blocked(true, None);
+        assert_eq!(card.blocked_note, None);
+
+        // Unmarking drops the message, whatever was passed.
+        card.set_blocked(true, Some("stale".into()));
+        card.set_blocked(false, Some("ignored".into()));
+        assert!(!card.blocked);
+        assert_eq!(card.blocked_note, None);
+        assert!(card.needs_attention());
     }
 
     #[test]

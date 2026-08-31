@@ -200,6 +200,9 @@ pub fn CardView(card: Card) -> Element {
     } else {
         card_class
     };
+    // Kept in step with the marker by `Card::set_blocked`: a note only
+    // exists while the card is blocked.
+    let blocked_note = card.blocked_note.clone();
     let status = card.state.status_label();
     let title = if card.title.trim().is_empty() {
         "Untitled".to_string()
@@ -351,123 +354,134 @@ pub fn CardView(card: Card) -> Element {
                     }
                 }
             }
+            // The reason the user left when marking the card blocked. Clamped to
+            // three lines so a long note can't stretch the column; the title
+            // attribute keeps the whole thing readable on hover.
+            if let Some(note) = blocked_note {
+                div { class: "blocked-note", title: "{note}", "{note}" }
+            }
             div { class: "card-actions",
                 // Shield the action buttons' keydowns from the card handler too.
                 onkeydown: move |e| e.stop_propagation(),
-                if can_start {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::Start { card_id: id }); },
-                        "Start"
-                    }
-                }
-                if needs_answer {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                        "Answer"
-                    }
-                }
-                if awaiting_approval {
-                    if can_approve {
+                // A blocked card is waiting on something outside Usine, so hide
+                // the actions that would advance it. The preview controls below
+                // and the chevron menu (the only way to unmark) stay.
+                if !card.blocked {
+                    if can_start {
                         button {
                             class: "btn primary",
-                            onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::ApprovePlan { card_id: id }); },
-                            "Approve"
+                            onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::Start { card_id: id }); },
+                            "Start"
                         }
                     }
-                    button {
-                        class: "btn",
-                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                        "Review"
+                    if needs_answer {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            "Answer"
+                        }
                     }
-                }
-                if let Some(label) = review_action {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                        "{label}"
+                    if awaiting_approval {
+                        if can_approve {
+                            button {
+                                class: "btn primary",
+                                onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::ApprovePlan { card_id: id }); },
+                                "Approve"
+                            }
+                        }
+                        button {
+                            class: "btn",
+                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            "Review"
+                        }
                     }
-                }
-                if concluded {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                        "Read conclusion"
+                    if let Some(label) = review_action {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            "{label}"
+                        }
                     }
-                }
-                if can_read {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::FetchComments { card_id: id }); },
-                        "Review comments"
+                    if concluded {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            "Read conclusion"
+                        }
                     }
-                }
-                if selecting {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                        "Select fixes"
+                    if can_read {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::FetchComments { card_id: id }); },
+                            "Review comments"
+                        }
                     }
-                }
-                if can_reevaluate {
-                    button {
-                        class: "btn",
-                        onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::FetchComments { card_id: id }); },
-                        "Review comments"
+                    if selecting {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            "Select fixes"
+                        }
                     }
-                }
-                if can_merge && pr_is_draft {
-                    button {
-                        class: "btn primary",
-                        onclick: move |e| {
-                            e.stop_propagation();
-                            state.send(ExecutorCommand::MarkPrReady { card_id: id });
-                        },
-                        "Mark ready"
+                    if can_reevaluate {
+                        button {
+                            class: "btn",
+                            onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::FetchComments { card_id: id }); },
+                            "Review comments"
+                        }
                     }
-                }
-                if can_merge && !pr_is_draft {
-                    if conflicting {
+                    if can_merge && pr_is_draft {
                         button {
                             class: "btn primary",
                             onclick: move |e| {
                                 e.stop_propagation();
-                                state.send(ExecutorCommand::ResolveConflicts { card_id: id });
+                                state.send(ExecutorCommand::MarkPrReady { card_id: id });
                             },
-                            "Resolve conflicts"
-                        }
-                    } else if ci_failing {
-                        button {
-                            class: "btn primary",
-                            onclick: move |e| {
-                                e.stop_propagation();
-                                state.send(ExecutorCommand::FixChecks { card_id: id });
-                            },
-                            "Fix checks"
-                        }
-                    } else if !ci_pending {
-                        button {
-                            class: "btn success",
-                            onclick: move |e| {
-                                e.stop_propagation();
-                                super::confirm_then_send(
-                                    state,
-                                    "Merge pull request",
-                                    "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
-                                    "Merge",
-                                    ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
-                                );
-                            },
-                            "Merge"
+                            "Mark ready"
                         }
                     }
-                }
-                if failed {
-                    button {
-                        class: "btn",
-                        onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::Retry { card_id: id }); },
-                        "{recover_label}"
+                    if can_merge && !pr_is_draft {
+                        if conflicting {
+                            button {
+                                class: "btn primary",
+                                onclick: move |e| {
+                                    e.stop_propagation();
+                                    state.send(ExecutorCommand::ResolveConflicts { card_id: id });
+                                },
+                                "Resolve conflicts"
+                            }
+                        } else if ci_failing {
+                            button {
+                                class: "btn primary",
+                                onclick: move |e| {
+                                    e.stop_propagation();
+                                    state.send(ExecutorCommand::FixChecks { card_id: id });
+                                },
+                                "Fix checks"
+                            }
+                        } else if !ci_pending {
+                            button {
+                                class: "btn success",
+                                onclick: move |e| {
+                                    e.stop_propagation();
+                                    super::confirm_then_send(
+                                        state,
+                                        "Merge pull request",
+                                        "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
+                                        "Merge",
+                                        ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
+                                    );
+                                },
+                                "Merge"
+                            }
+                        }
+                    }
+                    if failed {
+                        button {
+                            class: "btn",
+                            onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::Retry { card_id: id }); },
+                            "{recover_label}"
+                        }
                     }
                 }
                 // Pushed to the bottom-right corner, away from the state's primary action.
