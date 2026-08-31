@@ -301,13 +301,48 @@ pub fn merge_args(gitref: &str) -> Vec<String> {
     vec!["merge".into(), "--no-edit".into(), gitref.into()]
 }
 
-/// The paths left unresolved by a stopped merge (`U` = unmerged).
-pub fn conflicted_files_args() -> Vec<String> {
+/// The paths left unresolved by a stopped merge (`U` = unmerged),
+/// NUL-separated. `-z` because these paths are both read as files and listed
+/// in the agent's brief; C-quoted, they'd name nothing.
+pub fn unmerged_files_z_args() -> Vec<String> {
     vec![
         "diff".into(),
         "--name-only".into(),
         "--diff-filter=U".into(),
+        "-z".into(),
     ]
+}
+
+/// Every path the working tree (index included) changed since `gitref` — the
+/// candidate set for a conflict-marker scan, alongside
+/// [`unmerged_files_z_args`]. Needed because an agent that edits a conflicted
+/// file without `git add`ing it leaves the path unmerged in the index even
+/// though it is resolved, and conversely a resolved-then-staged file drops out
+/// of the unmerged list entirely — and a run that commits the merge itself
+/// leaves neither, which is what `ORIG_HEAD` (set by `git merge` to the
+/// pre-merge tip) covers. `-z` so paths come out raw: without it
+/// `core.quotePath` C-quotes any non-ASCII filename and the quoted string no
+/// longer names a real file to read.
+pub fn changed_since_args(gitref: &str) -> Vec<String> {
+    vec![
+        "diff".into(),
+        "--name-only".into(),
+        "-z".into(),
+        gitref.into(),
+    ]
+}
+
+/// True when `text` still carries both halves of a conflict marker pair.
+/// Content-based on purpose: the index alone can't tell a resolved file from an
+/// unresolved one once the agent has been editing (see [`changed_since_args`]).
+fn holds_conflict_markers(text: &str) -> bool {
+    let mut open = false;
+    let mut close = false;
+    for line in text.lines() {
+        open |= line.starts_with("<<<<<<< ");
+        close |= line.starts_with(">>>>>>> ");
+    }
+    open && close
 }
 
 /// How merging a ref into the current branch ended.
@@ -390,6 +425,12 @@ pub trait GitOps: Send + Sync {
     /// read that as "no information", never as proof the branch is empty.
     async fn branch_has_commits(&self, _dir: &Path, _base: &str) -> Result<bool> {
         Ok(false)
+    }
+    /// The paths in `dir` that still carry conflict markers. Empty means either
+    /// "resolved" or "this backend doesn't model working trees"; callers use a
+    /// non-empty answer as proof that the run left conflicts behind.
+    async fn unresolved_conflicts(&self, _dir: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
     /// Discard every uncommitted change in `dir` — tracked edits (`git reset
     /// --hard`) and untracked files (`git clean -fd`) — returning the tree to
@@ -569,13 +610,14 @@ impl GitOps for RealGit {
         // unmerged paths distinguish the two — without them, the worktree isn't
         // mid-merge and there's nothing for an agent to resolve, so report the
         // original error rather than sending it into an empty conflict.
-        let files: Vec<String> = run_git(dir, &conflicted_files_args())
+        // `-z`: the paths go straight into the agent's brief, and a C-quoted
+        // `"cr\303\251\303\251.txt"` names no file it could open.
+        let files: Vec<String> = run_git_bytes(dir, &unmerged_files_z_args())
             .await
             .unwrap_or_default()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| path_from_bytes(e).to_string_lossy().into_owned())
             .collect();
         if files.is_empty() {
             return Err(e);
@@ -613,6 +655,40 @@ impl GitOps for RealGit {
 
     async fn branch_has_commits(&self, dir: &Path, base: &str) -> Result<bool> {
         Ok(!log_subjects(dir, base, "HEAD")?.is_empty())
+    }
+
+    async fn unresolved_conflicts(&self, dir: &Path) -> Result<Vec<String>> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        // `ORIG_HEAD` may not exist (no merge was started here); that listing
+        // simply comes back empty, and the other two still cover the tree.
+        for args in [
+            unmerged_files_z_args(),
+            changed_since_args("HEAD"),
+            changed_since_args("ORIG_HEAD"),
+        ] {
+            for entry in run_git_bytes(dir, &args)
+                .await
+                .unwrap_or_default()
+                .split(|b| *b == 0)
+                .filter(|e| !e.is_empty())
+            {
+                let path = path_from_bytes(entry);
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
+            }
+        }
+        // Read the files themselves: only surviving markers prove a path is
+        // still unresolved (a binary/unreadable file simply can't carry them).
+        Ok(candidates
+            .into_iter()
+            .filter(|p| {
+                std::fs::read_to_string(dir.join(p))
+                    .map(|t| holds_conflict_markers(&t))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect())
     }
 
     async fn discard_changes(&self, dir: &Path) -> Result<()> {
@@ -1127,12 +1203,33 @@ mod tests {
         assert_eq!(fetch_args("origin"), vec!["fetch", "origin"]);
     }
 
+    /// `-z` is load-bearing on both listings: without it git C-quotes any path
+    /// with a non-ASCII or special character, and the quoted string names no
+    /// real file — the marker scan would read nothing and call it resolved.
     #[test]
-    fn conflicted_files_selects_unmerged_paths() {
-        let args = conflicted_files_args();
-        assert_eq!(args[0], "diff");
-        assert!(args.iter().any(|a| a == "--diff-filter=U"));
-        assert!(args.iter().any(|a| a == "--name-only"));
+    fn conflict_scan_listings_are_nul_separated() {
+        assert_eq!(
+            changed_since_args("ORIG_HEAD"),
+            vec!["diff", "--name-only", "-z", "ORIG_HEAD"]
+        );
+        let unmerged = unmerged_files_z_args();
+        assert_eq!(unmerged[0], "diff");
+        assert!(unmerged.iter().any(|a| a == "-z"));
+        assert!(unmerged.iter().any(|a| a == "--diff-filter=U"));
+        assert!(unmerged.iter().any(|a| a == "--name-only"));
+    }
+
+    /// Both halves must be present: a lone `<<<<<<<` in prose (or a test
+    /// fixture describing conflicts) isn't an unresolved merge.
+    #[test]
+    fn conflict_markers_need_both_halves() {
+        assert!(holds_conflict_markers(
+            "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> origin/dev\n"
+        ));
+        assert!(!holds_conflict_markers("<<<<<<< HEAD\nours only\n"));
+        assert!(!holds_conflict_markers("a\nb\n"));
+        // Markers are line-leading; a mention inside a sentence is not one.
+        assert!(!holds_conflict_markers("we saw <<<<<<< and >>>>>>> here\n"));
     }
 
     #[test]

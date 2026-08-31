@@ -603,6 +603,11 @@ impl Executor {
             CardState::Designing(_) => RunMode::Plan,
             CardState::Investigating(_) => RunMode::Investigate,
             CardState::Implementing(_) => RunMode::Implement,
+            // A conflict-resolution run that asked rather than guessing. The
+            // merge is still in progress in the worktree — deliberately NOT
+            // re-established here: re-cutting it would destroy that merge, and
+            // `launch`'s tripwire already errors clearly if it went missing.
+            CardState::PrReview(PrReviewSub::ApplyingFixes) => RunMode::ApplyFixes,
             _ => return Ok(()),
         };
         let resume = card.last_session.clone();
@@ -611,7 +616,17 @@ impl Executor {
         } else {
             None
         };
-        let extra = answer_extra(pending.as_ref(), &text, plan.as_deref(), mode);
+        let answer = answer_extra(pending.as_ref(), &text, plan.as_deref(), mode);
+        // A fix run's task lives entirely in its launch extra, and a resumed
+        // process may be a fresh one — restate the stashed conflict brief ahead
+        // of the answer, exactly as `relaunch` does for a retry.
+        let extra = match mode {
+            RunMode::ApplyFixes => match self.store.get_fix_extra(card_id).unwrap_or(None) {
+                Some(task) => format!("{task}\n\n{answer}"),
+                None => answer,
+            },
+            _ => answer,
+        };
         self.launch(card, mode, Some(extra), resume).await
     }
 
@@ -640,7 +655,14 @@ impl Executor {
             prior,
             CardState::AwaitingReview(
                 ReviewSub::ApplyingFixes | ReviewSub::FixingValidation { .. }
-            ) | CardState::PrReview(PrReviewSub::ApplyingFixes | PrReviewSub::ApplyingChange)
+            ) | CardState::PrReview(
+                PrReviewSub::ApplyingFixes
+                    | PrReviewSub::ApplyingChange
+                    // Abandoning an outstanding conflict question: unwind the
+                    // half-resolved merge rather than leaving it for the next
+                    // run's `git add -A` to sweep up.
+                    | PrReviewSub::AwaitingAnswer(_)
+            )
         ) {
             self.discard_cancelled_run_edits(card_id, run_id).await;
         }

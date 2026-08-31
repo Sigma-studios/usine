@@ -68,6 +68,14 @@ fn find_block(plan: &str) -> Option<(usize, usize, &str)> {
 /// questions then; see [`plan_block_malformed`]), so the garbage never badges
 /// the plan as questioned nor leaks into the implement prompt.
 pub fn parse_plan(plan: &str) -> (String, Vec<PlanQuestion>) {
+    parse_questions(plan)
+}
+
+/// [`parse_plan`] under the name the non-plan callers use: the same
+/// `usine-questions` block is how a conflict-resolution run asks for a
+/// decision, and there is nothing plan-specific about splitting it out.
+pub fn parse_questions(text: &str) -> (String, Vec<PlanQuestion>) {
+    let plan = text;
     let Some((start, block_end, json)) = find_block(plan) else {
         return (plan.to_string(), Vec::new());
     };

@@ -1325,7 +1325,7 @@ pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
 /// finish having done nothing while the card advanced as if it had worked.
 fn conflict_prompt(base: &str, files: &[String]) -> String {
     let mut s = format!(
-        "This branch's pull request cannot be merged: it conflicts with `{base}`.\n\n\
+        "{CONFLICT_BRIEF_OPENER} `{base}`.\n\n\
          `git merge origin/{base}` is already in progress in this worktree and stopped on \
          conflicts. Resolve every conflict, preserving the intent of BOTH sides — this branch's \
          change and the change that landed on `{base}`. Read the surrounding code before choosing \
@@ -1339,9 +1339,85 @@ fn conflict_prompt(base: &str, files: &[String]) -> String {
     }
     s.push_str(
         "\nWhen every conflict is resolved, leave no conflict markers behind and make sure the \
-         project still builds. The resolved files are committed for you when the run ends.",
+         project still builds. The resolved files are committed for you when the run ends.\n\n",
     );
+    s.push_str(CONFLICT_ESCAPE_HATCH);
     s
+}
+
+/// The opening of [`conflict_prompt`], and the marker that tells a stashed fix
+/// brief apart from every other one. A PR fix run's brief is persisted
+/// (`set_fix_extra`) before the run starts and only cleared once it commits, so
+/// this survives a restart — which matters because the pre-commit gate in
+/// `finalize_run` must know it is looking at a conflict resolution *after* the
+/// fact, when the worktree alone can no longer say so (an agent that committed
+/// the merge itself leaves no `MERGE_HEAD` behind).
+const CONFLICT_BRIEF_OPENER: &str =
+    "This branch's pull request cannot be merged: it conflicts with";
+
+/// Whether a stashed fix-run brief is a conflict resolution (see
+/// [`CONFLICT_BRIEF_OPENER`]). `starts_with`, not `contains`: an unrelated fix
+/// brief could quote this sentence back (a review comment about conflicts, say)
+/// without the run being one.
+pub(crate) fn is_conflict_brief(extra: &str) -> bool {
+    extra.starts_with(CONFLICT_BRIEF_OPENER)
+}
+
+/// The `request_id` every conflict question carries. There is no live run to
+/// route the answer back to (the run ended in order to ask), so the id is a
+/// constant — and doubles as the way the UI tells a conflict question apart
+/// from a fix run's live `AskUserQuestion`, which parks in the same state.
+pub const CONFLICT_INTERVENTION_ID: &str = "conflict";
+
+/// The one way out of resolving a conflict: ask. Deliberately framed as the
+/// exception — most conflicts are decidable from the code, and a run that asks
+/// costs the user a round trip. Asking means ending the turn with a
+/// `usine-questions` block (the same provider-neutral channel plan runs use:
+/// headless CLIs have no live question tool, and Codex none at all), which
+/// parks the card with the merge still in progress and NOTHING committed or
+/// pushed — so the half-resolved tree is exactly what the answering run
+/// inherits.
+const CONFLICT_ESCAPE_HATCH: &str = "\
+If — and only if — a conflict genuinely cannot be settled from the code (the two sides encode \
+incompatible intent, or picking a side is a product decision that isn't yours to make), do not \
+guess: leave that file's conflict markers exactly as they are, resolve whatever else you can, \
+and end your turn with a fenced code block tagged `usine-questions` containing a JSON array of \
+questions, each shaped like {\"question\": \"...\", \"options\": [\"Option A\", \"Option B\"]} \
+(2-4 short options each; the user can also type their own answer). Say in your final message \
+which conflicts you resolved and which are blocked on the answer. Nothing is committed or \
+pushed while a question is outstanding, and you'll be run again with the answer to finish the \
+merge. Do not use this to hand back a conflict you could have worked out by reading the code.";
+
+/// Fold a conflict run's questions into the single [`Intervention`] the
+/// intervention UI renders. One question keeps its option buttons; several are
+/// numbered into one prompt with a free-text answer, since the panel asks one
+/// thing at a time. `request_id` is a constant: there is no live run to route
+/// the answer back to (the run ended to ask), mirroring the stream parser's
+/// own `"ask"` / `"control"` fallbacks.
+fn conflict_intervention(questions: &[crate::agent::plan::PlanQuestion]) -> Intervention {
+    let id = CONFLICT_INTERVENTION_ID.to_string();
+    match questions {
+        [only] => Intervention {
+            request_id: id,
+            question: only.question.clone(),
+            options: only.options.clone(),
+        },
+        many => {
+            let mut q =
+                String::from("The agent can't resolve these conflicts without your decision:\n");
+            for (i, item) in many.iter().enumerate() {
+                q.push_str(&format!("\n{}. {}", i + 1, item.question));
+                if !item.options.is_empty() {
+                    q.push_str(&format!(" ({})", item.options.join(" / ")));
+                }
+            }
+            Intervention {
+                request_id: id,
+                question: q,
+                options: Vec::new(),
+            }
+        }
+    }
 }
 
 /// Build the prompt for the agent run that fixes a PR's failing CI checks.
@@ -1867,6 +1943,56 @@ mod tests {
         assert!(!plan.contains("partial changes"));
         assert!(plan.contains("refining the plan"));
         assert!(plan.contains("Mutex or channel?"));
+    }
+
+    /// The brief must keep both halves: the guardrails that stop the agent
+    /// escaping the merge, and the strictly-conditional way to ask instead of
+    /// guessing.
+    #[test]
+    fn conflict_prompt_forbids_escaping_the_merge_and_offers_the_question_channel() {
+        let p = conflict_prompt("dev", &["src/lib.rs".to_string()]);
+        assert!(p.contains("src/lib.rs"));
+        assert!(p.contains("git merge --abort") && p.contains("Do not push"));
+        assert!(p.contains("usine-questions"));
+        // Framed as the exception, and the agent must know nothing ships while
+        // a question is outstanding — otherwise "ask" reads like "give up".
+        assert!(p.contains("If — and only if —"));
+        assert!(p.contains("Nothing is committed or pushed"));
+        // The opener is what identifies the stashed brief as a conflict one
+        // long after the worktree stopped showing a merge in progress.
+        assert!(is_conflict_brief(&p));
+        assert!(!is_conflict_brief(
+            fix_prompt(&[], "resolve the conflicts").as_str()
+        ));
+    }
+
+    #[test]
+    fn conflict_intervention_folds_several_questions_into_one_prompt() {
+        use crate::agent::plan::PlanQuestion;
+        let one = conflict_intervention(&[PlanQuestion {
+            question: "Keep the retry loop?".into(),
+            options: vec!["Keep".into(), "Drop".into()],
+        }]);
+        // A single question keeps its option buttons verbatim.
+        assert_eq!(one.question, "Keep the retry loop?");
+        assert_eq!(one.options, vec!["Keep", "Drop"]);
+
+        let many = conflict_intervention(&[
+            PlanQuestion {
+                question: "Keep the retry loop?".into(),
+                options: vec!["Keep".into(), "Drop".into()],
+            },
+            PlanQuestion {
+                question: "Which timeout wins?".into(),
+                options: vec![],
+            },
+        ]);
+        assert!(many.question.contains("1. Keep the retry loop?"));
+        assert!(many.question.contains("(Keep / Drop)"));
+        assert!(many.question.contains("2. Which timeout wins?"));
+        // No buttons: the panel asks one thing at a time, so a folded prompt
+        // has to be answered in free text.
+        assert!(many.options.is_empty());
     }
 
     #[test]

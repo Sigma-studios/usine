@@ -6,6 +6,7 @@
 use dioxus::prelude::*;
 use usine_core::{
     Card, CardState, CheckStatus, DesignSub, ExecutorCommand, Handoff, PrReviewSub, ReviewSub,
+    CONFLICT_INTERVENTION_ID,
 };
 use uuid::Uuid;
 
@@ -329,6 +330,40 @@ fn CardPanel(card: Card) -> Element {
                     class: "btn subtle",
                     onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
                     "Cancel"
+                }
+            }
+        }
+
+        // A conflict-resolution run that stopped rather than guessing. Say what
+        // it did get through, and make plain that nothing has been published —
+        // the InterventionPanel below carries the question itself. Keyed on the
+        // conflict request id, not the state: a fix run's live `AskUserQuestion`
+        // (a review-comment or CI fix) parks in the same sub-state, and none of
+        // this copy is true of it — that one just gets the panel below.
+        if card
+            .state
+            .intervention()
+            .is_some_and(|i| i.request_id == CONFLICT_INTERVENTION_ID)
+        {
+            div { class: "section",
+                h3 { "Conflict resolution needs a decision" }
+                div { class: "hint",
+                    "The agent couldn't settle one of the conflicts from the code, so it stopped and published nothing — the pull request is exactly as it was. Answering resumes the resolution where it left off, in the card's worktree; stopping throws it away."
+                }
+                if let Some(recap) = recap.clone() {
+                    div { class: "hint", "What it got through" }
+                    div { class: "plan-box", "{recap}" }
+                }
+                button {
+                    class: "btn subtle",
+                    onclick: move |_| request_confirm(ConfirmRequest {
+                        title: "Stop the conflict resolution?".into(),
+                        message: "Discard everything the agent resolved and return the card to the PR gate? You can then resolve the conflicts yourself, or ask the agent again.".into(),
+                        confirm_label: "Stop".into(),
+                        danger: true,
+                        action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
+                    }),
+                    "Stop and resolve it myself"
                 }
             }
         }
@@ -767,6 +802,7 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::PrReview(PrReviewSub::SelectingFixes { .. }) => "pr-select",
         CardState::PrReview(PrReviewSub::ApplyingFixes) => "pr-apply",
         CardState::PrReview(PrReviewSub::ApplyingChange) => "pr-change",
+        CardState::PrReview(PrReviewSub::AwaitingAnswer(_)) => "pr-answer",
         CardState::ReadyToMerge => "ready",
         CardState::MergedWithoutReview { merged: true } => "ext-merged",
         CardState::MergedWithoutReview { merged: false } => "ext-closed",

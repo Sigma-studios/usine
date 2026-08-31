@@ -310,6 +310,19 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         }
         (S::PrReview(PrReviewSub::ApplyingFixes), T::AgentFixesDone) => S::ReadyToMerge,
 
+        // A conflict-resolution run that couldn't settle a hunk from the code
+        // parks here instead of guessing (see `conflict_prompt`). The merge is
+        // still in progress in the worktree with nothing committed, so the
+        // answer relaunches the same fix run to finish it.
+        (S::PrReview(PrReviewSub::ApplyingFixes), T::AgentNeedsInput(i)) => {
+            S::PrReview(PrReviewSub::AwaitingAnswer(i))
+        }
+        (S::PrReview(PrReviewSub::AwaitingAnswer(_)), T::AnswerIntervention) => {
+            S::PrReview(PrReviewSub::ApplyingFixes)
+        }
+        // As in the other phases: tolerate a terminal racing the park.
+        (S::PrReview(PrReviewSub::AwaitingAnswer(_)), T::AgentFixesDone) => S::ReadyToMerge,
+
         // An approval with no comments to triage skips the chain above — there is
         // no comment to fetch, nothing to select, and no fix run to finish, so
         // without this edge the card would sit in `Idle` forever. Only legal from
@@ -424,6 +437,9 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         (S::PrReview(PrReviewSub::FetchingComments), T::Cancel) => S::PrReview(PrReviewSub::Idle),
         (S::PrReview(PrReviewSub::ApplyingFixes), T::Cancel) => S::PrReview(PrReviewSub::Idle),
         (S::PrReview(PrReviewSub::ApplyingChange), T::Cancel) => S::PrReview(PrReviewSub::Idle),
+        // Abandoning the question: the executor also unwinds the half-done
+        // merge, so the card returns to a clean PR gate.
+        (S::PrReview(PrReviewSub::AwaitingAnswer(_)), T::Cancel) => S::PrReview(PrReviewSub::Idle),
 
         (s, other) => {
             return Err(CoreError::IllegalTransition(format!(
@@ -467,6 +483,51 @@ mod tests {
             reply: String::new(),
             instruction: String::new(),
         }]
+    }
+
+    /// A conflict-resolution run that can't settle a hunk parks on a question
+    /// instead of guessing, and the answer sends it back to finish the merge.
+    #[test]
+    fn a_conflict_fix_run_can_park_on_a_question_and_resume() {
+        let s = CardState::PrReview(PrReviewSub::ApplyingFixes);
+        let s = transition(&s, Transition::AgentNeedsInput(intervention())).unwrap();
+        assert!(matches!(
+            s,
+            CardState::PrReview(PrReviewSub::AwaitingAnswer(_))
+        ));
+        assert!(s.needs_intervention());
+        // Parked, not running: a restart's interrupted-run sweep must leave the
+        // question standing rather than failing the card out from under it.
+        assert!(!s.is_running());
+        assert_eq!(s.intervention().unwrap().request_id, "req-1");
+
+        let resumed = transition(&s, Transition::AnswerIntervention).unwrap();
+        assert!(matches!(
+            resumed,
+            CardState::PrReview(PrReviewSub::ApplyingFixes)
+        ));
+
+        // A terminal racing the park still lands at the merge gate…
+        assert!(matches!(
+            transition(&s, Transition::AgentFixesDone).unwrap(),
+            CardState::ReadyToMerge
+        ));
+        // …and abandoning the question returns to the PR gate.
+        assert!(matches!(
+            transition(&s, Transition::Cancel).unwrap(),
+            CardState::PrReview(PrReviewSub::Idle)
+        ));
+    }
+
+    /// The escape hatch is the conflict run's alone: a post-PR change run
+    /// leaves no mid-merge tree to park on, so a question there is illegal.
+    #[test]
+    fn a_post_pr_change_run_cannot_ask() {
+        assert!(transition(
+            &CardState::PrReview(PrReviewSub::ApplyingChange),
+            Transition::AgentNeedsInput(intervention()),
+        )
+        .is_err());
     }
 
     /// Drive a card through the entire happy path and assert each landing state.

@@ -421,6 +421,13 @@ pub enum PrReviewSub {
     /// `Idle` so the card stays in the PR-review gate (unlike `ApplyingFixes`, the
     /// comment-triage run, which advances to `ReadyToMerge`).
     ApplyingChange,
+    /// A fix run stopped to ask. Almost always a conflict resolution that hit a
+    /// hunk it couldn't settle from the code and ended its turn with a question
+    /// rather than guessing (its question carries `CONFLICT_INTERVENTION_ID`);
+    /// a live `AskUserQuestion` from any other fix run parks here too. Either
+    /// way nothing has been committed or pushed, and answering relaunches the
+    /// fix run with the answer in hand to finish the job.
+    AwaitingAnswer(Intervention),
 }
 
 /// Sub-states of the pre-PR review gate. Implementation finishes with the work
@@ -566,6 +573,7 @@ impl CardState {
                 | CardState::Implementing(RunSub::Intervention(_))
                 | CardState::Designing(DesignSub::AwaitingApproval { .. })
                 | CardState::PrReview(PrReviewSub::SelectingFixes { .. })
+                | CardState::PrReview(PrReviewSub::AwaitingAnswer(_))
                 | CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
         )
     }
@@ -604,6 +612,7 @@ impl CardState {
             CardState::Designing(DesignSub::Intervention(_))
                 | CardState::Investigating(RunSub::Intervention(_))
                 | CardState::Implementing(RunSub::Intervention(_))
+                | CardState::PrReview(PrReviewSub::AwaitingAnswer(_))
                 | CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
                 | CardState::Failed { .. }
         )
@@ -639,6 +648,7 @@ impl CardState {
             CardState::Designing(DesignSub::Intervention(i)) => Some(i),
             CardState::Investigating(RunSub::Intervention(i)) => Some(i),
             CardState::Implementing(RunSub::Intervention(i)) => Some(i),
+            CardState::PrReview(PrReviewSub::AwaitingAnswer(i)) => Some(i),
             _ => None,
         }
     }
@@ -675,6 +685,7 @@ impl CardState {
             CardState::PrReview(PrReviewSub::SelectingFixes { .. }) => "select fixes",
             CardState::PrReview(PrReviewSub::ApplyingFixes) => "applying fixes…",
             CardState::PrReview(PrReviewSub::ApplyingChange) => "applying change…",
+            CardState::PrReview(PrReviewSub::AwaitingAnswer(_)) => "needs answer",
             CardState::ReadyToMerge => "ready to merge",
             CardState::MergedWithoutReview { merged: true } => "merged w/o review",
             CardState::MergedWithoutReview { merged: false } => "PR closed",

@@ -24,11 +24,14 @@ pub use agent::events::{
     AdoptProbe, AgentEvent, DirtyAction, ExecutorCommand, ExecutorEvent, ExecutorEventKind,
     OpenTarget, QueuedTarget, RunControl, Severity,
 };
-pub use agent::executor::{fix_prompt, spawn as spawn_executor, ExecutorConfig, ExecutorHandle};
+pub use agent::executor::{
+    fix_prompt, spawn as spawn_executor, ExecutorConfig, ExecutorHandle, CONFLICT_INTERVENTION_ID,
+};
 pub use agent::handoff::{parse_handoff, Handoff, HANDOFF_INSTRUCTION};
 pub use agent::investigate::{investigate_instruction, INVESTIGATE_INSTRUCTION};
 pub use agent::plan::{
-    parse_plan, plan_block_malformed, plan_instruction, PlanQuestion, PLAN_QUESTIONS_INSTRUCTION,
+    parse_plan, parse_questions, plan_block_malformed, plan_instruction, PlanQuestion,
+    PLAN_QUESTIONS_INSTRUCTION,
 };
 pub use agent::provider::claude::ClaudeProvider;
 pub use agent::provider::codex::CodexProvider;
