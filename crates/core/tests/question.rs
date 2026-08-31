@@ -101,9 +101,10 @@ async fn a_question_from_awaiting_review_round_trips_with_an_answer() {
     // The answer arrives, then the card lands back on ReadyForReview — a run
     // that changed no files must NOT be demoted by the no-commit guard.
     let (question, answer) = wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::AnswerUpdated { question, answer } => {
-            Some((question.clone(), answer.clone()))
-        }
+        ExecutorEventKind::AnswersUpdated { answers } => answers
+            .exchanges
+            .last()
+            .map(|x| (x.question.clone(), x.answer.clone())),
         _ => None,
     })
     .await;
@@ -134,20 +135,88 @@ async fn a_question_from_awaiting_review_round_trips_with_an_answer() {
             "Q: why did you adapt at the boundary?\nA: {answer}"
         )]
     );
-    assert_eq!(store.get_answer(card_id).unwrap(), Some(answer));
+    assert_eq!(store.get_answer(card_id).unwrap(), Some(answer.clone()));
 
-    // A later change request supersedes the exchange: the write run's launch
-    // clears it so the panel can't resurface an answer about replaced work.
+    // A later change request supersedes the log: the write run's launch marks
+    // it so the panel can't resurface, expanded, an answer about replaced work
+    // — but the exchange itself is kept, readable behind its collapsed row.
     handle.send(ExecutorCommand::ReviseImplementation {
         card_id,
         feedback: "tighten the boundary".into(),
     });
-    wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::AnswerUpdated { answer, .. } if answer.is_empty() => Some(()),
+    let superseded = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::AnswersUpdated { answers } if answers.superseded => {
+            Some(answers.clone())
+        }
         _ => None,
     })
     .await;
-    assert_eq!(store.get_answer(card_id).unwrap(), None);
+    assert_eq!(
+        superseded.exchanges.len(),
+        1,
+        "a superseding write run keeps the exchange"
+    );
+    assert!(store.get_answers(card_id).unwrap().superseded);
+    assert_eq!(store.get_answer(card_id).unwrap(), Some(answer));
+}
+
+/// Asking twice keeps both exchanges, oldest first — the panel renders the
+/// whole log, not just the latest turn.
+#[tokio::test]
+async fn a_second_question_keeps_the_first_exchange() {
+    let store = Store::open_in_memory().unwrap();
+    let card_id = seed_card(&store, "/tmp/question-history");
+    store.set_skip_plan(card_id, true).unwrap();
+    store.set_auto_review(card_id, false).unwrap();
+    let (handle, mut rx) = spawn_with(&store);
+
+    handle.send(ExecutorCommand::Start { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(
+                c.state,
+                CardState::AwaitingReview(ReviewSub::ReadyForReview)
+            ) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    for q in ["why the boundary?", "and the retry?"] {
+        handle.send(ExecutorCommand::AskQuestion {
+            card_id,
+            question: q.into(),
+        });
+        wait_for(&mut rx, |e| match &e.kind {
+            ExecutorEventKind::AnswersUpdated { answers }
+                if answers.exchanges.last().is_some_and(|x| x.question == q) =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+    }
+
+    let log = store.get_answers(card_id).unwrap();
+    let questions: Vec<_> = log.exchanges.iter().map(|x| x.question.as_str()).collect();
+    assert_eq!(questions, vec!["why the boundary?", "and the retry?"]);
+    assert!(
+        log.exchanges.iter().all(|x| !x.answer.is_empty()),
+        "every kept exchange carries its answer"
+    );
+    assert!(!log.superseded, "a question run does not supersede the log");
+
+    // "Back to the starting block" is what actually discards the log.
+    handle.send(ExecutorCommand::BackToStart { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::AnswersUpdated { answers } if answers.exchanges.is_empty() => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(store.get_answers(card_id).unwrap().exchanges.is_empty());
 }
 
 #[tokio::test]

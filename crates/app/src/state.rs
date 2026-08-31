@@ -12,11 +12,11 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
-    spawn_executor, AdoptProbe, AppSettings, Card, CardState, DesignSub, DiffState, DirtyAction,
-    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle, Forge,
-    GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig, Provider,
-    ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity,
-    SimFactory, SimForge, SimGit, Store, UsageSnapshot,
+    spawn_executor, AdoptProbe, AppSettings, Card, CardAnswers, CardState, DesignSub, DiffState,
+    DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle,
+    Forge, GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig,
+    Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub,
+    Severity, SimFactory, SimForge, SimGit, Store, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -96,10 +96,10 @@ pub struct AppState {
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
     /// Per-card fixes recap, seeded at startup and updated via `RecapUpdated`.
     pub review_recaps: Signal<HashMap<Uuid, String>>,
-    /// Per-card Agent Chat exchange — the last question asked and its prose
-    /// answer — seeded at startup and updated via `AnswerUpdated` (an empty
-    /// answer removes the entry).
-    pub answers: Signal<HashMap<Uuid, (String, String)>>,
+    /// Per-card Agent Chat log — every question asked and its prose answer,
+    /// oldest first — seeded at startup and updated via `AnswersUpdated` (an
+    /// empty log removes the entry).
+    pub answers: Signal<HashMap<Uuid, CardAnswers>>,
     /// Per-card implementation hand-off — the recap, open questions, and testing
     /// checklist the implement run left for its reviewer. Seeded at startup and
     /// updated via `HandoffUpdated`.
@@ -480,15 +480,14 @@ impl AppState {
                 let mut recaps = self.review_recaps;
                 recaps.write().insert(evt.card_id, recap);
             }
-            // An empty answer means the exchange was cleared ("back to start",
-            // or a write run superseding it): drop the entry so the panel shows
-            // nothing.
-            ExecutorEventKind::AnswerUpdated { question, answer } => {
+            // An empty log means it was cleared ("back to start"): drop the
+            // entry so the panel shows nothing.
+            ExecutorEventKind::AnswersUpdated { answers: log } => {
                 let mut answers = self.answers;
-                if answer.is_empty() {
+                if log.exchanges.is_empty() {
                     answers.write().remove(&evt.card_id);
                 } else {
-                    answers.write().insert(evt.card_id, (question, answer));
+                    answers.write().insert(evt.card_id, log);
                 }
             }
             // An empty hand-off means the run left none: drop the entry so the

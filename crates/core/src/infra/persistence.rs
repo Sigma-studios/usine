@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::agent::handoff::Handoff;
 use crate::domain::config::AppSettings;
-use crate::domain::model::{Card, Project, ReviewComment, ReviewTask};
+use crate::domain::model::{Card, CardAnswers, Project, QaExchange, ReviewComment, ReviewTask};
 use crate::error::{CoreError, Result};
 
 // ---------------------------------------------------------------------------
@@ -236,11 +236,14 @@ struct DismissedReviewsRecord {
     pr_numbers: Vec<u64>,
 }
 
-/// The latest Agent Chat exchange for a card: the question is stashed when the
-/// run starts, the answer filled in when it finishes. Its own record (not a
-/// field on [`CardReviewRecord`]) so adding it doesn't change an existing
-/// record's layout.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// A card's Agent Chat log: `question` stashes the pending question of an
+/// in-flight run, and `history` collects every exchange once answered. Its own
+/// record (not a field on [`CardReviewRecord`]) so adding it doesn't change an
+/// existing record's layout. `history`/`superseded` are additive
+/// `#[serde(default)]` fields — no version bump, the startup
+/// `canonicalize_records()` refresh rewrites old rows; `answer` is legacy, a
+/// pre-history row's single answer folded into `history` on read.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[native_model(id = 12, version = 1, with = Json)]
 #[native_db]
 struct CardAnswerRecord {
@@ -249,6 +252,30 @@ struct CardAnswerRecord {
     #[serde(default)]
     question: String,
     answer: String,
+    #[serde(default)]
+    history: Vec<QaExchange>,
+    #[serde(default)]
+    superseded: bool,
+}
+
+impl CardAnswerRecord {
+    /// The record's log, folding a legacy pre-`history` row's lone answer into
+    /// a single exchange so an existing database keeps it.
+    fn answers(self) -> CardAnswers {
+        let exchanges = if self.history.is_empty() && !self.answer.is_empty() {
+            vec![QaExchange {
+                question: self.question,
+                answer: self.answer,
+                asked_at: 0,
+            }]
+        } else {
+            self.history
+        };
+        CardAnswers {
+            exchanges,
+            superseded: self.superseded,
+        }
+    }
 }
 
 const SETTINGS_ID: u8 = 1;
@@ -629,16 +656,26 @@ impl Store {
 
     // --- Agent Chat answers ---------------------------------------------
 
-    /// Stash the question a starting Agent Chat run will answer, clearing any
-    /// previous exchange. `set_answer` completes it when the run finishes.
+    /// Stash the question a starting Agent Chat run will answer; `set_answer`
+    /// completes it when the run finishes and the earlier exchanges are kept.
+    /// An empty `question` clears the stash without touching the log.
     pub fn set_question(&self, card_id: Uuid, question: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        // Fold a legacy row's lone `answer` into `history` here too: carrying it
+        // over untouched would leave the read-side fold pairing that old answer
+        // with the *new* pending question.
+        let prior = old
+            .clone()
+            .map(CardAnswerRecord::answers)
+            .unwrap_or_default();
         let rec = CardAnswerRecord {
             card_id: card_id.to_string(),
             question: question.to_string(),
             answer: String::new(),
+            history: prior.exchanges,
+            superseded: prior.superseded,
         };
-        let rw = self.db.rw_transaction()?;
-        let old: Option<CardAnswerRecord> = rw.get().primary(rec.card_id.clone())?;
         match old {
             Some(old) => rw.update(old, rec)?,
             None => rw.insert(rec)?,
@@ -647,21 +684,34 @@ impl Store {
         Ok(())
     }
 
-    /// The stashed question of the in-flight (or just-finished) Agent Chat run.
+    /// The stashed question of the in-flight Agent Chat run.
     pub fn get_question(&self, card_id: Uuid) -> Result<Option<String>> {
         let r = self.db.r_transaction()?;
         let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
         Ok(rec.map(|r| r.question).filter(|s: &String| !s.is_empty()))
     }
 
-    /// Store a card's latest Agent Chat answer, keeping the stashed question.
+    /// Append an answered exchange to the card's log, consuming the stashed
+    /// question and clearing `superseded` (this answer describes current work).
+    /// Unbounded: the log is only dropped by "back to start" or card removal.
     pub fn set_answer(&self, card_id: Uuid, answer: &str) -> Result<()> {
         let rw = self.db.rw_transaction()?;
         let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
-        let rec = CardAnswerRecord {
-            card_id: card_id.to_string(),
+        let mut history = old
+            .as_ref()
+            .map(|o| o.clone().answers().exchanges)
+            .unwrap_or_default();
+        history.push(QaExchange {
             question: old.as_ref().map(|o| o.question.clone()).unwrap_or_default(),
             answer: answer.to_string(),
+            asked_at: crate::now_millis(),
+        });
+        let rec = CardAnswerRecord {
+            card_id: card_id.to_string(),
+            question: String::new(),
+            answer: String::new(),
+            history,
+            superseded: false,
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -671,13 +721,39 @@ impl Store {
         Ok(())
     }
 
+    /// The card's most recent answer, if it has ever answered a question.
     pub fn get_answer(&self, card_id: Uuid) -> Result<Option<String>> {
-        let r = self.db.r_transaction()?;
-        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
-        Ok(rec.map(|r| r.answer).filter(|s: &String| !s.is_empty()))
+        Ok(self
+            .get_answers(card_id)?
+            .exchanges
+            .pop()
+            .map(|e| e.answer)
+            .filter(|s: &String| !s.is_empty()))
     }
 
-    /// Drop a card's stored answer (used by "back to start"). Idempotent.
+    /// A card's whole Agent Chat log (empty when it has never answered).
+    pub fn get_answers(&self, card_id: Uuid) -> Result<CardAnswers> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(CardAnswerRecord::answers).unwrap_or_default())
+    }
+
+    /// Mark the log as superseded by a write run: the exchanges stay, but the
+    /// panel stops showing any of them expanded. Idempotent.
+    pub fn supersede_answers(&self, card_id: Uuid) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        if let Some(old) = rw.get().primary::<CardAnswerRecord>(card_id.to_string())? {
+            let rec = CardAnswerRecord {
+                superseded: true,
+                ..old.clone()
+            };
+            rw.update(old, rec)?;
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// Drop a card's whole Agent Chat log (used by "back to start"). Idempotent.
     pub fn delete_answer(&self, card_id: Uuid) -> Result<()> {
         let rw = self.db.rw_transaction()?;
         if let Some(rec) = rw.get().primary::<CardAnswerRecord>(card_id.to_string())? {
@@ -687,19 +763,21 @@ impl Store {
         Ok(())
     }
 
-    /// All cards' answered exchanges as `(question, answer)`, keyed by card id
-    /// (loaded once at startup). Pending records (no answer yet) are skipped.
-    pub fn all_answers(&self) -> Result<HashMap<Uuid, (String, String)>> {
+    /// Every card's Agent Chat log, keyed by card id (loaded once at startup).
+    /// Cards with nothing answered yet are skipped.
+    pub fn all_answers(&self) -> Result<HashMap<Uuid, CardAnswers>> {
         let r = self.db.r_transaction()?;
         let mut out = HashMap::new();
         for rec in r.scan().primary::<CardAnswerRecord>()?.all()? {
             let rec = rec?;
-            if rec.answer.is_empty() {
+            let Ok(id) = Uuid::parse_str(&rec.card_id) else {
+                continue;
+            };
+            let answers = rec.answers();
+            if answers.exchanges.is_empty() {
                 continue;
             }
-            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
-                out.insert(id, (rec.question, rec.answer));
-            }
+            out.insert(id, answers);
         }
         Ok(out)
     }
@@ -1485,5 +1563,70 @@ mod tests {
         // Deleting the project cascades to its review tasks.
         store.delete_project(project.id).unwrap();
         assert!(store.list_review_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_answer_row_folds_before_the_next_question() {
+        // A pre-`history` row carries its lone answer in `answer`. Stashing the
+        // next question must fold it into an exchange, or the read-side fold
+        // would pair that old answer with the new, still-unanswered question.
+        let store = Store::open_in_memory().unwrap();
+        let card_id = Uuid::new_v4();
+        {
+            let rw = store.db.rw_transaction().unwrap();
+            rw.insert(CardAnswerRecord {
+                card_id: card_id.to_string(),
+                question: "old question".into(),
+                answer: "old answer".into(),
+                history: Vec::new(),
+                superseded: false,
+            })
+            .unwrap();
+            rw.commit().unwrap();
+        }
+
+        store.set_question(card_id, "new question").unwrap();
+        let pending = store.get_answers(card_id).unwrap();
+        assert_eq!(
+            pending
+                .exchanges
+                .iter()
+                .map(|x| (x.question.as_str(), x.answer.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("old question", "old answer")],
+            "the pending question adds no row of its own"
+        );
+
+        store.set_answer(card_id, "new answer").unwrap();
+        assert_eq!(
+            store
+                .get_answers(card_id)
+                .unwrap()
+                .exchanges
+                .iter()
+                .map(|x| (x.question.as_str(), x.answer.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("old question", "old answer"),
+                ("new question", "new answer")
+            ]
+        );
+    }
+
+    #[test]
+    fn clearing_the_stashed_question_keeps_the_log() {
+        // What a run that finishes with an empty result does: drop the stash,
+        // leave the answered exchanges alone.
+        let store = Store::open_in_memory().unwrap();
+        let card_id = Uuid::new_v4();
+        store.set_question(card_id, "why?").unwrap();
+        store.set_answer(card_id, "because").unwrap();
+        store.set_question(card_id, "and then?").unwrap();
+
+        store.set_question(card_id, "").unwrap();
+        assert_eq!(store.get_question(card_id).unwrap(), None);
+        let log = store.get_answers(card_id).unwrap();
+        assert_eq!(log.exchanges.len(), 1);
+        assert_eq!(log.exchanges[0].question, "why?");
     }
 }
