@@ -656,15 +656,25 @@ impl Store {
 
     // --- Agent Chat answers ---------------------------------------------
 
-    /// Stash the question a starting Agent Chat run will answer. `set_answer`
-    /// completes it when the run finishes; the earlier exchanges are kept.
+    /// Stash the question a starting Agent Chat run will answer; `set_answer`
+    /// completes it when the run finishes and the earlier exchanges are kept.
+    /// An empty `question` clears the stash without touching the log.
     pub fn set_question(&self, card_id: Uuid, question: &str) -> Result<()> {
         let rw = self.db.rw_transaction()?;
         let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        // Fold a legacy row's lone `answer` into `history` here too: carrying it
+        // over untouched would leave the read-side fold pairing that old answer
+        // with the *new* pending question.
+        let prior = old
+            .clone()
+            .map(CardAnswerRecord::answers)
+            .unwrap_or_default();
         let rec = CardAnswerRecord {
             card_id: card_id.to_string(),
             question: question.to_string(),
-            ..old.clone().unwrap_or_default()
+            answer: String::new(),
+            history: prior.exchanges,
+            superseded: prior.superseded,
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -1553,5 +1563,70 @@ mod tests {
         // Deleting the project cascades to its review tasks.
         store.delete_project(project.id).unwrap();
         assert!(store.list_review_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_answer_row_folds_before_the_next_question() {
+        // A pre-`history` row carries its lone answer in `answer`. Stashing the
+        // next question must fold it into an exchange, or the read-side fold
+        // would pair that old answer with the new, still-unanswered question.
+        let store = Store::open_in_memory().unwrap();
+        let card_id = Uuid::new_v4();
+        {
+            let rw = store.db.rw_transaction().unwrap();
+            rw.insert(CardAnswerRecord {
+                card_id: card_id.to_string(),
+                question: "old question".into(),
+                answer: "old answer".into(),
+                history: Vec::new(),
+                superseded: false,
+            })
+            .unwrap();
+            rw.commit().unwrap();
+        }
+
+        store.set_question(card_id, "new question").unwrap();
+        let pending = store.get_answers(card_id).unwrap();
+        assert_eq!(
+            pending
+                .exchanges
+                .iter()
+                .map(|x| (x.question.as_str(), x.answer.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("old question", "old answer")],
+            "the pending question adds no row of its own"
+        );
+
+        store.set_answer(card_id, "new answer").unwrap();
+        assert_eq!(
+            store
+                .get_answers(card_id)
+                .unwrap()
+                .exchanges
+                .iter()
+                .map(|x| (x.question.as_str(), x.answer.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("old question", "old answer"),
+                ("new question", "new answer")
+            ]
+        );
+    }
+
+    #[test]
+    fn clearing_the_stashed_question_keeps_the_log() {
+        // What a run that finishes with an empty result does: drop the stash,
+        // leave the answered exchanges alone.
+        let store = Store::open_in_memory().unwrap();
+        let card_id = Uuid::new_v4();
+        store.set_question(card_id, "why?").unwrap();
+        store.set_answer(card_id, "because").unwrap();
+        store.set_question(card_id, "and then?").unwrap();
+
+        store.set_question(card_id, "").unwrap();
+        assert_eq!(store.get_question(card_id).unwrap(), None);
+        let log = store.get_answers(card_id).unwrap();
+        assert_eq!(log.exchanges.len(), 1);
+        assert_eq!(log.exchanges[0].question, "why?");
     }
 }
