@@ -8,6 +8,12 @@ license.workspace = true
 name = "usine_core"
 path = "src/lib.rs"
 
+[features]
+# The in-process MCP server over the board (see `src/mcp`). On by default;
+# `--no-default-features` leaves it — and tokio's net stack — out entirely.
+default = ["mcp"]
+mcp = ["tokio/net"]
+
 [dependencies]
 async-trait = "0.1.89"
 directories.workspace = true

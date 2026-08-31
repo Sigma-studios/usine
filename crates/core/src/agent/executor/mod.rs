@@ -72,6 +72,13 @@ impl ExecutorHandle {
         let _ = self.commands.unbounded_send(cmd);
     }
 
+    /// The raw command channel, for in-process surfaces that aren't the UI
+    /// (see [`crate::mcp`]). Sending here goes through the same dispatcher, so
+    /// the resulting `ExecutorEvent` still reaches the board.
+    pub fn command_sender(&self) -> UnboundedSender<ExecutorCommand> {
+        self.commands.clone()
+    }
+
     /// Reap every running preview and validation check synchronously. Called
     /// from the app's window-close / loop-destroyed handler: both run in their
     /// own process groups (so their whole trees can be killed), which also
