@@ -13,8 +13,8 @@ use crate::agent::handoff::Handoff;
 use crate::agent::usage::UsageSnapshot;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
-    Card, DraftComment, FixVerdict, PrInfo, PreviewStatus, PreviewUrl, Project, ReviewEvent,
-    ReviewTask, Usage,
+    Card, CardAnswers, DraftComment, FixVerdict, PrInfo, PreviewStatus, PreviewUrl, Project,
+    ReviewEvent, ReviewTask, Usage,
 };
 
 /// Severity for a user-facing toast.
@@ -166,7 +166,7 @@ pub enum ExecutorCommand {
     /// changes: a strictly read-only turn from any Agent Chat panel (plan
     /// approval, awaiting review, PR idle, ready-to-merge). The card wraps
     /// into `CardState::Answering` while answering and returns to the exact
-    /// state it was asked from; the answer arrives via `AnswerUpdated`.
+    /// state it was asked from; the answer arrives via `AnswersUpdated`.
     AskQuestion { card_id: Uuid, question: String },
     /// From `Concluded`: dig deeper — re-run the investigation with the prior
     /// conclusion, the earlier rounds, and this follow-up as context (the
@@ -673,10 +673,10 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
-    /// A card's Agent Chat exchange changed (`card_id` on the event). An empty
-    /// `answer` means it was cleared (e.g. "back to start", or a write run
-    /// superseding it) and the UI drops its entry.
-    AnswerUpdated { question: String, answer: String },
+    /// A card's Agent Chat log changed (`card_id` on the event) — a new answer
+    /// appended, or the log superseded by a write run. Empty `exchanges` means
+    /// it was cleared ("back to start") and the UI drops its entry.
+    AnswersUpdated { answers: CardAnswers },
     /// A card's implementation hand-off changed (`card_id` on the event). An
     /// empty [`Handoff`] means the latest implement run produced none, and the UI
     /// drops the previous attempt's.
@@ -832,17 +832,10 @@ impl ExecutorEvent {
             },
         }
     }
-    pub fn answer_updated(
-        card_id: Uuid,
-        question: impl Into<String>,
-        answer: impl Into<String>,
-    ) -> Self {
+    pub fn answers_updated(card_id: Uuid, answers: CardAnswers) -> Self {
         ExecutorEvent {
             card_id,
-            kind: ExecutorEventKind::AnswerUpdated {
-                question: question.into(),
-                answer: answer.into(),
-            },
+            kind: ExecutorEventKind::AnswersUpdated { answers },
         }
     }
     pub fn handoff_updated(card_id: Uuid, handoff: Handoff) -> Self {

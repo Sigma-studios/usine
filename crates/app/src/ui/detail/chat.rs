@@ -37,7 +37,15 @@ pub(super) fn AgentChatSection(
     // Both sends therefore bump this generation, and the element is keyed with
     // it, so the clear lands as a fresh, empty element.
     let mut generation = use_signal(|| 0u32);
-    let exchange = state.answers.read().get(&card_id).cloned();
+    // The whole Q&A log: newest expanded, earlier ones collapsed behind a
+    // one-line summary of the question. A write run marks the log superseded,
+    // which collapses all of them without dropping any.
+    let log = state
+        .answers
+        .read()
+        .get(&card_id)
+        .cloned()
+        .unwrap_or_default();
     let blank = text.read().trim().is_empty();
     let request_label = match (blank, request_label_nonblank) {
         (false, Some(l)) => l,
@@ -48,13 +56,26 @@ pub(super) fn AgentChatSection(
         div { class: "section",
             h3 { "Agent Chat" }
             div { class: "hint", "{hint}" }
-            if let Some((question, answer)) = exchange {
-                if !question.is_empty() {
-                    div { class: "hint", "You asked" }
-                    div { class: "plan-box", "{question}" }
+            if !log.exchanges.is_empty() {
+                div { class: "qa-log",
+                    // Newest first, and only it is ever rendered `open` — an
+                    // older row the user expanded keeps `open: false` in the
+                    // vdom, so no re-render force-collapses it.
+                    for (i , ex) in log.exchanges.iter().rev().enumerate() {
+                        details {
+                            key: "{ex.asked_at}",
+                            class: "qa-item",
+                            open: i == 0 && !log.superseded,
+                            summary { title: "{ex.question}", "{summary_line(&ex.question)}" }
+                            if !ex.question.is_empty() {
+                                div { class: "hint", "You asked" }
+                                div { class: "plan-box", "{ex.question}" }
+                            }
+                            div { class: "hint", "Answer" }
+                            div { class: "plan-box", "{ex.answer}" }
+                        }
+                    }
                 }
-                div { class: "hint", "Answer" }
-                div { class: "plan-box", "{answer}" }
             }
             div { class: "field",
                 if crate::stress::fix_a() {
@@ -117,5 +138,19 @@ pub(super) fn AgentChatSection(
                 }
             }
         }
+    }
+}
+
+/// The collapsed row's label: the question on one line, capped. A legacy entry
+/// recorded before questions were kept falls back to a neutral label.
+fn summary_line(question: &str) -> String {
+    let flat = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "Answer".to_string();
+    }
+    if flat.chars().count() > 90 {
+        format!("{}…", flat.chars().take(89).collect::<String>())
+    } else {
+        flat
     }
 }

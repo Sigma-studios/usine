@@ -343,7 +343,13 @@ async fn agent_chat_questions_bypass_a_saturated_cap() {
         question: "is the boundary sound?".into(),
     });
     let answer = wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::AnswerUpdated { answer, .. } if e.card_id == c => Some(answer.clone()),
+        ExecutorEventKind::AnswersUpdated { answers } if e.card_id == c => Some(
+            answers
+                .exchanges
+                .last()
+                .map(|x| x.answer.clone())
+                .unwrap_or_default(),
+        ),
         _ => None,
     })
     .await;

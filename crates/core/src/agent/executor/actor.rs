@@ -795,11 +795,9 @@ fn finalize_question(
         Ok(())
     })?;
     let _ = store.set_answer(card_id, &answer);
-    let _ = evt_tx.unbounded_send(ExecutorEvent::answer_updated(
-        card_id,
-        question,
-        answer.clone(),
-    ));
+    if let Ok(answers) = store.get_answers(card_id) {
+        let _ = evt_tx.unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
+    }
     apply_transition(store, evt_tx, card_id, Transition::QuestionAnswered)?;
     if !answer.is_empty() {
         transcript(store, evt_tx, card_id, format!("✔ {answer}"));
