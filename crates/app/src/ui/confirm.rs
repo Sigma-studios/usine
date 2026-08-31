@@ -18,6 +18,9 @@ pub(crate) enum ConfirmAction {
     /// shared edit buffer and the diff viewer) — leaving either one open on a
     /// review that has already been posted invites a double submission.
     PublishReview(ExecutorCommand),
+    /// Mark a card blocked, carrying the optional message typed in the dialog.
+    /// Only ever raised for *marking* — unmarking doesn't ask.
+    BlockCard(Uuid),
 }
 
 #[derive(Clone)]
@@ -31,7 +34,13 @@ pub(crate) struct ConfirmRequest {
 
 static CONFIRM: GlobalSignal<Option<ConfirmRequest>> = Signal::global(|| None);
 
+/// The message typed in a `BlockCard` dialog. Global for the same reason
+/// `CONFIRM` is: the host outlives every individual dialog, so the buffer has to
+/// be reset by whoever opens one.
+static NOTE: GlobalSignal<String> = Signal::global(String::new);
+
 pub(crate) fn request_confirm(req: ConfirmRequest) {
+    *NOTE.write() = String::new();
     *CONFIRM.write() = Some(req);
 }
 
@@ -52,6 +61,9 @@ pub fn ConfirmHost() -> Element {
         "btn primary"
     };
     let action = req.action.clone();
+    // Only this action collects text, so the field is driven by the variant
+    // rather than by a `note` field every other request site would have to fill.
+    let with_note = matches!(req.action, ConfirmAction::BlockCard(_));
 
     rsx! {
         div { class: "modal-overlay confirm-overlay", onclick: move |_| dismiss(),
@@ -69,14 +81,35 @@ pub fn ConfirmHost() -> Element {
                         dismiss();
                     }
                 },
-                // Focus the dialog on open so Escape works and focus is trapped here.
+                // Focus the dialog on open so Escape works and focus is trapped
+                // here — unless the message field takes focus instead (the two
+                // would race). Escape still works from the field: the keydown
+                // bubbles up to this handler.
                 onmounted: move |e: MountedEvent| {
+                    if with_note {
+                        return;
+                    }
                     spawn(async move {
                         let _ = e.data().set_focus(true).await;
                     });
                 },
                 h3 { class: "modal-title", "{req.title}" }
                 div { class: "modal-body", "{req.message}" }
+                if with_note {
+                    div { class: "field",
+                        label { r#for: "confirm-note", "Message (optional)" }
+                        textarea {
+                            id: "confirm-note",
+                            value: "{NOTE}",
+                            oninput: move |e| *NOTE.write() = e.value(),
+                            onmounted: move |e: MountedEvent| {
+                                spawn(async move {
+                                    let _ = e.data().set_focus(true).await;
+                                });
+                            },
+                        }
+                    }
+                }
                 div { class: "modal-actions",
                     button { class: "btn", onclick: move |_| dismiss(), "Cancel" }
                     button {
@@ -89,6 +122,14 @@ pub fn ConfirmHost() -> Element {
                                 ConfirmAction::PublishReview(cmd) => {
                                     state.send(cmd);
                                     super::finish_review_validation();
+                                }
+                                ConfirmAction::BlockCard(id) => {
+                                    state.send(ExecutorCommand::SetBlocked {
+                                        card_id: id,
+                                        blocked: true,
+                                        // Trim / blank -> None lives in `Card::set_blocked`.
+                                        note: Some(NOTE.peek().clone()),
+                                    })
                                 }
                             }
                             dismiss();

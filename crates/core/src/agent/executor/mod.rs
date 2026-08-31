@@ -702,11 +702,15 @@ impl Executor {
                     .unbounded_send(ExecutorEvent::auto_review_changed(card_id, auto));
                 Ok(())
             }
-            ExecutorCommand::SetBlocked { card_id, blocked } => {
+            ExecutorCommand::SetBlocked {
+                card_id,
+                blocked,
+                note,
+            } => {
                 // Deliberately don't bump `updated_at`: an annotation isn't
                 // progress, and Done sorts on it (see `column_cards`).
                 let updated = self.store.mutate_card(card_id, |c| {
-                    c.blocked = blocked;
+                    c.set_blocked(blocked, note.clone());
                     Ok(())
                 })?;
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
