@@ -121,7 +121,11 @@ cargo run -p usine-cli                       # simulated end-to-end pipeline
 cargo run -p usine-cli github                # live GitHub forge test (throwaway repo)
 cargo run -p usine-cli real-e2e              # full real run through the executor
 cargo run -p usine-cli real-plan <dir> <task...>   # one real `claude` plan over <dir>
+cargo run -p usine-cli mcp                   # relay stdio to a running app's MCP socket
 ```
+
+The MCP server is on by default; `cargo build --workspace --no-default-features`
+leaves it out entirely (see below).
 
 ### Isolating instances (`USINE_DATA_DIR`)
 
@@ -129,6 +133,40 @@ cargo run -p usine-cli real-plan <dir> <task...>   # one real `claude` plan over
 worktrees, and attachments — letting a second instance run fully isolated from
 the main one. An absolute path is recommended; it composes with `USINE_SIM` (the
 demo DB name applies under whichever directory is active).
+
+### MCP server
+
+Usine serves a small [MCP](https://modelcontextprotocol.io) surface over the
+board, so an external agent — a terminal Claude Code session, say — can see
+what's in flight and file new work without you switching apps. Six tools:
+
+| Tool | |
+|---|---|
+| `list_projects`, `list_cards`, `get_card`, `get_plan` | read the board |
+| `create_project`, `create_card` | add a repo / file a card in the starting block |
+
+Nothing here can start an agent run: a card created over MCP lands in the
+starting block and waits for you. It does appear on an open board immediately —
+the write goes through the same executor command the UI uses.
+
+Register it with a client:
+
+```sh
+cargo build -p usine-cli
+claude mcp add usine -- "$PWD/target/debug/usine-cli" mcp
+```
+
+The server runs *inside* the desktop app (redb allows a single writer, so no
+separate process can open the database while Usine is running), and listens on a
+Unix socket at `<data_dir>/mcp.sock`, mode 0600 — `mcp-demo.sock` under
+`USINE_SIM=1`. A `USINE_DATA_DIR` instance therefore gets its own socket exactly
+as it gets its own database, and `usine-cli mcp` reaches whichever one its own
+environment points at. The app must be running; a socket left behind by a crash
+is replaced on the next launch, and a live one is never stolen.
+
+It is behind the `mcp` cargo feature, on by default in all three crates.
+`--no-default-features` compiles the module — and tokio's net stack — out, and
+no socket is created.
 
 ### Worktree conventions
 
@@ -167,7 +205,8 @@ The workspace is split into three crates:
   [state machine](crates/core/src/state_machine.rs), typed persistence (via
   `native_db`), git and forge (GitHub via `gh`) integration, the provider
   abstraction, and the async **executor** that ties them together. It has **no
-  UI dependencies**.
+  UI dependencies**. `src/mcp` is a self-contained, feature-gated
+  [MCP server](#mcp-server) over the board.
 - **`usine-app`** (bin `usine`) — the Dioxus desktop UI. A thin, reactive view
   over `usine-core`: it sends `CardCommand`s to the executor and renders the
   `ExecutorEvent`s it drains back.
@@ -185,7 +224,9 @@ runs with no agents, tokens, or network. Phase B injects the real backends
 multi-threaded Tokio runtime, communicating with the UI entirely over channels
 (an unbounded `CardCommand` channel in, an unbounded `ExecutorEvent` channel
 back). This keeps the executor's async work off the UI's single-threaded Dioxus
-runtime, which simply drains events in one place.
+runtime, which simply drains events in one place. The MCP server, when
+compiled in, gets a third thread and its own current-thread runtime — the app
+starts it, so nothing a client does can wedge the runtime driving agent runs.
 
 ## License
 

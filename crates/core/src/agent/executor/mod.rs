@@ -72,6 +72,13 @@ impl ExecutorHandle {
         let _ = self.commands.unbounded_send(cmd);
     }
 
+    /// The raw command channel, for in-process surfaces that aren't the UI
+    /// (see [`crate::mcp`]). Sending here goes through the same dispatcher, so
+    /// the resulting `ExecutorEvent` still reaches the board.
+    pub fn command_sender(&self) -> UnboundedSender<ExecutorCommand> {
+        self.commands.clone()
+    }
+
     /// Reap every running preview and validation check synchronously. Called
     /// from the app's window-close / loop-destroyed handler: both run in their
     /// own process groups (so their whole trees can be killed), which also
@@ -140,6 +147,7 @@ pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<Execu
                     validations: validations_for_exec,
                     scan_locks: Mutex::new(HashMap::new()),
                     gate: Mutex::new(gate::RunGate::new()),
+                    arrivals: std::sync::atomic::AtomicU64::new(0),
                     self_ref: self_ref.clone(),
                 });
                 // Background poll: every few minutes, discover new PRs to review
@@ -333,6 +341,9 @@ struct Executor {
     /// The global concurrency gate: active slot owners + the FIFO queue of
     /// launches waiting for one (see [`gate::RunGate`]).
     gate: Mutex<gate::RunGate>,
+    /// Hands out the monotonic arrival tickets that order the gate's queue (see
+    /// [`gate::ARRIVAL`]).
+    arrivals: std::sync::atomic::AtomicU64,
     /// Back-reference for actor tasks that must call the executor directly:
     /// a command re-dispatched from an actor can race the in-flight claim of
     /// the very handler that spawned it and be silently dropped, stranding the
@@ -372,7 +383,12 @@ impl Executor {
                     None
                 };
                 let this = Arc::clone(&self);
-                tokio::spawn(async move {
+                // Stamp the command with its place in the command stream before
+                // the spawn scatters the ordering: a launch that parks in the
+                // run queue takes its place in line from this ticket, not from
+                // whenever its task happens to reach the gate.
+                let ticket = self.next_arrival();
+                tokio::spawn(gate::ARRIVAL.scope(ticket, async move {
                     let _guard = guard;
                     let card_id = cmd.target_id();
                     if let Err(e) = this.handle(cmd).await {
@@ -382,7 +398,7 @@ impl Executor {
                             e.to_string(),
                         ));
                     }
-                });
+                }));
             }
         }
     }

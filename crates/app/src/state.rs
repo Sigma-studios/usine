@@ -134,7 +134,7 @@ impl AppState {
     /// Open the store, load data, spawn the executor, seed a demo project on
     /// first run. Runs once, inside the root `use_context_provider`.
     pub fn init() -> Self {
-        let store = open_store();
+        let (store, persisted) = open_store();
 
         // First startup only (no settings record yet, real mode): default the
         // provider to whichever agent CLI is actually installed — Codex when it
@@ -207,6 +207,15 @@ impl AppState {
         }
 
         let (providers, forge, git) = backends();
+        // The MCP server needs its own handle, taken before the store moves
+        // into the executor. Skipped on the in-memory fallback: serving off it
+        // would answer with a board nothing can ever write to, and in the
+        // locked-database case the instance that *holds* the file is the one
+        // that should own the socket.
+        #[cfg(all(feature = "mcp", unix))]
+        let store_for_mcp = persisted.then(|| store.clone());
+        #[cfg(not(all(feature = "mcp", unix)))]
+        let _ = persisted;
         // The executor takes the store; the UI keeps no handle of its own.
         let (exec, rx) = spawn_executor(ExecutorConfig {
             store,
@@ -214,6 +223,13 @@ impl AppState {
             forge,
             git,
         });
+        // Local MCP surface over the board: read projects/cards/plans, create
+        // projects/cards — nothing that starts an agent. Own thread and
+        // runtime; compiled out with `--no-default-features`.
+        #[cfg(all(feature = "mcp", unix))]
+        if let Some(store) = store_for_mcp {
+            usine_core::mcp::spawn(store, exec.command_sender(), demo_mode());
+        }
         if demo_mode() {
             push_toast(Severity::Info, "Demo mode — agents & GitHub are simulated");
         }
@@ -958,11 +974,15 @@ fn backends() -> (Arc<dyn ProviderFactory>, Arc<dyn Forge>, Arc<dyn GitOps>) {
     }
 }
 
-fn open_store() -> Store {
+/// Open the board's database. The bool is whether we got the *real* file: a
+/// `false` means the in-memory fallback below, which only this process can ever
+/// see. Callers that publish the store outside the app (the MCP server) use it
+/// to stay quiet rather than answer for a phantom empty board.
+fn open_store() -> (Store, bool) {
     // Path is owned by core so the app, executor, and CLI can't disagree.
     let path = usine_core::infra::paths::store_path(demo_mode());
     match Store::open(&path) {
-        Ok(store) => store,
+        Ok(store) => (store, true),
         Err(e) => {
             let hint = if e.is_db_locked() {
                 " Quit any other Usine instance — the database allows only one writer."
@@ -976,7 +996,7 @@ fn open_store() -> Store {
                      in-memory store — the board starts empty and changes will NOT be saved"
                 ),
             );
-            Store::open_in_memory().expect("in-memory store")
+            (Store::open_in_memory().expect("in-memory store"), false)
         }
     }
 }

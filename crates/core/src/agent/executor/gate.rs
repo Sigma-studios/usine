@@ -25,10 +25,24 @@ use super::*;
 /// still unwinding). Short: the common holder is gone in milliseconds.
 const PUMP_CONTENTION_RETRY: Duration = Duration::from_millis(200);
 
+tokio::task_local! {
+    /// The arrival ticket of the command currently being handled, set by the
+    /// dispatch loop before it spawns the handler. Lifecycle commands run on
+    /// their own tasks, so two `Start`s sent back to back reach the gate in
+    /// whatever order the scheduler picks: without the ticket the queue's
+    /// "first asked, first served" order would be a coin flip (and the second
+    /// click could jump the first). The ticket is read where the entry is
+    /// enqueued — still inside the handler's own task, so the task-local is in
+    /// scope — and orders the deque instead of raw arrival at the lock.
+    pub(super) static ARRIVAL: u64;
+}
+
 pub(super) struct RunGate {
     /// Slot-holder id → the admission generation (run id) that owns the slot.
     active: HashMap<Uuid, Uuid>,
-    queue: VecDeque<QueuedRun>,
+    /// Waiting launches, ordered by arrival ticket (except where a bump has
+    /// deliberately moved one to the front).
+    queue: VecDeque<Queued>,
 }
 
 impl RunGate {
@@ -37,6 +51,22 @@ impl RunGate {
             active: HashMap::new(),
             queue: VecDeque::new(),
         }
+    }
+}
+
+/// A queued launch with the ticket that fixes its place in line.
+pub(super) struct Queued {
+    arrival: u64,
+    run: QueuedRun,
+}
+
+impl Queued {
+    fn id(&self) -> Uuid {
+        self.run.id()
+    }
+
+    fn target(&self) -> QueuedTarget {
+        self.run.target()
     }
 }
 
@@ -107,6 +137,14 @@ impl Drop for SlotGuard {
 impl Executor {
     /// The cap, read live from settings so a save applies immediately. 0 =
     /// unlimited.
+    /// The next arrival ticket. Monotonic across the whole executor, so a
+    /// ticket taken at enqueue time (a launch with no command behind it — a
+    /// poll loop, an actor) sits behind every command already dispatched.
+    pub(super) fn next_arrival(&self) -> u64 {
+        self.arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn run_cap(&self) -> u32 {
         self.store
             .settings()
@@ -131,6 +169,9 @@ impl Executor {
     pub(super) fn admit_or_enqueue(&self, generation: Uuid, entry: QueuedRun) -> Option<SlotGuard> {
         let cap = self.run_cap();
         let id = entry.id();
+        let arrival = ARRIVAL
+            .try_with(|t| *t)
+            .unwrap_or_else(|_| self.next_arrival());
         let (slot, queue_changed, ahead) = {
             let mut gate = lock(&self.gate);
             let before = gate.queue.len();
@@ -145,8 +186,22 @@ impl Executor {
                 };
                 (Some(guard), purged, 0)
             } else {
-                gate.queue.push_back(entry);
-                (None, true, gate.queue.len() - 1)
+                // Ticket order, not arrival-at-the-lock order. Scanning for the
+                // first later ticket also leaves a bumped entry (which keeps its
+                // ticket but sits at the front) where the bump put it.
+                let at = gate
+                    .queue
+                    .iter()
+                    .position(|e| e.arrival > arrival)
+                    .unwrap_or(gate.queue.len());
+                gate.queue.insert(
+                    at,
+                    Queued {
+                        arrival,
+                        run: entry,
+                    },
+                );
+                (None, true, at)
             }
         };
         if queue_changed {
@@ -195,7 +250,8 @@ impl Executor {
     }
 
     /// Move `id`'s queued entry to the front of the queue, so the next freed
-    /// slot goes to it (the "bump to front" action). Purely a reorder of the
+    /// slot goes to it (the "bump to front" action) — it keeps its arrival
+    /// ticket, so a later entry still queues behind it. Purely a reorder of the
     /// waiting deque — no card state, no run, nothing persisted — and no pump
     /// kick: bumping frees no slot, and the pump re-reads the queue when one
     /// frees.
@@ -304,7 +360,7 @@ impl Executor {
                 });
                 return;
             };
-            match entry {
+            match entry.run {
                 QueuedRun::Card {
                     card_id,
                     mode,
@@ -395,7 +451,7 @@ impl Executor {
     /// Tell the UI the queue's current order (index = place in line).
     fn emit_queue_changed(&self) {
         let entries: Vec<QueuedTarget> =
-            lock(&self.gate).queue.iter().map(|e| e.target()).collect();
+            lock(&self.gate).queue.iter().map(Queued::target).collect();
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::run_queue_changed(entries));

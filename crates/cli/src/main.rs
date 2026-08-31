@@ -4,6 +4,7 @@
 //!   usine-cli                  — drive a card through the whole pipeline with the simulator
 //!   usine-cli github           — live GitHub forge test (creates a throwaway repo)
 //!   usine-cli real-plan <dir> <task...>  — run a real `claude` plan over <dir>
+//!   usine-cli mcp              — relay stdio to the running app's MCP socket
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,15 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        #[cfg(all(feature = "mcp", unix))]
+        Some("mcp") => mcp_relay().await,
+        // Without the feature (or off Unix) the arm above is gone, and `mcp`
+        // would otherwise fall through to the default arm and silently run the
+        // whole simulated pipeline. Say what happened instead.
+        #[cfg(not(all(feature = "mcp", unix)))]
+        Some("mcp") => anyhow::bail!(
+            "this build has no MCP relay: it was compiled without the `mcp` feature or for a non-Unix target"
+        ),
         Some("github") => github_smoke().await,
         Some("real-e2e") => real_e2e().await,
         Some("inspect-db") => {
@@ -73,6 +83,67 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => sim_pipeline().await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// MCP relay: pipe this process's stdio to the running app's Unix socket, so an
+// MCP client that only speaks stdio (`claude mcp add usine -- usine-cli mcp`)
+// can reach a server that lives inside the desktop app. No protocol knowledge
+// here — bytes in, bytes out.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "mcp", unix))]
+async fn mcp_relay() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Same demo rule as the app, so a `USINE_SIM=1` board is reached by a
+    // `USINE_SIM=1` relay and never mixed with the real one.
+    let demo = std::env::var("USINE_SIM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let path = usine_core::mcp::socket_path(demo);
+    let stream = tokio::net::UnixStream::connect(&path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "no Usine MCP socket at {} ({e}) — is Usine running?",
+            path.display()
+        )
+    })?;
+    let (mut sock_read, mut sock_write) = stream.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let up = async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stdin.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<_, std::io::Error>(());
+            }
+            sock_write.write_all(&buf[..n]).await?;
+            sock_write.flush().await?;
+        }
+    };
+    let down = async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = sock_read.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<_, std::io::Error>(());
+            }
+            stdout.write_all(&buf[..n]).await?;
+            // Flush per chunk: a client blocked on a response must not wait for
+            // the pipe buffer to fill.
+            stdout.flush().await?;
+        }
+    };
+
+    // Either direction closing ends the session — the client went away, or the
+    // app quit and took the socket with it.
+    tokio::select! {
+        r = up => r?,
+        r = down => r?,
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

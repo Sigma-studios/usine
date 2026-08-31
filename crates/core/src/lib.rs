@@ -16,6 +16,9 @@ pub mod diff;
 pub mod domain;
 pub mod error;
 pub mod infra;
+// Unix-only: the server's transport is a Unix domain socket.
+#[cfg(all(feature = "mcp", unix))]
+pub mod mcp;
 
 pub use agent::events::{
     AdoptProbe, AgentEvent, DirtyAction, ExecutorCommand, ExecutorEvent, ExecutorEventKind,
