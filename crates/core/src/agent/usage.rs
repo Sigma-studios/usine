@@ -54,7 +54,7 @@ pub struct UsageSnapshot {
     pub claude: Option<ProviderUsage>,
     pub codex: Option<ProviderUsage>,
     /// Unix millis of the poll that produced this snapshot (`None` = never).
-    /// Shown by the bar's refresh-button tooltip, so it is set on every
+    /// Shown by the bar's hover tooltip, so it is set on every
     /// refresh even when the numbers themselves didn't move.
     pub refreshed_at: Option<i64>,
 }
