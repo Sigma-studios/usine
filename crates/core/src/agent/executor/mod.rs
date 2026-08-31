@@ -800,13 +800,20 @@ fn apply_transition(
     card_id: Uuid,
     t: Transition,
 ) -> Result<Card> {
-    let card = store.mutate_card(card_id, |c| {
+    let card = persist_transition(store, card_id, t)?;
+    let _ = evt_tx.unbounded_send(ExecutorEvent::updated(card.clone()));
+    Ok(card)
+}
+
+/// The persisting half of [`apply_transition`], for the rare caller that must
+/// land the new state before announcing it and emit the card update itself
+/// (see `finalize_question`).
+fn persist_transition(store: &Store, card_id: Uuid, t: Transition) -> Result<Card> {
+    store.mutate_card(card_id, |c| {
         c.state = transition(&c.state, t)?;
         c.updated_at = now_millis();
         Ok(())
-    })?;
-    let _ = evt_tx.unbounded_send(ExecutorEvent::updated(card.clone()));
-    Ok(card)
+    })
 }
 
 fn transcript(store: &Store, evt_tx: &UnboundedSender<ExecutorEvent>, card_id: Uuid, line: String) {

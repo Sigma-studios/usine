@@ -385,7 +385,17 @@ async fn bumping_a_queued_card_jumps_the_line() {
     let (handle, mut rx) = spawn_with(&store);
 
     park_holding_slot(&handle, &mut rx, a).await;
+    // One start at a time: non-persistence commands are dispatched on their own
+    // tasks, so firing both at once leaves the arrival order — and with it the
+    // queue this test bumps within — up to the scheduler.
     handle.send(ExecutorCommand::Start { card_id: b });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::RunQueueChanged { entries } if entries == &[QueuedTarget::Card(b)] => {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
     handle.send(ExecutorCommand::Start { card_id: c });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::RunQueueChanged { entries }

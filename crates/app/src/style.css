@@ -867,7 +867,11 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
   white-space: normal; pointer-events: none;
   visibility: hidden; opacity: 0; transition: opacity 0.1s ease;
 }
-.info-icon:hover .info-tip { visibility: visible; opacity: 1; }
+.info-icon:hover .info-tip, .has-tip:hover .info-tip { visibility: visible; opacity: 1; }
+/* Any element can host a tip; `.up` opens it upward, for tips near the window's
+   bottom edge that would otherwise be clipped. */
+.has-tip { position: relative; }
+.info-tip.up { top: auto; bottom: calc(100% + 6px); }
 
 /* Multi-select: selected values as removable chips + an add dropdown. */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -922,3 +926,5 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
   cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 5px; border-radius: 4px;
 }
 .usage-refresh:hover { color: var(--text); background: var(--surface-hover); }
+/* One tip for the whole bar, anchored under the gauges rather than the padding edge. */
+.usage-bar .info-tip { left: 14px; }

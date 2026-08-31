@@ -4,10 +4,10 @@
 //! provider visible the bar itself doesn't mount, so it costs no space (and in
 //! demo mode, where usage is never polled, it never appears).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
-use usine_core::{Provider, ProviderUsage, RateLimitWindow};
+use usine_core::{now_millis, Provider, ProviderUsage, RateLimitWindow};
 
 use crate::state::AppState;
 use crate::ui::widgets::provider_value;
@@ -15,6 +15,15 @@ use crate::ui::widgets::provider_value;
 #[component]
 pub fn UsageBar() -> Element {
     let state = use_context::<AppState>();
+    // The poll only runs every 15 min, so the relative half of the label would
+    // sit frozen at "just now"; re-render every 30s to let it advance.
+    let mut tick = use_signal(|| 0u32);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            tick += 1;
+        }
+    });
     let snapshot = state.usage.read().clone();
     let claude = snapshot.claude.filter(has_visible_window);
     let codex = snapshot.codex.filter(has_visible_window);
@@ -31,29 +40,49 @@ pub fn UsageBar() -> Element {
             ProviderGauges { provider: Provider::Codex, usage }
         }
     });
-    let tooltip = match snapshot
-        .refreshed_at
-        .and_then(chrono::DateTime::from_timestamp_millis)
-    {
-        Some(t) => format!(
-            "Last refreshed at {} — click to refresh now",
-            t.with_timezone(&chrono::Local).format("%H:%M")
-        ),
-        None => "Refresh usage".to_string(),
-    };
+    // Read the ticker so the label re-renders with it.
+    let _ = tick();
+    let label = refreshed_label(snapshot.refreshed_at, now_millis());
 
     rsx! {
-        div { class: "usage-bar",
+        div { class: "usage-bar has-tip",
             {claude}
             {codex}
             button {
                 class: "usage-refresh",
-                title: "{tooltip}",
+                aria_label: "Refresh usage now",
                 onclick: move |_| state.refresh_usage(),
                 "↻"
             }
+            span { class: "info-tip up", "{label}" }
         }
     }
+}
+
+/// The bar's hover tooltip: how long ago the rate-limit numbers were refreshed,
+/// plus the wall-clock time ("Updated 3 min ago (14:32)").
+fn refreshed_label(refreshed_at: Option<i64>, now_ms: i64) -> String {
+    let Some(at) = refreshed_at.and_then(chrono::DateTime::from_timestamp_millis) else {
+        return "Usage not refreshed yet".to_string();
+    };
+    // Clock skew (or a snapshot from the future) reads as fresh, not negative.
+    let elapsed = (now_ms - at.timestamp_millis()).max(0) / 1_000;
+    let relative = if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 3_600 {
+        format!("{} min ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
+    };
+    let fmt = if elapsed < 86_400 {
+        "%H:%M"
+    } else {
+        "%b %d, %H:%M"
+    };
+    let absolute = at.with_timezone(&chrono::Local).format(fmt);
+    format!("Updated {relative} ({absolute})")
 }
 
 fn has_visible_window(usage: &ProviderUsage) -> bool {
@@ -135,5 +164,43 @@ fn countdown(resets_at: i64) -> String {
         format!("in {hours}h {minutes:02}m")
     } else {
         format!("in {minutes}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn never_refreshed_says_so() {
+        assert_eq!(refreshed_label(None, NOW), "Usage not refreshed yet");
+    }
+
+    #[test]
+    fn recent_refreshes_read_as_just_now() {
+        let label = refreshed_label(Some(NOW - 10_000), NOW);
+        assert!(label.starts_with("Updated just now ("), "{label}");
+        assert!(label.ends_with(')'), "{label}");
+    }
+
+    #[test]
+    fn elapsed_time_is_bucketed() {
+        for (ago_ms, expected) in [
+            (3 * 60_000, "Updated 3 min ago ("),
+            (2 * 3_600_000, "Updated 2h ago ("),
+            (2 * 86_400_000, "Updated 2d ago ("),
+        ] {
+            let label = refreshed_label(Some(NOW - ago_ms), NOW);
+            assert!(label.starts_with(expected), "{label}");
+            assert!(label.ends_with(')'), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_future_timestamp_is_clamped_to_fresh() {
+        let label = refreshed_label(Some(NOW + 60_000), NOW);
+        assert!(label.starts_with("Updated just now ("), "{label}");
     }
 }
