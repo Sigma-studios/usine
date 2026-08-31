@@ -36,6 +36,10 @@ use crate::ExecutorCommand;
 /// keeps a malformed or hostile peer from growing our buffer without bound.
 const MAX_LINE: u64 = 1024 * 1024;
 
+/// How long the accept loop waits after a failure, doubling up to the cap.
+const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(50);
+const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `<data_dir>/mcp.sock`, or `mcp-demo.sock` in demo mode — mirroring
 /// [`crate::infra::paths::store_path`], so a demo run can never answer for the
 /// real board.
@@ -98,11 +102,23 @@ pub async fn serve(path: PathBuf, ctx: Ctx) -> std::io::Result<()> {
     let listener = bind(&path).await?;
     tracing::info!("mcp: listening on {}", path.display());
     let ctx = std::sync::Arc::new(ctx);
+    // Most accept errors are per-connection and harmless, but fd exhaustion
+    // (EMFILE/ENFILE) is per-process and persists: retrying it flat out would
+    // spin this thread at 100% CPU and bury the log. So back off, and only log
+    // the first failure of a run.
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
+            Ok(pair) => {
+                backoff = ACCEPT_BACKOFF_MIN;
+                pair
+            }
             Err(e) => {
-                tracing::warn!("mcp: accept failed: {e}");
+                if backoff == ACCEPT_BACKOFF_MIN {
+                    tracing::warn!("mcp: accept failed ({e}) — backing off");
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                 continue;
             }
         };
@@ -121,27 +137,48 @@ pub async fn serve(path: PathBuf, ctx: Ctx) -> std::io::Result<()> {
 /// but a *connectable* one means another Usine instance sharing this data dir
 /// already owns the surface — quietly rebinding would silently hijack its
 /// clients. So we probe first: connect succeeds → back off; connect fails →
-/// the file is stale, remove and bind.
+/// the file is stale, and the bind below renames straight over it.
 async fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if path.exists() {
-        if UnixStream::connect(path).await.is_ok() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!(
-                    "{} is already served by another Usine instance",
-                    path.display()
-                ),
-            ));
-        }
-        let _ = std::fs::remove_file(path);
+    if path.exists() && UnixStream::connect(path).await.is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "{} is already served by another Usine instance",
+                path.display()
+            ),
+        ));
     }
-    let listener = UnixListener::bind(path)?;
-    // Owner-only: the socket is a write path onto the user's board.
+    // The socket is a write path onto the user's board, so it must never be
+    // reachable by another local user — not even briefly. `bind` applies the
+    // ambient umask, so binding straight onto `path` would leave a
+    // world-connectable socket until the chmod lands. Bind a private temp name
+    // instead, tighten it, and only then rename it into place; the rename is
+    // atomic and also clears any stale file left by a crash.
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("mcp.sock"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = UnixListener::bind(&tmp)?;
+    // A socket we cannot lock down is not one we are willing to serve.
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("could not restrict {} to owner-only: {e}", tmp.display()),
+        ));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(listener)
 }
 
@@ -151,15 +188,34 @@ async fn bind(path: &Path) -> std::io::Result<UnixListener> {
 /// back what it just wrote on the next line.
 async fn handle_conn(stream: UnixStream, ctx: &Ctx) -> std::io::Result<()> {
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).take(MAX_LINE).lines();
+    // One byte of slack over the cap plus one for the newline, so a line of
+    // exactly `MAX_LINE` bytes still leaves budget and doesn't read as an
+    // overflow.
+    let budget = MAX_LINE + 2;
+    let mut lines = BufReader::new(read).take(budget).lines();
     loop {
         let line = match lines.next_line().await? {
             Some(l) => l,
             None => return Ok(()),
         };
+        // A line that ate the whole budget was cut short by the cap: `Take`
+        // reports EOF mid-line, so the fragment above only *looks* like a
+        // message. Say so and hang up — the rest of the oversized line is still
+        // queued, and resuming mid-message would spray parse errors instead.
+        if lines.get_ref().limit() == 0 {
+            let response = jsonrpc::err(
+                Value::Null,
+                jsonrpc::PARSE_ERROR,
+                format!("message exceeds the {MAX_LINE} byte limit; closing connection"),
+            );
+            write.write_all(response.to_string().as_bytes()).await?;
+            write.write_all(b"\n").await?;
+            write.flush().await?;
+            return Ok(());
+        }
         // `take` caps the whole stream, so re-arm the budget after each line
         // rather than letting one connection run out of it mid-session.
-        lines.get_mut().set_limit(MAX_LINE);
+        lines.get_mut().set_limit(budget);
         if line.trim().is_empty() {
             continue;
         }

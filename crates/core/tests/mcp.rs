@@ -335,6 +335,71 @@ async fn socket_round_trip_and_stale_socket_replacement() {
     server.abort();
 }
 
+/// The socket is a write path onto the board, so it must be owner-only from the
+/// moment it is connectable — never briefly world-accessible under the umask.
+#[tokio::test]
+async fn the_socket_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.sock");
+    let server = tokio::spawn(serve(path.clone(), ctx(Store::open_in_memory().unwrap())));
+    for _ in 0..100 {
+        if tokio::net::UnixStream::connect(&path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "socket mode is {mode:o}");
+    // No leftover from the bind-then-rename dance.
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| n != "mcp.sock")
+        .collect();
+    assert!(strays.is_empty(), "left behind {strays:?}");
+    server.abort();
+}
+
+/// An oversized message is reported once and the connection closed, rather than
+/// being served back as a truncated fragment that parses as garbage forever.
+#[tokio::test]
+async fn an_oversized_message_is_rejected_and_hangs_up() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.sock");
+    let server = tokio::spawn(serve(path.clone(), ctx(Store::open_in_memory().unwrap())));
+    let stream = loop {
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+
+    let huge = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping",
+                       "params": { "pad": "x".repeat(2 * 1024 * 1024) } });
+    // The peer may hang up mid-write once it has seen enough; that is the point.
+    let _ = write.write_all(format!("{huge}\n").as_bytes()).await;
+    let _ = write.flush().await;
+
+    let response: Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().expect("an answer")).unwrap();
+    assert_eq!(response["error"]["code"], -32700);
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("exceeds"));
+    assert!(
+        lines.next_line().await.unwrap().is_none(),
+        "connection should be closed after an oversized message"
+    );
+    server.abort();
+}
+
 #[test]
 fn the_demo_socket_is_distinct_from_the_real_one() {
     assert_ne!(socket_path(true), socket_path(false));

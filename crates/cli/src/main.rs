@@ -28,6 +28,13 @@ async fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         #[cfg(all(feature = "mcp", unix))]
         Some("mcp") => mcp_relay().await,
+        // Without the feature (or off Unix) the arm above is gone, and `mcp`
+        // would otherwise fall through to the default arm and silently run the
+        // whole simulated pipeline. Say what happened instead.
+        #[cfg(not(all(feature = "mcp", unix)))]
+        Some("mcp") => anyhow::bail!(
+            "this build has no MCP relay: it was compiled without the `mcp` feature or for a non-Unix target"
+        ),
         Some("github") => github_smoke().await,
         Some("real-e2e") => real_e2e().await,
         Some("inspect-db") => {
