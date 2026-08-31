@@ -210,6 +210,7 @@ pub fn CardView(card: Card) -> Element {
         card.title.clone()
     };
     let menu_title = title.clone();
+    let menu_note = blocked_note.clone();
     let is_done = matches!(st, CardState::Done);
     // Non-done cards keep the open-project fallback (useful even with no
     // worktree yet); a done card whose worktree was reaped has nothing to open.
@@ -254,6 +255,7 @@ pub fn CardView(card: Card) -> Element {
                                     can_diff,
                                     can_open,
                                     blocked: card.blocked,
+                                    blocked_note: menu_note.clone(),
                                 },
                                 target_id: id,
                                 title: menu_title.clone(),
