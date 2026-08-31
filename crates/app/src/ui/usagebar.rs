@@ -7,7 +7,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
-use usine_core::{Provider, ProviderUsage, RateLimitWindow};
+use usine_core::{now_millis, Provider, ProviderUsage, RateLimitWindow};
 
 use crate::state::AppState;
 use crate::ui::widgets::provider_value;
@@ -57,13 +57,6 @@ pub fn UsageBar() -> Element {
             span { class: "info-tip up", "{label}" }
         }
     }
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// The bar's hover tooltip: how long ago the rate-limit numbers were refreshed,
