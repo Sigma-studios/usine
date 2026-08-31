@@ -802,10 +802,16 @@ fn finalize_question(
     } else {
         let _ = store.set_answer(card_id, &answer);
     }
+    // Unwrap `Answering` in the store BEFORE announcing the answer: the panel
+    // re-enables its ask box on the answer, so a card still recorded as
+    // `Answering` when that event lands refuses the next question as an
+    // illegal transition. The card update still trails the answer, which is
+    // the order the panel renders in.
+    let card = persist_transition(store, card_id, Transition::QuestionAnswered)?;
     if let Ok(answers) = store.get_answers(card_id) {
         let _ = evt_tx.unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
     }
-    apply_transition(store, evt_tx, card_id, Transition::QuestionAnswered)?;
+    let _ = evt_tx.unbounded_send(ExecutorEvent::updated(card));
     if !answer.is_empty() {
         transcript(store, evt_tx, card_id, format!("✔ {answer}"));
     }
