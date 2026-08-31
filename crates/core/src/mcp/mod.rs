@@ -43,6 +43,10 @@ const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5
 /// How long we keep swallowing a hung-up-on peer's leftovers before giving up.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the liveness probe waits for an answer before calling the socket
+/// dead (see [`is_live`]). Only ever paid when a socket file already exists.
+const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `<data_dir>/mcp.sock`, or `mcp-demo.sock` in demo mode — mirroring
 /// [`crate::infra::paths::store_path`], so a demo run can never answer for the
 /// real board.
@@ -137,15 +141,15 @@ pub async fn serve(path: PathBuf, ctx: Ctx) -> std::io::Result<()> {
 /// Take the socket path, refusing to steal a live one.
 ///
 /// A leftover socket file after a crash is ordinary and must not lock us out,
-/// but a *connectable* one means another Usine instance sharing this data dir
-/// already owns the surface — quietly rebinding would silently hijack its
-/// clients. So we probe first: connect succeeds → back off; connect fails →
-/// the file is stale, and the bind below renames straight over it.
+/// but a *live* one means another Usine instance sharing this data dir already
+/// owns the surface — quietly rebinding would silently hijack its clients. So
+/// we probe first: something answers → back off; nothing does → the file is
+/// stale, and the bind below renames straight over it.
 async fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if path.exists() && UnixStream::connect(path).await.is_ok() {
+    if path.exists() && is_live(path).await {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!(
@@ -183,6 +187,37 @@ async fn bind(path: &Path) -> std::io::Result<UnixListener> {
         return Err(e);
     }
     Ok(listener)
+}
+
+/// Is anything actually serving `path`?
+///
+/// A successful connect alone doesn't say so: on macOS a socket whose listener
+/// has just closed (the crash case this probe exists for) keeps accepting
+/// connects for a moment, and the connection only breaks on the first write.
+/// So ask it something — a live server answers a `ping` on a fresh connection
+/// immediately, a dead one gives a broken pipe, EOF, or silence.
+async fn is_live(path: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(path).await else {
+        return false;
+    };
+    let answered = async {
+        let ping = json!({ "jsonrpc": "2.0", "id": 0, "method": "ping" });
+        stream
+            .write_all(format!("{ping}\n").as_bytes())
+            .await
+            .ok()?;
+        stream.flush().await.ok()?;
+        let mut line = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .await
+            .ok()?;
+        (!line.is_empty()).then_some(())
+    };
+    matches!(
+        tokio::time::timeout(LIVENESS_TIMEOUT, answered).await,
+        Ok(Some(()))
+    )
 }
 
 /// Serve one client. Requests are handled strictly in order rather than

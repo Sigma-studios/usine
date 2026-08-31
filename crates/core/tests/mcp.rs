@@ -84,6 +84,37 @@ fn seed(store: &Store) -> (Project, Card) {
     (project, card)
 }
 
+/// Connect once the server is really serving. A bare connect is not enough: a
+/// socket whose listener has just closed still accepts one for a moment (the
+/// very race `serve`'s own liveness probe exists for), so round-trip a `ping`
+/// before handing the stream back.
+async fn connect_ready(path: &std::path::Path) -> tokio::net::UnixStream {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    for _ in 0..200 {
+        if let Ok(mut stream) = tokio::net::UnixStream::connect(path).await {
+            let pinged = async {
+                stream
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n")
+                    .await
+                    .ok()?;
+                let mut line = String::new();
+                BufReader::new(&mut stream)
+                    .read_line(&mut line)
+                    .await
+                    .ok()?;
+                (!line.is_empty()).then_some(())
+            }
+            .await;
+            if pinged.is_some() {
+                return stream;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no server answered on {}", path.display());
+}
+
 #[tokio::test]
 async fn initialize_echoes_a_supported_protocol_and_advertises_tools() {
     let ctx = ctx(Store::open_in_memory().unwrap());
@@ -294,17 +325,8 @@ async fn socket_round_trip_and_stale_socket_replacement() {
     drop(std::fs::File::open(&path));
 
     let server = tokio::spawn(serve(path.clone(), ctx(store)));
-    for _ in 0..100 {
-        if tokio::net::UnixStream::connect(&path).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let stream = tokio::net::UnixStream::connect(&path)
-        .await
-        .expect("server bound over the stale socket");
-    let (read, mut write) = stream.into_split();
+    // Bound over the stale socket, and answering.
+    let (read, mut write) = connect_ready(&path).await.into_split();
     let mut lines = BufReader::new(read).lines();
     for req in [
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
@@ -344,12 +366,7 @@ async fn the_socket_is_owner_only() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mcp.sock");
     let server = tokio::spawn(serve(path.clone(), ctx(Store::open_in_memory().unwrap())));
-    for _ in 0..100 {
-        if tokio::net::UnixStream::connect(&path).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    drop(connect_ready(&path).await);
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "socket mode is {mode:o}");
     // No leftover from the bind-then-rename dance.
@@ -371,13 +388,7 @@ async fn an_oversized_message_is_rejected_and_hangs_up() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mcp.sock");
     let server = tokio::spawn(serve(path.clone(), ctx(Store::open_in_memory().unwrap())));
-    let stream = loop {
-        match tokio::net::UnixStream::connect(&path).await {
-            Ok(s) => break s,
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-        }
-    };
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = connect_ready(&path).await.into_split();
     let mut lines = BufReader::new(read).lines();
 
     let huge = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping",
