@@ -366,6 +366,25 @@ impl ReviewColumn {
 // Card state machine states
 // ---------------------------------------------------------------------------
 
+/// One completed Agent Chat exchange: what the user asked and the agent's
+/// prose answer. `asked_at` (millis, set when the answer lands) is the stable
+/// list key the panel renders with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QaExchange {
+    pub question: String,
+    pub answer: String,
+    pub asked_at: i64,
+}
+
+/// A card's Agent Chat log: every answered exchange, oldest first.
+/// `superseded` records that a write run has since changed the work, so the
+/// panel shows nothing expanded — the history is kept, just not resurfaced.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CardAnswers {
+    pub exchanges: Vec<QaExchange>,
+    pub superseded: bool,
+}
+
 /// A clarifying question raised by the agent that requires the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intervention {

@@ -32,9 +32,9 @@ use crate::agent::handoff::Handoff;
 use crate::agent::provider::{ProviderFactory, RunConfig, RunMode};
 use crate::domain::config::CardKind;
 use crate::domain::model::{
-    now_millis, Card, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict, Intervention,
-    Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,
-    ReviewSummary, ReviewTask, ReviewThread, RunSub,
+    now_millis, Card, CardAnswers, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict,
+    Intervention, Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus,
+    ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
 };
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::{CoreError, Result};
