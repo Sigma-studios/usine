@@ -111,9 +111,19 @@ pub fn ConfirmHost() -> Element {
                             id: "confirm-note",
                             value: "{NOTE}",
                             oninput: move |e| *NOTE.write() = e.value(),
+                            // Focus the field, then park the caret after any
+                            // prefilled text — "Edit blocked message" opens with
+                            // the existing note, and a caret left at 0 would make
+                            // typing prepend to it.
                             onmounted: move |e: MountedEvent| {
                                 spawn(async move {
                                     let _ = e.data().set_focus(true).await;
+                                    dioxus::document::eval(
+                                        "requestAnimationFrame(function(){\
+                                           var el = document.getElementById('confirm-note');\
+                                           if (el) { el.selectionStart = el.selectionEnd = el.value.length; }\
+                                         });",
+                                    );
                                 });
                             },
                         }
