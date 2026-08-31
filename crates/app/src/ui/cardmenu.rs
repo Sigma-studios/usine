@@ -144,8 +144,9 @@ fn CardMenuItems(
 ) -> Element {
     let state = use_context::<AppState>();
     let id = card_id;
-    // Cosmetic and reversible, so no confirm dialog — same treatment as
-    // "Show diff" / "Open in editor".
+    // Marking asks for an optional message (a card that waits on something
+    // outside Usine should say what); unmarking is a plain one-click send —
+    // there's nothing to say about a card that no longer waits on anything.
     let block_label = if blocked {
         "Mark unblocked"
     } else {
@@ -155,6 +156,7 @@ fn CardMenuItems(
     let reset_title = title.clone();
     let done_title = title.clone();
     let del_title = title.clone();
+    let block_title = title.clone();
 
     rsx! {
         if can_diff {
@@ -225,7 +227,24 @@ fn CardMenuItems(
             class: "menu-item",
             onclick: move |_| {
                 dismiss();
-                state.send(ExecutorCommand::SetBlocked { card_id: id, blocked: !blocked });
+                if blocked {
+                    state
+                        .send(ExecutorCommand::SetBlocked {
+                            card_id: id,
+                            blocked: false,
+                            note: None,
+                        });
+                } else {
+                    request_confirm(ConfirmRequest {
+                        title: "Mark blocked".into(),
+                        message: format!(
+                            "Mark “{block_title}” as blocked? It stops counting toward the attention badges and its board buttons are hidden until you unmark it.",
+                        ),
+                        confirm_label: "Mark blocked".into(),
+                        danger: false,
+                        action: ConfirmAction::BlockCard(id),
+                    });
+                }
             },
             "{block_label}"
         }

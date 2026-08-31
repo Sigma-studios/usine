@@ -67,6 +67,7 @@ fn CardDetail() -> Element {
             let provider_class = provider_value(card.config.provider);
             let status = card.state.status_label();
             let cost = card.cost;
+            let blocked_note = card.blocked.then(|| card.blocked_note.clone()).flatten();
             let state_key = state_discriminant(&card.state);
             // Same gap the board card covers: a lifecycle command is working but
             // hasn't transitioned the card yet, so the panel still shows the
@@ -126,13 +127,18 @@ fn CardDetail() -> Element {
                             if card.blocked {
                                 span {
                                     class: "badge blocked",
-                                    title: "Marked blocked — this card doesn't count toward the attention badge",
+                                    title: "Marked blocked — this card doesn't count toward the attention badge; the message below is the user's own note",
                                     "blocked"
                                 }
                             }
                             if !cost.is_zero() {
                                 span { class: "badge cost", "{cost}" }
                             }
+                        }
+                        // The reason left when marking the card blocked, in full
+                        // (the board card clamps it).
+                        if let Some(note) = blocked_note {
+                            div { class: "blocked-note", "{note}" }
                         }
                     }
                     // Remount the panel whenever the selected card or its state
