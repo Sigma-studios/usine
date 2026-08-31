@@ -876,6 +876,18 @@ impl Executor {
             .map(|p| p.number)
             .ok_or_else(|| CoreError::other("card has no PR to merge"))?;
 
+        // Both merge gates reach here: `ReadyToMerge` (the review cleared it)
+        // and `PrReview(Idle)` (the last-resort merge without review). Anything
+        // else is a stale panel — the card moved on under it — and merging
+        // would land the PR on the forge before failing the transition, leaving
+        // the card behind its own merged PR.
+        if !matches!(
+            card.state,
+            CardState::ReadyToMerge | CardState::PrReview(PrReviewSub::Idle)
+        ) {
+            return Err(CoreError::other("the card is not at a merge gate"));
+        }
+
         if !force {
             if let Ok((read, failed)) = self.forge.pr_checks(&project.path, pr_number).await {
                 // An empty rollup inside the registration grace still means "the

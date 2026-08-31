@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 use usine_core::{Card, CardState, ExecutorCommand, PrReviewSub};
 
 use crate::state::AppState;
+use crate::ui::{request_confirm, ConfirmAction, ConfirmRequest};
 
 #[component]
 pub(super) fn PrReviewPanel(card: Card) -> Element {
@@ -35,6 +36,15 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
     // just like a Ready-for-PR card — the agent updates the branch and pushes,
     // updating the open PR in place.
     let is_idle = matches!(card.state, CardState::PrReview(PrReviewSub::Idle));
+    // The last-resort merge below deletes the head branch by default, like the
+    // merge gate's own checkbox.
+    let mut delete_branch = use_signal(|| true);
+    // Offer the last resort only where it can actually work: a draft PR is
+    // unmergeable on GitHub (the panel already offers "Mark ready for review"),
+    // and a conflicting one the executor would refuse — the merge gate keeps
+    // the same promise of never offering a merge that can't happen.
+    let can_merge_without_review = is_idle && !is_draft;
+    let is_conflicting = card.mergeable.is_conflicting();
 
     // The background poll keeps `card.reviews` fresh alongside the comment count,
     // so the panel just renders what the card knows — no fetch on open.
@@ -131,6 +141,52 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
                 },
+            }
+        }
+        // The bottom-of-the-list escape hatch: the reviewer never came, or left
+        // a comment nobody wants triaged. Skips the *review* only — the
+        // executor still re-reads CI and refuses a red or pending build, which
+        // is why there is no "Merge anyway" twin here; skipping both gates in
+        // one click stays at the merge gate, after an approval.
+        if can_merge_without_review {
+            div { class: "section",
+                h3 { "Merge without review" }
+                if is_conflicting {
+                    div { class: "hint",
+                        "The PR conflicts with the base branch — GitHub can't merge it as it stands. Resolve the conflicts first."
+                    }
+                } else {
+                    div { class: "hint",
+                        "Nobody is coming to review this? Merge the PR as it stands. The review comments stay unread and unanswered — last resort."
+                    }
+                    label { class: "checkbox-row",
+                        input {
+                            r#type: "checkbox",
+                            checked: delete_branch(),
+                            onchange: move |_| {
+                                let v = !delete_branch();
+                                delete_branch.set(v);
+                            },
+                        }
+                        "Delete the branch after merging"
+                    }
+                    button {
+                        class: "btn subtle",
+                        onclick: move |_| request_confirm(ConfirmRequest {
+                            title: "Merge without review?".into(),
+                            message: "No review has cleared this PR. Merge it into the base branch anyway? \
+                                      Any review comments stay unread and unanswered. This can't be undone.".into(),
+                            confirm_label: "Merge without review".into(),
+                            danger: true,
+                            action: ConfirmAction::Send(ExecutorCommand::Merge {
+                                card_id: id,
+                                delete_branch: delete_branch(),
+                                force: false,
+                            }),
+                        }),
+                        "Merge without review"
+                    }
+                }
             }
         }
         // Cancelling any of the three running PR-review phases returns the
