@@ -472,6 +472,10 @@ select option { background: var(--panel-2); color: var(--text); }
 .diff-line.del .diff-sign { color: var(--red); }
 .diff-code { flex: 1 1 auto; min-width: 0; color: var(--code-fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 .question { background: var(--panel-2); border: 1px solid var(--amber); border-radius: 8px; padding: 12px; }
+/* A question box goes green the moment it holds an answer — an option picked or
+   text typed — so a stack of plan questions shows at a glance which are done.
+   Failure banners reuse `.question` and never get this class: they stay amber. */
+.question.answered { border-color: var(--green); }
 .option-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
 .question .qtext { font-weight: 600; margin-bottom: 4px; }
 .question input {
