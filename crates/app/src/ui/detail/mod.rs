@@ -615,11 +615,17 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
     // Uncontrolled field (see `chat.rs`); the send clears it via a remount.
     let mut generation = use_signal(|| 0u32);
     let can_send = selected.read().is_some() || !answer.read().trim().is_empty();
+    // Amber says "waiting on you"; green once the box holds an answer.
+    let qcls = if can_send {
+        "question answered"
+    } else {
+        "question"
+    };
 
     rsx! {
         div { class: "section",
             h3 { "Needs your input" }
-            div { class: "question",
+            div { class: "{qcls}",
                 div { "{question}" }
                 div { class: "option-row",
                     for opt in options.iter() {

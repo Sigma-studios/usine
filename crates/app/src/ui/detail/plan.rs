@@ -59,8 +59,9 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                 for (idx, q) in questions.iter().enumerate() {
                     {
                         let cur = answers.read().get(idx).cloned().unwrap_or_default();
+                        let qcls = if cur.trim().is_empty() { "question" } else { "question answered" };
                         rsx! {
-                            div { key: "{idx}", class: "question",
+                            div { key: "{idx}", class: "{qcls}",
                                 div { class: "qtext", "{q.question}" }
                                 div { class: "option-row",
                                     for opt in q.options.iter() {
