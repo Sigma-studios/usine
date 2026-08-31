@@ -200,7 +200,9 @@ pub fn CardView(card: Card) -> Element {
     } else {
         card_class
     };
-    let blocked_note = card.blocked.then(|| card.blocked_note.clone()).flatten();
+    // Kept in step with the marker by `Card::set_blocked`: a note only
+    // exists while the card is blocked.
+    let blocked_note = card.blocked_note.clone();
     let status = card.state.status_label();
     let title = if card.title.trim().is_empty() {
         "Untitled".to_string()
