@@ -421,11 +421,12 @@ pub enum PrReviewSub {
     /// `Idle` so the card stays in the PR-review gate (unlike `ApplyingFixes`, the
     /// comment-triage run, which advances to `ReadyToMerge`).
     ApplyingChange,
-    /// A conflict-resolution run stopped to ask: it hit a conflict it couldn't
-    /// settle from the code and ended its turn with a question rather than
-    /// guessing. The merge is still in progress in the card's worktree and
-    /// nothing has been committed or pushed; answering relaunches the fix run
-    /// with the answer in hand, and it finishes the merge from there.
+    /// A fix run stopped to ask. Almost always a conflict resolution that hit a
+    /// hunk it couldn't settle from the code and ended its turn with a question
+    /// rather than guessing (its question carries `CONFLICT_INTERVENTION_ID`);
+    /// a live `AskUserQuestion` from any other fix run parks here too. Either
+    /// way nothing has been committed or pushed, and answering relaunches the
+    /// fix run with the answer in hand to finish the job.
     AwaitingAnswer(Intervention),
 }
 

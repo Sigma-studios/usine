@@ -246,12 +246,11 @@ async fn an_unknown_merge_status_is_never_guessed_into_a_conflict() {
 
 /// Git whose merge always stops on a conflict, standing in for a branch whose
 /// base has moved. Everything else succeeds. The fields model what the
-/// worktree looks like *after* the agent's turn — whether the merge is still in
-/// progress, which paths still carry markers — and record whether the commit
-/// completing the merge (and its push) actually happened.
+/// worktree looks like *after* the agent's turn — which paths still carry
+/// markers — and record whether the commit completing the merge (and its push)
+/// actually happened.
 #[derive(Default)]
 struct ConflictingGit {
-    mid_merge: bool,
     unresolved: Vec<String>,
     committed: Arc<Mutex<bool>>,
     pushed: Arc<Mutex<bool>>,
@@ -261,9 +260,6 @@ struct ConflictingGit {
 impl GitOps for ConflictingGit {
     async fn merge_ref(&self, _: &Path, _: &str) -> usine_core::Result<MergeOutcome> {
         Ok(MergeOutcome::Conflicted(vec!["src/lib.rs".into()]))
-    }
-    async fn merge_in_progress(&self, _: &Path) -> usine_core::Result<bool> {
-        Ok(self.mid_merge)
     }
     async fn unresolved_conflicts(&self, _: &Path) -> usine_core::Result<Vec<String>> {
         Ok(self.unresolved.clone())
@@ -690,7 +686,6 @@ const ASKING: &str = "I resolved src/a.rs. src/lib.rs needs your call.\n\n\
 async fn a_conflict_run_that_asks_parks_the_card_and_publishes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let git = Arc::new(ConflictingGit {
-        mid_merge: true,
         unresolved: vec!["src/lib.rs".into()],
         ..Default::default()
     });
@@ -729,7 +724,6 @@ async fn a_conflict_run_that_asks_parks_the_card_and_publishes_nothing() {
 async fn answering_resumes_the_resolution_with_the_brief_and_the_answer() {
     let tmp = tempfile::tempdir().unwrap();
     let git = Arc::new(ConflictingGit {
-        mid_merge: true,
         unresolved: vec!["src/lib.rs".into()],
         ..Default::default()
     });
@@ -800,7 +794,6 @@ async fn answering_resumes_the_resolution_with_the_brief_and_the_answer() {
 async fn a_run_that_leaves_conflict_markers_fails_instead_of_committing_them() {
     let tmp = tempfile::tempdir().unwrap();
     let git = Arc::new(ConflictingGit {
-        mid_merge: true,
         unresolved: vec!["src/lib.rs".into()],
         ..Default::default()
     });
@@ -824,16 +817,41 @@ async fn a_run_that_leaves_conflict_markers_fails_instead_of_committing_them() {
     assert!(!*git.pushed.lock().unwrap());
 }
 
+/// An agent that tries to ask but garbles the JSON must not be reported as if
+/// it had never asked (nor, with a clean tree, quietly ship a resolution it
+/// didn't stand behind): the dropped question is the news.
+#[tokio::test]
+async fn a_garbled_question_block_fails_and_says_the_question_was_lost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = Arc::new(ConflictingGit::default());
+    let (store, card, _handle, mut rx, _prompts) = scripted_resolve(
+        git.clone(),
+        tmp.path(),
+        vec!["Needs a call.\n\n```usine-questions\n[{\"question\": oops]\n```\n".to_string()],
+    );
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id && c.state.is_failed() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let CardState::Failed { message, .. } = store.get_card(card.id).unwrap().state else {
+        panic!("expected a faulted card");
+    };
+    assert!(message.contains("usine-questions"), "got: {message}");
+    // The tree was clean, so without the malformed check this would have
+    // committed and pushed a resolution nobody agreed to.
+    assert!(!*git.committed.lock().unwrap(), "nothing may be committed");
+    assert!(!*git.pushed.lock().unwrap(), "nothing may be pushed");
+}
+
 /// The gate must stay narrow: a resolution that actually resolved everything
 /// commits (completing the merge) and pushes, exactly as before.
 #[tokio::test]
 async fn a_clean_resolution_still_commits_and_pushes() {
     let tmp = tempfile::tempdir().unwrap();
-    let git = Arc::new(ConflictingGit {
-        mid_merge: true,
-        unresolved: Vec::new(),
-        ..Default::default()
-    });
+    let git = Arc::new(ConflictingGit::default());
     let (store, card, _handle, mut rx, _prompts) =
         scripted_resolve(git.clone(), tmp.path(), vec!["Resolved both sides.".into()]);
 
@@ -1035,4 +1053,65 @@ async fn merge_ref_reports_conflicts_as_an_outcome_and_breakage_as_an_error() {
         gitops.merge_ref(&wt, "dev").await.unwrap(),
         MergeOutcome::Clean
     );
+}
+
+/// The marker scan has to survive both things an agent routinely does: name a
+/// file something non-ASCII, and finish by committing the merge itself. The
+/// first breaks any listing without `-z` (git C-quotes the path, and the quoted
+/// string names no file to read); the second erases the merge state and the
+/// diff-vs-HEAD, leaving `ORIG_HEAD` as the only trace.
+#[tokio::test]
+async fn unresolved_conflicts_sees_markers_through_odd_names_and_a_self_committed_merge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "t@t.dev"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    let odd = "créé.txt";
+    std::fs::write(repo.join(odd), "base\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    git(&repo, &["branch", "-M", "dev"]);
+
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt.to_str().unwrap(),
+            "dev",
+        ],
+    );
+    std::fs::write(wt.join(odd), "feature\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "feat"]);
+    std::fs::write(repo.join(odd), "dev\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "dev moves"]);
+
+    let gitops = RealGit;
+    assert_eq!(
+        gitops.merge_ref(&wt, "dev").await.unwrap(),
+        MergeOutcome::Conflicted(vec![odd.to_string()])
+    );
+    // Mid-merge, markers on disk: named, despite the non-ASCII path.
+    assert_eq!(gitops.unresolved_conflicts(&wt).await.unwrap(), vec![odd]);
+
+    // Now the agent "finishes" the merge itself, markers and all. No MERGE_HEAD,
+    // no working-tree diff — and the markers are one `git push` from the PR.
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "resolve"]);
+    assert_eq!(gitops.unresolved_conflicts(&wt).await.unwrap(), vec![odd]);
+
+    // Genuinely resolved: nothing to report, so the commit and push proceed.
+    std::fs::write(wt.join(odd), "resolved\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "really resolve"]);
+    assert!(gitops.unresolved_conflicts(&wt).await.unwrap().is_empty());
 }

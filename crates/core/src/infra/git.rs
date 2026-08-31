@@ -301,39 +301,40 @@ pub fn merge_args(gitref: &str) -> Vec<String> {
     vec!["merge".into(), "--no-edit".into(), gitref.into()]
 }
 
-/// The paths left unresolved by a stopped merge (`U` = unmerged).
-pub fn conflicted_files_args() -> Vec<String> {
+/// The paths left unresolved by a stopped merge (`U` = unmerged),
+/// NUL-separated. `-z` because these paths are both read as files and listed
+/// in the agent's brief; C-quoted, they'd name nothing.
+pub fn unmerged_files_z_args() -> Vec<String> {
     vec![
         "diff".into(),
         "--name-only".into(),
         "--diff-filter=U".into(),
+        "-z".into(),
     ]
 }
 
-/// Whether a merge is stopped in progress here. Asks git for `MERGE_HEAD`
-/// rather than probing `.git/MERGE_HEAD`: in a linked worktree `.git` is a
-/// file pointing elsewhere, so the path probe would always miss.
-pub fn merge_head_args() -> Vec<String> {
+/// Every path the working tree (index included) changed since `gitref` — the
+/// candidate set for a conflict-marker scan, alongside
+/// [`unmerged_files_z_args`]. Needed because an agent that edits a conflicted
+/// file without `git add`ing it leaves the path unmerged in the index even
+/// though it is resolved, and conversely a resolved-then-staged file drops out
+/// of the unmerged list entirely — and a run that commits the merge itself
+/// leaves neither, which is what `ORIG_HEAD` (set by `git merge` to the
+/// pre-merge tip) covers. `-z` so paths come out raw: without it
+/// `core.quotePath` C-quotes any non-ASCII filename and the quoted string no
+/// longer names a real file to read.
+pub fn changed_since_args(gitref: &str) -> Vec<String> {
     vec![
-        "rev-parse".into(),
-        "--verify".into(),
-        "--quiet".into(),
-        "MERGE_HEAD".into(),
+        "diff".into(),
+        "--name-only".into(),
+        "-z".into(),
+        gitref.into(),
     ]
-}
-
-/// Every path the working tree changed relative to HEAD — the candidate set for
-/// a conflict-marker scan, alongside [`conflicted_files_args`]. Needed because
-/// an agent that edits a conflicted file without `git add`ing it leaves the
-/// path unmerged in the index even though it is resolved, and conversely a
-/// resolved-then-staged file drops out of the unmerged list entirely.
-pub fn changed_vs_head_args() -> Vec<String> {
-    vec!["diff".into(), "--name-only".into(), "HEAD".into()]
 }
 
 /// True when `text` still carries both halves of a conflict marker pair.
 /// Content-based on purpose: the index alone can't tell a resolved file from an
-/// unresolved one once the agent has been editing (see [`changed_vs_head_args`]).
+/// unresolved one once the agent has been editing (see [`changed_since_args`]).
 fn holds_conflict_markers(text: &str) -> bool {
     let mut open = false;
     let mut close = false;
@@ -423,12 +424,6 @@ pub trait GitOps: Send + Sync {
     /// `base`. Backends that don't model history report `false`; callers must
     /// read that as "no information", never as proof the branch is empty.
     async fn branch_has_commits(&self, _dir: &Path, _base: &str) -> Result<bool> {
-        Ok(false)
-    }
-    /// Whether a merge is stopped in progress in `dir` (`MERGE_HEAD` exists).
-    /// Backends that don't model merge state report `false`, which callers must
-    /// read as "no information" — it only ever *skips* the conflict-run checks.
-    async fn merge_in_progress(&self, _dir: &Path) -> Result<bool> {
         Ok(false)
     }
     /// The paths in `dir` that still carry conflict markers. Empty means either
@@ -615,13 +610,14 @@ impl GitOps for RealGit {
         // unmerged paths distinguish the two — without them, the worktree isn't
         // mid-merge and there's nothing for an agent to resolve, so report the
         // original error rather than sending it into an empty conflict.
-        let files: Vec<String> = run_git(dir, &conflicted_files_args())
+        // `-z`: the paths go straight into the agent's brief, and a C-quoted
+        // `"cr\303\251\303\251.txt"` names no file it could open.
+        let files: Vec<String> = run_git_bytes(dir, &unmerged_files_z_args())
             .await
             .unwrap_or_default()
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| path_from_bytes(e).to_string_lossy().into_owned())
             .collect();
         if files.is_empty() {
             return Err(e);
@@ -661,17 +657,24 @@ impl GitOps for RealGit {
         Ok(!log_subjects(dir, base, "HEAD")?.is_empty())
     }
 
-    async fn merge_in_progress(&self, dir: &Path) -> Result<bool> {
-        Ok(run_git(dir, &merge_head_args()).await.is_ok())
-    }
-
     async fn unresolved_conflicts(&self, dir: &Path) -> Result<Vec<String>> {
-        let mut candidates: Vec<String> = Vec::new();
-        for args in [conflicted_files_args(), changed_vs_head_args()] {
-            for line in run_git(dir, &args).await.unwrap_or_default().lines() {
-                let path = line.trim();
-                if !path.is_empty() && !candidates.iter().any(|c| c == path) {
-                    candidates.push(path.to_string());
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        // `ORIG_HEAD` may not exist (no merge was started here); that listing
+        // simply comes back empty, and the other two still cover the tree.
+        for args in [
+            unmerged_files_z_args(),
+            changed_since_args("HEAD"),
+            changed_since_args("ORIG_HEAD"),
+        ] {
+            for entry in run_git_bytes(dir, &args)
+                .await
+                .unwrap_or_default()
+                .split(|b| *b == 0)
+                .filter(|e| !e.is_empty())
+            {
+                let path = path_from_bytes(entry);
+                if !candidates.contains(&path) {
+                    candidates.push(path);
                 }
             }
         }
@@ -684,6 +687,7 @@ impl GitOps for RealGit {
                     .map(|t| holds_conflict_markers(&t))
                     .unwrap_or(false)
             })
+            .map(|p| p.to_string_lossy().into_owned())
             .collect())
     }
 
@@ -1199,29 +1203,20 @@ mod tests {
         assert_eq!(fetch_args("origin"), vec!["fetch", "origin"]);
     }
 
+    /// `-z` is load-bearing on both listings: without it git C-quotes any path
+    /// with a non-ASCII or special character, and the quoted string names no
+    /// real file — the marker scan would read nothing and call it resolved.
     #[test]
-    fn conflicted_files_selects_unmerged_paths() {
-        let args = conflicted_files_args();
-        assert_eq!(args[0], "diff");
-        assert!(args.iter().any(|a| a == "--diff-filter=U"));
-        assert!(args.iter().any(|a| a == "--name-only"));
-    }
-
-    /// `--quiet` is what makes a missing MERGE_HEAD a plain non-zero exit
-    /// instead of an error on stderr, and `--verify` rejects anything that
-    /// isn't a single resolvable ref.
-    #[test]
-    fn merge_head_probe_is_quiet_and_verified() {
-        let args = merge_head_args();
-        assert_eq!(args[0], "rev-parse");
-        assert!(args.iter().any(|a| a == "--quiet"));
-        assert!(args.iter().any(|a| a == "--verify"));
-        assert_eq!(args.last().unwrap(), "MERGE_HEAD");
-    }
-
-    #[test]
-    fn changed_vs_head_lists_working_tree_edits() {
-        assert_eq!(changed_vs_head_args(), vec!["diff", "--name-only", "HEAD"]);
+    fn conflict_scan_listings_are_nul_separated() {
+        assert_eq!(
+            changed_since_args("ORIG_HEAD"),
+            vec!["diff", "--name-only", "-z", "ORIG_HEAD"]
+        );
+        let unmerged = unmerged_files_z_args();
+        assert_eq!(unmerged[0], "diff");
+        assert!(unmerged.iter().any(|a| a == "-z"));
+        assert!(unmerged.iter().any(|a| a == "--diff-filter=U"));
+        assert!(unmerged.iter().any(|a| a == "--name-only"));
     }
 
     /// Both halves must be present: a lone `<<<<<<<` in prose (or a test

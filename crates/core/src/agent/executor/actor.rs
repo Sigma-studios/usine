@@ -253,7 +253,7 @@ async fn finalize_run(
     // pre-PR self-review fixes are `ApplyFixes` runs but resolve differently.
     // `is_pr_fix_run` rides along because both PR sub-states resolve to
     // `AgentFixesDone`, and only the fix one can be a conflict resolution — the
-    // mid-merge gate below needs to tell them apart.
+    // pre-commit gate below needs to tell them apart.
     let (transition, is_pr_fix_run) = match store.get_card(card_id)?.state {
         CardState::Implementing(RunSub::Running) => (Transition::AgentImplementDone, false),
         CardState::AwaitingReview(ReviewSub::ApplyingFixes) => (Transition::SelfFixesDone, false),
@@ -275,65 +275,85 @@ async fn finalize_run(
         Ok(())
     })?;
 
-    // A conflict-resolution run — the only one that finds its worktree still
-    // mid-merge — gets a gate before the commit, because here
+    // A conflict-resolution run gets a gate before the commit, because here
     // committing *completes the merge* and pushes it to the open PR — there is
     // no later step that could take it back.
     //
     //  - It asked a question (`usine-questions`, the channel `conflict_prompt`
-    //    hands it): park with the merge still in progress and nothing
-    //    published, so the answering run inherits the half-resolved tree.
+    //    hands it): park with nothing published, so the answering run inherits
+    //    the half-resolved tree.
+    //  - It tried to ask but garbled the block: fault rather than silently drop
+    //    the question and ship a resolution it didn't stand behind.
     //  - It left conflict markers behind: fault rather than commit them. `git
     //    add -A` would happily stage `<<<<<<<` into the PR.
-    if is_pr_fix_run {
+    //
+    // Identified by the stashed brief, NOT by the worktree still being
+    // mid-merge: an agent that ends with its own `git add -A && git commit`
+    // (a common habit, and nothing in the brief forbids it) leaves no
+    // `MERGE_HEAD`, and the checks matter just as much there — the local merge
+    // commit is pushed to the PR either way.
+    if is_pr_fix_run && is_conflict_brief(&store.get_fix_extra(card_id)?.unwrap_or_default()) {
         let project = store.get_project(card.project_id)?;
         if let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) {
-            if git.merge_in_progress(&dir).await.unwrap_or(false) {
-                let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
-                if !questions.is_empty() {
-                    let recap = crate::agent::handoff::strip_handoff_block(
-                        &crate::agent::commit::strip_commit_block(&clean),
-                    );
-                    if !recap.is_empty() {
-                        let _ = store.set_review_recap(card_id, &recap);
-                        let _ = evt_tx.unbounded_send(ExecutorEvent::recap_updated(card_id, recap));
-                    }
-                    // The stashed conflict brief and pending fix Q&A stay put:
-                    // the answering run restates the brief, and the fixes it
-                    // logs are only true once it commits.
-                    apply_transition(
-                        store,
-                        evt_tx,
-                        card_id,
-                        Transition::AgentNeedsInput(super::conflict_intervention(&questions)),
-                    )?;
-                    reap_idle_preview_direct(executor, card_id);
-                    return Ok(());
+            let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
+            if !questions.is_empty() {
+                let recap = crate::agent::handoff::strip_handoff_block(
+                    &crate::agent::commit::strip_commit_block(&clean),
+                );
+                if !recap.is_empty() {
+                    let _ = store.set_review_recap(card_id, &recap);
+                    let _ = evt_tx.unbounded_send(ExecutorEvent::recap_updated(card_id, recap));
                 }
+                // The stashed conflict brief and pending fix Q&A stay put:
+                // the answering run restates the brief, and the fixes it
+                // logs are only true once it commits.
+                apply_transition(
+                    store,
+                    evt_tx,
+                    card_id,
+                    Transition::AgentNeedsInput(super::conflict_intervention(&questions)),
+                )?;
+                reap_idle_preview_direct(executor, card_id);
+                return Ok(());
+            }
+            // A question block that doesn't parse leaves `questions` empty, so
+            // without this the run would fall through and be reported as if it
+            // had never tried to ask.
+            let fault = if crate::agent::plan::plan_block_malformed(&result_text) {
+                Some(
+                    "The run tried to ask about a conflict, but its `usine-questions` block \
+                     wasn't valid JSON, so the question was lost — nothing was committed or \
+                     pushed. Retry to run it again."
+                        .to_string(),
+                )
+            } else {
                 let unresolved = git.unresolved_conflicts(&dir).await.unwrap_or_default();
-                if !unresolved.is_empty() {
-                    let message = format!(
+                (!unresolved.is_empty()).then(|| {
+                    format!(
                         "The run left conflict markers in {} — nothing was committed or pushed. \
-                         Retry to run it again, or cancel to abandon the merge and resolve it \
-                         yourself.",
-                        unresolved.join(", ")
-                    );
-                    apply_transition(
-                        store,
-                        evt_tx,
-                        card_id,
-                        Transition::AgentError {
-                            message: message.clone(),
-                        },
-                    )?;
-                    let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
-                        card_id,
-                        Severity::Warning,
-                        message,
-                    ));
-                    reap_idle_preview_direct(executor, card_id);
-                    return Ok(());
-                }
+                         Retry to let the agent try again, or resolve them yourself in {} \
+                         first and then retry.",
+                        unresolved.join(", "),
+                        dir.display()
+                    )
+                })
+            };
+            if let Some(message) = fault {
+                apply_transition(
+                    store,
+                    evt_tx,
+                    card_id,
+                    Transition::AgentError {
+                        message: message.clone(),
+                    },
+                )?;
+                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Warning,
+                    message,
+                ));
+                reap_idle_preview_direct(executor, card_id);
+                return Ok(());
             }
         }
     }

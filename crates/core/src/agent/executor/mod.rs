@@ -1302,7 +1302,7 @@ pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
 /// finish having done nothing while the card advanced as if it had worked.
 fn conflict_prompt(base: &str, files: &[String]) -> String {
     let mut s = format!(
-        "This branch's pull request cannot be merged: it conflicts with `{base}`.\n\n\
+        "{CONFLICT_BRIEF_OPENER} `{base}`.\n\n\
          `git merge origin/{base}` is already in progress in this worktree and stopped on \
          conflicts. Resolve every conflict, preserving the intent of BOTH sides — this branch's \
          change and the change that landed on `{base}`. Read the surrounding code before choosing \
@@ -1321,6 +1321,30 @@ fn conflict_prompt(base: &str, files: &[String]) -> String {
     s.push_str(CONFLICT_ESCAPE_HATCH);
     s
 }
+
+/// The opening of [`conflict_prompt`], and the marker that tells a stashed fix
+/// brief apart from every other one. A PR fix run's brief is persisted
+/// (`set_fix_extra`) before the run starts and only cleared once it commits, so
+/// this survives a restart — which matters because the pre-commit gate in
+/// `finalize_run` must know it is looking at a conflict resolution *after* the
+/// fact, when the worktree alone can no longer say so (an agent that committed
+/// the merge itself leaves no `MERGE_HEAD` behind).
+const CONFLICT_BRIEF_OPENER: &str =
+    "This branch's pull request cannot be merged: it conflicts with";
+
+/// Whether a stashed fix-run brief is a conflict resolution (see
+/// [`CONFLICT_BRIEF_OPENER`]). `starts_with`, not `contains`: an unrelated fix
+/// brief could quote this sentence back (a review comment about conflicts, say)
+/// without the run being one.
+pub(crate) fn is_conflict_brief(extra: &str) -> bool {
+    extra.starts_with(CONFLICT_BRIEF_OPENER)
+}
+
+/// The `request_id` every conflict question carries. There is no live run to
+/// route the answer back to (the run ended in order to ask), so the id is a
+/// constant — and doubles as the way the UI tells a conflict question apart
+/// from a fix run's live `AskUserQuestion`, which parks in the same state.
+pub const CONFLICT_INTERVENTION_ID: &str = "conflict";
 
 /// The one way out of resolving a conflict: ask. Deliberately framed as the
 /// exception — most conflicts are decidable from the code, and a run that asks
@@ -1348,7 +1372,7 @@ merge. Do not use this to hand back a conflict you could have worked out by read
 /// the answer back to (the run ended to ask), mirroring the stream parser's
 /// own `"ask"` / `"control"` fallbacks.
 fn conflict_intervention(questions: &[crate::agent::plan::PlanQuestion]) -> Intervention {
-    let id = "conflict".to_string();
+    let id = CONFLICT_INTERVENTION_ID.to_string();
     match questions {
         [only] => Intervention {
             request_id: id,
@@ -1911,6 +1935,12 @@ mod tests {
         // a question is outstanding — otherwise "ask" reads like "give up".
         assert!(p.contains("If — and only if —"));
         assert!(p.contains("Nothing is committed or pushed"));
+        // The opener is what identifies the stashed brief as a conflict one
+        // long after the worktree stopped showing a merge in progress.
+        assert!(is_conflict_brief(&p));
+        assert!(!is_conflict_brief(
+            fix_prompt(&[], "resolve the conflicts").as_str()
+        ));
     }
 
     #[test]
