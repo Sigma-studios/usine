@@ -251,18 +251,21 @@ async fn finalize_run(
     // state lost the race (a Cancel landed just ahead of this Done), so we skip
     // committing/transitioning a run the user abandoned. Both PR-review fixes and
     // pre-PR self-review fixes are `ApplyFixes` runs but resolve differently.
-    let transition = match store.get_card(card_id)?.state {
-        CardState::Implementing(RunSub::Running) => Transition::AgentImplementDone,
-        CardState::AwaitingReview(ReviewSub::ApplyingFixes) => Transition::SelfFixesDone,
+    // `is_pr_fix_run` rides along because both PR sub-states resolve to
+    // `AgentFixesDone`, and only the fix one can be a conflict resolution — the
+    // mid-merge gate below needs to tell them apart.
+    let (transition, is_pr_fix_run) = match store.get_card(card_id)?.state {
+        CardState::Implementing(RunSub::Running) => (Transition::AgentImplementDone, false),
+        CardState::AwaitingReview(ReviewSub::ApplyingFixes) => (Transition::SelfFixesDone, false),
         // A validation-fix run: committing routes back into the check
         // (`Validating{n+1}`), closing the gate's fix loop.
         CardState::AwaitingReview(ReviewSub::FixingValidation { .. }) => {
-            Transition::ValidationFixDone
+            (Transition::ValidationFixDone, false)
         }
-        CardState::PrReview(PrReviewSub::ApplyingFixes) => Transition::AgentFixesDone,
+        CardState::PrReview(PrReviewSub::ApplyingFixes) => (Transition::AgentFixesDone, true),
         // A reprompt on an open PR: same commit + push, but the state machine
         // routes `AgentFixesDone` back to `PrReview(Idle)` (not `ReadyToMerge`).
-        CardState::PrReview(PrReviewSub::ApplyingChange) => Transition::AgentFixesDone,
+        CardState::PrReview(PrReviewSub::ApplyingChange) => (Transition::AgentFixesDone, false),
         _ => return Ok(()),
     };
 
@@ -271,6 +274,69 @@ async fn finalize_run(
         c.updated_at = now_millis();
         Ok(())
     })?;
+
+    // A conflict-resolution run — the only one that finds its worktree still
+    // mid-merge — gets a gate before the commit, because here
+    // committing *completes the merge* and pushes it to the open PR — there is
+    // no later step that could take it back.
+    //
+    //  - It asked a question (`usine-questions`, the channel `conflict_prompt`
+    //    hands it): park with the merge still in progress and nothing
+    //    published, so the answering run inherits the half-resolved tree.
+    //  - It left conflict markers behind: fault rather than commit them. `git
+    //    add -A` would happily stage `<<<<<<<` into the PR.
+    if is_pr_fix_run {
+        let project = store.get_project(card.project_id)?;
+        if let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) {
+            if git.merge_in_progress(&dir).await.unwrap_or(false) {
+                let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
+                if !questions.is_empty() {
+                    let recap = crate::agent::handoff::strip_handoff_block(
+                        &crate::agent::commit::strip_commit_block(&clean),
+                    );
+                    if !recap.is_empty() {
+                        let _ = store.set_review_recap(card_id, &recap);
+                        let _ = evt_tx.unbounded_send(ExecutorEvent::recap_updated(card_id, recap));
+                    }
+                    // The stashed conflict brief and pending fix Q&A stay put:
+                    // the answering run restates the brief, and the fixes it
+                    // logs are only true once it commits.
+                    apply_transition(
+                        store,
+                        evt_tx,
+                        card_id,
+                        Transition::AgentNeedsInput(super::conflict_intervention(&questions)),
+                    )?;
+                    reap_idle_preview_direct(executor, card_id);
+                    return Ok(());
+                }
+                let unresolved = git.unresolved_conflicts(&dir).await.unwrap_or_default();
+                if !unresolved.is_empty() {
+                    let message = format!(
+                        "The run left conflict markers in {} — nothing was committed or pushed. \
+                         Retry to run it again, or cancel to abandon the merge and resolve it \
+                         yourself.",
+                        unresolved.join(", ")
+                    );
+                    apply_transition(
+                        store,
+                        evt_tx,
+                        card_id,
+                        Transition::AgentError {
+                            message: message.clone(),
+                        },
+                    )?;
+                    let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                        card_id,
+                        Severity::Warning,
+                        message,
+                    ));
+                    reap_idle_preview_direct(executor, card_id);
+                    return Ok(());
+                }
+            }
+        }
+    }
 
     // Commit in the card's ISOLATED worktree, and ONLY there. A write run reaches
     // here via `launch`, which refuses to start without a worktree, so one is our
@@ -494,10 +560,13 @@ async fn finalize_run(
         }
     }
 
-    // For display, drop the machine-facing blocks the agent appended.
-    let summary = crate::agent::handoff::strip_handoff_block(
-        &crate::agent::commit::strip_commit_block(&result_text),
-    );
+    // For display, drop the machine-facing blocks the agent appended — including
+    // a questions block that got this far (a fix run that asked but whose merge
+    // had already been completed, say), which must never render raw as a recap.
+    let summary =
+        crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
+            &crate::agent::plan::parse_questions(&result_text).0,
+        ));
 
     // An implement run hands off to whoever reviews it next. Store it (and emit it)
     // before the transition, so the card arrives at the awaiting-review gate with

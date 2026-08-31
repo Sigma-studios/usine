@@ -310,6 +310,40 @@ pub fn conflicted_files_args() -> Vec<String> {
     ]
 }
 
+/// Whether a merge is stopped in progress here. Asks git for `MERGE_HEAD`
+/// rather than probing `.git/MERGE_HEAD`: in a linked worktree `.git` is a
+/// file pointing elsewhere, so the path probe would always miss.
+pub fn merge_head_args() -> Vec<String> {
+    vec![
+        "rev-parse".into(),
+        "--verify".into(),
+        "--quiet".into(),
+        "MERGE_HEAD".into(),
+    ]
+}
+
+/// Every path the working tree changed relative to HEAD — the candidate set for
+/// a conflict-marker scan, alongside [`conflicted_files_args`]. Needed because
+/// an agent that edits a conflicted file without `git add`ing it leaves the
+/// path unmerged in the index even though it is resolved, and conversely a
+/// resolved-then-staged file drops out of the unmerged list entirely.
+pub fn changed_vs_head_args() -> Vec<String> {
+    vec!["diff".into(), "--name-only".into(), "HEAD".into()]
+}
+
+/// True when `text` still carries both halves of a conflict marker pair.
+/// Content-based on purpose: the index alone can't tell a resolved file from an
+/// unresolved one once the agent has been editing (see [`changed_vs_head_args`]).
+fn holds_conflict_markers(text: &str) -> bool {
+    let mut open = false;
+    let mut close = false;
+    for line in text.lines() {
+        open |= line.starts_with("<<<<<<< ");
+        close |= line.starts_with(">>>>>>> ");
+    }
+    open && close
+}
+
 /// How merging a ref into the current branch ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -390,6 +424,18 @@ pub trait GitOps: Send + Sync {
     /// read that as "no information", never as proof the branch is empty.
     async fn branch_has_commits(&self, _dir: &Path, _base: &str) -> Result<bool> {
         Ok(false)
+    }
+    /// Whether a merge is stopped in progress in `dir` (`MERGE_HEAD` exists).
+    /// Backends that don't model merge state report `false`, which callers must
+    /// read as "no information" — it only ever *skips* the conflict-run checks.
+    async fn merge_in_progress(&self, _dir: &Path) -> Result<bool> {
+        Ok(false)
+    }
+    /// The paths in `dir` that still carry conflict markers. Empty means either
+    /// "resolved" or "this backend doesn't model working trees"; callers use a
+    /// non-empty answer as proof that the run left conflicts behind.
+    async fn unresolved_conflicts(&self, _dir: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
     /// Discard every uncommitted change in `dir` — tracked edits (`git reset
     /// --hard`) and untracked files (`git clean -fd`) — returning the tree to
@@ -613,6 +659,32 @@ impl GitOps for RealGit {
 
     async fn branch_has_commits(&self, dir: &Path, base: &str) -> Result<bool> {
         Ok(!log_subjects(dir, base, "HEAD")?.is_empty())
+    }
+
+    async fn merge_in_progress(&self, dir: &Path) -> Result<bool> {
+        Ok(run_git(dir, &merge_head_args()).await.is_ok())
+    }
+
+    async fn unresolved_conflicts(&self, dir: &Path) -> Result<Vec<String>> {
+        let mut candidates: Vec<String> = Vec::new();
+        for args in [conflicted_files_args(), changed_vs_head_args()] {
+            for line in run_git(dir, &args).await.unwrap_or_default().lines() {
+                let path = line.trim();
+                if !path.is_empty() && !candidates.iter().any(|c| c == path) {
+                    candidates.push(path.to_string());
+                }
+            }
+        }
+        // Read the files themselves: only surviving markers prove a path is
+        // still unresolved (a binary/unreadable file simply can't carry them).
+        Ok(candidates
+            .into_iter()
+            .filter(|p| {
+                std::fs::read_to_string(dir.join(p))
+                    .map(|t| holds_conflict_markers(&t))
+                    .unwrap_or(false)
+            })
+            .collect())
     }
 
     async fn discard_changes(&self, dir: &Path) -> Result<()> {
@@ -1133,6 +1205,36 @@ mod tests {
         assert_eq!(args[0], "diff");
         assert!(args.iter().any(|a| a == "--diff-filter=U"));
         assert!(args.iter().any(|a| a == "--name-only"));
+    }
+
+    /// `--quiet` is what makes a missing MERGE_HEAD a plain non-zero exit
+    /// instead of an error on stderr, and `--verify` rejects anything that
+    /// isn't a single resolvable ref.
+    #[test]
+    fn merge_head_probe_is_quiet_and_verified() {
+        let args = merge_head_args();
+        assert_eq!(args[0], "rev-parse");
+        assert!(args.iter().any(|a| a == "--quiet"));
+        assert!(args.iter().any(|a| a == "--verify"));
+        assert_eq!(args.last().unwrap(), "MERGE_HEAD");
+    }
+
+    #[test]
+    fn changed_vs_head_lists_working_tree_edits() {
+        assert_eq!(changed_vs_head_args(), vec!["diff", "--name-only", "HEAD"]);
+    }
+
+    /// Both halves must be present: a lone `<<<<<<<` in prose (or a test
+    /// fixture describing conflicts) isn't an unresolved merge.
+    #[test]
+    fn conflict_markers_need_both_halves() {
+        assert!(holds_conflict_markers(
+            "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> origin/dev\n"
+        ));
+        assert!(!holds_conflict_markers("<<<<<<< HEAD\nours only\n"));
+        assert!(!holds_conflict_markers("a\nb\n"));
+        // Markers are line-leading; a mention inside a sentence is not one.
+        assert!(!holds_conflict_markers("we saw <<<<<<< and >>>>>>> here\n"));
     }
 
     #[test]

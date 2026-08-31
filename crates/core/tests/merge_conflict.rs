@@ -245,13 +245,28 @@ async fn an_unknown_merge_status_is_never_guessed_into_a_conflict() {
 // --- resolving: an agent runs only when there is something to resolve --------
 
 /// Git whose merge always stops on a conflict, standing in for a branch whose
-/// base has moved. Everything else succeeds.
-struct ConflictingGit;
+/// base has moved. Everything else succeeds. The fields model what the
+/// worktree looks like *after* the agent's turn — whether the merge is still in
+/// progress, which paths still carry markers — and record whether the commit
+/// completing the merge (and its push) actually happened.
+#[derive(Default)]
+struct ConflictingGit {
+    mid_merge: bool,
+    unresolved: Vec<String>,
+    committed: Arc<Mutex<bool>>,
+    pushed: Arc<Mutex<bool>>,
+}
 
 #[async_trait]
 impl GitOps for ConflictingGit {
     async fn merge_ref(&self, _: &Path, _: &str) -> usine_core::Result<MergeOutcome> {
         Ok(MergeOutcome::Conflicted(vec!["src/lib.rs".into()]))
+    }
+    async fn merge_in_progress(&self, _: &Path) -> usine_core::Result<bool> {
+        Ok(self.mid_merge)
+    }
+    async fn unresolved_conflicts(&self, _: &Path) -> usine_core::Result<Vec<String>> {
+        Ok(self.unresolved.clone())
     }
     async fn fetch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
         Ok(())
@@ -287,9 +302,11 @@ impl GitOps for ConflictingGit {
         Ok(())
     }
     async fn commit_all(&self, _: &Path, _: &str) -> usine_core::Result<bool> {
+        *self.committed.lock().unwrap() = true;
         Ok(true)
     }
     async fn push(&self, _: &Path, _: &str) -> usine_core::Result<()> {
+        *self.pushed.lock().unwrap() = true;
         Ok(())
     }
 }
@@ -332,8 +349,11 @@ fn resolving(
 #[tokio::test]
 async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_store, card, mut rx) =
-        resolving(Arc::new(ConflictingGit), tmp.path(), Mergeable::Conflicting);
+    let (_store, card, mut rx) = resolving(
+        Arc::new(ConflictingGit::default()),
+        tmp.path(),
+        Mergeable::Conflicting,
+    );
 
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
@@ -391,7 +411,11 @@ async fn a_conflict_the_forge_says_is_gone_is_not_re_resolved() {
     // ConflictingGit would hand a conflict to an agent — reaching it at all
     // means the forge's `Clean` answer was ignored, which the panic arm below
     // catches as the card moving off `ReadyToMerge`.
-    let (store, card, mut rx) = resolving(Arc::new(ConflictingGit), tmp.path(), Mergeable::Clean);
+    let (store, card, mut rx) = resolving(
+        Arc::new(ConflictingGit::default()),
+        tmp.path(),
+        Mergeable::Clean,
+    );
 
     let msg = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::Toast {
@@ -496,7 +520,7 @@ async fn a_retried_conflict_fix_still_knows_about_the_merge() {
         forge: Arc::new(RefusingForge {
             status: Mergeable::Conflicting,
         }),
-        git: Arc::new(ConflictingGit),
+        git: Arc::new(ConflictingGit::default()),
     });
 
     // The first resolution run's provider dies at start: the card is demoted to
@@ -546,6 +570,290 @@ async fn a_retried_conflict_fix_still_knows_about_the_merge() {
         "the retried fix run must restate the conflict task:\n{}",
         fix_prompts[1]
     );
+}
+
+// --- asking instead of guessing ---------------------------------------------
+
+/// A one-shot provider (like the real CLIs — `interactive()` is false, so an
+/// answer resumes with a fresh run rather than being forwarded over a control
+/// channel) that ends each run with the next scripted final message.
+struct ScriptedProvider {
+    results: Arc<Mutex<Vec<String>>>,
+    prompts: Prompts,
+}
+
+#[async_trait]
+impl AgentProvider for ScriptedProvider {
+    fn provider(&self) -> Provider {
+        Provider::Claude
+    }
+    fn interactive(&self) -> bool {
+        false
+    }
+    async fn start(&self, cfg: RunConfig) -> usine_core::Result<RunHandle> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((cfg.mode, cfg.full_prompt()));
+        let result = {
+            let mut rs = self.results.lock().unwrap();
+            if rs.is_empty() {
+                "done".to_string()
+            } else {
+                rs.remove(0)
+            }
+        };
+        let (evt_tx, evt_rx) = futures::channel::mpsc::unbounded();
+        let (ctl_tx, _ctl_rx) = futures::channel::mpsc::unbounded();
+        let _ = evt_tx.unbounded_send(usine_core::AgentEvent::Started {
+            session_id: "sess-1".into(),
+        });
+        let _ = evt_tx.unbounded_send(usine_core::AgentEvent::Done {
+            result,
+            cost_usd: 0.0,
+            usage: usine_core::Usage::default(),
+        });
+        drop(evt_tx);
+        Ok(RunHandle {
+            events: evt_rx.boxed(),
+            control: ctl_tx,
+        })
+    }
+}
+
+struct ScriptedFactory {
+    results: Arc<Mutex<Vec<String>>>,
+    prompts: Prompts,
+}
+
+impl ProviderFactory for ScriptedFactory {
+    fn make(&self, _: Provider) -> Arc<dyn AgentProvider> {
+        Arc::new(ScriptedProvider {
+            results: self.results.clone(),
+            prompts: self.prompts.clone(),
+        })
+    }
+}
+
+/// Seed a `ReadyToMerge` card with a worktree and drive `ResolveConflicts`
+/// against a scripted agent, returning everything the assertions need.
+#[allow(clippy::type_complexity)]
+fn scripted_resolve(
+    git: Arc<ConflictingGit>,
+    worktree: &Path,
+    results: Vec<String>,
+) -> (
+    Store,
+    Card,
+    usine_core::ExecutorHandle,
+    UnboundedReceiver<ExecutorEvent>,
+    Prompts,
+) {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-conflict"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let mut card = ready_to_merge_card(&store, project.id);
+    card.worktree_path = Some(worktree.to_path_buf());
+    card.mergeable = Mergeable::Conflicting;
+    store.upsert_card(&card).unwrap();
+
+    let prompts: Prompts = Arc::new(Mutex::new(Vec::new()));
+    let (handle, rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(ScriptedFactory {
+            results: Arc::new(Mutex::new(results)),
+            prompts: prompts.clone(),
+        }),
+        forge: Arc::new(RefusingForge {
+            status: Mergeable::Conflicting,
+        }),
+        git,
+    });
+    handle.send(ExecutorCommand::ResolveConflicts { card_id: card.id });
+    (store, card, handle, rx, prompts)
+}
+
+const ASKING: &str = "I resolved src/a.rs. src/lib.rs needs your call.\n\n\
+```usine-questions\n\
+[{\"question\":\"Keep the retry loop?\",\"options\":[\"Keep\",\"Drop\"]}]\n\
+```\n";
+
+/// The whole point: an agent that can't settle a conflict from the code parks
+/// the card on the question instead of guessing — and, crucially, publishes
+/// nothing. Committing here would *complete the merge* and push it to the open
+/// PR, which no later step could take back.
+#[tokio::test]
+async fn a_conflict_run_that_asks_parks_the_card_and_publishes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = Arc::new(ConflictingGit {
+        mid_merge: true,
+        unresolved: vec!["src/lib.rs".into()],
+        ..Default::default()
+    });
+    let (store, card, _handle, mut rx, _prompts) =
+        scripted_resolve(git.clone(), tmp.path(), vec![ASKING.to_string()]);
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
+            c.state,
+            CardState::PrReview(usine_core::PrReviewSub::AwaitingAnswer(_))
+        )
+        .then_some(()),
+        _ => None,
+    })
+    .await;
+
+    let after = store.get_card(card.id).unwrap();
+    let iv = after.state.intervention().expect("the question is parked");
+    assert_eq!(iv.question, "Keep the retry loop?");
+    assert_eq!(iv.options, vec!["Keep", "Drop"]);
+    assert!(!*git.committed.lock().unwrap(), "nothing may be committed");
+    assert!(!*git.pushed.lock().unwrap(), "nothing may be pushed");
+    // The prose survives as the recap so the user can see what it did get
+    // through — but the machine-facing block must not leak into it.
+    let recap = store.get_review_recap(card.id).unwrap().unwrap_or_default();
+    assert!(recap.contains("src/lib.rs needs your call"), "got: {recap}");
+    assert!(!recap.contains("usine-questions"), "got: {recap}");
+    // The brief is still stashed: the answering run has to restate it.
+    assert!(store.get_fix_extra(card.id).unwrap().is_some());
+}
+
+/// Answering resumes the resolution: a fresh run, told both what the merge is
+/// and what the user decided — the process that asked is long gone, so neither
+/// can be assumed to be in its context.
+#[tokio::test]
+async fn answering_resumes_the_resolution_with_the_brief_and_the_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = Arc::new(ConflictingGit {
+        mid_merge: true,
+        unresolved: vec!["src/lib.rs".into()],
+        ..Default::default()
+    });
+    let (store, card, handle, mut rx, prompts) = scripted_resolve(
+        git.clone(),
+        tmp.path(),
+        vec![ASKING.to_string(), "resolved".to_string()],
+    );
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
+            c.state,
+            CardState::PrReview(usine_core::PrReviewSub::AwaitingAnswer(_))
+        )
+        .then_some(()),
+        _ => None,
+    })
+    .await;
+
+    handle.send(ExecutorCommand::Answer {
+        card_id: card.id,
+        text: "Keep".into(),
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
+            c.state,
+            CardState::PrReview(usine_core::PrReviewSub::ApplyingFixes)
+        )
+        .then_some(()),
+        _ => None,
+    })
+    .await;
+
+    // The state flips to `ApplyingFixes` a beat before the relaunched run
+    // reaches the provider, so wait on the prompt itself.
+    let second = {
+        let mut second = None;
+        for _ in 0..150 {
+            let fixes: Vec<String> = prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| *m == RunMode::ApplyFixes)
+                .map(|(_, t)| t.clone())
+                .collect();
+            if fixes.len() >= 2 {
+                second = Some(fixes[1].clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        second.expect("the answer must launch a second fix run")
+    };
+    assert!(second.contains("cannot be merged") && second.contains("src/lib.rs"));
+    assert!(second.contains("Keep the retry loop?") && second.contains("Keep"));
+    // The Q&A is on the record for a later back-to-start.
+    assert!(store
+        .get_card(card.id)
+        .unwrap()
+        .qa_log
+        .iter()
+        .any(|l| l.contains("Keep the retry loop?")));
+}
+
+/// A run that claims success while leaving markers in the tree must not
+/// publish them: `git add -A` would stage `<<<<<<<` straight onto the PR.
+#[tokio::test]
+async fn a_run_that_leaves_conflict_markers_fails_instead_of_committing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = Arc::new(ConflictingGit {
+        mid_merge: true,
+        unresolved: vec!["src/lib.rs".into()],
+        ..Default::default()
+    });
+    let (store, card, _handle, mut rx, _prompts) = scripted_resolve(
+        git.clone(),
+        tmp.path(),
+        vec!["All conflicts resolved.".to_string()],
+    );
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id && c.state.is_failed() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let CardState::Failed { message, .. } = store.get_card(card.id).unwrap().state else {
+        panic!("expected a faulted card");
+    };
+    assert!(message.contains("src/lib.rs"), "got: {message}");
+    assert!(!*git.committed.lock().unwrap(), "markers must not commit");
+    assert!(!*git.pushed.lock().unwrap());
+}
+
+/// The gate must stay narrow: a resolution that actually resolved everything
+/// commits (completing the merge) and pushes, exactly as before.
+#[tokio::test]
+async fn a_clean_resolution_still_commits_and_pushes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = Arc::new(ConflictingGit {
+        mid_merge: true,
+        unresolved: Vec::new(),
+        ..Default::default()
+    });
+    let (store, card, _handle, mut rx, _prompts) =
+        scripted_resolve(git.clone(), tmp.path(), vec!["Resolved both sides.".into()]);
+
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id => {
+            matches!(c.state, CardState::ReadyToMerge).then_some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        *git.committed.lock().unwrap(),
+        "the merge must be completed"
+    );
+    assert!(*git.pushed.lock().unwrap(), "and published to the PR");
+    assert!(matches!(
+        store.get_card(card.id).unwrap().state,
+        CardState::ReadyToMerge
+    ));
 }
 
 // --- real git: a conflicted merge is an outcome, a broken one is an error ----
