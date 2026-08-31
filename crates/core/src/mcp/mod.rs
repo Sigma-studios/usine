@@ -40,6 +40,9 @@ const MAX_LINE: u64 = 1024 * 1024;
 const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(50);
 const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long we keep swallowing a hung-up-on peer's leftovers before giving up.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `<data_dir>/mcp.sock`, or `mcp-demo.sock` in demo mode — mirroring
 /// [`crate::infra::paths::store_path`], so a demo run can never answer for the
 /// real board.
@@ -211,6 +214,13 @@ async fn handle_conn(stream: UnixStream, ctx: &Ctx) -> std::io::Result<()> {
             write.write_all(response.to_string().as_bytes()).await?;
             write.write_all(b"\n").await?;
             write.flush().await?;
+            // Half-close so the peer sees the end of the stream, then swallow
+            // the tail of the oversized message. Dropping the socket with data
+            // still queued on the receive side makes the kernel answer with a
+            // reset, which throws away the explanation we just sent before the
+            // peer can read it.
+            write.shutdown().await?;
+            drain(lines.into_inner().into_inner()).await;
             return Ok(());
         }
         // `take` caps the whole stream, so re-arm the budget after each line
@@ -225,6 +235,17 @@ async fn handle_conn(stream: UnixStream, ctx: &Ctx) -> std::io::Result<()> {
             write.flush().await?;
         }
     }
+}
+
+/// Read and discard whatever the peer still has in flight, so the socket can
+/// close gracefully instead of with a reset. Bounded in time as well as by EOF:
+/// a peer that keeps talking after being hung up on gets dropped anyway.
+async fn drain(mut read: impl AsyncReadExt + Unpin) {
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let mut scratch = [0u8; 8 * 1024];
+        while matches!(read.read(&mut scratch).await, Ok(n) if n > 0) {}
+    })
+    .await;
 }
 
 /// The whole protocol, as a pure-ish function over one line. `None` means "say
