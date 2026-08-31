@@ -919,12 +919,20 @@ impl Executor {
                             card_id, pr_number, names,
                         ));
                     } else {
+                        // "Merge anyway" (the `force` override) is a merge-gate
+                        // button only: a card refused here from `PrReview(Idle)`
+                        // has no such escape, so don't point it at one.
+                        let message = if card.state == CardState::ReadyToMerge {
+                            "CI checks are still running — merge once they're green, \
+                             or use Merge anyway"
+                        } else {
+                            "CI checks are still running — merge without review once \
+                             they're green"
+                        };
                         let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                             card_id,
                             Severity::Warning,
-                            "CI checks are still running — merge once they're green, \
-                             or use Merge anyway"
-                                .to_string(),
+                            message.to_string(),
                         ));
                     }
                     return Ok(());

@@ -14,21 +14,17 @@ use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, Card, CardConfig, CardState, CheckStatus, CoreError, DraftComment,
-    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, FailedCheck, Forge,
+    spawn_executor, Card, CardConfig, CardState, CheckStatus, DraftComment, ExecutorCommand,
+    ExecutorConfig, ExecutorEvent, ExecutorEventKind, FailedCheck, Forge,
     Mergeable, PrInfo, PrReviewSub, PrSummary, Project, ProjectConfig, ReviewComment, ReviewEvent,
     ReviewScope, ReviewSummary, Severity, SimFactory, SimForge, SimGit, Store,
 };
 
-/// A forge whose PR reports `checks`, recording whether `merge` was reached.
-/// `merge_fails` makes the merge itself fail as a conflict (base = "dev"), for
-/// proving a forced merge still goes through conflict detection.
+/// A forge whose PR reports `checks`, merges cleanly, and records whether
+/// `merge` was reached — the one thing every case here asserts, since skipping
+/// the review must never skip the CI gate in front of the forge.
 struct CheckedForge {
     checks: CheckStatus,
-    merge_fails: bool,
-    /// The PR was already merged (on GitHub directly): `merge` refuses like gh
-    /// does, and `is_merged` answers true.
-    merged: bool,
     merge_called: AtomicBool,
 }
 
@@ -36,8 +32,6 @@ impl CheckedForge {
     fn new(checks: CheckStatus) -> Self {
         CheckedForge {
             checks,
-            merge_fails: false,
-            merged: false,
             merge_called: AtomicBool::new(false),
         }
     }
@@ -63,23 +57,13 @@ impl Forge for CheckedForge {
     }
     async fn merge(&self, _: &Path, _: u64) -> usine_core::Result<()> {
         self.merge_called.store(true, Ordering::SeqCst);
-        if self.merge_fails {
-            Err(CoreError::forge("gh pr merge 7 --squash failed"))
-        } else if self.merged {
-            Err(CoreError::forge("pull request #7 is already merged"))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
     async fn is_merged(&self, _: &Path, _: u64) -> usine_core::Result<bool> {
-        Ok(self.merged)
+        Ok(false)
     }
     async fn merge_status(&self, _: &Path, _: u64) -> usine_core::Result<Mergeable> {
-        Ok(if self.merge_fails {
-            Mergeable::Conflicting
-        } else {
-            Mergeable::Clean
-        })
+        Ok(Mergeable::Clean)
     }
     async fn delete_remote_branch(&self, _: &Path, _: &str) -> usine_core::Result<()> {
         Ok(())
@@ -286,5 +270,37 @@ async fn a_card_that_left_the_gate_is_refused_before_the_forge() {
     assert!(matches!(
         store.get_card(card.id).unwrap().state,
         CardState::PrReview(PrReviewSub::FetchingComments)
+    ));
+}
+
+/// A still-running build refuses the merge too — and the toast that says so
+/// must not send the user after "Merge anyway", which only exists at the merge
+/// gate: from the PR gate there is no `force` button anywhere.
+#[tokio::test]
+async fn a_pending_build_refuses_the_merge_without_pointing_at_merge_anyway() {
+    let forge = Arc::new(CheckedForge::new(CheckStatus::Pending));
+    let (store, card, mut rx) = merging(forge.clone(), PrReviewSub::Idle);
+
+    let msg = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Warning,
+            message,
+        } if e.card_id == card.id => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(msg.contains("still running"), "got: {msg}");
+    assert!(
+        !msg.contains("Merge anyway"),
+        "no such button at the PR gate: {msg}"
+    );
+    assert!(
+        !forge.merge_called.load(Ordering::SeqCst),
+        "a pending build is not bypassed by skipping the review"
+    );
+    assert!(matches!(
+        store.get_card(card.id).unwrap().state,
+        CardState::PrReview(PrReviewSub::Idle)
     ));
 }

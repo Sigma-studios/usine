@@ -151,9 +151,26 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
         if can_merge_without_review {
             div { class: "section",
                 h3 { "Merge without review" }
+                // A conflicting PR replaces the merge with its way out, exactly
+                // like the merge gate: the agent merges the base in and resolves
+                // them. `ResolveConflicts` is legal from `Idle` (it runs as a
+                // post-PR change and lands the card back here), so this is the
+                // same offer the executor's own conflict dialog makes.
                 if is_conflicting {
                     div { class: "hint",
-                        "The PR conflicts with the base branch — GitHub can't merge it as it stands. Resolve the conflicts first."
+                        "The PR conflicts with the base branch — GitHub can't merge it as it stands. Have the agent resolve them, then merge again."
+                    }
+                    div { class: "option-row",
+                        button {
+                            class: "btn",
+                            onclick: move |_| state.send(ExecutorCommand::ResolveConflicts { card_id: id }),
+                            "Resolve conflicts with AI"
+                        }
+                        button {
+                            class: "btn",
+                            onclick: move |_| state.fetch_reviews(id),
+                            "Refresh checks"
+                        }
                     }
                 } else {
                     div { class: "hint",
