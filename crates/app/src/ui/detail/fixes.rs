@@ -128,6 +128,13 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     // the draft and is simply ignored, as replies already are.
                     let instruction = v.instruction.clone();
                     let show_steer = checked;
+                    // The assessment is what the user agreed to when ticking the
+                    // box, and it is sent as the scope of the fix — so on a row
+                    // that sends it, it's editable ("only A is real"). A checked
+                    // `skip` row overrides the verdict and sends nothing, so it
+                    // stays a read-only line rather than a box we'd discard.
+                    let edit_rationale = checked && v.worth_fixing;
+                    let override_skip = checked && !v.worth_fixing;
                     rsx! {
                         div { key: "{cid}", class: "comment",
                             input {
@@ -144,7 +151,23 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                     span { class: "verdict-tag {vclass}", "{verdict_label}" }
                                     span { class: "path", "{path}" }
                                 }
-                                div { class: "rationale", "{rationale}" }
+                                if edit_rationale {
+                                    label { class: "reply-label", "assessment — sent as the scope of this fix" }
+                                    textarea {
+                                        class: "review-comment-edit autogrow",
+                                        rows: "{fallback_rows(&rationale)}",
+                                        placeholder: "No assessment — say what part of this is actually worth fixing.",
+                                        value: "{rationale}",
+                                        oninput: move |e| edits.write()[i].rationale = e.value(),
+                                    }
+                                } else {
+                                    div { class: "rationale", "{rationale}" }
+                                    if override_skip {
+                                        div { class: "hint",
+                                            "not sent — you're overriding the reviewer's skip; use ↳ how to fix it to scope it."
+                                        }
+                                    }
+                                }
                                 if self_review {
                                     // The finding text IS the fix instruction the
                                     // agent receives — let the user reword it.

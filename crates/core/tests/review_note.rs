@@ -288,6 +288,51 @@ async fn a_per_finding_instruction_reaches_the_fix_prompt() {
     );
 }
 
+/// The reviewing agent's own assessment is what the user agreed to when they
+/// ticked the box, so it must reach the fix run — except on a row the agent said
+/// to skip, where checking it is an override and the reasoning would argue
+/// against the work.
+#[tokio::test]
+async fn the_reviewers_assessment_reaches_the_fix_prompt() {
+    let (handle, mut rx, _store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    // Finding 0 is worth_fixing, finding 1 is the agent's "optional nit".
+    for v in &mut verdicts {
+        v.selected = true;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: String::new(),
+        prompt: None,
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let fixes = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run");
+    assert!(
+        fixes.contains("Worth extracting to avoid drift."),
+        "the assessment must scope the fix:\n{fixes}"
+    );
+    assert!(
+        !fixes.contains("Optional nit."),
+        "an overridden skip must not send its reasoning:\n{fixes}"
+    );
+}
+
 #[tokio::test]
 async fn an_edited_task_is_sent_verbatim() {
     let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;

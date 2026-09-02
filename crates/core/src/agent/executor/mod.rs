@@ -1180,6 +1180,19 @@ fn one_line_capped(s: &str, max: usize) -> String {
     out
 }
 
+/// The reviewing agent's assessment of a finding, when there is one worth
+/// sending. Empty for a row the agent said to skip: checking such a row is the
+/// user overriding that verdict, and pasting "just a nit" would hand the fix run
+/// an argument for doing nothing. The no-verdict placeholder is UI text, not an
+/// assessment — but an *edited* box is sent, since the user wrote it.
+fn assessment(v: &FixVerdict) -> Option<&str> {
+    let r = v.rationale.trim();
+    if !v.worth_fixing || r.is_empty() || r == crate::agent::review::NO_VERDICT_RATIONALE {
+        return None;
+    }
+    Some(r)
+}
+
 /// The restart-log line for a review comment the user checked for fixing —
 /// shared by the PR-comment and self-review fix paths.
 fn fixed_comment_qa(v: &FixVerdict) -> String {
@@ -1198,6 +1211,11 @@ fn fixed_comment_qa(v: &FixVerdict) -> String {
             one_line_capped(&v.comment.body, 200)
         )
     };
+    // The reviewing agent's own assessment scoped the fix, so a restart
+    // restates it too — under the same conditions as the fix prompt.
+    if let Some(a) = assessment(v) {
+        s.push_str(&format!(" — assessed: {}", one_line_capped(a, 200)));
+    }
     // The user's steering is part of what was asked for, so a restart that
     // folds the log into its prompt restates it too.
     if !v.instruction.trim().is_empty() {
@@ -1277,7 +1295,17 @@ fn question_extra(stage: &str, plan: Option<&str>, question: &str) -> String {
 pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
     let mut out = String::new();
     if !selected.is_empty() {
-        out.push_str("Address the following review comments:\n");
+        out.push_str("Address the following review comments");
+        // Only promise assessments when at least one bullet actually carries
+        // one, so a picker with none reads exactly as it did before.
+        if selected.iter().any(|v| assessment(v).is_some()) {
+            out.push_str(
+                ". Some carry the reviewing agent's own assessment — treat that assessment as \
+                 the SCOPE of the fix: fix what it says is real, and leave alone what it says \
+                 is fine",
+            );
+        }
+        out.push_str(":\n");
         for v in selected {
             let loc = if v.comment.review_body_of.is_some() {
                 "PR review summary".to_string()
@@ -1287,18 +1315,32 @@ pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
                     None => v.comment.path.clone(),
                 }
             };
+            // The level the reviewer gave tells the fix run what to be careful
+            // with; an unrated comment keeps the bare shape.
+            let sev = match crate::agent::review::normalize_severity(&v.severity) {
+                s if s.is_empty() => String::new(),
+                s => format!("[{s}] "),
+            };
             // Indent continuation lines so a multi-line comment stays one bullet.
             out.push_str(&format!(
-                "- [{loc}] {}\n",
+                "- {sev}[{loc}] {}\n",
                 v.comment.body.trim().replace('\n', "\n  ")
             ));
+            // What the reviewing agent made of this one — the user ticked the
+            // box having read it, so it is the scope they agreed to.
+            if let Some(a) = assessment(v) {
+                out.push_str(&format!(
+                    "  \u{21b3} Reviewer's assessment (scopes this fix): {}\n",
+                    a.replace('\n', "\n  ")
+                ));
+            }
             // The user's own steering for this one, indented into the same
             // bullet so a multi-line instruction stays attached to its comment.
             let steer = v.instruction.trim();
             if !steer.is_empty() {
                 out.push_str(&format!(
-                    "  → How the reviewer wants this addressed (their instruction wins over the \
-                     comment's own wording): {}\n",
+                    "  \u{2192} How the reviewer wants this addressed (their instruction wins \
+                     over the comment's own wording and the assessment): {}\n",
                     steer.replace('\n', "\n  ")
                 ));
             }
@@ -1690,6 +1732,78 @@ mod tests {
         assert!(p.contains("fix this"));
         // No steering typed: no sub-bullet at all.
         assert!(!p.contains("How the reviewer wants this addressed"));
+    }
+
+    /// The reviewing agent's assessment is the scope the user agreed to when
+    /// they ticked the box, so it rides along with the finding.
+    #[test]
+    fn fix_prompt_carries_the_reviewers_assessment() {
+        let mut v = verdict();
+        v.rationale = "Half right — only the null check is real.".into();
+        let p = fix_prompt(&[v], "");
+        assert!(p.contains("- [medium] [src/a.rs:9] fix this"));
+        assert!(p.contains("Reviewer's assessment (scopes this fix): Half right"));
+        assert!(p.contains("treat that assessment as the SCOPE of the fix"));
+    }
+
+    /// Checking a row the agent said to skip is the user overriding it: sending
+    /// "just a nit" would argue the fix run out of doing the work.
+    #[test]
+    fn fix_prompt_drops_the_assessment_on_an_overridden_skip() {
+        let mut v = verdict();
+        v.worth_fixing = false;
+        v.rationale = "Optional nit.".into();
+        let p = fix_prompt(&[v], "");
+        assert!(p.contains("- [medium] [src/a.rs:9] fix this"));
+        assert!(!p.contains("Optional nit."));
+        assert!(!p.contains("SCOPE of the fix"));
+    }
+
+    /// With nothing rated and nothing assessed, the prompt is exactly what it
+    /// always was — no empty brackets, no dangling header sentence.
+    #[test]
+    fn fix_prompt_without_an_assessment_is_the_bare_bullet() {
+        let mut v = verdict();
+        v.severity = String::new();
+        v.rationale = String::new();
+        assert_eq!(
+            fix_prompt(&[v], ""),
+            "Address the following review comments:\n- [src/a.rs:9] fix this\n"
+        );
+    }
+
+    /// The "no verdict returned" filler is UI text, not an assessment.
+    #[test]
+    fn fix_prompt_skips_the_no_verdict_placeholder() {
+        let mut v = verdict();
+        v.rationale = crate::agent::review::NO_VERDICT_RATIONALE.into();
+        let p = fix_prompt(&[v], "");
+        assert!(!p.contains("review this one manually"));
+        assert!(!p.contains("SCOPE of the fix"));
+    }
+
+    #[test]
+    fn fix_prompt_keeps_a_multi_line_assessment_in_one_bullet() {
+        let mut v = verdict();
+        v.rationale = "Only A.\nB is fine.".into();
+        let p = fix_prompt(&[v], "");
+        assert!(p.contains(
+            "  \u{21b3} Reviewer's assessment (scopes this fix): Only A.\n  B is fine.\n"
+        ));
+    }
+
+    /// The restart log keeps the assessment too — one line, and only where the
+    /// prompt sends it.
+    #[test]
+    fn fixed_comment_qa_carries_the_assessment() {
+        let mut v = verdict();
+        v.rationale = "Half\nright.".into();
+        let line = fixed_comment_qa(&v);
+        assert!(line.contains("assessed: Half right."), "{line}");
+        assert!(!line.contains('\n'));
+
+        v.worth_fixing = false;
+        assert!(!fixed_comment_qa(&v).contains("assessed:"));
     }
 
     /// A per-finding instruction rides with its own comment, so the agent can

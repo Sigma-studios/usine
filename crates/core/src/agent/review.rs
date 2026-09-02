@@ -17,6 +17,10 @@ use crate::domain::model::{DraftComment, FixVerdict, ReviewComment, ReviewEvent}
 
 const TAG: &str = "usine-review";
 
+/// Filled in for a comment the triage agent returned no verdict for. It is UI
+/// text, not an assessment, so the fix prompt skips a rationale equal to it.
+pub const NO_VERDICT_RATIONALE: &str = "No verdict returned — review this one manually.";
+
 /// Appended to a self-review run: review the committed diff and report issues.
 pub const SELF_REVIEW_INSTRUCTION: &str = "\
 You are reviewing the committed changes on this branch (compare against the base branch, e.g. \
@@ -263,7 +267,7 @@ pub fn parse_triage(text: &str, comments: &[ReviewComment]) -> Vec<FixVerdict> {
                 selected: true,
                 worth_fixing: true,
                 severity: String::new(),
-                rationale: "No verdict returned — review this one manually.".into(),
+                rationale: NO_VERDICT_RATIONALE.into(),
                 reply: String::new(),
                 instruction: String::new(),
             },
