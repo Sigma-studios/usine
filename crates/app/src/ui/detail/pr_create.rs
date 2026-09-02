@@ -67,19 +67,23 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .unwrap_or_default();
     let has_people = !people.is_empty();
 
-    let is_ready_for_review = matches!(
-        card.state,
-        CardState::AwaitingReview(ReviewSub::ReadyForReview)
-    );
+    // The parked sub-states dispatch through a question or a fault, like
+    // `CardPanel` does: asking a question from `ReadyForPr` must not take the
+    // create-PR form, the self-review buttons and the Q&A log the answer lands
+    // in off screen. The banner in `CardDetail` freezes the body instead.
+    let st = card.state.effective();
+    let is_ready_for_review = matches!(st, CardState::AwaitingReview(ReviewSub::ReadyForReview));
+    // The live-run faces below keep reading the raw state — they describe a run
+    // that is actually in flight, which a fault or a question is not.
     let is_self_reviewing = matches!(
         card.state,
         CardState::AwaitingReview(ReviewSub::Reviewing | ReviewSub::ApplyingFixes)
     );
     let is_selecting_fixes = matches!(
-        card.state,
+        st,
         CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
     );
-    let is_ready_for_pr = matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr));
+    let is_ready_for_pr = matches!(st, CardState::AwaitingReview(ReviewSub::ReadyForPr));
     // The validation gate's three faces: the check running, the agent fixing a
     // failure, and the parked exhausted-budget failure.
     let validating_attempt = match &card.state {
@@ -90,7 +94,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         CardState::AwaitingReview(ReviewSub::FixingValidation { attempt, .. }) => Some(*attempt),
         _ => None,
     };
-    let validation_failure = match &card.state {
+    let validation_failure = match st {
         CardState::AwaitingReview(ReviewSub::ValidationFailed { attempt, output }) => {
             Some((*attempt, output.clone()))
         }

@@ -316,7 +316,10 @@ select option { background: var(--panel-2); color: var(--text); }
 .btn.primary:hover { background: var(--accent); }
 .btn.danger { color: var(--red); border-color: var(--danger-border); }
 .btn.success { background: var(--green); border-color: var(--green); color: var(--success-fg); }
-.btn:disabled { opacity: 0.5; cursor: default; }
+/* `aria-disabled` reads as disabled but stays hoverable, so a `title` that
+   explains why the button is inert can actually show — a real `disabled`
+   swallows pointer events, tooltip included. */
+.btn:disabled, .btn[aria-disabled="true"] { opacity: 0.5; cursor: default; }
 /* A lifecycle command is in flight for this card (`CardBusy`). Such a command
    does its git/forge work *before* transitioning, so the card's own state shows
    nothing happening — freeze its actions and let the spinner carry the wait.

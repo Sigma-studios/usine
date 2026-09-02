@@ -1682,7 +1682,14 @@ impl Card {
     pub fn status_label(&self) -> &'static str {
         match self.state {
             CardState::ReadyToMerge => {
-                if self.mergeable.is_conflicting() {
+                // Same order the board's merge-gate buttons gate on, so the
+                // badge names what the one offered button is about: a draft PR
+                // is unmergeable whatever its build says, and "Mark ready" is
+                // the only thing on offer — reading "waiting on CI" beside it
+                // pointed at a wait that isn't the blocker.
+                if self.pr.as_ref().is_some_and(|p| p.state == "draft") {
+                    "draft PR"
+                } else if self.mergeable.is_conflicting() {
                     "conflicts"
                 } else if self.unanswered_count > 0 || !self.pending_review_bodies().is_empty() {
                     "comments to triage"
@@ -1690,8 +1697,6 @@ impl Card {
                     "CI failing"
                 } else if self.checks == CheckStatus::Pending {
                     "waiting on CI"
-                } else if self.pr.as_ref().is_some_and(|p| p.state == "draft") {
-                    "draft PR"
                 } else {
                     self.state.status_label()
                 }
@@ -2146,10 +2151,26 @@ mod tests {
         assert_eq!(card.status_label(), "comments to triage");
         card.reviews.clear();
 
-        // Conflicts outrank everything: no green build makes them mergeable.
+        // Conflicts outrank everything but the draft check below.
         card.mergeable = Mergeable::Conflicting;
         card.unanswered_count = 2;
         assert_eq!(card.status_label(), "conflicts");
+
+        // A draft PR outranks the lot: "Mark ready" is the only button the
+        // board offers, so the badge must not name a different blocker.
+        card.pr = Some(PrInfo {
+            number: 1,
+            url: "u".into(),
+            title: "t".into(),
+            state: "draft".into(),
+            reviewer: None,
+            reviewer_recorded: false,
+        });
+        assert_eq!(card.status_label(), "draft PR");
+        card.mergeable = Mergeable::Clean;
+        card.unanswered_count = 0;
+        card.checks = CheckStatus::Pending;
+        assert_eq!(card.status_label(), "draft PR");
 
         // The PR gate says so when there is feedback waiting to be read.
         let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());

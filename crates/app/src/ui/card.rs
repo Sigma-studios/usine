@@ -512,9 +512,15 @@ pub fn CardView(card: Card) -> Element {
                             // card with no button and only the "• CI" badge's
                             // tooltip to explain the wait. The panel keeps the
                             // "Merge anyway" override.
+                            // `aria-disabled`, not `disabled`: a disabled
+                            // control gets no pointer events, so the tooltip
+                            // that explains the wait would never show. Inert
+                            // to the eye, and the click falls through to the
+                            // card — which opens the panel, where the
+                            // "Merge anyway" override lives.
                             button {
                                 class: "btn success",
-                                disabled: true,
+                                "aria-disabled": "true",
                                 title: "Waiting on CI — the poll re-enables this within ~20s. Open the card to merge without waiting.",
                                 "Merge"
                             }

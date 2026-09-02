@@ -21,8 +21,13 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
     // but every comment is worth reading) — or an unread review *body*, the
     // summary text a body-only review carries all its feedback in. The poll —
     // and the ↻ button — keep both fresh while the card sits in `Idle`.
-    let can_triage = matches!(card.state, CardState::PrReview(PrReviewSub::Idle))
-        && card.has_triageable_feedback();
+    // Dispatch through a question or a fault, like `CardPanel` does: asking a
+    // question from `Idle` must not take the triage button, the merge-without-
+    // review block and the Q&A log the answer lands in off screen. The banner
+    // freezes the body instead.
+    let st = card.state.effective();
+    let can_triage =
+        matches!(st, CardState::PrReview(PrReviewSub::Idle)) && card.has_triageable_feedback();
     // Bodies not yet handled (triaged or marked read) — what the "Mark as
     // read" button below clears.
     let has_pending_bodies = !card.pending_review_bodies().is_empty();
@@ -35,7 +40,7 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
     // A card sitting at the PR gate can be reprompted with a free-form change,
     // just like a Ready-for-PR card — the agent updates the branch and pushes,
     // updating the open PR in place.
-    let is_idle = matches!(card.state, CardState::PrReview(PrReviewSub::Idle));
+    let is_idle = matches!(st, CardState::PrReview(PrReviewSub::Idle));
     // The last-resort merge below deletes the head branch by default, like the
     // merge gate's own checkbox.
     let mut delete_branch = use_signal(|| true);
