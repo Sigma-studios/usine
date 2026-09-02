@@ -15,6 +15,7 @@ mod reviewboard;
 mod reviewdraft;
 mod search;
 mod settings;
+mod shortcuts;
 mod sidebar;
 mod usagebar;
 mod widgets;
@@ -28,6 +29,7 @@ pub use diffdialog::DiffDialogHost;
 pub use reviewboard::ReviewBoard;
 pub use search::SearchHost;
 pub use settings::{ProjectSettingsModal, SettingsModal};
+pub use shortcuts::ShortcutHost;
 pub use sidebar::Sidebar;
 pub use usagebar::UsageBar;
 
@@ -38,6 +40,28 @@ use crate::state::AppState;
 // Re-exported so the event reducer in `state` can raise a dialog of its own (a
 // merge conflict is discovered by the executor, not by a click).
 pub(crate) use confirm::{request_confirm, ConfirmAction, ConfirmRequest};
+
+/// Scroll the detail panel to the section a board button names, so a button
+/// whose card is already open does something visible instead of re-selecting an
+/// already-selected card. Best-effort: a missing anchor (the panel is still
+/// mounting, or the state moved on) is simply a no-op.
+fn focus_section(anchor: &str) {
+    dioxus::document::eval(&format!(
+        // On a timeout, not a single `requestAnimationFrame`: the caller has
+        // just selected the card, and the panel that owns the anchor has not
+        // rendered yet when the next frame runs.
+        "setTimeout(function(){{\
+           var el = document.getElementById('{anchor}');\
+           if (el) el.scrollIntoView({{ block: 'center', behavior: 'smooth' }});\
+         }}, 80);"
+    ));
+}
+
+/// Open a card and land on the section the caller's button names.
+pub(crate) fn open_card_at(state: AppState, id: Uuid, anchor: &'static str) {
+    state.select_card(Some(id));
+    focus_section(anchor);
+}
 
 /// Run an irreversible, outward-facing command (Create PR / Merge) behind a
 /// themed confirm dialog. In demo mode nothing real happens, so it fires

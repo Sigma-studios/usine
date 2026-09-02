@@ -13,6 +13,9 @@ use crate::ui::drafts;
 pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
     let state = use_context::<AppState>();
     let mut follow_up = drafts::use_draft(card_id, "investigate.followup", String::new);
+    // Nothing to send is nothing to do — same rule the chat section's two
+    // buttons already follow, rather than a live button that no-ops.
+    let blank = follow_up.read().trim().is_empty();
 
     rsx! {
         div { class: "section",
@@ -22,9 +25,6 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
 
         div { class: "section",
             h3 { "Dig deeper" }
-            div { class: "hint",
-                "Ask a follow-up — the agent re-investigates with this conclusion and every earlier round as context."
-            }
             div { class: "field",
                 textarea {
                     placeholder: "What should the agent look into next?",
@@ -34,6 +34,8 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
             }
             button {
                 class: "btn",
+                disabled: blank,
+                title: "The agent re-investigates with this conclusion and every earlier round as context",
                 onclick: move |_| {
                     let fb = follow_up.read().trim().to_string();
                     if !fb.is_empty() {
@@ -47,11 +49,9 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
 
         div { class: "section",
             h3 { "Turn into implementation" }
-            div { class: "hint",
-                "Continue this card as an implementation: the findings are folded into the task description and the card returns to the starting block, where you shape the prompt before starting."
-            }
             button {
                 class: "btn primary",
+                title: "Continues this card as an implementation: the findings are folded into the task description and the card returns to the starting block, where you shape the prompt before starting",
                 onclick: move |_| state.send(ExecutorCommand::ConvertToImplementation { card_id }),
                 "Turn into implementation"
             }

@@ -164,6 +164,17 @@ body {
   flex: 1; display: flex; gap: 12px;
   padding: 16px; overflow-x: auto; overflow-y: hidden;
 }
+/* An empty lane collapses to a labelled rail: nine 280px columns plus the
+   sidebar and the detail panel is more board than any laptop shows at once, and
+   the lanes that are empty are the ones costing the most for the least. It
+   re-expands on its own the moment a card lands (the component re-renders from
+   `cards`), so there is no toggle to persist. */
+.column.is-empty { width: 40px; min-width: 40px; }
+.column.is-empty .column-header {
+  writing-mode: vertical-rl; justify-content: flex-start;
+  border-bottom: none; padding: 10px 0; gap: 8px; color: var(--muted);
+}
+.column.is-empty .column-count { display: none; }
 .column {
   width: 280px; min-width: 280px;
   background: var(--col); border: 1px solid var(--border);
@@ -185,7 +196,12 @@ body {
   border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit; width: 100%;
 }
 .new-card textarea { resize: vertical; min-height: 48px; }
-.hint { color: var(--muted); font-size: 12px; padding: 8px; text-align: center; }
+/* A caption under (or over) the thing it describes, not an empty-state banner:
+   left-aligned and tight, since centered muted 12px is the worst possible
+   setting for a sentence in a 380px column. `.center` keeps the old treatment
+   for the few places that really are empty states. */
+.hint { color: var(--muted); font-size: 12px; line-height: 1.45; text-align: left; }
+.hint.center { padding: 8px; text-align: center; }
 .hint.warn { color: var(--amber); }
 .wt-path {
   color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace;
@@ -358,13 +374,32 @@ select option { background: var(--panel-2); color: var(--text); }
 }
 .detail-title-input:hover { border-color: var(--border); }
 .detail-title-input:focus { background: var(--panel-2); border-color: var(--border-hover); outline: none; }
+/* A question run or a fault, over the panel of the state underneath: the gate's
+   own sections stay on screen (frozen via `.detail-body.is-busy`) while this
+   says what is happening. Sits outside `.detail-body`, so its own Cancel/Retry
+   stays clickable. */
+.detail-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--panel-2); font-size: 13px; color: var(--muted);
+}
+.detail-banner .row { flex: 1; min-width: 0; align-items: center; gap: 8px; }
+/* `.row > *` stretches every child; the spinner and the text must not share
+   the width evenly — the message takes what is left. */
+.detail-banner .row > .spinner { flex: 0 0 auto; }
+.detail-banner .row span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-banner .btn { flex: 0 0 auto; }
+.detail-banner.danger { color: var(--red); border-bottom-color: var(--danger-border); }
 .detail-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
 .detail-close {
   margin-left: auto; flex: none; background: transparent; border: none;
   color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1;
 }
 
-.section { display: flex; flex-direction: column; gap: 8px; }
+/* Wraps a sub-panel's several `.section`s so it can carry a scroll anchor for
+   the board buttons, without collapsing the gaps `.detail-body` gives them. */
+.section-group { display: flex; flex-direction: column; gap: 16px; }
+.section { display: flex; flex-direction: column; gap: 6px; }
 .section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 .checkbox-row {
   display: flex; align-items: center; gap: 8px;
@@ -499,15 +534,19 @@ select option { background: var(--panel-2); color: var(--text); }
    are tucked away behind the same muted, caret-prefixed summary. */
 .comment .orig > summary,
 .qa-item > summary,
+.task-collapsed > summary,
 .fix-task > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; }
 .comment .orig > summary::before,
 .qa-item > summary::before,
+.task-collapsed > summary::before,
 .fix-task > summary::before { content: "▸ "; }
 .comment .orig[open] > summary::before,
 .qa-item[open] > summary::before,
+.task-collapsed[open] > summary::before,
 .fix-task[open] > summary::before { content: "▾ "; }
 .comment .orig > summary:hover,
 .qa-item > summary:hover,
+.task-collapsed > summary:hover,
 .fix-task > summary:hover { color: var(--text); }
 .comment .orig-body { margin-top: 4px; padding-left: 12px; color: var(--muted); font-size: 12px; white-space: pre-wrap; border-left: 2px solid var(--border); }
 
@@ -515,6 +554,10 @@ select option { background: var(--panel-2); color: var(--text); }
    newest is expanded; the rest collapse to their question on one line. */
 .qa-log { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .qa-item > summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The task the card was started from, collapsed once the card has moved on: it
+   is reference material by then, not something to act on. */
+.task-collapsed > summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-collapsed > .plan-box { margin-top: 6px; }
 .qa-item > .hint { margin-top: 6px; }
 
 /* The fix task itself, collapsed under the picker: what the agent will receive,

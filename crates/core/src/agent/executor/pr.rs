@@ -401,6 +401,14 @@ impl Executor {
             let _ = self
                 .evt_tx
                 .unbounded_send(ExecutorEvent::recap_updated(card_id, recap));
+            // Every comment the picker showed has been replied to, so none is
+            // still unanswered. Land that before the transition: otherwise the
+            // merge gate renders the pre-triage count until the refresh below
+            // returns — and keeps it if that call fails.
+            self.store.mutate_card(card_id, |c| {
+                c.unanswered_count = 0;
+                Ok(())
+            })?;
             self.apply(card_id, Transition::AgentFixesDone)?;
             // No fix run means no `ResolveFixedComments` follow-up, so refresh
             // here: the replies above just answered threads, and the merge
@@ -758,8 +766,10 @@ impl Executor {
     /// Mark every pending review *body* on the card handled — the panel's
     /// "Mark as read", for a body-only review (e.g. a bot's pass report) the
     /// user has read and doesn't need an agent run for. Purely local: nothing
-    /// is posted to the forge. The next poll tick (or ↻) re-runs the
-    /// auto-advance predicates, which no longer see the bodies as pending.
+    /// is posted to the forge. The auto-advance predicates are re-run inline, so
+    /// an approved PR whose only feedback was a body reaches the merge gate now
+    /// rather than sitting at the PR gate — with no triage offer and no badge —
+    /// until the next 5-minute poll.
     pub(super) fn mark_review_bodies_read(&self, card_id: Uuid) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let keys: Vec<String> = card
@@ -779,7 +789,26 @@ impl Executor {
             c.updated_at = now_millis();
             Ok(())
         })?;
-        let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::updated(updated.clone()));
+        // Same auto-advance `list_reviews` runs: the bodies that were holding the
+        // card at the PR gate are handled now, so a card that is otherwise clear
+        // belongs at the merge gate immediately. Both predicates guard on
+        // `PrReview(Idle)` themselves, so this is a no-op elsewhere.
+        let project = self.store.get_project(updated.project_id)?;
+        let reviewer = updated
+            .pr
+            .as_ref()
+            .and_then(|pr| pr.effective_reviewer(project.config.reviewer.as_deref()))
+            .map(str::to_string);
+        if updated.approval_clears_merge() {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ approved with no comments — ready to merge");
+        } else if updated.no_reviewer_clears_merge(reviewer.as_deref()) {
+            self.apply(card_id, Transition::ReviewApproved)?;
+            self.progress(card_id, "✔ no reviewer assigned — ready to merge");
+        }
         Ok(())
     }
 

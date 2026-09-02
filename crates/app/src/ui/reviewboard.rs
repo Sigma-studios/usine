@@ -25,7 +25,7 @@ pub fn ReviewBoard() -> Element {
     let SelectedView::Project(project_id) = *state.selected_view.read() else {
         return rsx! {
             div { class: "review-area",
-                div { class: "hint", "Select a project to review its PRs." }
+                div { class: "hint center", "Select a project to review its PRs." }
             }
         };
     };

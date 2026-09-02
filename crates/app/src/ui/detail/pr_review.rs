@@ -52,36 +52,37 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
 
     rsx! {
         div { class: "section",
-            h3 { "Pull request" }
+            div { class: "row",
+                h3 { "Pull request" }
+                // Refreshing belongs with the PR, not with a "Reviews" section
+                // that no longer exists when nothing has been submitted.
+                button {
+                    class: "btn icon",
+                    title: "Re-read the PR's reviews, comments and checks from GitHub",
+                    "aria-label": "Refresh review status",
+                    onclick: move |_| state.fetch_reviews(id),
+                    "↻"
+                }
+            }
             if let Some(p) = card.pr.clone() {
                 super::PrLink { number: p.number, url: p.url }
             }
             if is_draft {
-                div { class: "hint",
-                    "This PR is a draft — add any screenshots and finish its description on GitHub, then mark it ready for review."
-                }
+                div { class: "hint", "This PR is a draft — GitHub won't merge it." }
                 button {
                     class: "btn primary",
+                    title: "Add any screenshots and finish the description on GitHub first; this flips it to ready for review",
                     onclick: move |_| state.send(ExecutorCommand::MarkPrReady { card_id: id }),
                     "Mark ready for review"
                 }
             }
         }
 
-        div { class: "section",
-            div { class: "row",
+        // No section at all until a review lands: a heading plus "No submitted
+        // reviews yet." was two rows on every PR-gate card, saying nothing.
+        if !reviews.is_empty() {
+            div { class: "section",
                 h3 { "Reviews" }
-                button {
-                    class: "btn icon",
-                    title: "Refresh review status",
-                    "aria-label": "Refresh review status",
-                    onclick: move |_| state.fetch_reviews(id),
-                    "↻"
-                }
-            }
-            if reviews.is_empty() {
-                div { class: "hint", "No submitted reviews yet." }
-            } else {
                 for r in reviews.iter() {
                     {
                         let author = r.author.clone();
@@ -108,11 +109,10 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                     }
                 }
                 if has_pending_bodies {
-                    div { class: "hint",
-                        "A review's summary text awaits you — triage it below, or mark it read if it needs nothing."
-                    }
+                    div { class: "hint", "A review's summary text awaits you." }
                     button {
                         class: "btn",
+                        title: "Records it as handled, locally — nothing is posted. Use it when the body needs no work.",
                         onclick: move |_| state.send(ExecutorCommand::MarkReviewBodiesRead { card_id: id }),
                         "Mark as read"
                     }
@@ -123,21 +123,18 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
         if can_triage {
             div { class: "section",
                 h3 { "Triage" }
-                div { class: "hint",
-                    "Have an agent read the review comments and recommend which are worth fixing."
-                }
                 button {
                     class: "btn primary",
+                    title: "The agent reads every review comment, triages each one and proposes which are worth fixing — you pick before anything is changed",
                     onclick: move |_| state.send(ExecutorCommand::FetchComments { card_id: id }),
-                    "Evaluate the review"
+                    "Read the review"
                 }
             }
         }
         if is_idle {
             super::AgentChatSection {
                 card_id: id,
-                hint: "Want to tweak the branch without waiting on a review, or ask about the \
-                       work? A change updates this PR in place; a question leaves it untouched.",
+                request_title: "The agent commits and pushes to the PR's branch — this updates the open pull request in place",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
                 },
@@ -157,12 +154,11 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                 // post-PR change and lands the card back here), so this is the
                 // same offer the executor's own conflict dialog makes.
                 if is_conflicting {
-                    div { class: "hint",
-                        "The PR conflicts with the base branch — GitHub can't merge it as it stands. Have the agent resolve them, then merge again."
-                    }
+                    div { class: "hint", "The PR conflicts with the base branch." }
                     div { class: "option-row",
                         button {
                             class: "btn",
+                            title: "The agent merges the base branch into this one in the card's worktree, resolves the conflicts and pushes",
                             onclick: move |_| state.send(ExecutorCommand::ResolveConflicts { card_id: id }),
                             "Resolve conflicts with AI"
                         }
@@ -173,9 +169,7 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                         }
                     }
                 } else {
-                    div { class: "hint",
-                        "Nobody is coming to review this? Merge the PR as it stands. The review comments stay unread and unanswered — last resort."
-                    }
+                    div { class: "hint", "Nobody is coming to review this?" }
                     label { class: "checkbox-row",
                         input {
                             r#type: "checkbox",
@@ -189,6 +183,7 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                     }
                     button {
                         class: "btn subtle",
+                        title: "Merges the PR as it stands. Any review comments stay unread and unanswered — a last resort. CI is still checked.",
                         onclick: move |_| request_confirm(ConfirmRequest {
                             title: "Merge without review?".into(),
                             message: "No review has cleared this PR. Merge it into the base branch anyway? \

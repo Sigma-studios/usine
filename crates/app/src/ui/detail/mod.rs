@@ -66,7 +66,10 @@ fn CardDetail() -> Element {
             let project = state.project_name(card.project_id);
             let provider = card.config.provider.label();
             let provider_class = provider_value(card.config.provider);
-            let status = card.state.status_label();
+            // From the card, not the state alone: a `ReadyToMerge` card with
+            // conflicts, a red build or untriaged comments must not read
+            // "ready to merge" beside a button that says otherwise.
+            let status = card.status_label();
             let cost = card.cost;
             // Kept in step with the marker by `Card::set_blocked`: a note only
             // exists while the card is blocked.
@@ -82,7 +85,36 @@ fn CardDetail() -> Element {
             // hasn't transitioned the card yet, so the panel still shows the
             // buttons that led here (notably "Approve & implement").
             let busy = state.busy.read().contains(&id);
-            let body_class = if busy {
+            // The two states that WRAP another one — a question run and a fault
+            // — render as a banner ABOVE the panel of the state underneath,
+            // instead of replacing it. Asking a question used to take "What was
+            // done", the merge gate and the chat log off screen for the duration
+            // (and a fault took them for good); now they stay where the user
+            // left them, frozen. Frozen is not a taste call: a command sent from
+            // `Answering`/`Failed` fails the state guard and toasts an illegal
+            // transition, so the underlying actions must be disabled — which is
+            // exactly what `.is-busy` already does. The banner's own buttons sit
+            // outside `.detail-body`, so they stay live.
+            let question = match &card.state {
+                CardState::Answering { question, .. } => Some(question.clone()),
+                _ => None,
+            };
+            let fail_msg = match &card.state {
+                CardState::Failed { message, .. } => Some(message.clone()),
+                _ => None,
+            };
+            let interrupted = fail_msg
+                .as_deref()
+                .is_some_and(|m| m.starts_with("Interrupted"));
+            let recover_label = if interrupted { "Resume" } else { "Retry" };
+            let fail_display = fail_msg.as_ref().map(|m| {
+                if interrupted {
+                    m.clone()
+                } else {
+                    format!("Run failed: {m}")
+                }
+            });
+            let body_class = if busy || question.is_some() || fail_display.is_some() {
                 "detail-body is-busy"
             } else {
                 "detail-body"
@@ -148,6 +180,29 @@ fn CardDetail() -> Element {
                         // (the board card clamps it).
                         if let Some(note) = blocked_note {
                             div { class: "blocked-note", "{note}" }
+                        }
+                    }
+                    if let Some(q) = question {
+                        div { class: "detail-banner",
+                            div { class: "row",
+                                span { class: "spinner" }
+                                span { "The agent is answering: {q}" }
+                            }
+                            button {
+                                class: "btn subtle",
+                                onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
+                                "Cancel"
+                            }
+                        }
+                    }
+                    if let Some(msg) = fail_display {
+                        div { class: "detail-banner danger",
+                            div { "{msg}" }
+                            button {
+                                class: "btn",
+                                onclick: move |_| state.send(ExecutorCommand::Retry { card_id: id }),
+                                "{recover_label}"
+                            }
                         }
                     }
                     // Remount the panel whenever the selected card or its state
@@ -239,8 +294,14 @@ fn CardPanel(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
 
-    let is_start = matches!(card.state, CardState::StartingBlock);
-    let is_ready = matches!(card.state, CardState::ReadyToMerge);
+    // The gate sections dispatch on the state seen THROUGH a question or a
+    // fault (`effective()`), so neither takes the panel away — the banner in
+    // `CardDetail` says what is happening and freezes the body. The live-run
+    // bits below (the running-phase Stop, the intervention question) keep
+    // reading the raw state: they describe the run that is actually in flight.
+    let st = card.state.effective();
+    let is_start = matches!(st, CardState::StartingBlock);
+    let is_ready = matches!(st, CardState::ReadyToMerge);
     // A card can reach `ReadyToMerge` while its PR is still a draft (a draft PR
     // whose reviewer comments were triaged). GitHub won't merge a draft, so gate
     // the merge behind flipping it ready for review first.
@@ -263,39 +324,31 @@ fn CardPanel(card: Card) -> Element {
     // before merging.
     let pending_bodies = card.pending_review_bodies().len();
     let recap = state.review_recaps.read().get(&id).cloned();
-    let fail_msg = if let CardState::Failed { message, .. } = &card.state {
-        Some(message.clone())
-    } else {
-        None
-    };
-    let interrupted = fail_msg
-        .as_deref()
-        .map(|m| m.starts_with("Interrupted"))
-        .unwrap_or(false);
-    let recover_label = if interrupted { "Resume" } else { "Retry" };
-    let fail_display = fail_msg.as_ref().map(|m| {
-        if interrupted {
-            m.clone()
-        } else {
-            format!("Run failed: {m}")
-        }
-    });
 
     rsx! {
         if is_start {
             EditableTask { card: card.clone() }
-            Attachments { card_id: id }
             ConfigForm { card: card.clone() }
-        } else {
-            div { class: "section",
-                h3 { "Task" }
-                if card.description.trim().is_empty() {
-                    div { class: "hint", "No description." }
-                } else {
-                    div { class: "plan-box", "{card.description}" }
+        } else if !card.description.trim().is_empty() {
+            // Past the starting block the task is reference material, not
+            // something to act on — but it used to open every panel with up to
+            // 240px of scrolling prose. Collapsed behind the same muted caret
+            // summary the fix picker and the Q&A log already use. (A card with
+            // no description gets no section at all: "No description." is a row
+            // of panel spent saying nothing.)
+            details { class: "section task-collapsed",
+                summary {
+                    title: "{card.description}",
+                    "Task — {chat::summary_line(&card.description)}"
                 }
+                div { class: "plan-box", "{card.description}" }
             }
         }
+        // In every state, not just the starting block: a screenshot is exactly
+        // the thing you want to hand a card you are already reviewing, and the
+        // chat and revise paths send attachments along. It costs one button
+        // when there is nothing attached.
+        Attachments { card_id: id }
 
         // The main running phases used to render nothing actionable here; give
         // them a status line and a way out. Cancel drops the run's progress and
@@ -322,18 +375,6 @@ fn CardPanel(card: Card) -> Element {
             }
         }
 
-        if let CardState::Answering { question, .. } = &card.state {
-            div { class: "section",
-                h3 { "Answering" }
-                div { class: "hint", "The agent is answering: {question}" }
-                button {
-                    class: "btn subtle",
-                    onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
-                    "Cancel"
-                }
-            }
-        }
-
         // A conflict-resolution run that stopped rather than guessing. Say what
         // it did get through, and make plain that nothing has been published —
         // the InterventionPanel below carries the question itself. Keyed on the
@@ -348,7 +389,7 @@ fn CardPanel(card: Card) -> Element {
             div { class: "section",
                 h3 { "Conflict resolution needs a decision" }
                 div { class: "hint",
-                    "The agent couldn't settle one of the conflicts from the code, so it stopped and published nothing — the pull request is exactly as it was. Answering resumes the resolution where it left off, in the card's worktree; stopping throws it away."
+                    "Nothing has been published — the PR is exactly as it was."
                 }
                 if let Some(recap) = recap.clone() {
                     div { class: "hint", "What it got through" }
@@ -363,6 +404,7 @@ fn CardPanel(card: Card) -> Element {
                         danger: true,
                         action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
                     }),
+                    title: "Discards everything the agent resolved in the card's worktree and returns the card to the PR gate. Answering instead resumes the resolution where it left off.",
                     "Stop and resolve it myself"
                 }
             }
@@ -376,28 +418,40 @@ fn CardPanel(card: Card) -> Element {
             }
         }
 
-        if let CardState::Designing(DesignSub::AwaitingApproval { plan }) = &card.state {
-            PlanApproval { card_id: id, plan: plan.clone() }
+        if let CardState::Designing(DesignSub::AwaitingApproval { plan }) = st {
+            // Stable anchors for the board buttons that only open the card:
+            // they scroll here rather than looking like they did nothing.
+            div { class: "section-group", id: "plan-approval",
+                PlanApproval { card_id: id, plan: plan.clone() }
+            }
         }
 
-        if let CardState::Concluded { conclusion } = &card.state {
-            ConclusionPanel { card_id: id, conclusion: conclusion.clone() }
+        if let CardState::Concluded { conclusion } = st {
+            div { class: "section-group", id: "conclusion",
+                ConclusionPanel { card_id: id, conclusion: conclusion.clone() }
+            }
         }
 
-        if matches!(card.state, CardState::AwaitingReview(_)) {
-            PrCreateForm { card: card.clone() }
+        if matches!(st, CardState::AwaitingReview(_)) {
+            div { class: "section-group", id: "pr-create",
+                PrCreateForm { card: card.clone() }
+            }
         }
 
-        if matches!(card.state, CardState::PrReview(_)) {
+        if matches!(st, CardState::PrReview(_)) {
             PrReviewPanel { card: card.clone() }
         }
 
-        if let CardState::PrReview(PrReviewSub::SelectingFixes { verdicts }) = &card.state {
-            FixSelection { card_id: id, verdicts: verdicts.clone(), self_review: false }
+        if let CardState::PrReview(PrReviewSub::SelectingFixes { verdicts }) = st {
+            div { class: "section-group", id: "fix-selection",
+                FixSelection { card_id: id, verdicts: verdicts.clone(), self_review: false }
+            }
         }
 
-        if let CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) = &card.state {
-            FixSelection { card_id: id, verdicts: verdicts.clone(), self_review: true }
+        if let CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) = st {
+            div { class: "section-group", id: "fix-selection",
+                FixSelection { card_id: id, verdicts: verdicts.clone(), self_review: true }
+            }
         }
 
         if is_ready && (card.unanswered_count > 0 || pending_bodies > 0) {
@@ -407,18 +461,19 @@ fn CardPanel(card: Card) -> Element {
                     if card.unanswered_count == 0 {
                         // Only review bodies await — a body-only review (e.g. a
                         // bot report) landed after the card reached the gate.
-                        "A review's summary text on the PR hasn't been read yet. Have the agent read and triage it before merging — or mark it read if it needs nothing."
+                        "A review's summary text hasn't been read yet."
                     } else if card.unanswered_count == 1 {
-                        "A review comment on the PR has no answer yet — it arrived after (or survived) the last pass. Have the agent read and triage it before merging."
+                        "1 review comment has no answer yet."
                     } else {
-                        {format!("{} review threads on the PR have no answer yet — they arrived after (or survived) the last pass. Have the agent read and triage them before merging.", card.unanswered_count)}
+                        {format!("{} review threads have no answer yet.", card.unanswered_count)}
                     }
                 }
                 div { class: "row",
                     button {
                         class: "btn primary",
+                        title: "They arrived after (or survived) the last pass. The agent reads them, triages each one and proposes which to fix — worth doing before merging.",
                         onclick: move |_| state.send(ExecutorCommand::FetchComments { card_id: id }),
-                        "Reevaluate comments"
+                        "Re-read the review"
                     }
                     // A pending review body can also be dismissed by hand —
                     // same affordance as the PR-review panel, so a body landing
@@ -426,6 +481,7 @@ fn CardPanel(card: Card) -> Element {
                     if pending_bodies > 0 {
                         button {
                             class: "btn",
+                            title: "Records the review's summary as handled, locally — nothing is posted. Use it when the body needs no work.",
                             onclick: move |_| state.send(ExecutorCommand::MarkReviewBodiesRead { card_id: id }),
                             "Mark as read"
                         }
@@ -445,11 +501,10 @@ fn CardPanel(card: Card) -> Element {
                     div { class: "plan-box", "{recap}" }
                 }
                 if pr_is_draft {
-                    div { class: "hint",
-                        "This PR is still a draft — GitHub won't merge it. Mark it ready for review first, then merge."
-                    }
+                    div { class: "hint", "This PR is still a draft — GitHub won't merge it." }
                     button {
                         class: "btn primary",
+                        title: "Flips the PR from draft to ready for review on GitHub; the merge button comes back once it is",
                         onclick: move |_| state.send(ExecutorCommand::MarkPrReady { card_id: id }),
                         "Mark ready for review"
                     }
@@ -495,12 +550,11 @@ fn CardPanel(card: Card) -> Element {
                     // here — GitHub cannot merge a conflicting PR server-side, so
                     // the override would be a lie.
                     if card.mergeable.is_conflicting() {
-                        div { class: "hint",
-                            "The PR conflicts with the base branch — GitHub can't merge it until the conflicts are resolved. Have the agent resolve them, then merge again."
-                        }
+                        div { class: "hint", "The PR conflicts with the base branch." }
                         div { class: "option-row",
                             button {
                                 class: "btn primary",
+                                title: "The agent merges the base branch into this one in the card's worktree, resolves the conflicts and pushes. Nothing is published unless it succeeds; GitHub can't merge a conflicting PR either way.",
                                 onclick: move |_| state.send(ExecutorCommand::ResolveConflicts { card_id: id }),
                                 "Resolve conflicts with AI"
                             }
@@ -518,12 +572,11 @@ fn CardPanel(card: Card) -> Element {
                     // real one can't be dodged by a stale panel.
                     match checks {
                         CheckStatus::Failing => rsx! {
-                            div { class: "hint",
-                                "The PR's CI checks are failing — GitHub's checks must pass before this merges cleanly. Have the agent fix them, or merge anyway if the failure is noise."
-                            }
+                            div { class: "hint", "The PR's CI checks are failing." }
                             div { class: "option-row",
                                 button {
                                     class: "btn primary",
+                                    title: "The agent reads the failing run's logs, fixes the cause in the card's worktree and pushes",
                                     onclick: move |_| state.send(ExecutorCommand::FixChecks { card_id: id }),
                                     "Fix checks with AI"
                                 }
@@ -550,9 +603,7 @@ fn CardPanel(card: Card) -> Element {
                             }
                         },
                         CheckStatus::Pending => rsx! {
-                            div { class: "hint",
-                                "The PR's CI checks are still running. Merge once they're green — or merge anyway without waiting for them."
-                            }
+                            div { class: "hint", "The PR's CI checks are still running." }
                             div { class: "option-row",
                                 button {
                                     class: "btn",
@@ -595,25 +646,29 @@ fn CardPanel(card: Card) -> Element {
             }
             AgentChatSection {
                 card_id: id,
-                hint: "Not happy with a fix, have a reviewer follow-up, or a question about the \
-                       work? Request a change, or ask without sending it back.",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::RequestPostPrChange { card_id: id, feedback: fb });
                 },
             }
         }
 
-        if let CardState::MergedWithoutReview { merged } = &card.state {
+        if let CardState::MergedWithoutReview { merged } = st {
             div { class: "section",
                 h3 { if *merged { "Merged without review" } else { "PR closed" } }
                 if let Some(p) = card.pr.clone() {
                     PrLink { number: p.number, url: p.url }
                 }
-                div { class: "hint",
-                    if *merged {
-                        "This PR was merged on GitHub before its review finished here. The work is on the base branch; the worktree was cleaned up, the branch was left alone. Use the card menu to mark it done or send it back to start."
+                div {
+                    class: "hint",
+                    title: if *merged {
+                        "The work is on the base branch; the worktree was cleaned up and the branch left alone. Mark the card done, or send it back to start, from the card menu."
                     } else {
-                        "This PR was closed on GitHub without merging. The branch was left alone in case the work is still wanted. Use the card menu to mark the card done or send it back to start."
+                        "The branch was left alone in case the work is still wanted. Mark the card done, or send it back to start, from the card menu."
+                    },
+                    if *merged {
+                        "Merged on GitHub before its review finished here."
+                    } else {
+                        "Closed on GitHub without merging."
                     }
                 }
             }
@@ -621,19 +676,8 @@ fn CardPanel(card: Card) -> Element {
             OutcomeArtifacts { card_id: id }
         }
 
-        if matches!(card.state, CardState::Done) {
+        if matches!(st, CardState::Done) {
             DonePanel { card: card.clone() }
-        }
-
-        if let Some(msg) = fail_display.clone() {
-            div { class: "section",
-                div { class: "question", "{msg}" }
-                button {
-                    class: "btn",
-                    onclick: move |_| state.send(ExecutorCommand::Retry { card_id: id }),
-                    "{recover_label}"
-                }
-            }
         }
 
         TranscriptView { id }
@@ -785,8 +829,12 @@ pub(super) fn PrLink(number: u64, url: String) -> Element {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The panel body's remount key. Deliberately computed from
+/// [`CardState::effective`]: a question (or a fault) must not tear the body
+/// down and rebuild it — that resets every form signal and snaps the scroll
+/// position to the top, twice (going in, and coming back out).
 fn state_discriminant(s: &CardState) -> &'static str {
-    match s {
+    match s.effective() {
         CardState::StartingBlock => "start",
         CardState::Designing(DesignSub::Running) => "design-run",
         CardState::Designing(DesignSub::Intervention(_)) => "design-iv",
@@ -807,7 +855,7 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::MergedWithoutReview { merged: true } => "ext-merged",
         CardState::MergedWithoutReview { merged: false } => "ext-closed",
         CardState::Done => "done",
-        CardState::Failed { .. } => "failed",
-        CardState::Answering { .. } => "answering",
+        // `effective()` never returns either of these.
+        CardState::Failed { .. } | CardState::Answering { .. } => "wrapped",
     }
 }
