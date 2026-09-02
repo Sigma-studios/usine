@@ -10,10 +10,11 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 
 use crate::agent::events::{AgentEvent, RunControl};
+use crate::agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 use crate::domain::model::{Provider, Usage};
 use crate::error::Result;
 
-use super::{AgentProvider, ProviderFactory, RunConfig, RunHandle, RunMode};
+use super::{AgentProvider, ProviderFactory, RunConfig, RunHandle, RunMode, UsageSource};
 
 const SAMPLE_PLAN: &str = "\
 ## Plan
@@ -266,5 +267,89 @@ pub struct SimFactory;
 impl ProviderFactory for SimFactory {
     fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
         Arc::new(SimProvider::new(provider))
+    }
+
+    fn usage_source(&self) -> UsageSource {
+        UsageSource::Simulated
+    }
+}
+
+/// Mock rate-limit usage for the demo board's bar: no CLI, no network. The
+/// numbers wobble with the clock so the bar's refresh button visibly does
+/// something, and every window stays well above 0% — a 0% window renders no
+/// gauge, which would make the demo bar look broken.
+pub fn simulated_usage(now_secs: i64) -> UsageSnapshot {
+    // Claude reports a pre-formatted local time, Codex a unix timestamp, so
+    // the mock exercises both of the bar's reset-rendering branches.
+    UsageSnapshot {
+        claude: Some(ProviderUsage {
+            session: Some(RateLimitWindow {
+                used_percent: wobble(now_secs, 1, 8.0, 37.0),
+                resets_text: Some("today at 8pm".into()),
+                ..Default::default()
+            }),
+            weekly: Some(RateLimitWindow {
+                used_percent: wobble(now_secs, 2, 45.0, 64.0),
+                resets_text: Some("Sun at 9am".into()),
+                ..Default::default()
+            }),
+        }),
+        codex: Some(ProviderUsage {
+            session: Some(RateLimitWindow {
+                used_percent: wobble(now_secs, 3, 30.0, 54.0),
+                resets_at: Some(now_secs + 2 * 3_600 + 15 * 60),
+                ..Default::default()
+            }),
+            weekly: Some(RateLimitWindow {
+                used_percent: wobble(now_secs, 4, 72.0, 91.0),
+                resets_at: Some(now_secs + 3 * 86_400),
+                ..Default::default()
+            }),
+        }),
+        // Stamped by the executor, which knows when the "poll" happened.
+        refreshed_at: None,
+    }
+}
+
+/// A deterministic percentage inside `[lo, hi]` from the clock and a per-window
+/// salt — a cheap scramble, not randomness; it only has to move between ticks.
+fn wobble(now_secs: i64, salt: u64, lo: f64, hi: f64) -> f64 {
+    let mut h = (now_secs as u64)
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(salt);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 29;
+    lo + (h % 1_000) as f64 / 1_000.0 * (hi - lo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulated_windows_stay_visible_and_in_band() {
+        for now in [0_i64, 1, 1_800_000_000, 1_800_000_037, 2_100_000_000] {
+            let snap = simulated_usage(now);
+            let claude = snap.claude.expect("claude usage");
+            let codex = snap.codex.expect("codex usage");
+            for (window, lo, hi) in [
+                (claude.session.unwrap(), 8.0, 37.0),
+                (claude.weekly.unwrap(), 45.0, 64.0),
+                (codex.session.clone().unwrap(), 30.0, 54.0),
+                (codex.weekly.clone().unwrap(), 72.0, 91.0),
+            ] {
+                // > 0 matters on its own: a 0% window renders no gauge, which
+                // would drop the demo bar into its "No usage data" branch.
+                assert!(window.used_percent > 0.0, "{window:?} at {now}");
+                assert!(
+                    (lo..=hi).contains(&window.used_percent),
+                    "{window:?} outside [{lo}, {hi}] at {now}"
+                );
+            }
+            for window in [codex.session.unwrap(), codex.weekly.unwrap()] {
+                assert!(window.resets_at.is_some_and(|at| at > now), "{window:?}");
+            }
+        }
     }
 }

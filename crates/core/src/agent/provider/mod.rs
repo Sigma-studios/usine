@@ -119,20 +119,32 @@ pub trait AgentProvider: Send + Sync {
 pub trait ProviderFactory: Send + Sync {
     fn make(&self, provider: Provider) -> Arc<dyn AgentProvider>;
 
-    /// Whether the executor should poll the real CLIs' account rate-limit
-    /// usage for the usage bar. Off by default so the simulator (which
-    /// promises no network) and test factories never shell out to `claude`.
-    fn polls_usage(&self) -> bool {
-        false
+    /// Where the usage bar's numbers come from for this factory. `None` by
+    /// default so test factories never shell out to `claude` and never emit a
+    /// usage event.
+    fn usage_source(&self) -> UsageSource {
+        UsageSource::None
     }
+}
+
+/// Where the usage bar's numbers come from for a given [`ProviderFactory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    /// No usage at all (test factories): the poll loop isn't spawned and a
+    /// stray `RefreshUsage` is a no-op.
+    None,
+    /// Shell out to the real CLIs / read the codex rollouts.
+    Cli,
+    /// Made-up numbers for the demo board — no network, no processes.
+    Simulated,
 }
 
 /// Factory producing the real CLI-backed providers (`claude` / `codex`).
 pub struct RealFactory;
 
 impl ProviderFactory for RealFactory {
-    fn polls_usage(&self) -> bool {
-        true
+    fn usage_source(&self) -> UsageSource {
+        UsageSource::Cli
     }
 
     fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {

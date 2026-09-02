@@ -1,8 +1,10 @@
 //! The bottom usage bar: each provider's session + weekly rate-limit windows
-//! as small colored gauges. Fully conditional — a zero or absent window renders
-//! nothing, a provider with no visible window renders nothing, and with neither
-//! provider visible the bar itself doesn't mount, so it costs no space (and in
-//! demo mode, where usage is never polled, it never appears).
+//! as small colored gauges. The gauges are conditional — a zero or absent
+//! window renders nothing, and a provider with no visible window renders
+//! nothing — but the bar itself is always mounted: with nothing to draw it
+//! shows a short placeholder, so its refresh button stays reachable exactly
+//! when the numbers never arrived. In demo mode the gauges show the
+//! simulator's mock numbers, which the button re-rolls.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,12 +26,28 @@ pub fn UsageBar() -> Element {
             tick += 1;
         }
     });
+    // The click currently in flight, if any: without disabling the button,
+    // clicks fan out parallel `claude -p /usage` runs, since `RefreshUsage` is
+    // neither exclusive nor persistence and the executor's dispatch loop spawns
+    // every copy concurrently. Each click carries its own generation so a
+    // *later* click owns the button outright — the earlier one's safety timer
+    // and any snapshot older than it can no longer clear the spinner.
+    let mut clicks = use_signal(|| 0u32);
+    let mut pending = use_signal(|| None::<Pending>);
+    // Every refresh emits `UsageUpdated`, which is what retires the spinner.
+    // The 15-min background poll emits the same event, and a snapshot it lands
+    // mid-click counts too: the numbers on screen really are fresher than the
+    // click, so the wait is over either way.
+    use_effect(move || {
+        let refreshed_at = state.usage.read().refreshed_at;
+        if refresh_landed(*pending.peek(), refreshed_at) {
+            pending.set(None);
+        }
+    });
     let snapshot = state.usage.read().clone();
     let claude = snapshot.claude.filter(has_visible_window);
     let codex = snapshot.codex.filter(has_visible_window);
-    if claude.is_none() && codex.is_none() {
-        return rsx! {};
-    }
+    let empty = claude.is_none() && codex.is_none();
     let claude = claude.map(|usage| {
         rsx! {
             ProviderGauges { provider: Provider::Claude, usage }
@@ -43,19 +61,70 @@ pub fn UsageBar() -> Element {
     // Read the ticker so the label re-renders with it.
     let _ = tick();
     let label = refreshed_label(snapshot.refreshed_at, now_millis());
+    let empty_msg = empty.then(|| empty_message(snapshot.refreshed_at, pending().is_some()));
 
     rsx! {
         div { class: "usage-bar has-tip",
+            if let Some(msg) = empty_msg {
+                span { class: "usage-empty", "{msg}" }
+            }
             {claude}
             {codex}
             button {
                 class: "usage-refresh",
                 aria_label: "Refresh usage now",
-                onclick: move |_| state.refresh_usage(),
-                "↻"
+                disabled: pending().is_some(),
+                onclick: move |_| {
+                    clicks += 1;
+                    let generation = clicks();
+                    pending.set(Some(Pending { generation, clicked_at: now_millis() }));
+                    state.refresh_usage();
+                    // Safety net for the real path: if no event ever comes back
+                    // (executor gone, channel dropped) the button un-sticks on
+                    // its own, well past the CLI fetch's own timeout — but only
+                    // for the click that armed it, never a newer one's spinner.
+                    spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        if pending.peek().is_some_and(|p| p.generation == generation) {
+                            pending.set(None);
+                        }
+                    });
+                },
+                if pending().is_some() {
+                    span { class: "spinner" }
+                } else {
+                    "↻"
+                }
             }
             span { class: "info-tip up", "{label}" }
         }
+    }
+}
+
+/// A refresh click waiting for its `UsageUpdated`, identified so that neither a
+/// stale safety timer nor a snapshot from before the click can retire it.
+#[derive(Clone, Copy, PartialEq)]
+struct Pending {
+    generation: u32,
+    clicked_at: i64,
+}
+
+/// Whether an incoming snapshot ends the wait: only a snapshot refreshed at or
+/// after the click was made — one that predates it says nothing about it.
+fn refresh_landed(pending: Option<Pending>, refreshed_at: Option<i64>) -> bool {
+    match (pending, refreshed_at) {
+        (Some(pending), Some(at)) => at >= pending.clicked_at,
+        _ => false,
+    }
+}
+
+/// What the bar says when there are no gauges to draw: the first poll fires
+/// immediately at launch, so "never refreshed" still means "in flight".
+fn empty_message(refreshed_at: Option<i64>, pending: bool) -> &'static str {
+    if pending || refreshed_at.is_none() {
+        "Checking usage…"
+    } else {
+        "No usage data"
     }
 }
 
@@ -172,6 +241,28 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn an_empty_bar_reads_as_in_flight_until_a_refresh_lands() {
+        assert_eq!(empty_message(None, false), "Checking usage…");
+        assert_eq!(empty_message(None, true), "Checking usage…");
+        assert_eq!(empty_message(Some(NOW), true), "Checking usage…");
+        assert_eq!(empty_message(Some(NOW), false), "No usage data");
+    }
+
+    #[test]
+    fn only_a_snapshot_from_after_the_click_retires_the_spinner() {
+        let pending = Pending {
+            generation: 1,
+            clicked_at: NOW,
+        };
+        assert!(!refresh_landed(Some(pending), None));
+        assert!(!refresh_landed(Some(pending), Some(NOW - 1)));
+        assert!(refresh_landed(Some(pending), Some(NOW)));
+        assert!(refresh_landed(Some(pending), Some(NOW + 5_000)));
+        // Nothing in flight: an incoming snapshot has no spinner to clear.
+        assert!(!refresh_landed(None, Some(NOW)));
+    }
 
     #[test]
     fn never_refreshed_says_so() {

@@ -29,7 +29,7 @@ use crate::agent::events::{
     AgentEvent, ExecutorCommand, ExecutorEvent, OpenTarget, QueuedTarget, RunControl, Severity,
 };
 use crate::agent::handoff::Handoff;
-use crate::agent::provider::{ProviderFactory, RunConfig, RunMode};
+use crate::agent::provider::{ProviderFactory, RunConfig, RunMode, UsageSource};
 use crate::domain::config::CardKind;
 use crate::domain::model::{
     now_millis, Card, CardAnswers, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict,
@@ -161,9 +161,9 @@ pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<Execu
                 let poller = Arc::clone(&executor);
                 tokio::spawn(async move { poller.ci_poll_loop().await });
                 // Background poll: refresh the providers' account rate-limit
-                // usage for the bottom bar. Real CLIs only — the simulator
-                // promises no network, and tests must not shell out.
-                if executor.providers.polls_usage() {
+                // usage for the bottom bar. Real CLIs, or the simulator's mock
+                // numbers — but never tests, which must not shell out.
+                if executor.providers.usage_source() != UsageSource::None {
                     let poller = Arc::clone(&executor);
                     tokio::spawn(async move { poller.usage_poll_loop().await });
                 }

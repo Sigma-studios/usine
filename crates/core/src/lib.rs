@@ -37,7 +37,7 @@ pub use agent::provider::claude::ClaudeProvider;
 pub use agent::provider::codex::CodexProvider;
 pub use agent::provider::sim::SimFactory;
 pub use agent::provider::{
-    AgentProvider, ProviderFactory, RealFactory, RunConfig, RunHandle, RunMode,
+    AgentProvider, ProviderFactory, RealFactory, RunConfig, RunHandle, RunMode, UsageSource,
 };
 pub use agent::review::{
     find_review_prompt, normalize_severity, parse_pr_review, parse_self_review, parse_triage,
