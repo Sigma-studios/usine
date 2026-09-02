@@ -13,6 +13,7 @@ use crate::ui::diffdialog::{event_value, open_review_diff, open_review_diff_at, 
 use crate::ui::icons::IconDiff;
 use crate::ui::reviewdraft;
 use crate::ui::widgets::SeverityPicker;
+use crate::ui::{Panel, PanelResizer};
 
 /// The detail panel for the selected review task.
 #[component]
@@ -35,6 +36,7 @@ pub fn ReviewDetail() -> Element {
 
             rsx! {
                 div { class: "detail",
+                    PanelResizer { panel: Panel::Detail }
                     div { class: "detail-header",
                         div { class: "detail-title-row",
                             h2 { "{task.pr_title}" }

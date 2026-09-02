@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::state::{AppState, SelectedView};
+use crate::ui::{Panel, PanelResizer};
 
 #[component]
 pub fn Sidebar() -> Element {
@@ -178,6 +179,7 @@ pub fn Sidebar() -> Element {
                     div { class: "demo-badge", "● Demo mode" }
                 }
             }
+            PanelResizer { panel: Panel::Sidebar }
         }
     }
 }

@@ -15,6 +15,7 @@ use super::diffdialog::open_diff_dialog;
 use super::icons::IconDiff;
 use crate::state::{AppState, BoardMode};
 use crate::ui::widgets::provider_value;
+use crate::ui::{Panel, PanelResizer};
 
 mod chat;
 mod conclusion;
@@ -97,6 +98,7 @@ fn CardDetail() -> Element {
 
             rsx! {
                 div { class: "detail",
+                    PanelResizer { panel: Panel::Detail }
                     div { class: "detail-header",
                         div { class: "detail-title-row",
                             // Keyed per card (single-item `for`, same trick as

@@ -91,10 +91,31 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
+/* ----- Panel resize handles ----- */
+/* A 6px grab strip straddling the panel's inner edge; invisible until hovered,
+   focused, or dragged. Dragging is wired by a delegated JS listener (ui/resize.rs). */
+.panel-resizer {
+  position: absolute; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; z-index: 5; touch-action: none;
+  background: transparent; transition: background 0.12s ease;
+}
+.panel-resizer-right { right: -3px; }
+.panel-resizer-left { left: -3px; }
+.panel-resizer:hover, .panel-resizer:focus-visible,
+body.resizing .panel-resizer { background: var(--accent); outline: none; }
+/* Never select transcript text while dragging, and keep the cursor consistent
+   even when it strays off the 6px strip. */
+body.resizing { user-select: none; cursor: col-resize; }
+
 /* ----- Sidebar ----- */
 .sidebar {
-  width: 200px;
-  min-width: 200px;
+  /* Width is driven by --sidebar-w (persisted, live-updated during a drag);
+     `flex: none` keeps the old no-shrink behaviour min-width used to give, and
+     the vw cap keeps the board reachable when the window is smaller than the
+     saved width, without touching the stored value. */
+  flex: none;
+  width: clamp(160px, var(--sidebar-w, 200px), 33vw);
+  position: relative;
   background: var(--panel);
   border-right: 1px solid var(--border);
   display: flex;
@@ -336,7 +357,11 @@ select option { background: var(--panel-2); color: var(--text); }
 
 /* ----- Detail panel ----- */
 .detail {
-  width: 380px; min-width: 380px; background: var(--panel);
+  /* Same scheme as `.sidebar`, mirrored: see --detail-w. */
+  flex: none;
+  width: clamp(300px, var(--detail-w, 380px), 50vw);
+  position: relative;
+  background: var(--panel);
   border-left: 1px solid var(--border); display: flex; flex-direction: column;
 }
 .detail-header { padding: 16px; border-bottom: 1px solid var(--border); }
