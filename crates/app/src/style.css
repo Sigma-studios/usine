@@ -922,14 +922,17 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 .usage-pct.warn { color: var(--amber); }
 .usage-pct.high { color: var(--red); }
 .usage-reset { color: var(--muted); }
-.usage-empty { color: var(--muted); }
+/* Fixed box (13px of content = the `↻` glyph's line box, plus its padding), so
+   swapping the glyph for the spinner can't resize the button — and with it the
+   always-mounted bar's row — while a refresh is in flight. */
 .usage-refresh {
-  margin-left: auto; background: transparent; border: none; color: var(--muted);
+  margin-left: auto; display: inline-flex; align-items: center; justify-content: center;
+  height: 17px; min-width: 23px;
+  background: transparent; border: none; color: var(--muted);
   cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 5px; border-radius: 4px;
 }
 .usage-refresh:hover { color: var(--text); background: var(--surface-hover); }
-/* In flight: the spinner replaces the glyph without resizing the bar's row. */
+/* In flight: the spinner replaces the glyph, centered in the box above. */
 .usage-refresh:disabled { cursor: default; background: transparent; }
-.usage-refresh .spinner { vertical-align: middle; }
 /* One tip for the whole bar, anchored under the gauges rather than the padding edge. */
 .usage-bar .info-tip { left: 14px; }

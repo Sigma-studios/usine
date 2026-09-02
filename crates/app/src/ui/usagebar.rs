@@ -26,14 +26,23 @@ pub fn UsageBar() -> Element {
             tick += 1;
         }
     });
-    // Cleared by the `UsageUpdated` that every refresh emits (see the effect
-    // below); without it, clicks fan out parallel `claude -p /usage` runs,
-    // since `RefreshUsage` is neither exclusive nor persistence and the
-    // executor's dispatch loop spawns every copy concurrently.
-    let mut pending = use_signal(|| false);
+    // The click currently in flight, if any: without disabling the button,
+    // clicks fan out parallel `claude -p /usage` runs, since `RefreshUsage` is
+    // neither exclusive nor persistence and the executor's dispatch loop spawns
+    // every copy concurrently. Each click carries its own generation so a
+    // *later* click owns the button outright — the earlier one's safety timer
+    // and any snapshot older than it can no longer clear the spinner.
+    let mut clicks = use_signal(|| 0u32);
+    let mut pending = use_signal(|| None::<Pending>);
+    // Every refresh emits `UsageUpdated`, which is what retires the spinner.
+    // The 15-min background poll emits the same event, and a snapshot it lands
+    // mid-click counts too: the numbers on screen really are fresher than the
+    // click, so the wait is over either way.
     use_effect(move || {
-        let _ = state.usage.read().refreshed_at;
-        pending.set(false);
+        let refreshed_at = state.usage.read().refreshed_at;
+        if refresh_landed(*pending.peek(), refreshed_at) {
+            pending.set(None);
+        }
     });
     let snapshot = state.usage.read().clone();
     let claude = snapshot.claude.filter(has_visible_window);
@@ -52,7 +61,7 @@ pub fn UsageBar() -> Element {
     // Read the ticker so the label re-renders with it.
     let _ = tick();
     let label = refreshed_label(snapshot.refreshed_at, now_millis());
-    let empty_msg = empty.then(|| empty_message(snapshot.refreshed_at, pending()));
+    let empty_msg = empty.then(|| empty_message(snapshot.refreshed_at, pending().is_some()));
 
     rsx! {
         div { class: "usage-bar has-tip",
@@ -64,19 +73,24 @@ pub fn UsageBar() -> Element {
             button {
                 class: "usage-refresh",
                 aria_label: "Refresh usage now",
-                disabled: pending(),
+                disabled: pending().is_some(),
                 onclick: move |_| {
-                    pending.set(true);
+                    clicks += 1;
+                    let generation = clicks();
+                    pending.set(Some(Pending { generation, clicked_at: now_millis() }));
                     state.refresh_usage();
                     // Safety net for the real path: if no event ever comes back
                     // (executor gone, channel dropped) the button un-sticks on
-                    // its own, well past the CLI fetch's own timeout.
+                    // its own, well past the CLI fetch's own timeout — but only
+                    // for the click that armed it, never a newer one's spinner.
                     spawn(async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
-                        pending.set(false);
+                        if pending.peek().is_some_and(|p| p.generation == generation) {
+                            pending.set(None);
+                        }
                     });
                 },
-                if pending() {
+                if pending().is_some() {
                     span { class: "spinner" }
                 } else {
                     "↻"
@@ -84,6 +98,23 @@ pub fn UsageBar() -> Element {
             }
             span { class: "info-tip up", "{label}" }
         }
+    }
+}
+
+/// A refresh click waiting for its `UsageUpdated`, identified so that neither a
+/// stale safety timer nor a snapshot from before the click can retire it.
+#[derive(Clone, Copy, PartialEq)]
+struct Pending {
+    generation: u32,
+    clicked_at: i64,
+}
+
+/// Whether an incoming snapshot ends the wait: only a snapshot refreshed at or
+/// after the click was made — one that predates it says nothing about it.
+fn refresh_landed(pending: Option<Pending>, refreshed_at: Option<i64>) -> bool {
+    match (pending, refreshed_at) {
+        (Some(pending), Some(at)) => at >= pending.clicked_at,
+        _ => false,
     }
 }
 
@@ -217,6 +248,20 @@ mod tests {
         assert_eq!(empty_message(None, true), "Checking usage…");
         assert_eq!(empty_message(Some(NOW), true), "Checking usage…");
         assert_eq!(empty_message(Some(NOW), false), "No usage data");
+    }
+
+    #[test]
+    fn only_a_snapshot_from_after_the_click_retires_the_spinner() {
+        let pending = Pending {
+            generation: 1,
+            clicked_at: NOW,
+        };
+        assert!(!refresh_landed(Some(pending), None));
+        assert!(!refresh_landed(Some(pending), Some(NOW - 1)));
+        assert!(refresh_landed(Some(pending), Some(NOW)));
+        assert!(refresh_landed(Some(pending), Some(NOW + 5_000)));
+        // Nothing in flight: an incoming snapshot has no spinner to clear.
+        assert!(!refresh_landed(None, Some(NOW)));
     }
 
     #[test]
