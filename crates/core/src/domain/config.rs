@@ -336,6 +336,14 @@ pub struct AppSettings {
     /// `RunMode::is_capped`).
     #[serde(default = "default_max_concurrent_runs")]
     pub max_concurrent_runs: u32,
+    /// Width of the projects sidebar in CSS px, as last left by a drag. Pure UI
+    /// layout state; the view clamps it, so an out-of-range record is harmless.
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u32,
+    /// Width of the card/review detail panel in CSS px — same rules as
+    /// [`Self::sidebar_width`].
+    #[serde(default = "default_detail_width")]
+    pub detail_width: u32,
 }
 
 /// Serde default for [`AppSettings::max_concurrent_runs`]: a settings record
@@ -343,6 +351,18 @@ pub struct AppSettings {
 /// (which would mean unlimited).
 pub(crate) fn default_max_concurrent_runs() -> u32 {
     5
+}
+
+/// Serde default for [`AppSettings::sidebar_width`]: the width the sidebar had
+/// before it became resizable.
+pub(crate) fn default_sidebar_width() -> u32 {
+    200
+}
+
+/// Serde default for [`AppSettings::detail_width`]: as above, for the detail
+/// panel.
+pub(crate) fn default_detail_width() -> u32 {
+    380
 }
 
 impl Default for AppSettings {
@@ -364,6 +384,8 @@ impl AppSettings {
             terminal_command: None,
             editor_command: None,
             max_concurrent_runs: default_max_concurrent_runs(),
+            sidebar_width: default_sidebar_width(),
+            detail_width: default_detail_width(),
         }
     }
 
