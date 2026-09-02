@@ -140,8 +140,8 @@ pub fn PanelResizer(panel: Panel) -> Element {
     let state = use_context::<AppState>();
     let spec = panel.spec();
     let class = match panel {
-        Panel::Sidebar => "panel-resizer panel-resizer-right",
-        Panel::Detail => "panel-resizer panel-resizer-left",
+        Panel::Sidebar => "panel-resizer panel-resizer-right has-tip",
+        Panel::Detail => "panel-resizer panel-resizer-left has-tip",
     };
 
     rsx! {
@@ -152,7 +152,6 @@ pub fn PanelResizer(panel: Panel) -> Element {
             "aria-orientation": "vertical",
             "aria-label": "{spec.label}",
             tabindex: "0",
-            title: "Drag to resize · double-click to reset",
             onkeydown: move |e: KeyboardEvent| {
                 // Arrows nudge (Shift = coarse), Home restores the default.
                 let step = if e.modifiers().shift() { 64 } else { 16 };
@@ -166,6 +165,10 @@ pub fn PanelResizer(panel: Panel) -> Element {
                 e.prevent_default();
                 apply(&state, panel, width, true);
             },
+            // Hover hint. Not a native `title`: macOS WKWebView ignores that
+            // attribute, so the codebase's `.info-tip` pattern is used instead
+            // (the tip is `pointer-events: none`, so it can't swallow a grab).
+            span { class: "info-tip", "Drag to resize · double-click to reset" }
         }
     }
 }
@@ -239,8 +242,8 @@ fn drag_js() -> String {
              if (!el) return;\
              e.preventDefault();\
              var startX = e.clientX, startW = el.getBoundingClientRect().width;\
-             var last = clamp(sp, startW);\
-             document.body.classList.add('resizing');\
+             var last = null;\
+             document.body.classList.add('resizing', 'resizing-' + key);\
              function move(ev) {{\
                last = clamp(sp, startW + sp.sign * (ev.clientX - startX));\
                live(sp, last);\
@@ -250,8 +253,12 @@ fn drag_js() -> String {
                window.removeEventListener('pointerup', end);\
                window.removeEventListener('pointercancel', end);\
                window.removeEventListener('blur', end);\
-               document.body.classList.remove('resizing');\
-               dioxus.send({{ panel: key, width: last }});\
+               document.body.classList.remove('resizing', 'resizing-' + key);\
+               /* `startW` is the *rendered* width, which the vw cap may have\
+                  shrunk below the stored one; persisting it after a plain click\
+                  would quietly clamp the saved width down for good. Only a real\
+                  move produces a width worth saving. */\
+               if (last !== null) dioxus.send({{ panel: key, width: last }});\
              }}\
              window.addEventListener('pointermove', move);\
              window.addEventListener('pointerup', end);\

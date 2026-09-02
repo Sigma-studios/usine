@@ -101,11 +101,25 @@ body {
 }
 .panel-resizer-right { right: -3px; }
 .panel-resizer-left { left: -3px; }
+/* The drag listener marks `<body>` with the key of the handle in flight, so only
+   that handle stays lit (a plain `body.resizing` would light up both). The flag
+   lives on `<body>` rather than the handle because a re-render can swap the
+   handle node out mid-drag. */
 .panel-resizer:hover, .panel-resizer:focus-visible,
-body.resizing .panel-resizer { background: var(--accent); outline: none; }
+body.resizing-sidebar .panel-resizer[data-resize="sidebar"],
+body.resizing-detail .panel-resizer[data-resize="detail"] {
+  background: var(--accent); outline: none;
+}
 /* Never select transcript text while dragging, and keep the cursor consistent
    even when it strays off the 6px strip. */
 body.resizing { user-select: none; cursor: col-resize; }
+/* The handle is full-height, so the default `top: 100%` tip placement would land
+   off the bottom of the window; pin it near the top, on the panel's inner side.
+   Hidden mid-drag: the pointer sits on the handle the whole time. */
+.panel-resizer .info-tip { top: 16px; }
+.panel-resizer-right .info-tip { left: 10px; }
+.panel-resizer-left .info-tip { left: auto; right: 10px; }
+body.resizing .info-tip { visibility: hidden; opacity: 0; }
 
 /* ----- Sidebar ----- */
 .sidebar {
