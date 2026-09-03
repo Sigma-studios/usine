@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 use crate::ui::drafts;
+use crate::ui::textfield::use_push_back;
 
 #[component]
 pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
@@ -16,6 +17,9 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
     // Nothing to send is nothing to do — same rule the chat section's two
     // buttons already follow, rather than a live button that no-ops.
     let blank = follow_up.read().trim().is_empty();
+    // Uncontrolled (see `ui/textfield.rs`), so clearing the box after a send
+    // only reaches the DOM through a remount.
+    let mut pushback = use_push_back(follow_up.read().clone());
 
     rsx! {
         div { class: "section",
@@ -26,10 +30,16 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
         div { class: "section",
             h3 { "Dig deeper" }
             div { class: "field",
-                textarea {
-                    placeholder: "What should the agent look into next?",
-                    value: "{follow_up}",
-                    oninput: move |e| follow_up.set(e.value()),
+                for g in [pushback.key()] {
+                    textarea {
+                        key: "{g}",
+                        placeholder: "What should the agent look into next?",
+                        initial_value: "{follow_up.peek()}",
+                        oninput: move |e| {
+                            pushback.typed(&e.value());
+                            follow_up.set(e.value());
+                        },
+                    }
                 }
             }
             button {

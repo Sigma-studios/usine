@@ -105,13 +105,21 @@ impl Executor {
                 }
                 None => card.checks,
             };
-            let mergeable = mergeable.unwrap_or(card.mergeable);
+            // A `Conflicting` read taken while one of our pushes is still being
+            // recomputed by the forge is the pre-push answer — see
+            // `Card::settle_mergeable`. A read taken at face value clears the
+            // stamp, the same way a reported rollup clears the CI grace.
+            let settled_mergeable = mergeable.map(|read| card.settle_mergeable(read, now_millis()));
+            let mergeable = settled_mergeable.unwrap_or(card.mergeable);
+            let clear_stale = settled_mergeable.is_some_and(|m| m != Mergeable::Unknown)
+                && card.mergeable_stale_since.is_some();
             let card = if by_reviewer != card.reviewer_comment_count
                 || total != card.comment_count
                 || unanswered != card.unanswered_count
                 || reviews != card.reviews
                 || checks != card.checks
                 || mergeable != card.mergeable
+                || clear_stale
             {
                 // Deliberately don't bump `updated_at`: a background refresh isn't
                 // a user-facing edit and shouldn't reorder the board. The fetch
@@ -160,6 +168,10 @@ impl Executor {
                     if c.mergeable == card.mergeable {
                         changed |= c.mergeable != mergeable;
                         c.mergeable = mergeable;
+                        if clear_stale && c.mergeable_stale_since == card.mergeable_stale_since {
+                            changed |= c.mergeable_stale_since.is_some();
+                            c.mergeable_stale_since = None;
+                        }
                     }
                     Ok(())
                 })?;

@@ -109,7 +109,11 @@ pub fn ConfirmHost() -> Element {
                         label { r#for: "confirm-note", "Message (optional)" }
                         textarea {
                             id: "confirm-note",
-                            value: "{NOTE}",
+                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                            // DOM patch a frame after each keystroke, which parks the caret at the
+                            // end whenever macOS splits one keystroke into two mutations (dead
+                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                            initial_value: "{NOTE.peek()}",
                             oninput: move |e| *NOTE.write() = e.value(),
                             // Focus the field, then park the caret after any
                             // prefilled text — "Edit blocked message" opens with

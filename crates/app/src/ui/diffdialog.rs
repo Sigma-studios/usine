@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::reviewdraft;
 use crate::state::AppState;
+use crate::ui::textfield::use_push_back;
 use crate::ui::widgets::SeverityPicker;
 
 /// Which entity's diff the dialog is showing. Both are keyed by a plain id in
@@ -307,6 +308,7 @@ fn DiffView(
     let mut collapsed = use_signal(HashSet::<usize>::new);
     // Case-insensitive substring filter over the left file list.
     let mut query = use_signal(String::new);
+    let mut pushback = use_push_back(query.read().clone());
     let files = data.read();
 
     let drafts_ref = drafts.as_deref().unwrap_or(&[]);
@@ -342,19 +344,36 @@ fn DiffView(
             // and scrolls the diff to it.
             div { class: "diff-filelist",
                 div { class: "diff-filelist-search",
-                    input {
-                        r#type: "text",
-                        placeholder: "Filter files…",
-                        "aria-label": "Filter files",
-                        value: "{query}",
-                        oninput: move |e| query.set(e.value()),
-                        onkeydown: move |e: KeyboardEvent| {
-                            if e.key() == Key::Escape && !query.read().is_empty() {
-                                // Clear the filter first; a second Escape closes the dialog.
-                                e.stop_propagation();
-                                query.set(String::new());
-                            }
-                        },
+                    // Uncontrolled (see `ui/textfield.rs`): Escape clears the
+                    // filter from outside the field, so that clear only reaches
+                    // the DOM by remounting — which also costs the focus the
+                    // user still has, hence the re-focus below.
+                    for g in [pushback.key()] {
+                        input {
+                            key: "{g}",
+                            r#type: "text",
+                            placeholder: "Filter files…",
+                            "aria-label": "Filter files",
+                            initial_value: "{query.peek()}",
+                            oninput: move |e| {
+                                pushback.typed(&e.value());
+                                query.set(e.value());
+                            },
+                            onkeydown: move |e: KeyboardEvent| {
+                                if e.key() == Key::Escape && !query.read().is_empty() {
+                                    // Clear the filter first; a second Escape closes the dialog.
+                                    e.stop_propagation();
+                                    query.set(String::new());
+                                }
+                            },
+                            onmounted: move |e: MountedEvent| {
+                                if g > 0 {
+                                    spawn(async move {
+                                        let _ = e.data().set_focus(true).await;
+                                    });
+                                }
+                            },
+                        }
                     }
                 }
                 div { class: "diff-filelist-items",
@@ -505,6 +524,7 @@ fn InlineComment(index: usize, comment: DraftComment) -> Element {
         "inline-comment is-skipped"
     };
     let rows = fallback_rows(&comment.body);
+    let mut pushback = use_push_back(comment.body.clone());
 
     rsx! {
         div {
@@ -534,11 +554,20 @@ fn InlineComment(index: usize, comment: DraftComment) -> Element {
                     span { class: "inline-comment-skip", "skipped" }
                 }
             }
-            textarea {
-                class: "review-comment-edit autogrow",
-                rows: "{rows}",
-                value: "{comment.body}",
-                oninput: move |e| reviewdraft::set_body(index, e.value()),
+            // Uncontrolled (see `ui/textfield.rs`): the review panel renders the
+            // same `reviewdraft` body at the same time as this dialog, so an edit
+            // made on the other surface has to be pushed back in.
+            for g in [pushback.key()] {
+                textarea {
+                    key: "{g}",
+                    class: "review-comment-edit autogrow",
+                    rows: "{rows}",
+                    initial_value: "{comment.body}",
+                    oninput: move |e| {
+                        pushback.typed(&e.value());
+                        reviewdraft::set_body(index, e.value());
+                    },
+                }
             }
         }
     }
@@ -550,7 +579,15 @@ fn InlineComment(index: usize, comment: DraftComment) -> Element {
 #[component]
 fn ValidateBar(review_id: Uuid) -> Element {
     let state = use_context::<AppState>();
-    let Some(edits) = reviewdraft::edits_for(review_id) else {
+    let edits = reviewdraft::edits_for(review_id);
+    // Before the early return below: hooks must run on every render.
+    let mut pushback = use_push_back(
+        edits
+            .as_ref()
+            .map(|e| e.summary.clone())
+            .unwrap_or_default(),
+    );
+    let Some(edits) = edits else {
         return rsx! {};
     };
     let checked = edits.comments.iter().filter(|c| c.selected).count();
@@ -567,12 +604,20 @@ fn ValidateBar(review_id: Uuid) -> Element {
         div { class: "review-validate-bar",
             div { class: "review-validate-summary",
                 label { class: "review-validate-label", "Review summary" }
-                textarea {
-                    class: "review-summary-edit",
-                    rows: "2",
-                    placeholder: "The overall review comment posted with the verdict…",
-                    value: "{edits.summary}",
-                    oninput: move |e| reviewdraft::set_summary(e.value()),
+                // Uncontrolled (see `ui/textfield.rs`): the review panel edits
+                // the same `reviewdraft` summary while this bar is mounted.
+                for g in [pushback.key()] {
+                    textarea {
+                        key: "{g}",
+                        class: "review-summary-edit",
+                        rows: "2",
+                        placeholder: "The overall review comment posted with the verdict…",
+                        initial_value: "{edits.summary}",
+                        oninput: move |e| {
+                            pushback.typed(&e.value());
+                            reviewdraft::set_summary(e.value());
+                        },
+                    }
                 }
             }
             div { class: "review-validate-actions",
@@ -623,7 +668,11 @@ fn FixBar(review_id: Uuid, head_ref: String) -> Element {
                     class: "review-summary-edit",
                     rows: "2",
                     placeholder: "What should the agent do differently?",
-                    value: "{note}",
+                    // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                    // DOM patch a frame after each keystroke, which parks the caret at the
+                    // end whenever macOS splits one keystroke into two mutations (dead
+                    // keys, smart quotes). Nothing but this field writes it while mounted.
+                    initial_value: "{note.peek()}",
                     oninput: move |e| note.set(e.value()),
                 }
             }

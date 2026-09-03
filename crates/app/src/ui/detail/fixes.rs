@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::review::fallback_rows;
 use crate::state::AppState;
 use crate::ui::drafts;
+use crate::ui::textfield::use_push_back;
 
 #[component]
 pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review: bool) -> Element {
@@ -34,6 +35,9 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     // advances (skipping to the PR for a self-review, ignoring the comments and
     // moving to merge for PR triage), so it says that instead.
     let has_note = !note.read().trim().is_empty();
+    // The note box is uncontrolled, and both Apply and "Skip to PR" clear it —
+    // see the field below.
+    let mut note_push = use_push_back(note.read().clone());
     let any_selected = edits.read().iter().any(|v| v.selected);
 
     // The task exactly as the agent will get it. `None` = untouched, so the box
@@ -52,6 +56,10 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     let shown = edited.clone().unwrap_or_else(|| generated.clone());
     let will_run = !shown.trim().is_empty();
     let task_rows = fallback_rows(&shown);
+    // Uncontrolled (see `ui/textfield.rs`): unlike the fields above, this one is
+    // *derived* — checking a row, typing a note or "Reset to generated" all
+    // rewrite it from outside, which only reaches the DOM by remounting.
+    let mut task_push = use_push_back(shown.clone());
 
     let apply_label = if !will_run {
         if self_review {
@@ -69,19 +77,12 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
         }
     };
 
-    // Grow each edit box to fit its text (same script as the review drafts
-    // panel: idempotent, keeps sizing on every keystroke). Unlike that panel,
-    // textareas here appear and disappear as rows are (un)checked — reply boxes
-    // mount when a row is unchecked — so the effect subscribes to `edits` to
-    // re-wire whatever the toggle just put in the DOM.
+    // Grow each edit box to fit its text, with the review panel's script. Boxes
+    // here appear and disappear as rows are (un)checked — a reply box mounts
+    // when a row is unchecked — which its observer picks up, so this runs once
+    // rather than on every edit.
     use_effect(move || {
-        edits.read();
-        dioxus::document::eval(
-            "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
-             var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
-             if(!el.dataset.growInit){el.dataset.growInit='1';el.addEventListener('input',fit);}\
-             fit();});})();",
-        );
+        dioxus::document::eval(super::review::AUTOGROW_JS);
     });
 
     let rows_snapshot = edits.read().clone();
@@ -192,7 +193,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                     textarea {
                                         class: "review-comment-edit autogrow",
                                         rows: "{fallback_rows(&body)}",
-                                        value: "{body}",
+                                        // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                                        // DOM patch a frame after each keystroke, which parks the caret at the
+                                        // end whenever macOS splits one keystroke into two mutations (dead
+                                        // keys, smart quotes). Nothing but this field writes it while mounted.
+                                        initial_value: "{body}",
                                         oninput: move |e| edits.write()[i].comment.body = e.value(),
                                     }
                                 } else {
@@ -211,7 +216,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                             class: "review-comment-edit autogrow",
                                             rows: "{fallback_rows(&instruction)}",
                                             placeholder: "Steer this fix — e.g. \"do it in the extractor, not the caller\".",
-                                            value: "{instruction}",
+                                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                                            // DOM patch a frame after each keystroke, which parks the caret at the
+                                            // end whenever macOS splits one keystroke into two mutations (dead
+                                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                                            initial_value: "{instruction}",
                                             oninput: move |e| edits.write()[i].instruction = e.value(),
                                         }
                                     }
@@ -223,7 +232,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                             class: "review-comment-edit autogrow",
                                             rows: "{fallback_rows(&reply)}",
                                             placeholder: "No reply — leave empty to ignore silently.",
-                                            value: "{reply}",
+                                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                                            // DOM patch a frame after each keystroke, which parks the caret at the
+                                            // end whenever macOS splits one keystroke into two mutations (dead
+                                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                                            initial_value: "{reply}",
                                             oninput: move |e| edits.write()[i].reply = e.value(),
                                         }
                                     }
@@ -235,15 +248,25 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
             }
             div { class: "field",
                 label { r#for: "fix-note", "Add a comment (free-form)" }
-                textarea {
-                    id: "fix-note",
-                    placeholder: if self_review {
-                        "Anything the review missed? It's applied with the fixes you checked."
-                    } else {
-                        "Anything to change beyond these comments? It's applied with the fixes you checked."
-                    },
-                    value: "{note}",
-                    oninput: move |e| note.set(e.value()),
+                // Uncontrolled (see `ui/textfield.rs`): both Apply and "Skip to
+                // PR" clear the note, and on a field the user has typed into a
+                // `defaultValue` patch is inert — so that clear only reaches the
+                // DOM by remounting.
+                for g in [note_push.key()] {
+                    textarea {
+                        key: "{g}",
+                        id: "fix-note",
+                        placeholder: if self_review {
+                            "Anything the review missed? It's applied with the fixes you checked."
+                        } else {
+                            "Anything to change beyond these comments? It's applied with the fixes you checked."
+                        },
+                        initial_value: "{note.peek()}",
+                        oninput: move |e| {
+                            note_push.typed(&e.value());
+                            note.set(e.value());
+                        },
+                    }
                 }
             }
             details { class: "fix-task",
@@ -251,12 +274,18 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     title: "The run also receives the card description and its worktree context ahead of this text",
                     "Task sent to the agent — edit to send your own wording"
                 }
-                textarea {
-                    class: "review-comment-edit task-edit",
-                    rows: "{task_rows}",
-                    placeholder: "Nothing to do — check a finding, add a note, or write the task yourself.",
-                    value: "{shown}",
-                    oninput: move |e| task.set(Some(e.value())),
+                for g in [task_push.key()] {
+                    textarea {
+                        key: "{g}",
+                        class: "review-comment-edit task-edit",
+                        rows: "{task_rows}",
+                        placeholder: "Nothing to do — check a finding, add a note, or write the task yourself.",
+                        initial_value: "{shown}",
+                        oninput: move |e| {
+                            task_push.typed(&e.value());
+                            task.set(Some(e.value()));
+                        },
+                    }
                 }
                 if edited.is_some() {
                     div { class: "hint", "edited — the rows and note no longer update this text" }
