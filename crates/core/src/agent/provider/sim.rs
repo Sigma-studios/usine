@@ -293,6 +293,16 @@ pub fn simulated_usage(now_secs: i64) -> UsageSnapshot {
                 resets_text: Some("Sun at 9am".into()),
                 ..Default::default()
             }),
+            // Fable's separate weekly cap, so the demo bar shows the per-model
+            // gauge too.
+            weekly_model: Some((
+                "Fable".into(),
+                RateLimitWindow {
+                    used_percent: wobble(now_secs, 5, 12.0, 29.0),
+                    resets_text: Some("Sun at 9am".into()),
+                    ..Default::default()
+                },
+            )),
         }),
         codex: Some(ProviderUsage {
             session: Some(RateLimitWindow {
@@ -305,6 +315,7 @@ pub fn simulated_usage(now_secs: i64) -> UsageSnapshot {
                 resets_at: Some(now_secs + 3 * 86_400),
                 ..Default::default()
             }),
+            weekly_model: None,
         }),
         // Stamped by the executor, which knows when the "poll" happened.
         refreshed_at: None,

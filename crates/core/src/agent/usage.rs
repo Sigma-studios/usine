@@ -6,7 +6,7 @@
 //!   turn runs and no tokens are spent (`num_turns: 0`, zero cost). The
 //!   percentages only exist in the human-readable `result` text, so parsing is
 //!   deliberately defensive: a wording change hides the segment, never breaks
-//!   the app.
+//!   the app. Fable's separate weekly bucket is parsed too, as `weekly_model`.
 //! - Codex: `codex exec --json` doesn't emit its `rate_limits` snapshot on
 //!   stdout, but the CLI records one in its session rollout files
 //!   (`~/.codex/sessions/**/*.jsonl`) on every turn — including usine's own
@@ -32,17 +32,23 @@ pub struct RateLimitWindow {
     pub resets_text: Option<String>,
 }
 
-/// A provider's session + weekly windows. Either side may be missing — not
+/// A provider's session + weekly windows. Any side may be missing — not
 /// reported, unparsable, or expired.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProviderUsage {
     pub session: Option<RateLimitWindow>,
     pub weekly: Option<RateLimitWindow>,
+    /// A model family with its own weekly cap, as the provider names it
+    /// ("Fable") plus that window. Claude bills Fable against a separate weekly
+    /// bucket, so a Fable card can hit a wall while `weekly` still reads
+    /// comfortable. The name is carried rather than hardcoded, so a rename or a
+    /// second such family needs no code change. Codex reports none.
+    pub weekly_model: Option<(String, RateLimitWindow)>,
 }
 
 impl ProviderUsage {
     pub fn is_empty(&self) -> bool {
-        self.session.is_none() && self.weekly.is_none()
+        self.session.is_none() && self.weekly.is_none() && self.weekly_model.is_none()
     }
 }
 
@@ -107,8 +113,10 @@ pub async fn fetch_claude_usage() -> Option<ProviderUsage> {
 /// Current week (all models): 44% used · resets Jul 24 at 12am (Europe/Paris)
 /// ```
 ///
-/// The per-model week line ("Current week (Fable): …") is deliberately skipped —
-/// the bar shows one weekly gauge per provider.
+/// A per-model week line ("Current week (Fable): …") becomes `weekly_model`,
+/// keeping the family name Claude itself printed. Should several appear, the
+/// tightest one wins (highest percentage, ties to the first) — that is the cap a
+/// run hits first, and the bar has room for one such gauge.
 pub fn parse_claude_usage_text(text: &str) -> ProviderUsage {
     let mut usage = ProviderUsage::default();
     for line in text.lines() {
@@ -117,6 +125,20 @@ pub fn parse_claude_usage_text(text: &str) -> ProviderUsage {
             usage.session = parse_claude_usage_line(rest);
         } else if let Some(rest) = line.strip_prefix("Current week (all models):") {
             usage.weekly = parse_claude_usage_line(rest);
+        } else if let Some(rest) = line.strip_prefix("Current week (") {
+            let Some((name, tail)) = rest.split_once("):") else {
+                continue;
+            };
+            let Some(window) = parse_claude_usage_line(tail) else {
+                continue;
+            };
+            let tighter = usage
+                .weekly_model
+                .as_ref()
+                .is_none_or(|(_, w)| window.used_percent > w.used_percent);
+            if tighter {
+                usage.weekly_model = Some((name.trim().to_string(), window));
+            }
         }
     }
     usage
@@ -226,6 +248,8 @@ fn parse_codex_rate_limits(line: &str, now_secs: i64) -> Option<ProviderUsage> {
     Some(ProviderUsage {
         session: window("primary"),
         weekly: window("secondary"),
+        // Codex reports no per-model bucket.
+        weekly_model: None,
     })
 }
 
@@ -254,6 +278,31 @@ mod tests {
         let weekly = usage.weekly.expect("weekly window");
         assert_eq!(weekly.used_percent, 44.0);
         assert_eq!(weekly.resets_text.as_deref(), Some("Jul 24 at 12am"));
+        // Fable's own weekly cap, labelled with the name Claude printed.
+        let (name, fable) = usage.weekly_model.expect("per-model weekly window");
+        assert_eq!(name, "Fable");
+        assert_eq!(fable.used_percent, 12.0);
+        assert_eq!(fable.resets_text.as_deref(), Some("Jul 24 at 12am"));
+    }
+
+    #[test]
+    fn claude_usage_text_without_a_per_model_line_has_no_per_model_window() {
+        let text = "Current session: 4% used · resets Jul 21 at 8pm (Europe/Paris)\n\
+                    Current week (all models): 44% used · resets Jul 24 at 12am (Europe/Paris)\n";
+        let usage = parse_claude_usage_text(text);
+        assert!(usage.weekly_model.is_none());
+        assert!(usage.weekly.is_some());
+    }
+
+    #[test]
+    fn the_tightest_per_model_weekly_cap_wins() {
+        let text = "Current week (Fable): 12% used · resets Jul 24 at 12am (Europe/Paris)\n\
+                    Current week (Mythos): 71% used · resets Jul 24 at 12am (Europe/Paris)\n";
+        let (name, window) = parse_claude_usage_text(text)
+            .weekly_model
+            .expect("per-model weekly window");
+        assert_eq!(name, "Mythos");
+        assert_eq!(window.used_percent, 71.0);
     }
 
     #[test]
