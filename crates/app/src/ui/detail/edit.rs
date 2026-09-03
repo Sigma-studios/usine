@@ -57,14 +57,8 @@ pub(super) fn EditableTask(card: Card) -> Element {
                             placeholder: "What should the agent do? (paste a screenshot to attach it)",
                             oninput: move |e| desc.set(e.value()),
                             onchange: move |e| state.update_card(id, |c| c.description = e.value()),
-                            // Paste an image from the clipboard to attach it (text
-                            // paste is unaffected — we only act when the clipboard
-                            // actually holds an image).
-                            onpaste: move |_| {
-                                if let Some(png) = clipboard_image_png() {
-                                    state.attach_image_bytes(id, png);
-                                }
-                            },
+                            // Paste an image from the clipboard to attach it.
+                            onpaste: move |_| attach_from_clipboard(state, id),
                         }
                     } else {
                         // The pre-fix rendering, kept only so `USINE_STRESS_CARET`
@@ -75,11 +69,7 @@ pub(super) fn EditableTask(card: Card) -> Element {
                             placeholder: "What should the agent do? (paste a screenshot to attach it)",
                             oninput: move |e| desc.set(e.value()),
                             onchange: move |e| state.update_card(id, |c| c.description = e.value()),
-                            onpaste: move |_| {
-                                if let Some(png) = clipboard_image_png() {
-                                    state.attach_image_bytes(id, png);
-                                }
-                            },
+                            onpaste: move |_| attach_from_clipboard(state, id),
                         }
                     }
                 }
@@ -88,11 +78,21 @@ pub(super) fn EditableTask(card: Card) -> Element {
     }
 }
 
+/// The `onpaste` handler every text field with an attach affordance uses: if
+/// the clipboard holds an image, attach it to the card; a text paste is
+/// unaffected, since [`clipboard_image_png`] returns `None` then and the
+/// webview's own paste has already run.
+pub(super) fn attach_from_clipboard(state: AppState, card_id: Uuid) {
+    if let Some(png) = clipboard_image_png() {
+        state.attach_image_bytes(card_id, png);
+    }
+}
+
 /// Read an image off the OS clipboard and PNG-encode it, if one is present.
 /// Returns `None` for a text paste (or when the clipboard has no image), so the
 /// caller can safely try this on every paste. Uses the native clipboard rather
 /// than the webview paste payload, which doesn't reliably expose image bytes.
-pub(super) fn clipboard_image_png() -> Option<Vec<u8>> {
+fn clipboard_image_png() -> Option<Vec<u8>> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
     let buf =
@@ -112,11 +112,20 @@ pub(super) fn clipboard_image_png() -> Option<Vec<u8>> {
 /// vision-capable Read tool, Codex receives them as `codex exec -i` flags. Non-
 /// image files ride as prompt-listed paths either way (Codex's `-i` filter only
 /// covers png/jpg/jpeg/gif/webp), which both CLIs read with their shell tools.
+///
+/// `can_attach: false` drops the picker but keeps the chips: in a terminal
+/// state nothing can ever read a new attachment, but what was attached earlier
+/// still has to be visible (and removable).
 #[component]
-pub(super) fn Attachments(card_id: Uuid) -> Element {
+pub(super) fn Attachments(card_id: Uuid, #[props(default = true)] can_attach: bool) -> Element {
     let atts_empty = use_context::<AppState>()
         .card_attachments(card_id)
         .is_empty();
+
+    // No picker and nothing to show: no section at all.
+    if atts_empty && !can_attach {
+        return rsx! {};
+    }
 
     rsx! {
         // Nothing attached: the section IS the button. A heading and a "No files
@@ -126,7 +135,9 @@ pub(super) fn Attachments(card_id: Uuid) -> Element {
                 h3 { "Attachments" }
             }
             AttachmentChips { card_id }
-            AttachButton { card_id }
+            if can_attach {
+                AttachButton { card_id }
+            }
         }
     }
 }

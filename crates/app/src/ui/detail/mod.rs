@@ -350,12 +350,14 @@ fn CardPanel(card: Card) -> Element {
         // want to hand a card you are already reviewing, and the chat and
         // revise paths send attachments along. Where the panel renders a chat
         // box, the control lives *in* that box instead (`chat::renders_chat`),
-        // next to the change it is evidence for; the terminal states drop it,
-        // since nothing there can ever read an attachment.
-        if !chat::renders_chat(&card.state)
-            && !matches!(st, CardState::Done | CardState::MergedWithoutReview { .. })
-        {
-            Attachments { card_id: id }
+        // next to the change it is evidence for. The terminal states keep the
+        // chips but lose the picker — nothing there can read a new attachment,
+        // yet what was attached earlier still has to be visible and removable.
+        if !chat::renders_chat(&card.state) {
+            Attachments {
+                card_id: id,
+                can_attach: !matches!(st, CardState::Done | CardState::MergedWithoutReview { .. }),
+            }
         }
 
         // The main running phases used to render nothing actionable here; give
@@ -762,11 +764,7 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                             initial_value: "{answer.peek()}",
                             oninput: move |e| answer.set(e.value()),
                             // Paste a screenshot straight into the answer.
-                            onpaste: move |_| {
-                                if let Some(png) = edit::clipboard_image_png() {
-                                    state.attach_image_bytes(card_id, png);
-                                }
-                            },
+                            onpaste: move |_| edit::attach_from_clipboard(state, card_id),
                         }
                     }
                     button {

@@ -39,12 +39,7 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
                             pushback.typed(&e.value());
                             follow_up.set(e.value());
                         },
-                        // Paste an image to attach it (text paste is unaffected).
-                        onpaste: move |_| {
-                            if let Some(png) = super::edit::clipboard_image_png() {
-                                state.attach_image_bytes(card_id, png);
-                            }
-                        },
+                        onpaste: move |_| super::edit::attach_from_clipboard(state, card_id),
                     }
                 }
             }

@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use usine_core::{CardState, DesignSub, ExecutorCommand, PrReviewSub, ReviewSub};
 use uuid::Uuid;
 
-use super::edit::{clipboard_image_png, AttachButton, AttachmentChips};
+use super::edit::{attach_from_clipboard, AttachButton, AttachmentChips};
 use crate::state::AppState;
 use crate::ui::drafts;
 
@@ -41,6 +41,23 @@ pub(super) fn AgentChatSection(
     request_title: Option<String>,
 ) -> Element {
     let state = use_context::<AppState>();
+    // The other half of the `renders_chat` coupling: this section carries the
+    // card's only attach control at the states that render it, so if a gate ever
+    // renders one that `renders_chat` doesn't list, the panel drops its top-level
+    // attachments section and the card is left with no way to attach at all.
+    debug_assert!(
+        state
+            .cards
+            // `peek`, not `read`: this check must not subscribe the section to
+            // the card list, or a debug build would re-render on edits a release
+            // build ignores.
+            .peek()
+            .iter()
+            .find(|c| c.id == card_id)
+            .is_none_or(|c| renders_chat(&c.state)),
+        "AgentChatSection rendered at a state `renders_chat` says has none — \
+         the panel-top Attachments section is being dropped for nothing",
+    );
     let mut text = drafts::use_draft(card_id, "chat", String::new);
     // The box is *uncontrolled* (`initial_value` → `defaultValue`), so a
     // re-render can never rewind what has been typed since the keystroke that
@@ -112,13 +129,7 @@ pub(super) fn AgentChatSection(
                                 crate::stress::record_chat_input(&v);
                                 text.set(v);
                             },
-                            // Paste an image to attach it; a text paste is
-                            // unaffected (the helper returns None then).
-                            onpaste: move |_| {
-                                if let Some(png) = clipboard_image_png() {
-                                    state.attach_image_bytes(card_id, png);
-                                }
-                            },
+                            onpaste: move |_| attach_from_clipboard(state, card_id),
                         }
                     }
                 } else {
@@ -131,11 +142,7 @@ pub(super) fn AgentChatSection(
                             crate::stress::record_chat_input(&v);
                             text.set(v);
                         },
-                        onpaste: move |_| {
-                            if let Some(png) = clipboard_image_png() {
-                                state.attach_image_bytes(card_id, png);
-                            }
-                        },
+                        onpaste: move |_| attach_from_clipboard(state, card_id),
                     }
                 }
                 AttachButton { card_id, icon: true }
@@ -194,17 +201,50 @@ pub(super) fn summary_line(question: &str) -> String {
 /// duplicate it. Mirrors the call sites in `plan.rs`, `pr_create.rs`,
 /// `pr_review.rs` and the merge gate; computed from `effective()` so the
 /// `Failed`/`Answering` wrappers resolve exactly as those panels do.
+///
+/// Deliberately exhaustive — no `_` arm — so a new state or sub-state has to be
+/// classified here rather than silently defaulting. That covers one direction of
+/// drift; the other (a gate quietly dropping its chat box, leaving the card with
+/// no attach affordance at all) is caught by the `debug_assert!` below, which
+/// fires whenever a state renders this section while this function says it
+/// doesn't.
 pub(super) fn renders_chat(state: &CardState) -> bool {
-    matches!(
-        state.effective(),
+    match state.effective() {
         CardState::Designing(DesignSub::AwaitingApproval { .. })
-            | CardState::AwaitingReview(
-                ReviewSub::ReadyForReview
-                    | ReviewSub::SelectingFixes { .. }
-                    | ReviewSub::ValidationFailed { .. }
-                    | ReviewSub::ReadyForPr
-            )
-            | CardState::PrReview(PrReviewSub::Idle)
-            | CardState::ReadyToMerge
-    )
+        | CardState::AwaitingReview(
+            ReviewSub::ReadyForReview
+            | ReviewSub::SelectingFixes { .. }
+            | ReviewSub::ValidationFailed { .. }
+            | ReviewSub::ReadyForPr,
+        )
+        | CardState::PrReview(PrReviewSub::Idle)
+        | CardState::ReadyToMerge => true,
+
+        // The running phases and the two panels with a send box of their own
+        // (the intervention answer, the conclusion's "dig deeper"), plus the
+        // terminal states: these keep the panel-top attachments section.
+        CardState::StartingBlock
+        | CardState::Designing(DesignSub::Running | DesignSub::Intervention(_))
+        | CardState::Investigating(_)
+        | CardState::Concluded { .. }
+        | CardState::Implementing(_)
+        | CardState::AwaitingReview(
+            ReviewSub::Reviewing
+            | ReviewSub::ApplyingFixes
+            | ReviewSub::Validating { .. }
+            | ReviewSub::FixingValidation { .. },
+        )
+        | CardState::PrReview(
+            PrReviewSub::FetchingComments
+            | PrReviewSub::SelectingFixes { .. }
+            | PrReviewSub::ApplyingFixes
+            | PrReviewSub::ApplyingChange
+            | PrReviewSub::AwaitingAnswer(_),
+        )
+        | CardState::MergedWithoutReview { .. }
+        | CardState::Done => false,
+
+        // Unreachable: `effective()` unwrapped both of these above.
+        CardState::Failed { .. } | CardState::Answering { .. } => false,
+    }
 }
