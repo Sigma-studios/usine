@@ -1369,6 +1369,15 @@ impl Project {
 /// real status landing clears it early either way.
 pub const CI_REGISTER_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// How long a locally-invalidated mergeability distrusts a `CONFLICTING` read
+/// from the forge. Pushing a merge commit cures a conflict locally seconds
+/// before GitHub recomputes the PR's mergeability, so the first poll after the
+/// push routinely reports the conflict the push just fixed. Taking that at face
+/// value re-gated the merge button — and re-offered a resolve run — for the
+/// whole five minutes until the next tick. A `MERGEABLE` read is good news and
+/// is never distrusted, so this only has to outlast the recompute.
+pub const MERGEABILITY_RECOMPUTE_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// A unit of work moving across the board.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Card {
@@ -1463,6 +1472,16 @@ pub struct Card {
     /// records loadable.
     #[serde(default)]
     pub mergeable: Mergeable,
+    /// When this card's cached mergeability was last invalidated by a push of
+    /// ours (a resolve run's merge commit, or any run pushing onto the PR), in
+    /// epoch millis. The forge keeps answering with the pre-push mergeability
+    /// until it recomputes, so within [`MERGEABILITY_RECOMPUTE_GRACE`] a
+    /// `Conflicting` read is treated as "not recomputed yet" rather than as the
+    /// conflict returning (see [`Card::settle_mergeable`]). Cleared as soon as a
+    /// read is taken at face value. `#[serde(default)]` keeps older records
+    /// loadable.
+    #[serde(default)]
+    pub mergeable_stale_since: Option<i64>,
     /// A user-set "waiting on something outside Usine" marker. Purely cosmetic:
     /// the board tints the card and shows a "blocked" chip, and the card stops
     /// counting toward the attention badges — no run, poll, or transition looks
@@ -1511,6 +1530,7 @@ impl Card {
             checks: CheckStatus::None,
             ci_awaited_since: None,
             mergeable: Mergeable::Unknown,
+            mergeable_stale_since: None,
             blocked: false,
             blocked_note: None,
             created_at: now,
@@ -1611,6 +1631,25 @@ impl Card {
                 CheckStatus::Pending
             }
             _ => CheckStatus::None,
+        }
+    }
+
+    /// What a freshly-read mergeability means for this card. Mirrors
+    /// [`Self::settle_checks`]: a definite `Clean` (and an honest `Unknown`) is
+    /// always taken as-is, but a `Conflicting` read inside the recompute grace
+    /// that follows one of our own pushes is the forge's pre-push answer — the
+    /// merge commit that push carried is exactly what cured the conflict — so it
+    /// reads as "not recomputed yet" instead of resurrecting the conflict the
+    /// card just shed.
+    pub fn settle_mergeable(&self, read: Mergeable, now: i64) -> Mergeable {
+        if read != Mergeable::Conflicting {
+            return read;
+        }
+        match self.mergeable_stale_since {
+            Some(t) if now.saturating_sub(t) < MERGEABILITY_RECOMPUTE_GRACE.as_millis() as i64 => {
+                Mergeable::Unknown
+            }
+            _ => read,
         }
     }
 
@@ -2248,6 +2287,43 @@ mod tests {
         assert_eq!(
             card.settle_checks(CheckStatus::Passing, late),
             CheckStatus::Passing
+        );
+    }
+
+    #[test]
+    fn a_conflict_read_right_after_our_push_waits_for_the_recompute() {
+        let now = now_millis();
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+
+        // Nothing of ours is in flight: every read is the forge's truth.
+        assert_eq!(card.mergeable_stale_since, None);
+        for read in [Mergeable::Unknown, Mergeable::Clean, Mergeable::Conflicting] {
+            assert_eq!(card.settle_mergeable(read, now), read);
+        }
+
+        // A push of ours just landed: its merge commit is what cures a
+        // conflict, so a `Conflicting` answer is the forge's pre-push one.
+        card.mergeable_stale_since = Some(now);
+        assert_eq!(
+            card.settle_mergeable(Mergeable::Conflicting, now),
+            Mergeable::Unknown
+        );
+        // Good news needs no grace, and an honest `Unknown` passes through.
+        assert_eq!(
+            card.settle_mergeable(Mergeable::Clean, now),
+            Mergeable::Clean
+        );
+        assert_eq!(
+            card.settle_mergeable(Mergeable::Unknown, now),
+            Mergeable::Unknown
+        );
+
+        // Past the grace the forge has had every chance to recompute, so a
+        // conflict now is a real one — the base moved again.
+        let late = now + MERGEABILITY_RECOMPUTE_GRACE.as_millis() as i64 + 1;
+        assert_eq!(
+            card.settle_mergeable(Mergeable::Conflicting, late),
+            Mergeable::Conflicting
         );
     }
 

@@ -413,7 +413,7 @@ async fn finalize_run(
                                 let expects_ci = project.expects_ci();
                                 if let Ok(updated) = store.mutate_card(card_id, |c| {
                                     super::pr::mark_ci_in_flight(c, expects_ci);
-                                    c.mergeable = Mergeable::Unknown;
+                                    super::pr::mark_mergeable_stale(c);
                                     Ok(())
                                 }) {
                                     let _ = evt_tx.unbounded_send(ExecutorEvent::updated(updated));
