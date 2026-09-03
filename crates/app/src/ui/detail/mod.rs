@@ -346,11 +346,19 @@ fn CardPanel(card: Card) -> Element {
                 div { class: "plan-box", "{card.description}" }
             }
         }
-        // In every state, not just the starting block: a screenshot is exactly
-        // the thing you want to hand a card you are already reviewing, and the
-        // chat and revise paths send attachments along. It costs one button
-        // when there is nothing attached.
-        Attachments { card_id: id }
+        // Not just the starting block: a screenshot is exactly the thing you
+        // want to hand a card you are already reviewing, and the chat and
+        // revise paths send attachments along. Where the panel renders a chat
+        // box, the control lives *in* that box instead (`chat::renders_chat`),
+        // next to the change it is evidence for. The terminal states keep the
+        // chips but lose the picker — nothing there can read a new attachment,
+        // yet what was attached earlier still has to be visible and removable.
+        if !chat::renders_chat(&card.state) {
+            Attachments {
+                card_id: id,
+                can_attach: !matches!(st, CardState::Done | CardState::MergedWithoutReview { .. }),
+            }
+        }
 
         // The main running phases used to render nothing actionable here; give
         // them a status line and a way out. Cancel drops the run's progress and
@@ -755,6 +763,8 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                             placeholder: if options.is_empty() { "Type an answer…" } else { "Or type an answer…" },
                             initial_value: "{answer.peek()}",
                             oninput: move |e| answer.set(e.value()),
+                            // Paste a screenshot straight into the answer.
+                            onpaste: move |_| edit::attach_from_clipboard(state, card_id),
                         }
                     }
                     button {
