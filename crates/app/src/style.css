@@ -199,17 +199,9 @@ body.resizing .info-tip { visibility: hidden; opacity: 0; }
   flex: 1; display: flex; gap: 12px;
   padding: 16px; overflow-x: auto; overflow-y: hidden;
 }
-/* An empty lane collapses to a labelled rail: nine 280px columns plus the
-   sidebar and the detail panel is more board than any laptop shows at once, and
-   the lanes that are empty are the ones costing the most for the least. It
-   re-expands on its own the moment a card lands (the component re-renders from
-   `cards`), so there is no toggle to persist. */
-.column.is-empty { width: 40px; min-width: 40px; }
-.column.is-empty .column-header {
-  writing-mode: vertical-rl; justify-content: flex-start;
-  border-bottom: none; padding: 10px 0; gap: 8px; color: var(--muted);
-}
-.column.is-empty .column-count { display: none; }
+/* An empty lane is not drawn at all (see `visible_columns`): nine 280px columns
+   plus the sidebar and the detail panel is more board than any laptop shows at
+   once. A lane reappears on its own the moment a card lands in it. */
 .column {
   width: 280px; min-width: 280px;
   background: var(--col); border: 1px solid var(--border);
