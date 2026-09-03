@@ -18,6 +18,7 @@ mod search;
 mod settings;
 mod shortcuts;
 mod sidebar;
+mod textfield;
 mod usagebar;
 mod widgets;
 

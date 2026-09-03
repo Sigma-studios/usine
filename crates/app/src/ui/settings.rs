@@ -10,6 +10,7 @@ use super::widgets::{
     parse_provider, provider_value, ModelEffortPicker, OptionalModelEffortPicker,
 };
 use crate::state::AppState;
+use crate::ui::textfield::use_push_back;
 
 /// Upper bound (a day) on the validate timeout field, enforced on save as well
 /// as by the input, since a typed value bypasses the input's `max`.
@@ -434,6 +435,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
         .collect();
     let mut manual = use_signal(String::new);
     let mut manual_err = use_signal(String::new);
+    let mut manual_push = use_push_back(manual.read().clone());
 
     rsx! {
         div { class: "section",
@@ -548,22 +550,29 @@ fn ReviewsTab(pid: Uuid) -> Element {
                 // fork contributor may have no open PR right now and is never a
                 // collaborator, so there has to be a way to type a login.
                 div { class: "add-row",
-                    input {
-                        r#type: "text",
-                        placeholder: "GitHub login",
-                        value: "{manual}",
-                        oninput: move |e: Event<FormData>| {
-                            manual.set(e.value());
-                            manual_err.set(String::new());
-                        },
-                        onkeydown: {
-                            let project = project.clone();
-                            move |e: Event<KeyboardData>| {
-                                if e.key() == Key::Enter {
-                                    submit_manual(state, &project, manual, manual_err);
+                    // Uncontrolled (see `ui/textfield.rs`): `submit_manual` clears
+                    // the field on success, which only reaches the DOM by
+                    // remounting.
+                    for g in [manual_push.key()] {
+                        input {
+                            key: "{g}",
+                            r#type: "text",
+                            placeholder: "GitHub login",
+                            initial_value: "{manual.peek()}",
+                            oninput: move |e: Event<FormData>| {
+                                manual_push.typed(&e.value());
+                                manual.set(e.value());
+                                manual_err.set(String::new());
+                            },
+                            onkeydown: {
+                                let project = project.clone();
+                                move |e: Event<KeyboardData>| {
+                                    if e.key() == Key::Enter {
+                                        submit_manual(state, &project, manual, manual_err);
+                                    }
                                 }
-                            }
-                        },
+                            },
+                        }
                     }
                     button {
                         class: "btn",

@@ -12,6 +12,9 @@ mod stress {
     pub fn fix_a() -> bool {
         true
     }
+    pub fn fix_c() -> bool {
+        true
+    }
     pub fn transcript_cap() -> usize {
         500
     }

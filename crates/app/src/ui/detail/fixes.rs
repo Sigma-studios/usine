@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::review::fallback_rows;
 use crate::state::AppState;
 use crate::ui::drafts;
+use crate::ui::textfield::use_push_back;
 
 #[component]
 pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review: bool) -> Element {
@@ -52,6 +53,10 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     let shown = edited.clone().unwrap_or_else(|| generated.clone());
     let will_run = !shown.trim().is_empty();
     let task_rows = fallback_rows(&shown);
+    // Uncontrolled (see `ui/textfield.rs`): unlike the fields above, this one is
+    // *derived* — checking a row, typing a note or "Reset to generated" all
+    // rewrite it from outside, which only reaches the DOM by remounting.
+    let mut task_push = use_push_back(shown.clone());
 
     let apply_label = if !will_run {
         if self_review {
@@ -152,7 +157,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                     textarea {
                                         class: "review-comment-edit autogrow",
                                         rows: "{fallback_rows(&body)}",
-                                        value: "{body}",
+                                        // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                                        // DOM patch a frame after each keystroke, which parks the caret at the
+                                        // end whenever macOS splits one keystroke into two mutations (dead
+                                        // keys, smart quotes). Nothing but this field writes it while mounted.
+                                        initial_value: "{body}",
                                         oninput: move |e| edits.write()[i].comment.body = e.value(),
                                     }
                                 } else {
@@ -171,7 +180,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                             class: "review-comment-edit autogrow",
                                             rows: "{fallback_rows(&instruction)}",
                                             placeholder: "Steer this fix — e.g. \"do it in the extractor, not the caller\".",
-                                            value: "{instruction}",
+                                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                                            // DOM patch a frame after each keystroke, which parks the caret at the
+                                            // end whenever macOS splits one keystroke into two mutations (dead
+                                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                                            initial_value: "{instruction}",
                                             oninput: move |e| edits.write()[i].instruction = e.value(),
                                         }
                                     }
@@ -183,7 +196,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                             class: "review-comment-edit autogrow",
                                             rows: "{fallback_rows(&reply)}",
                                             placeholder: "No reply — leave empty to ignore silently.",
-                                            value: "{reply}",
+                                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                                            // DOM patch a frame after each keystroke, which parks the caret at the
+                                            // end whenever macOS splits one keystroke into two mutations (dead
+                                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                                            initial_value: "{reply}",
                                             oninput: move |e| edits.write()[i].reply = e.value(),
                                         }
                                     }
@@ -202,7 +219,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     } else {
                         "Anything to change beyond these comments? It's applied with the fixes you checked."
                     },
-                    value: "{note}",
+                    // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                    // DOM patch a frame after each keystroke, which parks the caret at the
+                    // end whenever macOS splits one keystroke into two mutations (dead
+                    // keys, smart quotes). Nothing but this field writes it while mounted.
+                    initial_value: "{note.peek()}",
                     oninput: move |e| note.set(e.value()),
                 }
             }
@@ -211,12 +232,18 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     title: "The run also receives the card description and its worktree context ahead of this text",
                     "Task sent to the agent — edit to send your own wording"
                 }
-                textarea {
-                    class: "review-comment-edit task-edit",
-                    rows: "{task_rows}",
-                    placeholder: "Nothing to do — check a finding, add a note, or write the task yourself.",
-                    value: "{shown}",
-                    oninput: move |e| task.set(Some(e.value())),
+                for g in [task_push.key()] {
+                    textarea {
+                        key: "{g}",
+                        class: "review-comment-edit task-edit",
+                        rows: "{task_rows}",
+                        placeholder: "Nothing to do — check a finding, add a note, or write the task yourself.",
+                        initial_value: "{shown}",
+                        oninput: move |e| {
+                            task_push.typed(&e.value());
+                            task.set(Some(e.value()));
+                        },
+                    }
                 }
                 if edited.is_some() {
                     div { class: "hint", "edited — the rows and note no longer update this text" }

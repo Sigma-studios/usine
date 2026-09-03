@@ -12,6 +12,7 @@ use crate::state::AppState;
 use crate::ui::diffdialog::{event_value, open_review_diff, open_review_diff_at, parse_event};
 use crate::ui::icons::IconDiff;
 use crate::ui::reviewdraft;
+use crate::ui::textfield::use_push_back;
 use crate::ui::widgets::SeverityPicker;
 use crate::ui::{Panel, PanelResizer};
 
@@ -159,7 +160,11 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                         label { "Steer this review (optional)" }
                         textarea {
                             placeholder: "What should this pass focus on? e.g. \"the migration and its rollback path\"",
-                            value: "{guidance}",
+                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                            // DOM patch a frame after each keystroke, which parks the caret at the
+                            // end whenever macOS splits one keystroke into two mutations (dead
+                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                            initial_value: "{guidance.peek()}",
                             oninput: move |e| guidance.set(e.value()),
                         }
                     }
@@ -277,7 +282,11 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                         label { "Steer this review (optional)" }
                         textarea {
                             placeholder: "What should this pass focus on? e.g. \"the migration and its rollback path\"",
-                            value: "{guidance}",
+                            // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                            // DOM patch a frame after each keystroke, which parks the caret at the
+                            // end whenever macOS splits one keystroke into two mutations (dead
+                            // keys, smart quotes). Nothing but this field writes it while mounted.
+                            initial_value: "{guidance.peek()}",
                             oninput: move |e| guidance.set(e.value()),
                         }
                     }
@@ -324,7 +333,15 @@ fn DraftSelection(
     // Both surfaces edit one buffer, so unchecking a comment in the diff shows up
     // here and vice versa. Seeding is idempotent and keyed by review id.
     reviewdraft::ensure_seeded(review_id, &drafts, &summary, event);
-    let Some(edits) = reviewdraft::edits_for(review_id) else {
+    let edits = reviewdraft::edits_for(review_id);
+    // Before the early return below: hooks must run on every render.
+    let mut pushback = use_push_back(
+        edits
+            .as_ref()
+            .map(|e| e.summary.clone())
+            .unwrap_or_default(),
+    );
+    let Some(edits) = edits else {
         return rsx! {};
     };
 
@@ -347,12 +364,7 @@ fn DraftSelection(
     // panel remounts whenever the status changes) and keeps sizing on every
     // keystroke. Without JS the boxes fall back to their `rows` estimate.
     use_effect(move || {
-        dioxus::document::eval(
-            "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
-             var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
-             if(!el.dataset.growInit){el.dataset.growInit='1';el.addEventListener('input',fit);}\
-             fit();});})();",
-        );
+        dioxus::document::eval(AUTOGROW_JS);
     });
 
     rsx! {
@@ -426,12 +438,7 @@ fn DraftSelection(
                                             "jump ↗"
                                         }
                                     }
-                                    textarea {
-                                        class: "review-comment-edit autogrow",
-                                        rows: "{rows}",
-                                        value: "{body_text}",
-                                        oninput: move |e| reviewdraft::set_body(i, e.value()),
-                                    }
+                                    ReviewCommentEdit { index: i, body: body_text.clone(), rows }
                                 }
                             }
                         }
@@ -440,11 +447,23 @@ fn DraftSelection(
             }
             div { class: "field",
                 label { "Overall summary" }
-                textarea {
-                    class: "review-summary-edit autogrow",
-                    rows: "{fallback_rows(&edits.summary)}",
-                    value: "{edits.summary}",
-                    oninput: move |e| reviewdraft::set_summary(e.value()),
+                // Uncontrolled (see `ui/textfield.rs`): the diff dialog's publish
+                // bar edits the same `reviewdraft` summary while this panel stays
+                // mounted underneath it, so its edits must be pushed back in.
+                for g in [pushback.key()] {
+                    textarea {
+                        key: "{g}",
+                        class: "review-summary-edit autogrow",
+                        rows: "{fallback_rows(&edits.summary)}",
+                        initial_value: "{edits.summary}",
+                        oninput: move |e| {
+                            pushback.typed(&e.value());
+                            reviewdraft::set_summary(e.value());
+                        },
+                        onmounted: move |_| {
+                            dioxus::document::eval(AUTOGROW_JS);
+                        },
+                    }
                 }
             }
             div { class: "field",
@@ -559,7 +578,11 @@ fn FixGate(
                 label { "Send it back with feedback" }
                 textarea {
                     placeholder: "What should the agent do differently? e.g. \"keep the helper private\"",
-                    value: "{note}",
+                    // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
+                    // DOM patch a frame after each keystroke, which parks the caret at the
+                    // end whenever macOS splits one keystroke into two mutations (dead
+                    // keys, smart quotes). Nothing but this field writes it while mounted.
+                    initial_value: "{note.peek()}",
                     oninput: move |e| note.set(e.value()),
                 }
             }
@@ -587,6 +610,44 @@ fn FixGate(
 /// A `rows` estimate used only until the autogrow script measures the box for
 /// real — and as the final height if scripting is unavailable. Counts hard line
 /// breaks and allows one wrapped line per ~72 characters.
+/// Wire and apply the auto-grow behaviour to every `textarea.autogrow` on the
+/// page. Idempotent (`growInit`), so any box that appears later — a push-back
+/// remount mints a brand-new node — re-runs it from its own `onmounted`.
+const AUTOGROW_JS: &str =
+    "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
+     var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
+     if(!el.dataset.growInit){el.dataset.growInit='1';el.addEventListener('input',fit);}\
+     fit();});})();";
+
+/// The editable body of one drafted comment. A component of its own only
+/// because it needs a hook, and hooks cannot be called inside the `for` over
+/// the comments.
+#[component]
+fn ReviewCommentEdit(index: usize, body: String, rows: usize) -> Element {
+    // Uncontrolled (see `ui/textfield.rs`): the diff dialog edits the same
+    // `reviewdraft` comment while this panel is mounted underneath it.
+    let mut pushback = use_push_back(body.clone());
+    rsx! {
+        for g in [pushback.key()] {
+            textarea {
+                key: "{g}",
+                class: "review-comment-edit autogrow",
+                rows: "{rows}",
+                initial_value: "{body}",
+                oninput: move |e| {
+                    pushback.typed(&e.value());
+                    reviewdraft::set_body(index, e.value());
+                },
+                // A remount mints a fresh node, which lost the panel-level
+                // effect's auto-grow wiring; re-running it is idempotent.
+                onmounted: move |_| {
+                    dioxus::document::eval(AUTOGROW_JS);
+                },
+            }
+        }
+    }
+}
+
 pub(super) fn fallback_rows(body: &str) -> usize {
     let rows: usize = body.lines().map(|l| 1 + l.len() / 72).sum();
     rows.clamp(2, 24)

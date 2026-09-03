@@ -40,20 +40,46 @@ pub(super) fn EditableTask(card: Card) -> Element {
             div { class: "field",
                 label { r#for: "task-desc", "Description" }
                 div { class: "grow-wrap", "data-replicated-value": "{desc}",
-                    textarea {
-                        id: "task-desc",
-                        value: "{desc}",
-                        placeholder: "What should the agent do? (paste a screenshot to attach it)",
-                        oninput: move |e| desc.set(e.value()),
-                        onchange: move |e| state.update_card(id, |c| c.description = e.value()),
-                        // Paste an image from the clipboard to attach it (text
-                        // paste is unaffected — we only act when the clipboard
-                        // actually holds an image).
-                        onpaste: move |_| {
-                            if let Some(png) = clipboard_image_png() {
-                                state.attach_image_bytes(id, png);
-                            }
-                        },
+                    if crate::stress::fix_c() {
+                        textarea {
+                            id: "task-desc",
+                            // Uncontrolled (see `detail/chat.rs`): a controlled
+                            // `value` re-emits a DOM patch a frame after every
+                            // keystroke, and a keystroke macOS splits into two
+                            // mutations (dead key `^e`, smart quotes) makes the
+                            // first patch stale — WebKit then reparks the caret
+                            // at the end. Nothing but this field writes the
+                            // description while the card is in StartingBlock,
+                            // so `defaultValue` seeding is enough, with no
+                            // remount generation to carry.
+                            initial_value: "{desc.peek()}",
+                            placeholder: "What should the agent do? (paste a screenshot to attach it)",
+                            oninput: move |e| desc.set(e.value()),
+                            onchange: move |e| state.update_card(id, |c| c.description = e.value()),
+                            // Paste an image from the clipboard to attach it (text
+                            // paste is unaffected — we only act when the clipboard
+                            // actually holds an image).
+                            onpaste: move |_| {
+                                if let Some(png) = clipboard_image_png() {
+                                    state.attach_image_bytes(id, png);
+                                }
+                            },
+                        }
+                    } else {
+                        // The pre-fix rendering, kept only so `USINE_STRESS_CARET`
+                        // can show it failing (`USINE_STRESS_NO_FIX_C=1`).
+                        textarea {
+                            id: "task-desc",
+                            value: "{desc}",
+                            placeholder: "What should the agent do? (paste a screenshot to attach it)",
+                            oninput: move |e| desc.set(e.value()),
+                            onchange: move |e| state.update_card(id, |c| c.description = e.value()),
+                            onpaste: move |_| {
+                                if let Some(png) = clipboard_image_png() {
+                                    state.attach_image_bytes(id, png);
+                                }
+                            },
+                        }
                     }
                 }
             }
