@@ -10,7 +10,15 @@ use uuid::Uuid;
 use crate::state::AppState;
 use crate::ui::drafts;
 
-/// Props: `hint` explains what "request changes" means at this stage;
+/// The one line above the box, at every gate that renders this section. It used
+/// to be a two-line paragraph rewritten per stage — five near-identical
+/// variants saying the same thing the two buttons already say. What differs per
+/// stage is what "request changes" *does*, which now rides on that button's
+/// tooltip.
+pub(super) const CHAT_HINT: &str = "Send this back to the agent, or just ask about the work.";
+
+/// Props: `hint` overrides [`CHAT_HINT`] (only the plan panel needs to, since
+/// its request button also carries the answered questions);
 /// `on_request` dispatches the panel-specific change command with the typed
 /// text. `request_enabled_when_blank` lets the plan panel submit answered
 /// questions with no free-form text (its request folds both), and
@@ -22,11 +30,14 @@ use crate::ui::drafts;
 #[component]
 pub(super) fn AgentChatSection(
     card_id: Uuid,
-    hint: String,
+    #[props(default = CHAT_HINT.to_string())] hint: String,
     on_request: EventHandler<String>,
     #[props(default = false)] request_enabled_when_blank: bool,
     request_label: Option<String>,
     request_label_nonblank: Option<String>,
+    /// What the request button actually does at this stage — the per-stage
+    /// specifics the shared hint no longer spells out.
+    request_title: Option<String>,
 ) -> Element {
     let state = use_context::<AppState>();
     let mut text = drafts::use_draft(card_id, "chat", String::new);
@@ -47,6 +58,8 @@ pub(super) fn AgentChatSection(
         .cloned()
         .unwrap_or_default();
     let blank = text.read().trim().is_empty();
+    let request_title = request_title
+        .unwrap_or_else(|| "Sends the work back to the agent with this text".to_string());
     let request_label = match (blank, request_label_nonblank) {
         (false, Some(l)) => l,
         _ => request_label.unwrap_or_else(|| "Request changes".to_string()),
@@ -121,11 +134,13 @@ pub(super) fn AgentChatSection(
                             generation += 1;
                         }
                     },
+                    title: "{request_title}",
                     "{request_label}"
                 }
                 button {
                     class: "btn",
                     disabled: blank,
+                    title: "A read-only run: the agent answers here and the card stays exactly where it is",
                     onclick: move |_| {
                         let q = text.read().trim().to_string();
                         if !q.is_empty() {
@@ -141,9 +156,10 @@ pub(super) fn AgentChatSection(
     }
 }
 
-/// The collapsed row's label: the question on one line, capped. A legacy entry
-/// recorded before questions were kept falls back to a neutral label.
-fn summary_line(question: &str) -> String {
+/// The collapsed row's label: the text on one line, capped. A legacy entry
+/// recorded before questions were kept falls back to a neutral label. Shared
+/// with the panel's collapsed task, which wants the same one-line treatment.
+pub(super) fn summary_line(question: &str) -> String {
     let flat = question.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.is_empty() {
         return "Answer".to_string();

@@ -321,7 +321,7 @@ fn card_summary(c: &Card) -> Value {
         "id": c.id,
         "project_id": c.project_id,
         "title": c.title,
-        "status": c.state.status_label(),
+        "status": c.status_label(),
         "column": c.state.column().title(),
         "blocked": c.blocked,
         "needs_attention": c.needs_attention(),

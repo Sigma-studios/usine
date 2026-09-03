@@ -67,19 +67,23 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         .unwrap_or_default();
     let has_people = !people.is_empty();
 
-    let is_ready_for_review = matches!(
-        card.state,
-        CardState::AwaitingReview(ReviewSub::ReadyForReview)
-    );
+    // The parked sub-states dispatch through a question or a fault, like
+    // `CardPanel` does: asking a question from `ReadyForPr` must not take the
+    // create-PR form, the self-review buttons and the Q&A log the answer lands
+    // in off screen. The banner in `CardDetail` freezes the body instead.
+    let st = card.state.effective();
+    let is_ready_for_review = matches!(st, CardState::AwaitingReview(ReviewSub::ReadyForReview));
+    // The live-run faces below keep reading the raw state — they describe a run
+    // that is actually in flight, which a fault or a question is not.
     let is_self_reviewing = matches!(
         card.state,
         CardState::AwaitingReview(ReviewSub::Reviewing | ReviewSub::ApplyingFixes)
     );
     let is_selecting_fixes = matches!(
-        card.state,
+        st,
         CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
     );
-    let is_ready_for_pr = matches!(card.state, CardState::AwaitingReview(ReviewSub::ReadyForPr));
+    let is_ready_for_pr = matches!(st, CardState::AwaitingReview(ReviewSub::ReadyForPr));
     // The validation gate's three faces: the check running, the agent fixing a
     // failure, and the parked exhausted-budget failure.
     let validating_attempt = match &card.state {
@@ -90,7 +94,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         CardState::AwaitingReview(ReviewSub::FixingValidation { attempt, .. }) => Some(*attempt),
         _ => None,
     };
-    let validation_failure = match &card.state {
+    let validation_failure = match st {
         CardState::AwaitingReview(ReviewSub::ValidationFailed { attempt, output }) => {
             Some((*attempt, output.clone()))
         }
@@ -120,19 +124,17 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         if is_ready_for_review {
             div { class: "section",
                 h3 { "Self-review" }
-                div { class: "hint",
-                    "The self-review normally starts by itself when the implementation finishes. \
-                     Run the review pass over the committed diff (guided by the project's \
-                     review.md, or a default prompt), or skip straight to the pull request."
-                }
+                div { class: "hint", "The self-review didn't run — it was cancelled or failed to start." }
                 div { class: "row",
                     button {
                         class: "btn primary",
+                        title: "Runs the review pass over the committed diff, guided by the project's review.md (or a default prompt)",
                         onclick: move |_| state.send(ExecutorCommand::SelfReview { card_id: id }),
                         "Self-review"
                     }
                     button {
                         class: "btn",
+                        title: "Goes straight to the create-PR form with no review pass",
                         onclick: move |_| state.send(ExecutorCommand::SkipReview { card_id: id }),
                         "Skip review"
                     }
@@ -140,9 +142,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
             super::AgentChatSection {
                 card_id: id,
-                hint: "Not happy with the implementation, or curious why it went a certain way? \
-                       Request changes to send it back to the agent's worktree, or ask a question \
-                       without sending it back.",
+                request_title: "The agent picks the work back up in the card's worktree and re-runs the self-review afterwards",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },
@@ -167,9 +167,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         if is_selecting_fixes {
             super::AgentChatSection {
                 card_id: id,
-                hint: "Not happy with the implementation, or curious why it went a certain way? \
-                       Request changes to send it back to the agent's worktree, or ask a question \
-                       without sending it back.",
+                request_title: "The agent picks the work back up in the card's worktree and re-runs the self-review afterwards",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },
@@ -185,8 +183,12 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
                 button {
                     class: "btn",
+                    // Sends `Cancel`: it stops the check that is running, it does
+                    // not mark validation skipped (that is "Create PR anyway",
+                    // below, once the check has parked).
+                    title: "Stops the validate command; the card returns to the create-PR gate",
                     onclick: move |_| state.send(ExecutorCommand::Cancel { card_id: id }),
-                    "Skip validation"
+                    "Stop validation"
                 }
             }
         }
@@ -235,8 +237,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // The parked failure can also bounce the work back wholesale.
             super::AgentChatSection {
                 card_id: id,
-                hint: "Request changes to send the work back to the agent's worktree, or ask a \
-                       question about it without sending it back.",
+                request_title: "The agent picks the work back up in the card's worktree and re-runs the self-review afterwards",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },
@@ -377,9 +378,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,
-                hint: "Spotted something before opening the PR, or want to double-check a \
-                       decision? Request changes to send it back to the agent's worktree, or ask \
-                       a question without sending it back.",
+                request_title: "The agent picks the work back up in the card's worktree, before anything is pushed to GitHub",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },

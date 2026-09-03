@@ -569,6 +569,12 @@ impl ExecutorCommand {
                 | ExecutorCommand::MarkDone { .. }
                 | ExecutorCommand::Retry { .. }
                 | ExecutorCommand::RetryFresh { .. }
+                // Both re-run the auto-advance predicates and can transition the
+                // card, so they need the claim (and the `CardBusy` that gives the
+                // ↻ buttons a spinner instead of looking dead for a `gh` round
+                // trip) just like the lifecycle commands above.
+                | ExecutorCommand::RefreshReviews { .. }
+                | ExecutorCommand::MarkReviewBodiesRead { .. }
         )
     }
 
@@ -577,7 +583,6 @@ impl ExecutorCommand {
             self,
             ExecutorCommand::CreateCard { .. }
                 | ExecutorCommand::SaveCard { .. }
-                | ExecutorCommand::MarkReviewBodiesRead { .. }
                 | ExecutorCommand::AddProject { .. }
                 | ExecutorCommand::SaveProject { .. }
                 | ExecutorCommand::SaveSettings { .. }

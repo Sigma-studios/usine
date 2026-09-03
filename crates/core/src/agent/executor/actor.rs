@@ -622,6 +622,19 @@ async fn finalize_run(
     if !is_implement_done {
         let _ = store.set_fix_extra(card_id, None);
     }
+    // The fix run replied to every declined comment and resolved every fixed one
+    // (see `apply_fixes`), so no thread the picker saw is still unanswered. Land
+    // that before the transition: otherwise the merge gate renders the pre-fix
+    // count for the seconds `ResolveFixedComments` spends talking to GitHub, and
+    // keeps it until the 5-minute poll if that call fails. The `list_reviews` in
+    // `resolve_fixed_comments` stays authoritative — a comment that landed
+    // mid-run comes back with it.
+    if is_pr_fix {
+        let _ = store.mutate_card(card_id, |c| {
+            c.unanswered_count = 0;
+            Ok(())
+        });
+    }
     apply_transition(store, evt_tx, card_id, transition)?;
     // The card just parked (`ReadyForReview`, `ReadyToMerge`, or PR-review
     // idle): light-stop the preview this run brought up. The validation routes

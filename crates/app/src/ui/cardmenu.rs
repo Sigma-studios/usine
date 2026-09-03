@@ -81,6 +81,18 @@ fn dismiss() {
     *CARD_MENU.write() = None;
 }
 
+/// Close the menu from outside — the app-level Escape handler, which has to
+/// close the topmost thing rather than the panel behind it.
+pub(crate) fn close_card_menu() {
+    dismiss();
+}
+
+/// Whether a menu is open, so Escape can tell "close the menu" from "close the
+/// panel" without reaching into the DOM.
+pub(crate) fn card_menu_open() -> bool {
+    CARD_MENU.read().is_some()
+}
+
 #[component]
 pub fn CardMenuHost() -> Element {
     // Before the early return: the host re-renders as the menu opens and closes,

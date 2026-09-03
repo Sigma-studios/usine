@@ -253,10 +253,10 @@ pub fn DiffDialogHost() -> Element {
                 div { class: "modal-body-fill",
                     match diff {
                         None | Some(DiffState::Computing) => rsx! {
-                            div { class: "hint", "Computing the diff…" }
+                            div { class: "hint center", "Computing the diff…" }
                         },
                         Some(DiffState::Empty) => rsx! {
-                            div { class: "hint", "No committed changes over the base branch yet." }
+                            div { class: "hint center", "No committed changes over the base branch yet." }
                         },
                         Some(DiffState::Failed(msg)) => rsx! {
                             div { class: "hint error", "Couldn't compute the diff: {msg}" }
