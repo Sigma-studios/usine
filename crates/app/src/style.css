@@ -199,7 +199,7 @@ body.resizing .info-tip { visibility: hidden; opacity: 0; }
   flex: 1; display: flex; gap: 12px;
   padding: 16px; overflow-x: auto; overflow-y: hidden;
 }
-/* An empty lane is not drawn at all (see `visible_columns`): nine 280px columns
+/* An empty lane is not drawn at all (see `visible_columns`): eight 280px columns
    plus the sidebar and the detail panel is more board than any laptop shows at
    once. A lane reappears on its own the moment a card lands in it. */
 .column {

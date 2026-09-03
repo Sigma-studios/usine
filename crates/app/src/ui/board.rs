@@ -22,13 +22,14 @@ pub fn Board() -> Element {
     let mut cards = state.visible_cards();
     // Live Ctrl+F/Cmd+F filter; column counts follow since they're computed
     // from the list handed to each column.
-    if let Some(q) = super::search::query() {
-        cards.retain(|c| super::search::matches(&c.title, &q));
+    let filter = super::search::query();
+    if let Some(q) = &filter {
+        cards.retain(|c| super::search::matches(&c.title, q));
     }
 
     rsx! {
         div { class: "board",
-            for (col , col_cards) in visible_columns(&cards) {
+            for (col , col_cards) in visible_columns(&cards, filter.is_some()) {
                 ColumnView {
                     key: "{col:?}",
                     column: col,
@@ -71,12 +72,16 @@ fn column_cards(cards: &[Card], col: Column) -> Vec<Card> {
 /// comes back on its own the moment a card lands in it, so there is nothing to
 /// persist. The starting block always shows — it holds "+ Add card", which is
 /// where an empty board begins.
-fn visible_columns(cards: &[Card]) -> Vec<(Column, Vec<Card>)> {
+///
+/// While the find bar filters the board (`keep_all`), every lane stays: there
+/// an empty lane is the answer — the zero counts read as "no matches here"
+/// instead of an empty project.
+fn visible_columns(cards: &[Card], keep_all: bool) -> Vec<(Column, Vec<Card>)> {
     Column::board()
         .into_iter()
         .filter_map(|col| {
             let col_cards = column_cards(cards, col);
-            let keep = !col_cards.is_empty() || col == Column::StartingBlock;
+            let keep = keep_all || !col_cards.is_empty() || col == Column::StartingBlock;
             keep.then_some((col, col_cards))
         })
         .collect()
@@ -170,7 +175,7 @@ mod tests {
             false,
             1,
         )];
-        let shown = visible_columns(&cards);
+        let shown = visible_columns(&cards, false);
         let cols: Vec<Column> = shown.iter().map(|(c, _)| *c).collect();
         assert_eq!(cols, [Column::StartingBlock, Column::Implementing]);
         assert_eq!(titles(&shown[1].1), ["work"]);
@@ -178,8 +183,18 @@ mod tests {
         assert!(shown[0].1.is_empty());
 
         // An empty board is just the starting block.
-        let cols: Vec<Column> = visible_columns(&[]).iter().map(|(c, _)| *c).collect();
+        let cols: Vec<Column> = visible_columns(&[], false).iter().map(|(c, _)| *c).collect();
         assert_eq!(cols, [Column::StartingBlock]);
+    }
+
+    #[test]
+    fn a_filtered_board_keeps_every_lane() {
+        // The find bar filtered everything away: the lanes stay so the zero
+        // counts read as "no matches", not as an empty project.
+        let shown = visible_columns(&[], true);
+        let cols: Vec<Column> = shown.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cols, Column::board().to_vec());
+        assert!(shown.iter().all(|(_, c)| c.is_empty()));
     }
 
     #[test]
