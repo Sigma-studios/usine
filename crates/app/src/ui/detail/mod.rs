@@ -346,11 +346,17 @@ fn CardPanel(card: Card) -> Element {
                 div { class: "plan-box", "{card.description}" }
             }
         }
-        // In every state, not just the starting block: a screenshot is exactly
-        // the thing you want to hand a card you are already reviewing, and the
-        // chat and revise paths send attachments along. It costs one button
-        // when there is nothing attached.
-        Attachments { card_id: id }
+        // Not just the starting block: a screenshot is exactly the thing you
+        // want to hand a card you are already reviewing, and the chat and
+        // revise paths send attachments along. Where the panel renders a chat
+        // box, the control lives *in* that box instead (`chat::renders_chat`),
+        // next to the change it is evidence for; the terminal states drop it,
+        // since nothing there can ever read an attachment.
+        if !chat::renders_chat(&card.state)
+            && !matches!(st, CardState::Done | CardState::MergedWithoutReview { .. })
+        {
+            Attachments { card_id: id }
+        }
 
         // The main running phases used to render nothing actionable here; give
         // them a status line and a way out. Cancel drops the run's progress and
@@ -755,6 +761,12 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                             placeholder: if options.is_empty() { "Type an answer…" } else { "Or type an answer…" },
                             initial_value: "{answer.peek()}",
                             oninput: move |e| answer.set(e.value()),
+                            // Paste a screenshot straight into the answer.
+                            onpaste: move |_| {
+                                if let Some(png) = edit::clipboard_image_png() {
+                                    state.attach_image_bytes(card_id, png);
+                                }
+                            },
                         }
                     }
                     button {

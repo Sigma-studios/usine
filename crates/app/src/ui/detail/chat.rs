@@ -4,9 +4,10 @@
 //! returns the card to where it sits, with the answer rendered here.
 
 use dioxus::prelude::*;
-use usine_core::ExecutorCommand;
+use usine_core::{CardState, DesignSub, ExecutorCommand, PrReviewSub, ReviewSub};
 use uuid::Uuid;
 
+use super::edit::{clipboard_image_png, AttachButton, AttachmentChips};
 use crate::state::AppState;
 use crate::ui::drafts;
 
@@ -90,7 +91,11 @@ pub(super) fn AgentChatSection(
                     }
                 }
             }
-            div { class: "field",
+            AttachmentChips { card_id }
+            // The attach control lives in the box it is evidence for: the
+            // screenshot you paste at a gate belongs to the change you are
+            // requesting, not to the card's opening prompt.
+            div { class: "field attach-field",
                 if crate::stress::fix_a() {
                     // A lone child's `key` is ignored — Dioxus only honors keys
                     // among siblings in a list — so the single-item `for` is what
@@ -107,6 +112,13 @@ pub(super) fn AgentChatSection(
                                 crate::stress::record_chat_input(&v);
                                 text.set(v);
                             },
+                            // Paste an image to attach it; a text paste is
+                            // unaffected (the helper returns None then).
+                            onpaste: move |_| {
+                                if let Some(png) = clipboard_image_png() {
+                                    state.attach_image_bytes(card_id, png);
+                                }
+                            },
                         }
                     }
                 } else {
@@ -119,8 +131,14 @@ pub(super) fn AgentChatSection(
                             crate::stress::record_chat_input(&v);
                             text.set(v);
                         },
+                        onpaste: move |_| {
+                            if let Some(png) = clipboard_image_png() {
+                                state.attach_image_bytes(card_id, png);
+                            }
+                        },
                     }
                 }
+                AttachButton { card_id, icon: true }
             }
             div { class: "row",
                 button {
@@ -169,4 +187,24 @@ pub(super) fn summary_line(question: &str) -> String {
     } else {
         flat
     }
+}
+
+/// The states whose panel renders an [`AgentChatSection`] — i.e. the ones that
+/// carry their own attach control, so the panel-top attachments section would
+/// duplicate it. Mirrors the call sites in `plan.rs`, `pr_create.rs`,
+/// `pr_review.rs` and the merge gate; computed from `effective()` so the
+/// `Failed`/`Answering` wrappers resolve exactly as those panels do.
+pub(super) fn renders_chat(state: &CardState) -> bool {
+    matches!(
+        state.effective(),
+        CardState::Designing(DesignSub::AwaitingApproval { .. })
+            | CardState::AwaitingReview(
+                ReviewSub::ReadyForReview
+                    | ReviewSub::SelectingFixes { .. }
+                    | ReviewSub::ValidationFailed { .. }
+                    | ReviewSub::ReadyForPr
+            )
+            | CardState::PrReview(PrReviewSub::Idle)
+            | CardState::ReadyToMerge
+    )
 }

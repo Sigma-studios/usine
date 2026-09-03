@@ -10,6 +10,7 @@ use usine_core::{Card, CardConfig, CardKind, ExecutorCommand};
 use uuid::Uuid;
 
 use crate::state::AppState;
+use crate::ui::icons::IconPaperclip;
 use crate::ui::widgets::{
     parse_provider, provider_value, ModelEffortPicker, OptionalModelEffortPicker,
 };
@@ -91,7 +92,7 @@ pub(super) fn EditableTask(card: Card) -> Element {
 /// Returns `None` for a text paste (or when the clipboard has no image), so the
 /// caller can safely try this on every paste. Uses the native clipboard rather
 /// than the webview paste payload, which doesn't reliably expose image bytes.
-fn clipboard_image_png() -> Option<Vec<u8>> {
+pub(super) fn clipboard_image_png() -> Option<Vec<u8>> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
     let buf =
@@ -113,74 +114,110 @@ fn clipboard_image_png() -> Option<Vec<u8>> {
 /// covers png/jpg/jpeg/gif/webp), which both CLIs read with their shell tools.
 #[component]
 pub(super) fn Attachments(card_id: Uuid) -> Element {
-    let state = use_context::<AppState>();
-    let atts = state.card_attachments(card_id);
-    // Image chip clicked → preview it in a modal; None when the dialog is closed.
-    let mut preview = use_signal(|| None::<PathBuf>);
-
-    let empty = atts.is_empty();
+    let atts_empty = use_context::<AppState>()
+        .card_attachments(card_id)
+        .is_empty();
 
     rsx! {
         // Nothing attached: the section IS the button. A heading and a "No files
         // attached." line are two rows of panel telling you what isn't there.
         div { class: "section",
-            if !empty {
+            if !atts_empty {
                 h3 { "Attachments" }
-                div { class: "chips",
-                    for path in atts {
-                        {
-                            let key = path.to_string_lossy().into_owned();
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let label = usine_core::infra::paths::attachment_label(&path);
-                            let to_remove = path.clone();
-                            let is_image = image_mime(&path).is_some();
-                            let to_preview = path.clone();
-                            rsx! {
-                                span { key: "{key}", class: "chip",
-                                    if is_image {
-                                        span {
-                                            class: "chip-label clickable",
-                                            title: "{name}",
-                                            onclick: move |_| preview.set(Some(to_preview.clone())),
-                                            "{label}"
-                                        }
-                                    } else {
-                                        span { class: "chip-label", title: "{name}", "{label}" }
-                                    }
-                                    button {
-                                        class: "chip-remove",
-                                        title: "Remove",
-                                        onclick: move |_| state.detach_image(card_id, to_remove.clone()),
-                                        "×"
-                                    }
+            }
+            AttachmentChips { card_id }
+            AttachButton { card_id }
+        }
+    }
+}
+
+/// The attached files, as removable chips (images also open a preview). Renders
+/// nothing when the list is empty, so it can sit above a chat box unconditionally.
+#[component]
+pub(super) fn AttachmentChips(card_id: Uuid) -> Element {
+    let state = use_context::<AppState>();
+    let atts = state.card_attachments(card_id);
+    // Image chip clicked → preview it in a modal; None when the dialog is closed.
+    let mut preview = use_signal(|| None::<PathBuf>);
+
+    if atts.is_empty() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "chips",
+            for path in atts {
+                {
+                    let key = path.to_string_lossy().into_owned();
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let label = usine_core::infra::paths::attachment_label(&path);
+                    let to_remove = path.clone();
+                    let is_image = image_mime(&path).is_some();
+                    let to_preview = path.clone();
+                    rsx! {
+                        span { key: "{key}", class: "chip",
+                            if is_image {
+                                span {
+                                    class: "chip-label clickable",
+                                    title: "{name}",
+                                    onclick: move |_| preview.set(Some(to_preview.clone())),
+                                    "{label}"
                                 }
+                            } else {
+                                span { class: "chip-label", title: "{name}", "{label}" }
+                            }
+                            button {
+                                class: "chip-remove",
+                                title: "Remove",
+                                onclick: move |_| state.detach_image(card_id, to_remove.clone()),
+                                "×"
                             }
                         }
                     }
                 }
             }
-            if let Some(path) = preview() {
-                AttachmentPreview { path, on_close: move |_| preview.set(None) }
-            }
-            button {
-                class: "btn",
-                title: "Images ride along with the run — Claude reads them, Codex receives them as -i flags; other files are listed to the agent by path",
-                onclick: move |_| {
-                    spawn(async move {
-                        if let Some(handles) = rfd::AsyncFileDialog::new().pick_files().await {
-                            let paths = handles.iter().map(|h| h.path().to_path_buf()).collect();
-                            state.attach_images(card_id, paths);
-                        }
-                    });
-                },
-                "Attach file"
-            }
+        }
+        if let Some(path) = preview() {
+            AttachmentPreview { path, on_close: move |_| preview.set(None) }
         }
     }
 }
+
+/// The file picker itself. `icon` swaps the labelled panel button for a small
+/// paperclip, which is what sits in the corner of the chat box.
+#[component]
+pub(super) fn AttachButton(card_id: Uuid, #[props(default = false)] icon: bool) -> Element {
+    let state = use_context::<AppState>();
+    let pick = move |_| {
+        spawn(async move {
+            if let Some(handles) = rfd::AsyncFileDialog::new().pick_files().await {
+                let paths = handles.iter().map(|h| h.path().to_path_buf()).collect();
+                state.attach_images(card_id, paths);
+            }
+        });
+    };
+
+    rsx! {
+        if icon {
+            button {
+                class: "attach-btn",
+                aria_label: "Attach file",
+                title: "{ATTACH_TITLE}",
+                onclick: pick,
+                IconPaperclip {}
+            }
+        } else {
+            button { class: "btn", title: "{ATTACH_TITLE}", onclick: pick, "Attach file" }
+        }
+    }
+}
+
+/// Attachments are card-scoped and read at launch, so what they ride is the
+/// *next* run — not one already going.
+const ATTACH_TITLE: &str = "Images go out with the next run — Claude reads them, Codex receives them as -i flags; other files are listed to the agent by path";
 
 /// The mime type for an attachment path, if its extension is a web-renderable
 /// image — only those chips open the preview dialog.

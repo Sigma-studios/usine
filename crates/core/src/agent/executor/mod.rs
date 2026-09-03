@@ -977,7 +977,7 @@ fn followup_extra(prev_conclusion: Option<&str>, prior_qa: &[String], feedback: 
 /// Paths are absolute and live outside the project, which both CLIs handle fine.
 fn append_attachments(base: String, paths: &[PathBuf]) -> String {
     let mut out = base;
-    out.push_str("\n\nAttached files (read each before starting):");
+    out.push_str("\n\nAttached files (read each):");
     for p in paths {
         out.push_str("\n- ");
         out.push_str(&p.to_string_lossy());
