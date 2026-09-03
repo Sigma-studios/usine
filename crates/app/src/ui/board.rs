@@ -183,7 +183,10 @@ mod tests {
         assert!(shown[0].1.is_empty());
 
         // An empty board is just the starting block.
-        let cols: Vec<Column> = visible_columns(&[], false).iter().map(|(c, _)| *c).collect();
+        let cols: Vec<Column> = visible_columns(&[], false)
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
         assert_eq!(cols, [Column::StartingBlock]);
     }
 
