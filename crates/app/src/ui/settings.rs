@@ -559,6 +559,18 @@ fn ReviewsTab(pid: Uuid) -> Element {
                             r#type: "text",
                             placeholder: "GitHub login",
                             initial_value: "{manual.peek()}",
+                            // The only push-back here is that clear, and it
+                            // follows an Enter or a click in this row — so the
+                            // remount would drop focus mid-flow, right when the
+                            // user is likely adding a second login. Generation 0
+                            // is the first mount, which must not steal focus.
+                            onmounted: move |e: MountedEvent| {
+                                if g > 0 {
+                                    spawn(async move {
+                                        let _ = e.data().set_focus(true).await;
+                                    });
+                                }
+                            },
                             oninput: move |e: Event<FormData>| {
                                 manual_push.typed(&e.value());
                                 manual.set(e.value());

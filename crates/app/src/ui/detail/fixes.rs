@@ -35,6 +35,9 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
     // advances (skipping to the PR for a self-review, ignoring the comments and
     // moving to merge for PR triage), so it says that instead.
     let has_note = !note.read().trim().is_empty();
+    // The note box is uncontrolled, and both Apply and "Skip to PR" clear it —
+    // see the field below.
+    let mut note_push = use_push_back(note.read().clone());
     let any_selected = edits.read().iter().any(|v| v.selected);
 
     // The task exactly as the agent will get it. `None` = untouched, so the box
@@ -74,19 +77,12 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
         }
     };
 
-    // Grow each edit box to fit its text (same script as the review drafts
-    // panel: idempotent, keeps sizing on every keystroke). Unlike that panel,
-    // textareas here appear and disappear as rows are (un)checked — reply boxes
-    // mount when a row is unchecked — so the effect subscribes to `edits` to
-    // re-wire whatever the toggle just put in the DOM.
+    // Grow each edit box to fit its text, with the review panel's script. Boxes
+    // here appear and disappear as rows are (un)checked — a reply box mounts
+    // when a row is unchecked — which its observer picks up, so this runs once
+    // rather than on every edit.
     use_effect(move || {
-        edits.read();
-        dioxus::document::eval(
-            "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
-             var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
-             if(!el.dataset.growInit){el.dataset.growInit='1';el.addEventListener('input',fit);}\
-             fit();});})();",
-        );
+        dioxus::document::eval(super::review::AUTOGROW_JS);
     });
 
     let rows_snapshot = edits.read().clone();
@@ -212,19 +208,25 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
             }
             div { class: "field",
                 label { r#for: "fix-note", "Add a comment (free-form)" }
-                textarea {
-                    id: "fix-note",
-                    placeholder: if self_review {
-                        "Anything the review missed? It's applied with the fixes you checked."
-                    } else {
-                        "Anything to change beyond these comments? It's applied with the fixes you checked."
-                    },
-                    // Uncontrolled (see `detail/chat.rs`): a controlled `value` re-emits a
-                    // DOM patch a frame after each keystroke, which parks the caret at the
-                    // end whenever macOS splits one keystroke into two mutations (dead
-                    // keys, smart quotes). Nothing but this field writes it while mounted.
-                    initial_value: "{note.peek()}",
-                    oninput: move |e| note.set(e.value()),
+                // Uncontrolled (see `ui/textfield.rs`): both Apply and "Skip to
+                // PR" clear the note, and on a field the user has typed into a
+                // `defaultValue` patch is inert — so that clear only reaches the
+                // DOM by remounting.
+                for g in [note_push.key()] {
+                    textarea {
+                        key: "{g}",
+                        id: "fix-note",
+                        placeholder: if self_review {
+                            "Anything the review missed? It's applied with the fixes you checked."
+                        } else {
+                            "Anything to change beyond these comments? It's applied with the fixes you checked."
+                        },
+                        initial_value: "{note.peek()}",
+                        oninput: move |e| {
+                            note_push.typed(&e.value());
+                            note.set(e.value());
+                        },
+                    }
                 }
             }
             details { class: "fix-task",

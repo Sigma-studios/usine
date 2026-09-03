@@ -236,13 +236,22 @@ async fn run_caret(state: AppState) {
         &CARET_TEXT[CARET_POS..]
     );
     let want_caret = CARET_POS + 1;
-    let ok = caret == want_caret;
+    // The text matters as much as the caret: a probe that ended up with the
+    // wrong characters didn't reproduce the keystroke it claims to measure, so
+    // its caret reading proves nothing. Both must hold to pass.
+    let value_ok = value == want_value;
+    let caret_ok = caret == want_caret;
+    let verdict = match (caret_ok, value_ok) {
+        (true, true) => "PASS",
+        (false, true) => "FAIL (caret moved)",
+        (true, false) => "FAIL (wrong text)",
+        (false, false) => "FAIL (caret moved, wrong text)",
+    };
+    let ok = caret_ok && value_ok;
     println!(
         "[caret] fix_c={} caret={caret} want={want_caret} value={value:?} \
-         value_ok={} VERDICT={}",
+         value_ok={value_ok} VERDICT={verdict}",
         fix_c(),
-        value == want_value,
-        if ok { "PASS" } else { "FAIL (caret moved)" },
     );
     std::process::exit(if ok { 0 } else { 1 });
 }

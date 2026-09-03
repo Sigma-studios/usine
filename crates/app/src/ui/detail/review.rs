@@ -360,9 +360,9 @@ fn DraftSelection(
     let summary_for_fix = edits.summary.clone();
 
     // Grow each comment box to fit its text: a review comment is meant to be read
-    // in full, not scrolled inside a two-row window. Runs once after mount (the
-    // panel remounts whenever the status changes) and keeps sizing on every
-    // keystroke. Without JS the boxes fall back to their `rows` estimate.
+    // in full, not scrolled inside a two-row window. Runs once after mount; the
+    // script it installs keeps sizing on every keystroke and picks up boxes that
+    // mount later. Without JS the boxes fall back to their `rows` estimate.
     use_effect(move || {
         dioxus::document::eval(AUTOGROW_JS);
     });
@@ -459,9 +459,6 @@ fn DraftSelection(
                         oninput: move |e| {
                             pushback.typed(&e.value());
                             reviewdraft::set_summary(e.value());
-                        },
-                        onmounted: move |_| {
-                            dioxus::document::eval(AUTOGROW_JS);
                         },
                     }
                 }
@@ -607,17 +604,27 @@ fn FixGate(
     }
 }
 
-/// A `rows` estimate used only until the autogrow script measures the box for
-/// real — and as the final height if scripting is unavailable. Counts hard line
-/// breaks and allows one wrapped line per ~72 characters.
-/// Wire and apply the auto-grow behaviour to every `textarea.autogrow` on the
-/// page. Idempotent (`growInit`), so any box that appears later — a push-back
-/// remount mints a brand-new node — re-runs it from its own `onmounted`.
-const AUTOGROW_JS: &str =
-    "(function(){document.querySelectorAll('textarea.autogrow').forEach(function(el){\
-     var fit=function(){el.style.height='auto';el.style.height=el.scrollHeight+'px';};\
-     if(!el.dataset.growInit){el.dataset.growInit='1';el.addEventListener('input',fit);}\
-     fit();});})();";
+/// Install the auto-grow behaviour for `textarea.autogrow`, then size whatever
+/// is on the page right now. Installed once per document (`__usineAutogrow`):
+/// one delegated `input` listener, and a `MutationObserver` that sizes boxes
+/// added later — a toggled reply box, or the fresh node a push-back remount
+/// mints (sized on the next frame, since the interpreter may still be filling
+/// the node in when the observer sees it). Per-element `onmounted` hooks would
+/// instead re-run this whole sweep — measuring *every* box, a forced layout
+/// each — on every keystroke typed into a field the diff dialog and the panel
+/// both render.
+pub(super) const AUTOGROW_JS: &str = "(function(){var fit=function(el){el.style.height='auto';\
+     el.style.height=el.scrollHeight+'px';};\
+     if(!window.__usineAutogrow){window.__usineAutogrow=1;\
+     document.addEventListener('input',function(e){var t=e.target;\
+     if(t&&t.matches&&t.matches('textarea.autogrow'))fit(t);},true);\
+     var soon=function(el){requestAnimationFrame(function(){fit(el);});};\
+     new MutationObserver(function(ms){ms.forEach(function(m){\
+     m.addedNodes.forEach(function(n){if(n.nodeType!==1)return;\
+     if(n.matches('textarea.autogrow'))soon(n);\
+     else n.querySelectorAll('textarea.autogrow').forEach(soon);});});})\
+     .observe(document.body,{childList:true,subtree:true});}\
+     document.querySelectorAll('textarea.autogrow').forEach(fit);})();";
 
 /// The editable body of one drafted comment. A component of its own only
 /// because it needs a hook, and hooks cannot be called inside the `for` over
@@ -634,20 +641,20 @@ fn ReviewCommentEdit(index: usize, body: String, rows: usize) -> Element {
                 class: "review-comment-edit autogrow",
                 rows: "{rows}",
                 initial_value: "{body}",
+                // A remount mints a fresh node; the panel-level script's
+                // observer sizes it, so there is nothing to do here.
                 oninput: move |e| {
                     pushback.typed(&e.value());
                     reviewdraft::set_body(index, e.value());
-                },
-                // A remount mints a fresh node, which lost the panel-level
-                // effect's auto-grow wiring; re-running it is idempotent.
-                onmounted: move |_| {
-                    dioxus::document::eval(AUTOGROW_JS);
                 },
             }
         }
     }
 }
 
+/// A `rows` estimate used only until the autogrow script measures the box for
+/// real — and as the final height if scripting is unavailable. Counts hard line
+/// breaks and allows one wrapped line per ~72 characters.
 pub(super) fn fallback_rows(body: &str) -> usize {
     let rows: usize = body.lines().map(|l| 1 + l.len() / 72).sum();
     rows.clamp(2, 24)
