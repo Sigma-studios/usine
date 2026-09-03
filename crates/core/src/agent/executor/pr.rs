@@ -40,6 +40,17 @@ pub(super) fn mark_ci_in_flight(card: &mut Card, expects_ci: bool) {
     card.ci_awaited_since = Some(now_millis());
 }
 
+/// Record that one of our own pushes just staled this card's cached
+/// mergeability: the merge commit it carried is what cures a conflict, so the
+/// cache is wrong the moment it lands. Drops the cache to `Unknown` and stamps
+/// the recompute grace, so the poll tick that follows doesn't hand the forge's
+/// not-yet-recomputed `Conflicting` straight back (see
+/// [`Card::settle_mergeable`]).
+pub(super) fn mark_mergeable_stale(card: &mut Card) {
+    card.mergeable = Mergeable::Unknown;
+    card.mergeable_stale_since = Some(now_millis());
+}
+
 impl Executor {
     pub(super) async fn create_pr(
         &self,
@@ -165,6 +176,7 @@ impl Executor {
             // and light the dock badge before its build existed.
             mark_ci_in_flight(c, expects_ci);
             c.mergeable = Mergeable::Unknown;
+            c.mergeable_stale_since = None;
             c.updated_at = now_millis();
             Ok(())
         })?;
@@ -723,7 +735,13 @@ impl Executor {
         // the stamp alone.
         let clear_awaited =
             settled.is_some_and(|s| s != CheckStatus::Pending) && card.ci_awaited_since.is_some();
-        let mergeable = mergeable.unwrap_or(card.mergeable);
+        // Same treatment for a mergeability read taken while one of our pushes
+        // is still being recomputed (see `Card::settle_mergeable`); a read that
+        // is taken at face value clears the stamp.
+        let settled_mergeable = mergeable.map(|read| card.settle_mergeable(read, now_millis()));
+        let mergeable = settled_mergeable.unwrap_or(card.mergeable);
+        let clear_stale = settled_mergeable.is_some_and(|m| m != Mergeable::Unknown)
+            && card.mergeable_stale_since.is_some();
         let card = if reviews != card.reviews
             || by_reviewer != card.reviewer_comment_count
             || total != card.comment_count
@@ -731,6 +749,7 @@ impl Executor {
             || checks != card.checks
             || mergeable != card.mergeable
             || clear_awaited
+            || clear_stale
         {
             let updated = self.store.mutate_card(card_id, |c| {
                 c.reviews = reviews;
@@ -741,6 +760,9 @@ impl Executor {
                 c.mergeable = mergeable;
                 if clear_awaited {
                     c.ci_awaited_since = None;
+                }
+                if clear_stale {
+                    c.mergeable_stale_since = None;
                 }
                 Ok(())
             })?;
@@ -1295,7 +1317,7 @@ impl Executor {
                 let has_checks = expects_ci || card.checks != CheckStatus::None;
                 if let Ok(updated) = self.store.mutate_card(card_id, |c| {
                     mark_ci_in_flight(c, expects_ci);
-                    c.mergeable = Mergeable::Unknown;
+                    mark_mergeable_stale(c);
                     Ok(())
                 }) {
                     let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
@@ -1488,6 +1510,9 @@ impl Executor {
         }
         if let Ok(updated) = self.store.mutate_card(card_id, |c| {
             c.mergeable = mergeable;
+            // Read (or refused) against the forge right now, so it supersedes
+            // any push waiting on a recompute.
+            c.mergeable_stale_since = None;
             Ok(())
         }) {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));

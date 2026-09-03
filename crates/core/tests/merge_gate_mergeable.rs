@@ -169,11 +169,17 @@ where
     }
 }
 
-fn ready_to_merge_card(store: &Store, project_id: uuid::Uuid, mergeable: Mergeable) -> Card {
+fn ready_to_merge_card(
+    store: &Store,
+    project_id: uuid::Uuid,
+    mergeable: Mergeable,
+    stale_since: Option<i64>,
+) -> Card {
     let mut card = Card::new(project_id, "t", "d", CardConfig::default());
     card.state = CardState::ReadyToMerge;
     card.branch = Some("feat/thing".into());
     card.mergeable = mergeable;
+    card.mergeable_stale_since = stale_since;
     card.pr = Some(PrInfo {
         number: 7,
         url: "https://github.com/example/repo/pull/7".into(),
@@ -204,7 +210,7 @@ fn seeded(
         ProjectConfig::default(),
     );
     store.upsert_project(&project).unwrap();
-    let mut card = ready_to_merge_card(&store, project.id, mergeable);
+    let mut card = ready_to_merge_card(&store, project.id, mergeable, None);
     if let Some(dir) = worktree {
         card.worktree_path = Some(dir.to_path_buf());
         store.upsert_card(&card).unwrap();
@@ -362,5 +368,56 @@ async fn a_conflict_that_resolved_itself_still_resets_the_cache() {
     assert_eq!(
         store.get_card(card.id).unwrap().mergeable,
         Mergeable::Unknown
+    );
+}
+
+/// A push of ours (a resolve run's merge commit) leaves the card's mergeability
+/// stamped as awaiting the forge's recompute. GitHub keeps answering with the
+/// pre-push mergeability for a few seconds, and the poll tick that lands inside
+/// that window must not hand the cured conflict straight back — that re-gated
+/// the merge button, and re-offered a resolve run, until the next tick five
+/// minutes later.
+#[tokio::test]
+async fn the_poll_does_not_resurrect_a_conflict_our_push_just_cured() {
+    let forge = Arc::new(GateForge {
+        mergeable: Mergeable::Conflicting,
+        merge_fails: false,
+    });
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-merge-gate"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    // Exactly the state `mark_mergeable_stale` leaves behind.
+    let card = ready_to_merge_card(
+        &store,
+        project.id,
+        Mergeable::Unknown,
+        Some(usine_core::now_millis()),
+    );
+    let (_handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SimFactory),
+        forge,
+        git: Arc::new(SimGit),
+    });
+
+    // The first tick fires immediately and always lands the sim forge's comment
+    // counts, so this is the tick's own update — with the conflict withheld.
+    let polled = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card.id && c.comment_count > 0 => {
+            Some(c.mergeable)
+        }
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(polled, Mergeable::Unknown);
+    assert_eq!(
+        store.get_card(card.id).unwrap().mergeable,
+        Mergeable::Unknown,
+        "the poll must not write back the mergeability our push staled"
     );
 }

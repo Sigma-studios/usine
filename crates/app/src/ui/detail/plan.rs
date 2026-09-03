@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 use crate::ui::drafts;
+use crate::ui::textfield::use_push_back;
 
 #[component]
 pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
@@ -79,11 +80,7 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                                         }
                                     }
                                 }
-                                input {
-                                    placeholder: "Or type your own answer…",
-                                    value: "{cur}",
-                                    oninput: move |e| answers.write()[idx] = e.value(),
-                                }
+                                QuestionAnswer { idx, value: cur.clone(), answers }
                             }
                         }
                     }
@@ -139,6 +136,32 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                     drafts::forget(card_id, "plan.answers");
                 }
             },
+        }
+    }
+}
+
+/// The free-form answer box for one question. It is a component of its own
+/// only because it needs a hook, and hooks cannot be called inside the `for`
+/// over the questions.
+#[component]
+fn QuestionAnswer(idx: usize, value: String, answers: Signal<Vec<String>>) -> Element {
+    let mut answers = answers;
+    // Uncontrolled (see `ui/textfield.rs`): clicking an option writes the
+    // answer from outside the field, which only reaches the DOM by remounting.
+    let mut pushback = use_push_back(value.clone());
+    rsx! {
+        for g in [pushback.key()] {
+            input {
+                key: "{g}",
+                // Stable hook for the push-back regression check in `stress.rs`.
+                id: "plan-answer-{idx}",
+                placeholder: "Or type your own answer…",
+                initial_value: "{value}",
+                oninput: move |e| {
+                    pushback.typed(&e.value());
+                    answers.write()[idx] = e.value();
+                },
+            }
         }
     }
 }

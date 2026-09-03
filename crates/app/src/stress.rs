@@ -16,6 +16,14 @@
 //!   real `apply_event` reducer plus periodic `CardUpdated` churn, so the whole
 //!   render path — `TranscriptView`, its autoscroll eval, the board — is on the
 //!   hot path exactly as it is under five concurrent runs.
+//! - `USINE_STRESS_CARET=1` — the caret probe. Needs no load at all: it
+//!   reproduces the *macOS* half of the same defect, where one keystroke
+//!   becomes two DOM mutations (a dead key `^` then `ê`, or a smart-quote
+//!   substitution `"` to `»`). The first mutation's patch is already stale when
+//!   the interpreter flushes it, so the equality guard cedes and a controlled
+//!   field is rewritten under a focused caret — WebKit then parks the caret at
+//!   the end. The probe types a quote mid-text into `#task-desc` and reports
+//!   where the caret ended up.
 //! - `USINE_STRESS_TYPE=1` — the probe. Drives the chat textarea from JS at a
 //!   fixed interval, appending one character of an 80-char sentinel at a time
 //!   and dispatching a bubbling `InputEvent`. That traverses the same
@@ -44,6 +52,9 @@ const SENTINEL: &str =
 
 /// The DOM id given to the chat textarea so the probe can find it.
 pub const CHAT_INPUT_ID: &str = "chat-input";
+
+/// The DOM id of the starting-block description box, driven by the caret probe.
+pub const TASK_DESC_ID: &str = "task-desc";
 
 thread_local! {
     static LAST_CHAT_INPUT: std::cell::RefCell<String> =
@@ -94,6 +105,19 @@ pub fn fix_a() -> bool {
     !flag("USINE_STRESS_NO_FIX_A")
 }
 
+/// Whether the caret probe is armed.
+pub fn caret_enabled() -> bool {
+    flag("USINE_STRESS_CARET")
+}
+
+/// Fix C: the card description renders uncontrolled, like the chat box.
+/// `USINE_STRESS_NO_FIX_C=1` restores the controlled rendering so the caret
+/// probe can be shown to detect the bug it claims to guard against — same
+/// reasoning as `fix_a`.
+pub fn fix_c() -> bool {
+    !flag("USINE_STRESS_NO_FIX_C")
+}
+
 /// Fix B: how many transcript lines `TranscriptView` renders, newest last.
 /// `USINE_STRESS_NO_FIX_B=1` gives `0`, meaning "all of them, unkeyed" — the
 /// pre-fix rendering.
@@ -108,11 +132,128 @@ pub fn transcript_cap() -> usize {
 /// Install the harness. A no-op unless `USINE_STRESS=1`.
 pub fn use_stress(state: AppState) {
     use_future(move || async move {
+        if caret_enabled() {
+            // Deliberately not under the flood: the caret race is a
+            // one-keystroke ordering bug, not a throughput one.
+            run_caret(state).await;
+            return;
+        }
         if !enabled() {
             return;
         }
         run(state).await;
     });
+}
+
+/// The text the caret probe types into, and where it puts the caret: right
+/// after `mot`, mid-string, because a caret already at the end would be reset
+/// to the same place and hide the bug.
+const CARET_TEXT: &str = "debut mot fin";
+const CARET_POS: usize = 9;
+
+/// The JS half of the caret probe. One keystroke, two mutations, dispatched in
+/// the same tick — exactly what NSSpellChecker's quote substitution produces.
+const CARET_JS: &str = r#"
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const el = document.getElementById("__ID__");
+if (!el) {
+  dioxus.send("__NOELEM__");
+} else {
+  const POS = __POS__;
+  el.focus();
+  el.value = "__TEXT__";
+  el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+  // Let that round-trip settle so the Rust side and the DOM agree before the
+  // measured keystroke — otherwise a leftover patch would be blamed on it.
+  await sleep(__SETTLE__);
+  el.setSelectionRange(POS, POS);
+  // Mutation 1: the raw quote the key produces.
+  el.value = el.value.slice(0, POS) + '"' + el.value.slice(POS);
+  el.setSelectionRange(POS + 1, POS + 1);
+  el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: '"' }));
+  // Mutation 2: the substitution, same tick, no await. This is what makes the
+  // first mutation's in-flight patch stale.
+  el.value = el.value.slice(0, POS) + "»" + el.value.slice(POS + 1);
+  el.setSelectionRange(POS + 1, POS + 1);
+  el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertReplacementText" }));
+  await sleep(__QUIET__);
+  dioxus.send(el.selectionStart + ":" + el.value);
+}
+"#;
+
+/// Type one two-mutation keystroke into `#task-desc` and report the caret.
+async fn run_caret(state: AppState) {
+    let settle_ms = num("USINE_STRESS_SETTLE_MS", 1500);
+    let quiet_ms = num("USINE_STRESS_QUIET_MS", 2000);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let project_id = state
+        .projects
+        .read()
+        .first()
+        .map(|p| p.id)
+        .unwrap_or_else(Uuid::new_v4);
+    // `Card::new` lands in `StartingBlock`, the one state whose panel renders
+    // the editable description.
+    let card = Card::new(project_id, "caret probe", "", CardConfig::default());
+    let card_id = card.id;
+    state.apply_event(ExecutorEvent {
+        card_id,
+        kind: ExecutorEventKind::CardUpdated(Box::new(card)),
+    });
+    state.select_card(Some(card_id));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let js = CARET_JS
+        .replace("__ID__", TASK_DESC_ID)
+        .replace("__TEXT__", CARET_TEXT)
+        .replace("__POS__", &CARET_POS.to_string())
+        .replace("__SETTLE__", &settle_ms.to_string())
+        .replace("__QUIET__", &quiet_ms.to_string());
+    let mut ev = dioxus::document::eval(&js);
+    let raw: String = match ev.recv().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[caret] eval channel error: {e}");
+            std::process::exit(2);
+        }
+    };
+    if raw == "__NOELEM__" {
+        println!(
+            "[caret] FATAL: no #{TASK_DESC_ID} in the DOM — the selected card is not \
+             showing the starting-block description box."
+        );
+        std::process::exit(2);
+    }
+    let (caret, value) = match raw.split_once(':') {
+        Some((c, v)) => (c.parse::<usize>().unwrap_or(usize::MAX), v.to_string()),
+        None => (usize::MAX, raw),
+    };
+    let want_value = format!(
+        "{}\u{bb}{}",
+        &CARET_TEXT[..CARET_POS],
+        &CARET_TEXT[CARET_POS..]
+    );
+    let want_caret = CARET_POS + 1;
+    // The text matters as much as the caret: a probe that ended up with the
+    // wrong characters didn't reproduce the keystroke it claims to measure, so
+    // its caret reading proves nothing. Both must hold to pass.
+    let value_ok = value == want_value;
+    let caret_ok = caret == want_caret;
+    let verdict = match (caret_ok, value_ok) {
+        (true, true) => "PASS",
+        (false, true) => "FAIL (caret moved)",
+        (true, false) => "FAIL (wrong text)",
+        (false, false) => "FAIL (caret moved, wrong text)",
+    };
+    let ok = caret_ok && value_ok;
+    println!(
+        "[caret] fix_c={} caret={caret} want={want_caret} value={value:?} \
+         value_ok={value_ok} VERDICT={verdict}",
+        fix_c(),
+    );
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 /// How long the sentinel should take to type at `gap` ms per character.
@@ -485,6 +626,15 @@ async fn set_state(app: AppState, card: &Card, state: CardState, settle: u64) {
     pause(settle).await;
 }
 
+/// A plan awaiting approval whose single question has options — the state that
+/// renders the free-form answer box the push-back check drives.
+fn plan_with_question() -> CardState {
+    CardState::Designing(usine_core::DesignSub::AwaitingApproval {
+        plan: "TL;DR: a plan.\n\n```usine-questions\n               [{\"question\": \"Which way?\", \"options\": [\"Option A\", \"Option B\"]}]\n               ```"
+            .into(),
+    })
+}
+
 fn intervention(q: &str) -> CardState {
     CardState::Implementing(usine_core::RunSub::Intervention(usine_core::Intervention {
         request_id: "stress".into(),
@@ -679,6 +829,37 @@ dioxus.send(before + "/" + filtered + "/" + restored + " typed=" + JSON.stringif
         && parts[0] == parts[2]
         && out.contains(r#"typed="stress card 3""#);
     all_ok &= report("search filters live", ok, &out);
+
+    // 5. `use_push_back`: an uncontrolled field that app code must still be able
+    //    to write into. Clicking a plan option fills the free-form answer box
+    //    from outside; `defaultValue` cannot do that, so the value only appears
+    //    if the generation bump genuinely remounted the input.
+    set_state(app, &card, plan_with_question(), 900 * slow).await;
+    let typed = type_into("plan-answer-0", "typed-by-hand", slow).await;
+    all_ok &= report("plan answer field present", typed == "ok", &typed);
+    let out = eval_str(&format!(
+        r##"{JS_SLEEP}
+const btn = [...document.querySelectorAll("#plan-approval button")]
+    .find((b) => b.textContent.trim() === "Option B");
+if (!btn) {{ dioxus.send("missing:option-b"); }} else {{
+  btn.click();
+  await sleep({settle});
+  const el = document.getElementById("plan-answer-0");
+  dioxus.send(el ? "=" + el.value : "missing:plan-answer-0");
+}}"##,
+        settle = 900 * slow
+    ))
+    .await;
+    all_ok &= report("option click reaches the box", out == "=Option B", &out);
+
+    // …and typing after that push must not be undone by another remount.
+    let _ = type_into("plan-answer-0", "Option B and more", slow).await;
+    let after = read_value("plan-answer-0").await;
+    all_ok &= report(
+        "typing after a push survives",
+        value_of(&after) == "=Option B and more",
+        &after,
+    );
 
     println!(
         "[check] --- {} ---",

@@ -13,6 +13,7 @@ use usine_core::DirtyAction;
 use uuid::Uuid;
 
 use crate::state::AppState;
+use crate::ui::textfield::use_push_back;
 
 static ADOPT: GlobalSignal<Option<Uuid>> = Signal::global(|| None);
 
@@ -96,6 +97,11 @@ fn AdoptDialog(project_id: Uuid) -> Element {
             description.set(text);
         }
     });
+
+    // Uncontrolled (see `ui/textfield.rs`): the branch probe prefills both
+    // fields while they are mounted, so the prefill only lands via a remount.
+    let mut title_push = use_push_back(title.read().clone());
+    let mut desc_push = use_push_back(description.read().clone());
 
     let remote_only = picked.starts_with("origin/");
     let refusal = probe.as_ref().and_then(|p| p.refusal.clone());
@@ -216,24 +222,32 @@ fn AdoptDialog(project_id: Uuid) -> Element {
                     }
                     div { class: "field",
                         label { r#for: "adopt-title", "Card title" }
-                        input {
-                            id: "adopt-title",
-                            value: "{title}",
-                            oninput: move |e| {
-                                title_edited.set(true);
-                                title.set(e.value());
-                            },
+                        for g in [title_push.key()] {
+                            input {
+                                key: "{g}",
+                                id: "adopt-title",
+                                initial_value: "{title.peek()}",
+                                oninput: move |e| {
+                                    title_push.typed(&e.value());
+                                    title_edited.set(true);
+                                    title.set(e.value());
+                                },
+                            }
                         }
                     }
                     div { class: "field",
                         label { r#for: "adopt-desc", "Description (required — what this work does; the review and fix agents read it)" }
-                        textarea {
-                            id: "adopt-desc",
-                            value: "{description}",
-                            oninput: move |e| {
-                                desc_edited.set(true);
-                                description.set(e.value());
-                            },
+                        for g in [desc_push.key()] {
+                            textarea {
+                                key: "{g}",
+                                id: "adopt-desc",
+                                initial_value: "{description.peek()}",
+                                oninput: move |e| {
+                                    desc_push.typed(&e.value());
+                                    desc_edited.set(true);
+                                    description.set(e.value());
+                                },
+                            }
                         }
                     }
                     label { class: "adopt-choice",

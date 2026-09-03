@@ -59,7 +59,7 @@ pub use domain::model::{
     DesignSub, DraftComment, Effort, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo,
     PrReviewSub, PreviewStatus, PreviewUrl, Project, Provider, QaExchange, ReviewColumn,
     ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread,
-    RunSub, Usage, CI_REGISTER_GRACE,
+    RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,
 };
 pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
 pub use error::{CoreError, Result};
