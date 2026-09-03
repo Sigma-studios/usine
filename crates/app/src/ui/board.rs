@@ -22,17 +22,18 @@ pub fn Board() -> Element {
     let mut cards = state.visible_cards();
     // Live Ctrl+F/Cmd+F filter; column counts follow since they're computed
     // from the list handed to each column.
-    if let Some(q) = super::search::query() {
-        cards.retain(|c| super::search::matches(&c.title, &q));
+    let filter = super::search::query();
+    if let Some(q) = &filter {
+        cards.retain(|c| super::search::matches(&c.title, q));
     }
 
     rsx! {
         div { class: "board",
-            for col in Column::board() {
+            for (col , col_cards) in visible_columns(&cards, filter.is_some()) {
                 ColumnView {
                     key: "{col:?}",
                     column: col,
-                    cards: column_cards(&cards, col),
+                    cards: col_cards,
                 }
             }
         }
@@ -64,32 +65,46 @@ fn column_cards(cards: &[Card], col: Column) -> Vec<Card> {
     out
 }
 
+/// The lanes the board actually draws, with their cards. An empty lane is left
+/// out entirely: eight full-width columns plus the sidebar and the detail panel
+/// is more board than a laptop shows at once, and the lanes that are empty
+/// (typically half of them) are the ones costing the most for the least. A lane
+/// comes back on its own the moment a card lands in it, so there is nothing to
+/// persist. The starting block always shows — it holds "+ Add card", which is
+/// where an empty board begins.
+///
+/// While the find bar filters the board (`keep_all`), every lane stays: there
+/// an empty lane is the answer — the zero counts read as "no matches here"
+/// instead of an empty project.
+fn visible_columns(cards: &[Card], keep_all: bool) -> Vec<(Column, Vec<Card>)> {
+    Column::board()
+        .into_iter()
+        .filter_map(|col| {
+            let col_cards = column_cards(cards, col);
+            let keep = keep_all || !col_cards.is_empty() || col == Column::StartingBlock;
+            keep.then_some((col, col_cards))
+        })
+        .collect()
+}
+
 #[component]
 fn ColumnView(column: Column, cards: Vec<Card>) -> Element {
     let title = column.title();
     let count = cards.len();
     let is_start = column == Column::StartingBlock;
-    // An empty lane collapses to a 40px labelled rail. Eight full-width columns
-    // plus the sidebar and the detail panel is more board than a laptop shows at
-    // once, and the lanes that are empty (typically half of them) are the ones
-    // costing the most for the least. The starting block always stays open —
-    // it holds "+ Add card", which is where an empty board begins.
-    let collapsed = count == 0 && !is_start;
 
     rsx! {
-        div { class: if collapsed { "column is-empty" } else { "column" },
+        div { class: "column",
             div { class: "column-header", title: "{title}",
                 span { "{title}" }
                 span { class: "column-count", "{count}" }
             }
-            if !collapsed {
-                div { class: "column-body",
-                    for card in cards.iter() {
-                        CardView { key: "{card.id}", card: card.clone() }
-                    }
-                    if is_start {
-                        AddCardButton {}
-                    }
+            div { class: "column-body",
+                for card in cards.iter() {
+                    CardView { key: "{card.id}", card: card.clone() }
+                }
+                if is_start {
+                    AddCardButton {}
                 }
             }
         }
@@ -148,6 +163,41 @@ mod tests {
 
     fn titles(cards: &[Card]) -> Vec<&str> {
         cards.iter().map(|c| c.title.as_str()).collect()
+    }
+
+    #[test]
+    fn empty_lanes_are_left_out_but_the_starting_block_stays() {
+        // One card in Implementing: that lane and the starting block draw, the
+        // six other lanes are gone rather than collapsed.
+        let cards = vec![card(
+            "work",
+            CardState::Implementing(usine_core::RunSub::Running),
+            false,
+            1,
+        )];
+        let shown = visible_columns(&cards, false);
+        let cols: Vec<Column> = shown.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cols, [Column::StartingBlock, Column::Implementing]);
+        assert_eq!(titles(&shown[1].1), ["work"]);
+        // The starting block draws empty — it holds "+ Add card".
+        assert!(shown[0].1.is_empty());
+
+        // An empty board is just the starting block.
+        let cols: Vec<Column> = visible_columns(&[], false)
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(cols, [Column::StartingBlock]);
+    }
+
+    #[test]
+    fn a_filtered_board_keeps_every_lane() {
+        // The find bar filtered everything away: the lanes stay so the zero
+        // counts read as "no matches", not as an empty project.
+        let shown = visible_columns(&[], true);
+        let cols: Vec<Column> = shown.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cols, Column::board().to_vec());
+        assert!(shown.iter().all(|(_, c)| c.is_empty()));
     }
 
     #[test]
