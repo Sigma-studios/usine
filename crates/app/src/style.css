@@ -572,6 +572,9 @@ select option { background: var(--panel-2); color: var(--text); }
 .comment .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
 /* Lead with the analysis: rationale is the prominent line. */
 .comment .rationale { color: var(--text); font-size: 13px; line-height: 1.45; }
+/* Why a checked `skip` row sends no assessment — sits under the rationale, so
+   it stays left-aligned and muted rather than borrowing the centred `.hint`. */
+.comment .skip-note { color: var(--muted); font-size: 12px; line-height: 1.4; }
 /* Collapsibles in the fix picker — the original comment and the composed task —
    are tucked away behind the same muted, caret-prefixed summary. */
 .comment .orig > summary,
