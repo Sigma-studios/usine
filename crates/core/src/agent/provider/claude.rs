@@ -359,10 +359,7 @@ mod tests {
         // Fable 5.1 has no `ultra` tier — clamp down rather than let the CLI
         // reject the flag.
         c.spec = ModelSpec::new("claude-fable-5-1", Effort::Ultra);
-        assert_eq!(
-            pair(&build_args(&c), "--effort").as_deref(),
-            Some("max")
-        );
+        assert_eq!(pair(&build_args(&c), "--effort").as_deref(), Some("max"));
     }
 
     #[test]

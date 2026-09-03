@@ -1,10 +1,12 @@
 //! The bottom usage bar: each provider's session + weekly rate-limit windows
-//! as small colored gauges. The gauges are conditional — a zero or absent
-//! window renders nothing, and a provider with no visible window renders
-//! nothing — but the bar itself is always mounted: with nothing to draw it
-//! shows a short placeholder, so its refresh button stays reachable exactly
-//! when the numbers never arrived. In demo mode the gauges show the
-//! simulator's mock numbers, which the button re-rolls.
+//! as small colored gauges, plus — where a model family is billed against its
+//! own weekly cap (Claude's Fable) — a third gauge for that per-model window.
+//! The gauges are conditional — a zero or absent window renders nothing, and a
+//! provider with no visible window renders nothing — but the bar itself is
+//! always mounted: with nothing to draw it shows a short placeholder, so its
+//! refresh button stays reachable exactly when the numbers never arrived. In
+//! demo mode the gauges show the simulator's mock numbers, which the button
+//! re-rolls.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
