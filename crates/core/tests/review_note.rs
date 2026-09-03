@@ -15,8 +15,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardState, ExecutorCommand, ExecutorConfig,
-    ExecutorEvent, ExecutorEventKind, Project, ProjectConfig, Provider, ProviderFactory, Result,
-    ReviewSub, RunConfig, RunHandle, RunMode, SimFactory, SimForge, SimGit, Store,
+    ExecutorEvent, ExecutorEventKind, FixVerdict, Project, ProjectConfig, Provider,
+    ProviderFactory, Result, ReviewComment, ReviewSub, RunConfig, RunHandle, RunMode, SimFactory,
+    SimForge, SimGit, Store,
 };
 
 /// Every prompt handed to a provider, tagged with the run mode that asked for it
@@ -288,6 +289,51 @@ async fn a_per_finding_instruction_reaches_the_fix_prompt() {
     );
 }
 
+/// The reviewing agent's own assessment is what the user agreed to when they
+/// ticked the box, so it must reach the fix run — except on a row the agent said
+/// to skip, where checking it is an override and the reasoning would argue
+/// against the work.
+#[tokio::test]
+async fn the_reviewers_assessment_reaches_the_fix_prompt() {
+    let (handle, mut rx, _store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
+
+    // Finding 0 is worth_fixing, finding 1 is the agent's "optional nit".
+    for v in &mut verdicts {
+        v.selected = true;
+    }
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts,
+        note: String::new(),
+        prompt: None,
+    });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if matches!(c.state, CardState::AwaitingReview(ReviewSub::ReadyForPr)) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+
+    let fixes = prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run");
+    assert!(
+        fixes.contains("Worth extracting to avoid drift."),
+        "the assessment must scope the fix:\n{fixes}"
+    );
+    assert!(
+        !fixes.contains("Optional nit."),
+        "an overridden skip must not send its reasoning:\n{fixes}"
+    );
+}
+
 #[tokio::test]
 async fn an_edited_task_is_sent_verbatim() {
     let (handle, mut rx, store, card_id, prompts, mut verdicts) = card_at_the_fix_picker().await;
@@ -416,5 +462,41 @@ async fn an_edited_task_does_not_log_the_dropped_note() {
     assert!(
         !qa.iter().any(|l| l.starts_with("Requested change:")),
         "a note the agent never saw must not be logged as a request: {qa:?}"
+    );
+}
+
+/// A PR-comment row the triage agent returned no verdict for carries a filler
+/// rationale, not an assessment — it must never be sent as the fix's scope (the
+/// picker blanks the editable box for the same reason).
+#[test]
+fn the_no_verdict_filler_is_not_sent_as_an_assessment() {
+    let verdict = FixVerdict {
+        comment: ReviewComment {
+            id: 1,
+            author: "someone".into(),
+            path: "src/lib.rs".into(),
+            line: Some(12),
+            body: "This looks off.".into(),
+            review_body_of: None,
+        },
+        worth_fixing: true,
+        severity: String::new(),
+        rationale: usine_core::NO_VERDICT_RATIONALE.into(),
+        selected: true,
+        reply: String::new(),
+        instruction: String::new(),
+    };
+    let prompt = usine_core::fix_prompt(&[verdict], "");
+    assert!(
+        prompt.contains("This looks off."),
+        "the comment itself still goes out:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("review this one manually"),
+        "the filler must not scope the fix:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("assessment"),
+        "with no real assessment the prompt keeps its old shape:\n{prompt}"
     );
 }
