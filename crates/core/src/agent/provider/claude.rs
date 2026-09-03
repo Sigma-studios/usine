@@ -347,6 +347,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_fable_5_1_id_is_forwarded_verbatim_with_its_effort_clamped() {
+        // The CLI only resolves the bare aliases, so a pinned id must reach it
+        // unrewritten.
+        let mut c = cfg(RunMode::Implement);
+        c.spec = ModelSpec::new("claude-fable-5-1", Effort::Max);
+        let args = build_args(&c);
+        assert_eq!(pair(&args, "--model").as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(pair(&args, "--effort").as_deref(), Some("max"));
+
+        // Fable 5.1 has no `ultra` tier — clamp down rather than let the CLI
+        // reject the flag.
+        c.spec = ModelSpec::new("claude-fable-5-1", Effort::Ultra);
+        assert_eq!(
+            pair(&build_args(&c), "--effort").as_deref(),
+            Some("max")
+        );
+    }
+
+    #[test]
     fn question_args_are_read_only() {
         let args = build_args(&cfg(RunMode::Question));
         assert_eq!(pair(&args, "--permission-mode").as_deref(), Some("plan"));

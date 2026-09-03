@@ -155,7 +155,9 @@ fn refreshed_label(refreshed_at: Option<i64>, now_ms: i64) -> String {
 }
 
 fn has_visible_window(usage: &ProviderUsage) -> bool {
-    shown(usage.session.as_ref()) || shown(usage.weekly.as_ref())
+    shown(usage.session.as_ref())
+        || shown(usage.weekly.as_ref())
+        || shown(usage.weekly_model.as_ref().map(|(_, w)| w))
 }
 
 /// "Conditionally if non-zero": a window at 0% says nothing worth a gauge.
@@ -175,12 +177,19 @@ fn ProviderGauges(provider: Provider, usage: ProviderUsage) -> Element {
         .weekly
         .filter(|w| w.used_percent > 0.0)
         .map(|w| rsx! { WindowGauge { label: "7d", window: w } });
+    // A model family billed against its own weekly cap (Claude's Fable), which
+    // the all-models gauge above says nothing about.
+    let weekly_model = usage
+        .weekly_model
+        .filter(|(_, w)| w.used_percent > 0.0)
+        .map(|(name, w)| rsx! { WindowGauge { label: "7d {name}", window: w } });
 
     rsx! {
         div { class: "usage-group",
             span { class: "badge provider {class}", "{name}" }
             {session}
             {weekly}
+            {weekly_model}
         }
     }
 }
@@ -293,5 +302,30 @@ mod tests {
     fn a_future_timestamp_is_clamped_to_fresh() {
         let label = refreshed_label(Some(NOW + 60_000), NOW);
         assert!(label.starts_with("Updated just now ("), "{label}");
+    }
+
+    #[test]
+    fn a_per_model_weekly_cap_alone_still_shows_the_provider_segment() {
+        // An account that has only touched Fable this week reports 0% on both
+        // shared windows; the segment must not vanish.
+        let usage = ProviderUsage {
+            session: None,
+            weekly: None,
+            weekly_model: Some((
+                "Fable".into(),
+                RateLimitWindow {
+                    used_percent: 6.0,
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(has_visible_window(&usage));
+
+        // A 0% per-model window says nothing worth a gauge, like the others.
+        let idle = ProviderUsage {
+            weekly_model: Some(("Fable".into(), RateLimitWindow::default())),
+            ..Default::default()
+        };
+        assert!(!has_visible_window(&idle));
     }
 }

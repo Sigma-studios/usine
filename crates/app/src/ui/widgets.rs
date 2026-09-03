@@ -7,7 +7,7 @@ use usine_core::{supported_efforts, Effort, ModelSpec, Provider, SEVERITY_LEVELS
 /// Selectable model ids per provider.
 pub(crate) fn models_for(provider: Provider) -> &'static [&'static str] {
     match provider {
-        Provider::Claude => &["opus", "sonnet", "haiku", "fable"],
+        Provider::Claude => &["opus", "sonnet", "haiku", "fable", "claude-fable-5-1"],
         // Models available through Codex with ChatGPT authentication, newest
         // first. Older entries remain selectable for plan-dependent access.
         Provider::Codex => &[
@@ -19,6 +19,15 @@ pub(crate) fn models_for(provider: Provider) -> &'static [&'static str] {
             "gpt-5.3-codex",
             "gpt-5.4",
         ],
+    }
+}
+
+/// Display text for a model id. Ids that are already friendly (the Claude
+/// aliases, the Codex ids) print as-is.
+pub(crate) fn model_label(model: &str) -> &str {
+    match model {
+        "claude-fable-5-1" => "fable 5.1",
+        other => other,
     }
 }
 
@@ -102,7 +111,7 @@ pub(crate) fn ModelEffortPicker(
                     }
                 },
                 for m in models.iter() {
-                    option { value: "{m}", selected: model.as_str() == *m, "{m}" }
+                    option { value: "{m}", selected: model.as_str() == *m, "{model_label(m)}" }
                 }
             }
             select {
@@ -160,7 +169,7 @@ pub(crate) fn OptionalModelEffortPicker(
                 },
                 option { value: "", selected: model.is_empty(), "{inherit_label}" }
                 for m in models.iter() {
-                    option { value: "{m}", selected: model.as_str() == *m, "{m}" }
+                    option { value: "{m}", selected: model.as_str() == *m, "{model_label(m)}" }
                 }
             }
             if let Some(effort) = effort {
@@ -189,6 +198,22 @@ mod tests {
         assert!(models.contains(&"gpt-5.6-sol"));
         assert!(models.contains(&"gpt-5.6-terra"));
         assert!(models.contains(&"gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn claude_picker_pins_fable_5_1_while_keeping_the_alias() {
+        let models = models_for(Provider::Claude);
+        assert!(models.contains(&"claude-fable-5-1"));
+        // Dropping the bare alias would strand cards already configured on it:
+        // the select would render blank and silently switch model on next edit.
+        assert!(models.contains(&"fable"));
+    }
+
+    #[test]
+    fn only_the_pinned_ids_get_a_friendlier_label() {
+        assert_eq!(model_label("claude-fable-5-1"), "fable 5.1");
+        assert_eq!(model_label("opus"), "opus");
+        assert_eq!(model_label("gpt-5.6-sol"), "gpt-5.6-sol");
     }
 
     #[test]
