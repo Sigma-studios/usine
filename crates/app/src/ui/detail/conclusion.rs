@@ -39,6 +39,7 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
                             pushback.typed(&e.value());
                             follow_up.set(e.value());
                         },
+                        onpaste: move |_| super::edit::attach_from_clipboard(state, card_id),
                     }
                 }
             }

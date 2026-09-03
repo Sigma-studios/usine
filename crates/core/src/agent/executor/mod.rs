@@ -971,13 +971,16 @@ fn followup_extra(prev_conclusion: Option<&str>, prior_qa: &[String], feedback: 
     s
 }
 
-/// Append a note listing the card's attached file paths so the agent reads
-/// them before starting (Claude's Read tool handles images via vision; Codex
-/// reads text with its shell tools and receives images via `codex exec -i`).
+/// Append a note listing the card's attached file paths for the agent to read
+/// (Claude's Read tool handles images via vision; Codex reads text with its
+/// shell tools and receives images via `codex exec -i`). Deliberately not "read
+/// them before starting": attachments are re-read at every launch, so on a
+/// revise or fix run they are evidence for the change being requested, not a
+/// preamble to work that hasn't begun.
 /// Paths are absolute and live outside the project, which both CLIs handle fine.
 fn append_attachments(base: String, paths: &[PathBuf]) -> String {
     let mut out = base;
-    out.push_str("\n\nAttached files (read each before starting):");
+    out.push_str("\n\nAttached files (read each):");
     for p in paths {
         out.push_str("\n- ");
         out.push_str(&p.to_string_lossy());

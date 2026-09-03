@@ -353,7 +353,7 @@ select option { background: var(--panel-2); color: var(--text); }
    The executor drops a duplicate anyway (`CardCommand::is_exclusive`), so this
    only makes that visible rather than letting a second click look ignored.
    Icon tools (preview, diff) are excluded: they don't advance the lifecycle. */
-.is-busy .btn { pointer-events: none; opacity: 0.5; }
+.is-busy .btn, .is-busy .attach-btn { pointer-events: none; opacity: 0.5; }
 /* Compact square button (e.g. the reviewer-list refresh) that shouldn't stretch
    to fill a flex `.row`. */
 .btn.icon { flex: 0 0 auto; width: 36px; padding: 6px 0; font-size: 14px; line-height: 1; }
@@ -447,6 +447,22 @@ select option { background: var(--panel-2); color: var(--text); }
   border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
 }
 .field textarea { resize: vertical; min-height: 60px; }
+
+/* An attach control inside the box it belongs to: the textarea reserves a strip
+   at the bottom so the last line never runs under the button, which sits on the
+   left, clear of the resize grip WebKit draws bottom-right. */
+.attach-field { position: relative; }
+.attach-field textarea { padding-bottom: 28px; }
+.attach-btn {
+  position: absolute; left: 6px; bottom: 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0;
+  /* The field's own background, not `none`: the button overlays the textarea,
+     so transparent lets scrolled text run visibly under the icon. */
+  background: var(--panel-2); border: none; border-radius: 6px;
+  color: var(--muted); cursor: pointer;
+}
+.attach-btn:hover { color: var(--text); background: var(--panel); }
 
 /* Adopt-branch dialog: a small form inside the standard modal shell. */
 .adopt-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
