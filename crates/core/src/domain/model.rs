@@ -229,22 +229,30 @@ impl Effort {
 /// [`Effort::clamp_to`]), so a run never asks a model for a level it would reject
 /// or silently drop.
 ///
-/// * **Claude** — the `opus` (4.8), `sonnet` (5), and `fable` (5) aliases take the
-///   full range; Haiku 4.5 has no effort tiers, so it gets a single neutral entry.
+/// * **Claude** — the `opus` (4.8), `sonnet` (5), and `fable` aliases take the
+///   full range, as does the pinned `claude-fable-5-1` id (Fable 5.1 tops out at
+///   `max`; it has no `ultra`). The `fable` alias resolves to Fable 5.1 today.
+///   Haiku 4.5 has no effort tiers, so it gets a single neutral entry. Matched by
+///   family rather than exact alias, so pinned ids resolve too.
 /// * **Codex** — GPT-5.6 Sol and Terra reach `ultra`, while Luna reaches `max`.
 ///   GPT-5.3 through GPT-5.5 reach `xhigh`, as did the retiring
 ///   `gpt-5.1-codex-max`; legacy or unknown ids stay at `high`.
 ///
 /// Verified against the Claude Code model-config docs and OpenAI's Codex model
-/// docs (Jul 2026 — the pre-5.3 Codex lineup shuts down 2026-07-23). Claude Code
+/// docs (Jul 2026 — the pre-5.3 Codex lineup shuts down 2026-07-23), and the
+/// Claude Code 2.1.259 baked catalog for Fable 5.1 (Sep 2026: `effort_cost_index`
+/// lists `low`…`max`). Claude Code
 /// clamps unsupported levels itself; Codex does not, which is why clamping
 /// happens before the CLI call.
 pub fn supported_efforts(provider: Provider, model: &str) -> &'static [Effort] {
     use Effort::*;
     match provider {
         Provider::Claude => match model {
-            "haiku" => &[Medium],
-            // opus / sonnet / fable — and any newer alias — take the full range.
+            // Haiku 4.5 has no effort tiers — match the family, not just the bare
+            // alias, so a pinned id (`claude-haiku-4-5`) is recognized too.
+            m if m.contains("haiku") => &[Medium],
+            // opus / sonnet / fable — aliases and pinned ids alike — take the
+            // full range. Fable 5.1 tops out at `max` (no `ultra`), as do the rest.
             _ => &[Low, Medium, High, XHigh, Max],
         },
         Provider::Codex => match model {
@@ -1784,6 +1792,27 @@ impl Card {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_5_1_takes_the_full_range_up_to_max_but_not_ultra() {
+        let efforts = supported_efforts(Provider::Claude, "claude-fable-5-1");
+        assert_eq!(efforts.last(), Some(&Effort::Max));
+        assert!(!efforts.contains(&Effort::Ultra));
+        // A spec carried over from a Codex model must land on max, not blank.
+        assert_eq!(Effort::Ultra.clamp_to(efforts), Effort::Max);
+    }
+
+    #[test]
+    fn haiku_has_no_effort_tiers_by_alias_or_pinned_id() {
+        assert_eq!(
+            supported_efforts(Provider::Claude, "haiku"),
+            &[Effort::Medium]
+        );
+        assert_eq!(
+            supported_efforts(Provider::Claude, "claude-haiku-4-5"),
+            &[Effort::Medium]
+        );
+    }
 
     #[test]
     fn cost_rounds_serializes_deterministically_and_reads_both_forms() {
