@@ -15,8 +15,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardState, ExecutorCommand, ExecutorConfig,
-    ExecutorEvent, ExecutorEventKind, Project, ProjectConfig, Provider, ProviderFactory, Result,
-    ReviewSub, RunConfig, RunHandle, RunMode, SimFactory, SimForge, SimGit, Store,
+    ExecutorEvent, ExecutorEventKind, FixVerdict, Project, ProjectConfig, Provider,
+    ProviderFactory, Result, ReviewComment, ReviewSub, RunConfig, RunHandle, RunMode, SimFactory,
+    SimForge, SimGit, Store,
 };
 
 /// Every prompt handed to a provider, tagged with the run mode that asked for it
@@ -461,5 +462,41 @@ async fn an_edited_task_does_not_log_the_dropped_note() {
     assert!(
         !qa.iter().any(|l| l.starts_with("Requested change:")),
         "a note the agent never saw must not be logged as a request: {qa:?}"
+    );
+}
+
+/// A PR-comment row the triage agent returned no verdict for carries a filler
+/// rationale, not an assessment — it must never be sent as the fix's scope (the
+/// picker blanks the editable box for the same reason).
+#[test]
+fn the_no_verdict_filler_is_not_sent_as_an_assessment() {
+    let verdict = FixVerdict {
+        comment: ReviewComment {
+            id: 1,
+            author: "someone".into(),
+            path: "src/lib.rs".into(),
+            line: Some(12),
+            body: "This looks off.".into(),
+            review_body_of: None,
+        },
+        worth_fixing: true,
+        severity: String::new(),
+        rationale: usine_core::NO_VERDICT_RATIONALE.into(),
+        selected: true,
+        reply: String::new(),
+        instruction: String::new(),
+    };
+    let prompt = usine_core::fix_prompt(&[verdict], "");
+    assert!(
+        prompt.contains("This looks off."),
+        "the comment itself still goes out:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("review this one manually"),
+        "the filler must not scope the fix:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("assessment"),
+        "with no real assessment the prompt keeps its old shape:\n{prompt}"
     );
 }

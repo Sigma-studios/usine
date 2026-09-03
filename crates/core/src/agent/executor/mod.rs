@@ -1315,12 +1315,7 @@ pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
                     None => v.comment.path.clone(),
                 }
             };
-            // The level the reviewer gave tells the fix run what to be careful
-            // with; an unrated comment keeps the bare shape.
-            let sev = match crate::agent::review::normalize_severity(&v.severity) {
-                s if s.is_empty() => String::new(),
-                s => format!("[{s}] "),
-            };
+            let sev = crate::agent::review::severity_prefix(&v.severity);
             // Indent continuation lines so a multi-line comment stays one bullet.
             out.push_str(&format!(
                 "- {sev}[{loc}] {}\n",

@@ -105,6 +105,10 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     };
                     let body = v.comment.body.clone();
                     let rationale = v.rationale.clone();
+                    // The triage filler for a comment the agent returned no
+                    // verdict on isn't an assessment — `fix_prompt` drops it, so
+                    // the editable box must not offer it as text to keep either.
+                    let no_verdict = rationale.trim() == usine_core::NO_VERDICT_RATIONALE;
                     // Severity badge (falls back to a neutral dash when unrated).
                     let sev = v.severity.clone();
                     let sev_label = if sev.is_empty() { "—".to_string() } else { sev.clone() };
@@ -134,6 +138,19 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     // `skip` row overrides the verdict and sends nothing, so it
                     // stays a read-only line rather than a box we'd discard.
                     let edit_rationale = checked && v.worth_fixing;
+                    // Blank the box on a no-verdict row: the filler is a status
+                    // line, shown as the placeholder instead, so an edit ships
+                    // only what the user actually wrote.
+                    let rationale_value = if edit_rationale && no_verdict {
+                        String::new()
+                    } else {
+                        rationale.clone()
+                    };
+                    let rationale_placeholder = if no_verdict {
+                        "No verdict returned — say what part of this is actually worth fixing."
+                    } else {
+                        "No assessment — say what part of this is actually worth fixing."
+                    };
                     let override_skip = checked && !v.worth_fixing;
                     rsx! {
                         div { key: "{cid}", class: "comment",
@@ -155,15 +172,15 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                                     label { class: "reply-label", "assessment — sent as the scope of this fix" }
                                     textarea {
                                         class: "review-comment-edit autogrow",
-                                        rows: "{fallback_rows(&rationale)}",
-                                        placeholder: "No assessment — say what part of this is actually worth fixing.",
-                                        value: "{rationale}",
+                                        rows: "{fallback_rows(&rationale_value)}",
+                                        placeholder: "{rationale_placeholder}",
+                                        value: "{rationale_value}",
                                         oninput: move |e| edits.write()[i].rationale = e.value(),
                                     }
                                 } else {
                                     div { class: "rationale", "{rationale}" }
                                     if override_skip {
-                                        div { class: "hint",
+                                        div { class: "skip-note",
                                             "not sent — you're overriding the reviewer's skip; use ↳ how to fix it to scope it."
                                         }
                                     }

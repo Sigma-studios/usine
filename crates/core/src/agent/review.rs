@@ -179,6 +179,17 @@ pub fn normalize_severity(s: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The `[level] ` prefix a fix-run bullet carries, or empty for an unrated
+/// comment — the level tells the fix run what to be careful with, and an
+/// unrated one keeps the bare shape. Shared by [`review_fix_prompt`] and the
+/// self/PR fix prompt.
+pub fn severity_prefix(sev: &str) -> String {
+    match normalize_severity(sev) {
+        s if s.is_empty() => String::new(),
+        s => format!("[{s}] "),
+    }
+}
+
 /// How a level is written when the comment is published to the author: an emoji
 /// plus a word, so criticality is visible at a glance in a GitHub thread.
 ///
@@ -457,12 +468,7 @@ pub fn review_fix_prompt(
             Some(line) => format!("{}:{}", c.path, line),
             None => c.path.clone(),
         };
-        // The level the maintainer published tells the fix run what to be
-        // careful with; an unrated comment keeps the bare shape.
-        let sev = match normalize_severity(&c.severity) {
-            s if s.is_empty() => String::new(),
-            s => format!("[{s}] "),
-        };
+        let sev = severity_prefix(&c.severity);
         // Indent continuation lines so a multi-line comment stays one bullet.
         out.push_str(&format!(
             "- {sev}[{loc}] {}\n",
