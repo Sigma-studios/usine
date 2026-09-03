@@ -28,7 +28,8 @@ use state::AppState;
 use toast::ToastHost;
 use ui::{
     AdoptDialogHost, BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost,
-    ProjectSettingsModal, SearchHost, SettingsModal, ShortcutHost, Sidebar, UsageBar,
+    PanelResizeHost, ProjectSettingsModal, SearchHost, SettingsModal, ShortcutHost, Sidebar,
+    UsageBar,
 };
 
 const CSS: &str = include_str!("style.css");
@@ -327,6 +328,9 @@ fn App() -> Element {
 
     rsx! {
         style { dangerous_inner_html: CSS }
+        // After the base sheet: emits the `:root` width overrides and owns the
+        // panel drag listener.
+        PanelResizeHost {}
         div { class: "app-shell",
             div { class: "app",
                 Sidebar {}
