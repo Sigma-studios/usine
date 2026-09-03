@@ -207,7 +207,10 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                 }
             }
             details { class: "fix-task",
-                summary { "Task sent to the agent — edit to send your own wording" }
+                summary {
+                    title: "The run also receives the card description and its worktree context ahead of this text",
+                    "Task sent to the agent — edit to send your own wording"
+                }
                 textarea {
                     class: "review-comment-edit task-edit",
                     rows: "{task_rows}",
@@ -216,17 +219,13 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     oninput: move |e| task.set(Some(e.value())),
                 }
                 if edited.is_some() {
-                    div { class: "hint",
-                        "edited — the rows and note above no longer update this text; the checkboxes still control replies and thread resolution"
-                    }
+                    div { class: "hint", "edited — the rows and note no longer update this text" }
                     button {
                         class: "btn subtle",
+                        title: "The checkboxes still control the replies posted and the threads resolved, whatever this text says",
                         onclick: move |_| task.set(None),
                         "Reset to generated"
                     }
-                }
-                div { class: "hint",
-                    "The run also receives the card description and its worktree context ahead of this text."
                 }
             }
             div { class: "row",

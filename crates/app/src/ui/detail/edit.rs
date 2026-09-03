@@ -92,12 +92,14 @@ pub(super) fn Attachments(card_id: Uuid) -> Element {
     // Image chip clicked → preview it in a modal; None when the dialog is closed.
     let mut preview = use_signal(|| None::<PathBuf>);
 
+    let empty = atts.is_empty();
+
     rsx! {
+        // Nothing attached: the section IS the button. A heading and a "No files
+        // attached." line are two rows of panel telling you what isn't there.
         div { class: "section",
-            h3 { "Attachments" }
-            if atts.is_empty() {
-                div { class: "hint", "No files attached." }
-            } else {
+            if !empty {
+                h3 { "Attachments" }
                 div { class: "chips",
                     for path in atts {
                         {
@@ -139,6 +141,7 @@ pub(super) fn Attachments(card_id: Uuid) -> Element {
             }
             button {
                 class: "btn",
+                title: "Images ride along with the run — Claude reads them, Codex receives them as -i flags; other files are listed to the agent by path",
                 onclick: move |_| {
                     spawn(async move {
                         if let Some(handles) = rfd::AsyncFileDialog::new().pick_files().await {

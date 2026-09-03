@@ -28,7 +28,8 @@ use state::AppState;
 use toast::ToastHost;
 use ui::{
     AdoptDialogHost, BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost,
-    PanelResizeHost, ProjectSettingsModal, SearchHost, SettingsModal, Sidebar, UsageBar,
+    PanelResizeHost, ProjectSettingsModal, SearchHost, SettingsModal, ShortcutHost, Sidebar,
+    UsageBar,
 };
 
 const CSS: &str = include_str!("style.css");
@@ -340,6 +341,7 @@ fn App() -> Element {
         }
         ToastHost {}
         SearchHost {}
+        ShortcutHost {}
         CardMenuHost {}
         ConfirmHost {}
         AdoptDialogHost {}

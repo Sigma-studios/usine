@@ -285,7 +285,10 @@ pub enum Column {
     StartingBlock,
     Designing,
     Implementing,
-    AwaitingReview,
+    /// The whole pre-PR gate: work awaiting the user's read, the self-review
+    /// pass, the fix picker and the validation check. (Was split into
+    /// `AwaitingReview` + `SelfReview`; the alias keeps old records loadable.)
+    #[serde(alias = "AwaitingReview")]
     SelfReview,
     PrReview,
     ReadyToMerge,
@@ -302,8 +305,7 @@ impl Column {
             Column::StartingBlock => "Starting block",
             Column::Designing => "Designing",
             Column::Implementing => "Implementing",
-            Column::AwaitingReview => "Awaiting review",
-            Column::SelfReview => "Self-review",
+            Column::SelfReview => "Review",
             Column::PrReview => "PR review",
             Column::ReadyToMerge => "Ready to merge",
             Column::MergedWithoutReview => "Merged w/o review",
@@ -311,12 +313,11 @@ impl Column {
         }
     }
     /// Columns shown on the board, in order.
-    pub fn board() -> [Column; 9] {
+    pub fn board() -> [Column; 8] {
         [
             Column::StartingBlock,
             Column::Designing,
             Column::Implementing,
-            Column::AwaitingReview,
             Column::SelfReview,
             Column::PrReview,
             Column::ReadyToMerge,
@@ -525,22 +526,15 @@ impl CardState {
             // with Designing, and the finished conclusion parks with the other
             // work awaiting the user's read.
             CardState::Investigating(_) => Column::Designing,
-            CardState::Concluded { .. } => Column::AwaitingReview,
+            CardState::Concluded { .. } => Column::SelfReview,
             CardState::Implementing(_) => Column::Implementing,
-            // The pre-PR gate spans two columns: the freshly-implemented work
-            // awaiting the user's review sits in `AwaitingReview`; the active
-            // self-review pass (running, fix picker, ready-for-PR) sits in
-            // `SelfReview`, mirroring the `PrReview` column.
-            CardState::AwaitingReview(ReviewSub::ReadyForReview) => Column::AwaitingReview,
-            CardState::AwaitingReview(
-                ReviewSub::Reviewing
-                | ReviewSub::SelectingFixes { .. }
-                | ReviewSub::ApplyingFixes
-                | ReviewSub::Validating { .. }
-                | ReviewSub::FixingValidation { .. }
-                | ReviewSub::ValidationFailed { .. }
-                | ReviewSub::ReadyForPr,
-            ) => Column::SelfReview,
+            // The whole pre-PR gate is one column, mirroring `PrReview`: the
+            // freshly-implemented work, the self-review pass, the fix picker,
+            // the validation check and ready-for-PR. `ReadyForReview` is
+            // near-transient now that the review auto-starts, so splitting it
+            // out bought an almost-always-empty lane; the per-card status badge
+            // spells out which sub-state each card is in.
+            CardState::AwaitingReview(_) => Column::SelfReview,
             CardState::PrReview(_) => Column::PrReview,
             CardState::ReadyToMerge => Column::ReadyToMerge,
             CardState::MergedWithoutReview { .. } => Column::MergedWithoutReview,
@@ -656,7 +650,7 @@ impl CardState {
     /// Short human label for the current sub-state (for badges).
     pub fn status_label(&self) -> &'static str {
         match self {
-            CardState::StartingBlock => "configured",
+            CardState::StartingBlock => "not started",
             CardState::Designing(DesignSub::Running) => "designing…",
             CardState::Designing(DesignSub::Intervention(_)) => "needs answer",
             CardState::Designing(DesignSub::AwaitingApproval { plan }) => {
@@ -691,7 +685,7 @@ impl CardState {
             CardState::MergedWithoutReview { merged: false } => "PR closed",
             CardState::Done => "done",
             CardState::Failed { .. } => "failed",
-            CardState::Answering { .. } => "answering…",
+            CardState::Answering { .. } => "agent replying…",
         }
     }
 }
@@ -1679,6 +1673,41 @@ impl Card {
         self.comment_count > 0 || !self.pending_review_bodies().is_empty()
     }
 
+    /// Short human label for the card's status, for the board badge and the
+    /// panel header. [`CardState::status_label`] is the base; this overrides the
+    /// gate states whose name alone lies about what the card is waiting on — a
+    /// `ReadyToMerge` card with conflicts, a red build or untriaged comments is
+    /// not "ready to merge", and the button beside the badge already says so.
+    /// First match wins, most blocking first.
+    pub fn status_label(&self) -> &'static str {
+        match self.state {
+            CardState::ReadyToMerge => {
+                // Same order the board's merge-gate buttons gate on, so the
+                // badge names what the one offered button is about: a draft PR
+                // is unmergeable whatever its build says, and "Mark ready" is
+                // the only thing on offer — reading "waiting on CI" beside it
+                // pointed at a wait that isn't the blocker.
+                if self.pr.as_ref().is_some_and(|p| p.state == "draft") {
+                    "draft PR"
+                } else if self.mergeable.is_conflicting() {
+                    "conflicts"
+                } else if self.unanswered_count > 0 || !self.pending_review_bodies().is_empty() {
+                    "comments to triage"
+                } else if self.checks == CheckStatus::Failing {
+                    "CI failing"
+                } else if self.checks == CheckStatus::Pending {
+                    "waiting on CI"
+                } else {
+                    self.state.status_label()
+                }
+            }
+            CardState::PrReview(PrReviewSub::Idle) if self.has_triageable_feedback() => {
+                "comments to read"
+            }
+            _ => self.state.status_label(),
+        }
+    }
+
     /// The reviewers whose latest review approves this card's PR.
     /// `latestReviews` keeps one verdict per reviewer, so this is the set of
     /// standing approvals — what the board badge and the merge panel restate,
@@ -1891,11 +1920,11 @@ mod tests {
         assert!(concluded.needs_attention() && !concluded.needs_intervention());
         assert!(!concluded.is_running());
 
-        // Investigating renders with Designing; the conclusion parks with the
-        // other work awaiting the user's read.
+        // Investigating renders with Designing; the conclusion parks in the
+        // Review column with the other work awaiting the user's read.
         assert_eq!(running.column(), Column::Designing);
         assert_eq!(parked.column(), Column::Designing);
-        assert_eq!(concluded.column(), Column::AwaitingReview);
+        assert_eq!(concluded.column(), Column::SelfReview);
 
         // The new variants round-trip through the store's JSON codec shape.
         for s in [running, parked, concluded] {
@@ -1915,7 +1944,7 @@ mod tests {
             ),
             (
                 CardState::AwaitingReview(ReviewSub::ReadyForReview),
-                Column::AwaitingReview,
+                Column::SelfReview,
             ),
             (
                 CardState::AwaitingReview(ReviewSub::ValidationFailed {
@@ -1940,7 +1969,7 @@ mod tests {
             assert!(s.intervention().is_none());
             assert_eq!(s.column(), column);
             assert_eq!(*s.effective(), previous);
-            assert_eq!(s.status_label(), "answering…");
+            assert_eq!(s.status_label(), "agent replying…");
 
             // Round-trips through the store's JSON codec shape.
             let json = serde_json::to_string(&s).unwrap();
@@ -2096,6 +2125,59 @@ mod tests {
         // With a timestamp, the key is the timestamp form as before.
         r.submitted_at = "2026-08-21T13:58:00Z".into();
         assert_eq!(r.body_key(), "bot@2026-08-21T13:58:00Z");
+    }
+
+    #[test]
+    fn card_status_label_reflects_gate_blockers() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::ReadyToMerge;
+        // Nothing in the way: the state's own label stands.
+        assert_eq!(card.status_label(), "ready to merge");
+
+        card.checks = CheckStatus::Pending;
+        assert_eq!(card.status_label(), "waiting on CI");
+        card.checks = CheckStatus::Failing;
+        assert_eq!(card.status_label(), "CI failing");
+
+        // Untriaged comments outrank a red build — that's what the button offers.
+        card.unanswered_count = 1;
+        assert_eq!(card.status_label(), "comments to triage");
+        card.unanswered_count = 0;
+
+        // An unread review body counts as untriaged too.
+        let mut r = ReviewSummary::new("Bot", "COMMENTED");
+        r.body = "a note".into();
+        card.reviews = vec![r];
+        assert_eq!(card.status_label(), "comments to triage");
+        card.reviews.clear();
+
+        // Conflicts outrank everything but the draft check below.
+        card.mergeable = Mergeable::Conflicting;
+        card.unanswered_count = 2;
+        assert_eq!(card.status_label(), "conflicts");
+
+        // A draft PR outranks the lot: "Mark ready" is the only button the
+        // board offers, so the badge must not name a different blocker.
+        card.pr = Some(PrInfo {
+            number: 1,
+            url: "u".into(),
+            title: "t".into(),
+            state: "draft".into(),
+            reviewer: None,
+            reviewer_recorded: false,
+        });
+        assert_eq!(card.status_label(), "draft PR");
+        card.mergeable = Mergeable::Clean;
+        card.unanswered_count = 0;
+        card.checks = CheckStatus::Pending;
+        assert_eq!(card.status_label(), "draft PR");
+
+        // The PR gate says so when there is feedback waiting to be read.
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.state = CardState::PrReview(PrReviewSub::Idle);
+        assert_eq!(card.status_label(), "PR open");
+        card.comment_count = 3;
+        assert_eq!(card.status_label(), "comments to read");
     }
 
     #[test]
@@ -2336,17 +2418,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_pr_gate_splits_across_awaiting_and_self_review_columns() {
-        // The freshly-implemented work awaiting the user's review lives in the
-        // Awaiting review column.
-        assert_eq!(
-            CardState::AwaitingReview(ReviewSub::ReadyForReview).column(),
-            Column::AwaitingReview,
-            "ReadyForReview → Awaiting review"
-        );
-        // The active self-review pass (running → ready for PR) lives in the
-        // Self-review column.
+    fn pre_pr_gate_is_one_review_column() {
+        // Every pre-PR sub-state — the freshly-implemented work awaiting the
+        // user's read as much as the active self-review pass — sits in the one
+        // Review column, so the near-transient `ReadyForReview` no longer costs
+        // a lane of its own.
         for s in [
+            ReviewSub::ReadyForReview,
             ReviewSub::Reviewing,
             ReviewSub::SelectingFixes { verdicts: vec![] },
             ReviewSub::ApplyingFixes,
@@ -2355,7 +2433,7 @@ mod tests {
             assert_eq!(
                 CardState::AwaitingReview(s.clone()).column(),
                 Column::SelfReview,
-                "{s:?} → Self-review"
+                "{s:?} → Review"
             );
         }
     }

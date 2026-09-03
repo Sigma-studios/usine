@@ -42,9 +42,19 @@ pub fn CardView(card: Card) -> Element {
     // its place in line instead of a spinner.
     let queued_pos = state.queue_position(id);
 
-    let st = &card.state;
-    let running = st.is_running();
-    let failed = st.is_failed();
+    let running = card.state.is_running();
+    let failed = card.state.is_failed();
+    // The buttons dispatch on the state seen THROUGH a question run: asking
+    // something used to strip the card of every action (and reflow the column)
+    // for the duration. They stay put and read disabled instead — `frozen`
+    // adds `.is-busy`, whose `.btn` rule is exactly the "a command wouldn't
+    // land right now" treatment. A fault keeps its Retry-only board treatment:
+    // a faulted card is acted on in the panel.
+    let frozen = matches!(card.state, CardState::Answering { .. });
+    let st = match &card.state {
+        CardState::Answering { previous, .. } => previous.effective(),
+        s => s,
+    };
     let recover_label = match st {
         CardState::Failed { message, .. } if message.starts_with("Interrupted") => "Resume",
         _ => "Retry",
@@ -63,11 +73,20 @@ pub fn CardView(card: Card) -> Element {
     );
     // Only the parked review sub-states get a board button, labelled for what
     // opening the panel actually offers there; the running ones just spin.
+    // Each carries the panel anchor it promises to land on: these buttons only
+    // open the card, which clicking it already does, so they must at least take
+    // you to the section they name.
     let review_action = match st {
-        CardState::AwaitingReview(ReviewSub::ReadyForReview) => Some("Review"),
-        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. }) => Some("Select fixes"),
-        CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => Some("Fix validation"),
-        CardState::AwaitingReview(ReviewSub::ReadyForPr) => Some("Create PR"),
+        CardState::AwaitingReview(ReviewSub::ReadyForReview) => Some(("Review", "pr-create")),
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. }) => {
+            Some(("Select fixes", "fix-selection"))
+        }
+        // The panel offers three ways forward (fix, skip, re-run), not just a
+        // fix — say "Validation failed" and let the panel present them.
+        CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => {
+            Some(("Validation failed", "pr-create"))
+        }
+        CardState::AwaitingReview(ReviewSub::ReadyForPr) => Some(("Create PR", "pr-create")),
         _ => None,
     };
     // Validation gave up — urgent tier (`needs_urgent_attention`), so the badge
@@ -203,7 +222,16 @@ pub fn CardView(card: Card) -> Element {
     // Kept in step with the marker by `Card::set_blocked`: a note only
     // exists while the card is blocked.
     let blocked_note = card.blocked_note.clone();
-    let status = card.state.status_label();
+    // From the card, not the state alone — "ready to merge" must not sit on a
+    // card whose button says "Resolve conflicts". While a lifecycle command is
+    // in flight the card is doing something its state can't show yet, so say so
+    // and keep the real state on the tooltip.
+    let status = if busy && !running {
+        "working…"
+    } else {
+        card.status_label()
+    };
+    let status_title = card.status_label();
     let title = if card.title.trim().is_empty() {
         "Untitled".to_string()
     } else {
@@ -226,11 +254,14 @@ pub fn CardView(card: Card) -> Element {
             class: "{card_class}",
             tabindex: "0",
             "role": "button",
-            onclick: move |_| state.select_card(Some(id)),
+            // Clicking the open card closes its panel — the same toggle every
+            // other "selected" affordance in the app has, and the board's only
+            // way back to full width besides the panel's ×.
+            onclick: move |_| state.select_card((!selected).then_some(id)),
             onkeydown: move |e: KeyboardEvent| {
                 if e.key() == Key::Enter || e.key() == Key::Character(" ".to_string()) {
                     e.prevent_default();
-                    state.select_card(Some(id));
+                    state.select_card((!selected).then_some(id));
                 }
             },
             div { class: "card-top",
@@ -295,22 +326,24 @@ pub fn CardView(card: Card) -> Element {
                         "blocked"
                     }
                 }
+                // Beside the status badge, not instead of it: a queued card
+                // still has a state, and losing it left the card saying only
+                // where it stood in line.
                 if let Some(n) = queued_pos {
                     span {
                         class: "badge queued",
                         title: "Waiting for a free run slot (see max concurrent runs in Settings)",
                         "queued #{n}"
                     }
-                } else if needs_answer {
+                }
+                if needs_answer {
                     span { class: "badge intervention", "needs answer" }
-                } else if externally_closed {
-                    span { class: "badge intervention", "{status}" }
-                } else if validation_failed {
-                    span { class: "badge intervention", "{status}" }
+                } else if externally_closed || validation_failed {
+                    span { class: "badge intervention", title: "{status_title}", "{status}" }
                 } else if concluded {
-                    span { class: "badge concluded", "{status}" }
+                    span { class: "badge concluded", title: "{status_title}", "{status}" }
                 } else {
-                    span { class: "badge status", "{status}" }
+                    span { class: "badge status", title: "{status_title}", "{status}" }
                 }
                 if let Some((number, url)) = pr_link {
                     a {
@@ -362,7 +395,7 @@ pub fn CardView(card: Card) -> Element {
             if let Some(note) = blocked_note {
                 div { class: "blocked-note", title: "{note}", "{note}" }
             }
-            div { class: "card-actions",
+            div { class: if frozen { "card-actions is-busy" } else { "card-actions" },
                 // Shield the action buttons' keydowns from the card handler too.
                 onkeydown: move |e| e.stop_propagation(),
                 // A blocked card is waiting on something outside Usine, so hide
@@ -379,7 +412,10 @@ pub fn CardView(card: Card) -> Element {
                     if needs_answer {
                         button {
                             class: "btn primary",
-                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                super::open_card_at(state, id, "intervention-answer");
+                            },
                             "Answer"
                         }
                     }
@@ -393,43 +429,53 @@ pub fn CardView(card: Card) -> Element {
                         }
                         button {
                             class: "btn",
-                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
-                            "Review"
+                            // "Review" is the self-review pass; reading a plan is
+                            // a different thing and gets a different verb.
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                super::open_card_at(state, id, "plan-approval");
+                            },
+                            "Read plan"
                         }
                     }
-                    if let Some(label) = review_action {
+                    if let Some((label, anchor)) = review_action {
                         button {
                             class: "btn primary",
-                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            onclick: move |e| { e.stop_propagation(); super::open_card_at(state, id, anchor); },
                             "{label}"
                         }
                     }
                     if concluded {
                         button {
                             class: "btn primary",
-                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            onclick: move |e| { e.stop_propagation(); super::open_card_at(state, id, "conclusion"); },
                             "Read conclusion"
                         }
                     }
                     if can_read {
                         button {
                             class: "btn primary",
+                            title: "The agent reads the review, triages each comment and proposes which to fix",
                             onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::FetchComments { card_id: id }); },
-                            "Review comments"
+                            "Read the review"
                         }
                     }
                     if selecting {
                         button {
                             class: "btn primary",
-                            onclick: move |e| { e.stop_propagation(); state.select_card(Some(id)); },
+                            onclick: move |e| { e.stop_propagation(); super::open_card_at(state, id, "fix-selection"); },
                             "Select fixes"
                         }
                     }
+                    // Sits beside the green Merge, so it is explicitly the
+                    // secondary of the two — nothing else said which one the
+                    // merge gate wants you to press.
                     if can_reevaluate {
                         button {
-                            class: "btn",
+                            class: "btn subtle",
+                            title: "Feedback landed after the last pass — have the agent read and triage it before merging",
                             onclick: move |e| { e.stop_propagation(); state.send(ExecutorCommand::FetchComments { card_id: id }); },
-                            "Review comments"
+                            "Re-read the review"
                         }
                     }
                     if can_merge && pr_is_draft {
@@ -461,7 +507,24 @@ pub fn CardView(card: Card) -> Element {
                                 },
                                 "Fix checks"
                             }
-                        } else if !ci_pending {
+                        } else if ci_pending {
+                            // Was nothing at all, which left an actionable-looking
+                            // card with no button and only the "• CI" badge's
+                            // tooltip to explain the wait. The panel keeps the
+                            // "Merge anyway" override.
+                            // `aria-disabled`, not `disabled`: a disabled
+                            // control gets no pointer events, so the tooltip
+                            // that explains the wait would never show. Inert
+                            // to the eye, and the click falls through to the
+                            // card — which opens the panel, where the
+                            // "Merge anyway" override lives.
+                            button {
+                                class: "btn success",
+                                "aria-disabled": "true",
+                                title: "Waiting on CI — the poll re-enables this within ~20s. Open the card to merge without waiting.",
+                                "Merge"
+                            }
+                        } else {
                             button {
                                 class: "btn success",
                                 onclick: move |e| {
@@ -469,13 +532,36 @@ pub fn CardView(card: Card) -> Element {
                                     super::confirm_then_send(
                                         state,
                                         "Merge pull request",
-                                        "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
+                                        // The board button has always deleted the
+                                        // branch (the panel offers a checkbox);
+                                        // say so, since the action can't be undone.
+                                        "Merge this pull request into the base branch on GitHub and delete its branch? This can't be undone.".to_string(),
                                         "Merge",
                                         ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
                                     );
                                 },
                                 "Merge"
                             }
+                        }
+                    }
+                    // A run in flight had no board-level way out at all — the
+                    // only Stop lived in the panel. A question run is excluded:
+                    // its Cancel is on the panel's banner, and the row is frozen.
+                    if running && !frozen && queued_pos.is_none() {
+                        button {
+                            class: "btn subtle",
+                            title: "Stop the agent's current run",
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                super::request_confirm(super::ConfirmRequest {
+                                    title: "Stop the run?".into(),
+                                    message: "Stop the agent's current run? Its progress is discarded.".into(),
+                                    confirm_label: "Stop".into(),
+                                    danger: true,
+                                    action: super::ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
+                                });
+                            },
+                            "Stop"
                         }
                     }
                     if failed {

@@ -553,7 +553,24 @@ impl Executor {
             ExecutorCommand::RunValidation { card_id } => self.run_validation(card_id).await,
             ExecutorCommand::FixValidation { card_id } => self.fix_validation(card_id).await,
             ExecutorCommand::SkipValidation { card_id } => self.skip_validation(card_id),
-            ExecutorCommand::RefreshReviews { card_id } => self.list_reviews(card_id).await,
+            ExecutorCommand::RefreshReviews { card_id } => {
+                // `list_reviews` emits only when something moved, so a manual ↻
+                // that finds nothing is indistinguishable from a broken button.
+                // Say so explicitly.
+                let before = self.store.get_card(card_id).ok();
+                let res = self.list_reviews(card_id).await;
+                if res.is_ok() {
+                    let after = self.store.get_card(card_id).ok();
+                    if before.is_some() && before == after {
+                        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                            card_id,
+                            Severity::Info,
+                            "Review status is up to date",
+                        ));
+                    }
+                }
+                res
+            }
             ExecutorCommand::MarkPrReady { card_id } => self.mark_pr_ready(card_id).await,
             ExecutorCommand::RequestPostPrChange { card_id, feedback } => {
                 self.request_post_pr_change(card_id, feedback).await

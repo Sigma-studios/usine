@@ -53,6 +53,12 @@ fn column_cards(cards: &[Card], col: Column) -> Vec<Card> {
     if col == Column::Done {
         out.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
     }
+    // The Review lane holds the whole pre-PR gate — cards waiting on the user
+    // next to cards the agent is still working — so float what wants you above
+    // what doesn't. The other lanes are uniform enough not to need it.
+    if col == Column::SelfReview {
+        out.sort_by_key(|c| !c.needs_attention());
+    }
     // `sort_by_key` is stable, so each group keeps the order chosen above.
     out.sort_by_key(|c| c.blocked);
     out
@@ -63,19 +69,27 @@ fn ColumnView(column: Column, cards: Vec<Card>) -> Element {
     let title = column.title();
     let count = cards.len();
     let is_start = column == Column::StartingBlock;
+    // An empty lane collapses to a 40px labelled rail. Eight full-width columns
+    // plus the sidebar and the detail panel is more board than a laptop shows at
+    // once, and the lanes that are empty (typically half of them) are the ones
+    // costing the most for the least. The starting block always stays open —
+    // it holds "+ Add card", which is where an empty board begins.
+    let collapsed = count == 0 && !is_start;
 
     rsx! {
-        div { class: "column",
-            div { class: "column-header",
+        div { class: if collapsed { "column is-empty" } else { "column" },
+            div { class: "column-header", title: "{title}",
                 span { "{title}" }
                 span { class: "column-count", "{count}" }
             }
-            div { class: "column-body",
-                for card in cards.iter() {
-                    CardView { key: "{card.id}", card: card.clone() }
-                }
-                if is_start {
-                    AddCardButton {}
+            if !collapsed {
+                div { class: "column-body",
+                    for card in cards.iter() {
+                        CardView { key: "{card.id}", card: card.clone() }
+                    }
+                    if is_start {
+                        AddCardButton {}
+                    }
                 }
             }
         }
@@ -90,7 +104,7 @@ fn AddCardButton() -> Element {
     let projects = state.projects.read().clone();
     if projects.is_empty() {
         return rsx! {
-            div { class: "hint", "Add a project to create cards." }
+            div { class: "hint center", "Add a project to create cards." }
         };
     }
     let target = match *state.selected_view.read() {
@@ -159,6 +173,62 @@ mod tests {
         ];
         let out = column_cards(&cards, Column::Done);
         assert_eq!(titles(&out), ["new", "old", "blocked-new", "blocked-old"]);
+    }
+
+    #[test]
+    fn the_review_lane_floats_the_cards_waiting_on_the_user() {
+        use usine_core::ReviewSub;
+        // The pre-PR gate is one lane now, so a card the agent is still
+        // self-reviewing must not bury one that is waiting to be looked at.
+        let cards = vec![
+            card(
+                "reviewing",
+                CardState::AwaitingReview(ReviewSub::Reviewing),
+                false,
+                1,
+            ),
+            card(
+                "ready-for-pr",
+                CardState::AwaitingReview(ReviewSub::ReadyForPr),
+                false,
+                2,
+            ),
+            card(
+                "applying",
+                CardState::AwaitingReview(ReviewSub::ApplyingFixes),
+                false,
+                3,
+            ),
+            card(
+                "pick-fixes",
+                CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts: vec![] }),
+                false,
+                4,
+            ),
+        ];
+        let out = column_cards(&cards, Column::SelfReview);
+        assert_eq!(
+            titles(&out),
+            ["ready-for-pr", "pick-fixes", "reviewing", "applying"]
+        );
+
+        // Blocked still sinks below everything, attention or not.
+        let cards = vec![
+            card(
+                "blocked-ready",
+                CardState::AwaitingReview(ReviewSub::ReadyForPr),
+                true,
+                1,
+            ),
+            card(
+                "reviewing",
+                CardState::AwaitingReview(ReviewSub::Reviewing),
+                false,
+                2,
+            ),
+        ];
+        let out = column_cards(&cards, Column::SelfReview);
+        assert_eq!(titles(&out), ["reviewing", "blocked-ready"]);
     }
 
     #[test]
