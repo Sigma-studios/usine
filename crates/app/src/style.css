@@ -216,8 +216,9 @@ body.resizing .info-tip { visibility: hidden; opacity: 0; }
 .column-count { color: var(--muted); font-weight: 500; background: var(--panel-2); border-radius: 10px; padding: 1px 8px; font-size: 12px; }
 .column-body { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
 .column-header-right { display: flex; align-items: center; gap: 4px; }
-/* Reuses .card-icon-btn's transparent/muted look, at header size. */
-.column-toggle { width: 22px; height: 22px; }
+/* Reuses .card-icon-btn's transparent/muted look, at header size — the second
+   selector outranks `.card-icon-btn`'s own 26px box, which is declared later. */
+.column-toggle, .card-icon-btn.column-toggle { width: 22px; height: 22px; }
 /* A lane the user isn't watching folds to a labelled rail; the whole rail is
    the button that reopens it. */
 .column.collapsed { width: 44px; min-width: 44px; }
