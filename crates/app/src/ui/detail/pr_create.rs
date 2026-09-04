@@ -104,7 +104,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
     rsx! {
         if let Some(handoff) = handoff {
-            super::HandoffPanel { handoff }
+            super::HandoffPanel { card_id: id, handoff }
         }
 
         if has_branch {

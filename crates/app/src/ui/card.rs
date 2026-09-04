@@ -249,6 +249,19 @@ pub fn CardView(card: Card) -> Element {
             .map(|p| p.exists())
             .unwrap_or(false);
 
+    // Counts from the hand-off, shown only where they are actionable: once the
+    // card is merged the questions and the test list are history, not a to-do.
+    let handoff_chips: Vec<String> = if matches!(card.state, CardState::Done) {
+        Vec::new()
+    } else {
+        state
+            .handoffs
+            .read()
+            .get(&card.id)
+            .map(handoff_chips)
+            .unwrap_or_default()
+    };
+
     rsx! {
         div {
             class: "{card_class}",
@@ -378,6 +391,12 @@ pub fn CardView(card: Card) -> Element {
                         title: "Approved by {approved_by}",
                         "✓ approved"
                     }
+                }
+                // What the implement run left for its reviewer, as counts: the
+                // point of the hand-off is that it tells you whether a card
+                // needs your attention before you open it.
+                for (i, chip) in handoff_chips.iter().enumerate() {
+                    span { key: "{i}", class: "badge kind", title: "From the run's hand-off", "{chip}" }
                 }
                 // An unread review body — feedback with no inline comments to
                 // count, worth seeing from the board until read or triaged.
@@ -650,4 +669,19 @@ fn PreviewControls(card_id: Uuid, tools: PreviewTools) -> Element {
             }
         },
     }
+}
+
+/// The hand-off's counts as board chips — "2 questions · 3 to test · 1 risk" —
+/// omitting whatever is zero. Empty when the run left nothing worth counting,
+/// so an ordinary card's meta row is unchanged.
+fn handoff_chips(handoff: &usine_core::Handoff) -> Vec<String> {
+    [
+        (handoff.questions.len(), "question", "questions"),
+        (handoff.tests.len(), "to test", "to test"),
+        (handoff.risks.len(), "risk", "risks"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+    .collect()
 }

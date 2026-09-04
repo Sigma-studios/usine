@@ -312,6 +312,21 @@ impl Executor {
         self.open_dir(card_id, &dir, target).await
     }
 
+    /// Open one file of a card's working copy in the configured editor.
+    ///
+    /// The path is agent-written, so it is normalized and refused if it climbs
+    /// out of the working copy — a `../` in a claim must not turn a click into
+    /// an arbitrary file open. A path that doesn't exist falls back to opening
+    /// the directory, which is more useful than a silent no-op (the agent may
+    /// have named a file it planned rather than one it wrote).
+    pub(super) async fn open_path(&self, card_id: Uuid, path: &str) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let dir = card.worktree_path.clone().unwrap_or(project.path);
+        let target = resolve_within(&dir, path).unwrap_or_else(|| dir.clone());
+        self.open_dir(card_id, &target, OpenTarget::Editor).await
+    }
+
     /// Open a PR-under-review's checkout in the terminal or editor.
     ///
     /// Unlike a card — whose worktree exists from the moment it starts — a review
@@ -1024,5 +1039,61 @@ mod tests {
             resolve_script(&None, dir.path(), SETUP_CANDIDATES),
             Some("bash setup-worktree.sh".into())
         );
+    }
+}
+
+/// `dir` joined with a repo-relative `path`, or `None` when the path is absolute,
+/// climbs out of `dir`, or names nothing that exists. Purely lexical — the input
+/// is agent-written text, so it is never trusted to stay inside on its own.
+fn resolve_within(dir: &Path, path: &str) -> Option<PathBuf> {
+    let path = path.trim().trim_start_matches("./");
+    // A trailing `:line` is how agents write references; the file is the part
+    // before it.
+    let path = match path.rsplit_once(':') {
+        Some((p, l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) => p,
+        _ => path,
+    };
+    if path.is_empty() || Path::new(path).is_absolute() {
+        return None;
+    }
+    let mut out = dir.to_path_buf();
+    for part in Path::new(path).components() {
+        match part {
+            std::path::Component::Normal(p) => out.push(p),
+            // `.` is a no-op; anything else (`..`, a root, a prefix) is a way out.
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    out.exists().then_some(out)
+}
+
+#[cfg(test)]
+mod open_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_path_resolves_and_an_escaping_one_does_not() {
+        let dir = std::env::temp_dir().join("usine-open-path-test");
+        let _ = std::fs::create_dir_all(dir.join("src"));
+        let file = dir.join("src/lib.rs");
+        std::fs::write(&file, "x").unwrap();
+
+        assert_eq!(resolve_within(&dir, "src/lib.rs"), Some(file.clone()));
+        assert_eq!(resolve_within(&dir, "./src/lib.rs:42"), Some(file.clone()));
+        assert_eq!(
+            resolve_within(&dir, "../etc/passwd"),
+            None,
+            "no climbing out"
+        );
+        assert_eq!(
+            resolve_within(&dir, "/etc/passwd"),
+            None,
+            "no absolute paths"
+        );
+        assert_eq!(resolve_within(&dir, "src/missing.rs"), None);
+        assert_eq!(resolve_within(&dir, "  "), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
