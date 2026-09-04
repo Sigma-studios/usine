@@ -61,6 +61,10 @@ struct DiffRequest {
     /// DOM id to scroll into view once the diff has rendered — set when the user
     /// jumped here from a specific drafted comment.
     scroll_to: Option<String>,
+    /// A file path to scroll to instead. Resolved to a file's anchor once the
+    /// diff is rendered, because the file's index — which the anchor is keyed by
+    /// — isn't known until then.
+    scroll_to_path: Option<String>,
     /// Fresh per open. The host computes once per token, which is what makes an
     /// open recompute rather than re-show whatever the cache holds.
     token: Uuid,
@@ -73,6 +77,19 @@ pub(crate) fn open_diff_dialog(card_id: Uuid) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Card(card_id),
         scroll_to: None,
+        scroll_to_path: None,
+        token: Uuid::new_v4(),
+    });
+}
+
+/// Open a card's diff scrolled to one file — the card-side twin of
+/// [`open_review_diff_at`], for the hand-off's Changes tab and the `path:line`
+/// chips in agent prose.
+pub(crate) fn open_diff_dialog_at(card_id: Uuid, path: String) {
+    *DIFF_DIALOG.write() = Some(DiffRequest {
+        target: DiffTarget::Card(card_id),
+        scroll_to: None,
+        scroll_to_path: Some(path),
         token: Uuid::new_v4(),
     });
 }
@@ -82,6 +99,7 @@ pub(crate) fn open_review_diff(review_id: Uuid) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Review(review_id),
         scroll_to: None,
+        scroll_to_path: None,
         token: Uuid::new_v4(),
     });
 }
@@ -92,6 +110,7 @@ pub(crate) fn open_review_diff_at(review_id: Uuid, comment_index: usize) {
     *DIFF_DIALOG.write() = Some(DiffRequest {
         target: DiffTarget::Review(review_id),
         scroll_to: Some(reviewdraft::anchor_id(comment_index)),
+        scroll_to_path: None,
         token: Uuid::new_v4(),
     });
 }
@@ -276,6 +295,7 @@ pub fn DiffDialogHost() -> Element {
                                 data,
                                 drafts: drafts.clone(),
                                 scroll_to: req.scroll_to.clone(),
+                                scroll_to_path: req.scroll_to_path.clone(),
                             }
                         },
                     }
@@ -303,6 +323,7 @@ fn DiffView(
     data: ReadSignal<usine_core::DiffData>,
     drafts: Option<Vec<DraftComment>>,
     scroll_to: Option<String>,
+    scroll_to_path: Option<String>,
 ) -> Element {
     // Indices of files the user has collapsed (expanded by default).
     let mut collapsed = use_signal(HashSet::<usize>::new);
@@ -317,7 +338,18 @@ fn DiffView(
     // Scroll to the requested comment once the diff is on screen. Runs after
     // mount; the anchor exists only if the comment could be placed.
     use_effect(move || {
-        if let Some(anchor) = scroll_to.clone() {
+        // A path target resolves here, where the file list exists: the anchor is
+        // keyed by index, and a path the diff doesn't cover simply doesn't scroll.
+        let anchor = scroll_to.clone().or_else(|| {
+            let want = scroll_to_path.clone()?;
+            let files = data.read();
+            files
+                .files
+                .iter()
+                .position(|f| crate::ui::widgets::same_path(&want, &file_path(f)))
+                .map(|fi| format!("difffile-{fi}"))
+        });
+        if let Some(anchor) = anchor {
             dioxus::document::eval(&format!(
                 "requestAnimationFrame(function(){{document.getElementById('{anchor}')\
                  ?.scrollIntoView({{behavior:'smooth',block:'center'}});}});"

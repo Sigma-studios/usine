@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 use usine_core::{Card, CardState, ExecutorCommand, PrReviewSub};
 
 use crate::state::AppState;
+use crate::ui::widgets::ArtifactText;
 use crate::ui::{request_confirm, ConfirmAction, ConfirmRequest};
 
 #[component]
@@ -106,7 +107,7 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                                         div { "{rstate}" }
                                     }
                                     if !body.is_empty() {
-                                        div { class: "plan-box", "{body}" }
+                                        ArtifactText { text: body.clone() }
                                     }
                                 }
                             }

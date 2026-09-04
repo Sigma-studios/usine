@@ -502,6 +502,7 @@ async fn merging_stamps_the_pr_record_and_keeps_the_handoff() {
                 summary: "did the thing".into(),
                 questions: vec![],
                 tests: vec!["press the button".into()],
+                ..Default::default()
             },
         )
         .unwrap();

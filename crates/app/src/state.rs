@@ -12,11 +12,12 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
-    spawn_executor, AdoptProbe, AppSettings, Card, CardAnswers, CardState, DesignSub, DiffState,
-    DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, ExecutorHandle,
-    Forge, GhForge, GitOps, Handoff, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig,
-    Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub,
-    Severity, SimFactory, SimForge, SimGit, Store, UsageSnapshot,
+    spawn_executor, AdoptProbe, AppSettings, Card, CardAnswers, CardState, Change, DesignSub,
+    DiffState, DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind,
+    ExecutorHandle, FixItem, FixOutcome, FixReport, Forge, GhForge, GitOps, Handoff, Outcome,
+    PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig, Provider, ProviderFactory,
+    QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory,
+    SimForge, SimGit, Store, TestItem, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -96,6 +97,10 @@ pub struct AppState {
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
     /// Per-card fixes recap, seeded at startup and updated via `RecapUpdated`.
     pub review_recaps: Signal<HashMap<Uuid, String>>,
+    /// Per-card fix-run report — the findings the last fix run was asked to
+    /// address joined to the outcomes it reported. Seeded at startup and updated
+    /// via `FixReportUpdated` (an empty report removes the entry).
+    pub fix_reports: Signal<HashMap<Uuid, FixReport>>,
     /// Per-card Agent Chat log — every question asked and its prose answer,
     /// oldest first — seeded at startup and updated via `AnswersUpdated` (an
     /// empty log removes the entry).
@@ -198,6 +203,7 @@ impl AppState {
         let auto_reviews = store.auto_review_flags().unwrap_or_default();
         let attachments = store.all_attachments().unwrap_or_default();
         let review_recaps = store.all_review_recaps().unwrap_or_default();
+        let fix_reports = store.all_fix_reports().unwrap_or_default();
         let answers = store.all_answers().unwrap_or_default();
         let handoffs = store.all_handoffs().unwrap_or_default();
         // Group persisted review tasks by project for the review board.
@@ -254,6 +260,7 @@ impl AppState {
             auto_reviews: Signal::new(auto_reviews),
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
+            fix_reports: Signal::new(fix_reports),
             answers: Signal::new(answers),
             handoffs: Signal::new(handoffs),
             previews: Signal::new(HashMap::new()),
@@ -495,6 +502,16 @@ impl AppState {
             ExecutorEventKind::RecapUpdated { recap } => {
                 let mut recaps = self.review_recaps;
                 recaps.write().insert(evt.card_id, recap);
+            }
+            // An empty report means the run had no checklist (or it was cleared
+            // by "back to start"): drop the entry so nothing stale is rendered.
+            ExecutorEventKind::FixReportUpdated { report } => {
+                let mut reports = self.fix_reports;
+                if report.is_empty() {
+                    reports.write().remove(&evt.card_id);
+                } else {
+                    reports.write().insert(evt.card_id, report);
+                }
             }
             // An empty log means it was cleared ("back to start"): drop the
             // entry so the panel shows nothing.
@@ -1030,21 +1047,51 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
     store.set_handoff(
         awaiting.id,
         &Handoff {
-            summary: "Deferred the syntax-highlighting theme load until the first diff is opened, \
-                      which is where the 300ms went. Cold start is now ~90ms on my machine. I did \
-                      not touch the database open path — it looked cheap enough that the added \
-                      complexity wasn't worth it."
-                .into(),
+            summary:
+                "TL;DR: cold start is now ~90ms, down from ~390ms.\n- The syntax-highlighting \
+                      theme load was the whole 300ms; it is now deferred to the first diff open.\n\
+                      - The database open path was left alone — it looked cheap enough that the \
+                      added complexity wasn't worth it."
+                    .into(),
+            changes: vec![
+                Change {
+                    path: "crates/app/src/highlight.rs".into(),
+                    what: "Theme set is built lazily on first use instead of at startup.".into(),
+                    kind: "fix".into(),
+                },
+                Change {
+                    path: "crates/app/src/main.rs".into(),
+                    what: "Drops the eager theme warm-up from the boot path.".into(),
+                    kind: "fix".into(),
+                },
+                Change {
+                    path: "crates/app/tests/startup.rs".into(),
+                    what: "Asserts the theme set is untouched until a diff is rendered.".into(),
+                    kind: "test".into(),
+                },
+            ],
+            tests: vec![
+                TestItem {
+                    scenario: "Launch the app cold".into(),
+                    expect: "the board paints before the window finishes animating".into(),
+                    verified: true,
+                },
+                TestItem {
+                    scenario: "Open a card's diff".into(),
+                    expect: "highlighting appears, not plain text".into(),
+                    verified: false,
+                },
+            ],
+            risks: vec![
+                "The first diff open now pays the ~200ms theme load, so that click feels slower."
+                    .into(),
+            ],
             questions: vec![
                 "The theme now loads on the first diff open, so that click is ~200ms slower. \
                  Worth pre-warming it in the background instead?"
                     .into(),
             ],
-            tests: vec![
-                "Launch the app cold — the board should paint before the window finishes animating"
-                    .into(),
-                "Open a card's diff — highlighting should appear, not plain text".into(),
-            ],
+            ..Default::default()
         },
     )?;
 
@@ -1082,18 +1129,76 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
     store.set_handoff(
         done.id,
         &Handoff {
-            summary: "Avatars now land in the app's cache dir keyed by their URL hash, with a \
-                      7-day TTL. The board render reads from the cache and only fetches on a \
-                      miss, so a warm launch makes no network calls at all."
+            summary: "TL;DR: a warm launch now makes no avatar network calls at all.\n- Avatars \
+                      land in the app's cache dir keyed by their URL hash, with a 7-day TTL."
                 .into(),
-            questions: vec![],
-            tests: vec!["Relaunch with the network off — avatars should still render".into()],
+            changes: vec![Change {
+                path: "crates/app/src/avatar.rs".into(),
+                what:
+                    "Disk cache keyed by URL hash; the board reads it and only fetches on a miss."
+                        .into(),
+                kind: "feat".into(),
+            }],
+            tests: vec![TestItem {
+                scenario: "Relaunch with the network off".into(),
+                expect: "avatars still render from the cache".into(),
+                verified: false,
+            }],
+            ..Default::default()
         },
     )?;
     store.set_review_recap(
         done.id,
         "Fixed 2 of 3 review comments: the missing TTL and the unbounded cache dir. Skipped the \
          suggestion to move the cache into the database — the files are large and binary.",
+    )?;
+    // The structured half of the same run: what was picked, and what came back.
+    store.set_fix_report(
+        done.id,
+        &FixReport {
+            v: 1,
+            items: vec![
+                FixItem {
+                    id: 101,
+                    label: "Cached avatars never expire — add a TTL.".into(),
+                    path: "crates/app/src/avatar.rs".into(),
+                    line: Some(48),
+                    severity: "high".into(),
+                },
+                FixItem {
+                    id: 102,
+                    label: "The cache directory can grow without bound.".into(),
+                    path: "crates/app/src/avatar.rs".into(),
+                    line: Some(72),
+                    severity: "medium".into(),
+                },
+                FixItem {
+                    id: 103,
+                    label: "Consider storing avatars in the database instead of on disk.".into(),
+                    path: "crates/app/src/avatar.rs".into(),
+                    line: None,
+                    severity: "low".into(),
+                },
+            ],
+            outcomes: vec![
+                FixOutcome {
+                    id: 101,
+                    outcome: Outcome::Fixed,
+                    note: "Entries older than 7 days are dropped on read.".into(),
+                },
+                FixOutcome {
+                    id: 102,
+                    outcome: Outcome::Fixed,
+                    note: "The directory is swept to 200 entries after each write.".into(),
+                },
+                FixOutcome {
+                    id: 103,
+                    outcome: Outcome::Skipped,
+                    note: "The files are large and binary — the database is the wrong home.".into(),
+                },
+            ],
+            malformed: false,
+        },
     )?;
 
     let cards = vec![
@@ -1106,7 +1211,19 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
             "Refactor the auth module",
             "Split the monolithic auth module into smaller units.",
             CardState::Designing(DesignSub::AwaitingApproval {
-                plan: "## Plan\n\n1. Extract token handling.\n2. Add tests.\n3. Wire it back in."
+                plan: "## Plan\n\n1. Extract token handling.\n2. Add tests.\n3. Wire it back in.\n\n\
+                       ```usine-plan\n{\"v\":1,\
+                       \"tldr\":[\"Split auth into token / session / middleware\"],\
+                       \"steps\":[\
+                       {\"title\":\"Extract token handling\",\"detail\":\"Move signing and \
+                       verification out of the god module.\",\"files\":[\"src/auth/token.rs\"]},\
+                       {\"title\":\"Add tests\",\"detail\":\"Cover expiry and clock skew.\",\
+                       \"files\":[\"tests/auth.rs\"]},\
+                       {\"title\":\"Wire it back in\",\"detail\":\"Re-export from the old path so \
+                       no call site moves.\",\"files\":[\"src/auth/mod.rs\"]}],\
+                       \"files\":[\"src/auth/mod.rs\",\"src/auth/token.rs\",\"tests/auth.rs\"],\
+                       \"verification\":[\"cargo test -p auth\",\"Sign in and out in the running app\"],\
+                       \"risks\":[\"Sessions issued before the split keep the old claim shape.\"]}\n```"
                     .into(),
             }),
         ),

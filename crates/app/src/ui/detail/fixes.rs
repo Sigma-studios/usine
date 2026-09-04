@@ -97,7 +97,7 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                     // path/line — label it the way the prompts do.
                     let is_review_body = v.comment.review_body_of.is_some();
                     let path = if is_review_body {
-                        "PR review summary".to_string()
+                        usine_core::REVIEW_BODY_PATH.to_string()
                     } else {
                         match v.comment.line {
                             Some(l) => format!("{}:{}", v.comment.path, l),

@@ -297,8 +297,10 @@ async fn finalize_run(
         if let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) {
             let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
             if !questions.is_empty() {
-                let recap = crate::agent::handoff::strip_handoff_block(
-                    &crate::agent::commit::strip_commit_block(&clean),
+                let recap = crate::agent::fixes::strip_fixes_block(
+                    &crate::agent::handoff::strip_handoff_block(
+                        &crate::agent::commit::strip_commit_block(&clean),
+                    ),
                 );
                 if !recap.is_empty() {
                     let _ = store.set_review_recap(card_id, &recap);
@@ -583,19 +585,34 @@ async fn finalize_run(
     // For display, drop the machine-facing blocks the agent appended — including
     // a questions block that got this far (a fix run that asked but whose merge
     // had already been completed, say), which must never render raw as a recap.
-    let summary =
-        crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
+    let summary = crate::agent::fixes::strip_fixes_block(
+        &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
             &crate::agent::plan::parse_questions(&result_text).0,
-        ));
+        )),
+    );
 
     // An implement run hands off to whoever reviews it next. Store it (and emit it)
     // before the transition, so the card arrives at the awaiting-review gate with
     // its recap already in hand. A run that emitted no block clears the field
     // rather than leaving the previous attempt's recap describing this one.
     if matches!(transition, Transition::AgentImplementDone) {
-        let handoff = crate::agent::handoff::parse_handoff(&result_text).unwrap_or_default();
+        let handoff = crate::agent::handoff::handoff_from_reply(&result_text);
         let _ = store.set_handoff(card_id, &handoff);
         let _ = evt_tx.unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
+    }
+
+    // A fix run's per-finding outcomes, joined to the findings it was launched
+    // with. Stored on the same "only once the commit is real" rule as the
+    // restart-log lines above, and for every fix path (PR comments, self-review,
+    // validation) — the checklist is what makes an under-reported run visible.
+    if !matches!(transition, Transition::AgentImplementDone) {
+        let items = store.take_pending_fix_items(card_id).unwrap_or_default();
+        // An empty report clears the field: a later fix run that stashed nothing
+        // (or reported nothing) must not leave the previous run's checklist
+        // describing it.
+        let report = crate::agent::fixes::fix_report(items, &result_text);
+        let _ = store.set_fix_report(card_id, &report);
+        let _ = evt_tx.unbounded_send(ExecutorEvent::fix_report_updated(card_id, report));
     }
 
     // A PR fix run: keep the agent's summary as the fixes recap so the user can
@@ -1061,8 +1078,11 @@ pub(super) fn handle_event(
             const MIN_PLAN_CHARS: usize = 200;
             let fresh = store.get_card(card_id)?;
             if matches!(fresh.state, CardState::Designing(DesignSub::Running)) {
-                let (_, questions) = crate::agent::plan::parse_plan(&result);
-                let trimmed = result.trim();
+                // Measure the plan *prose*: the machine-facing outline block is
+                // stripped by `parse_plan`, so a bailed turn can't clear the
+                // floor on block payload alone.
+                let (clean, questions) = crate::agent::plan::parse_plan(&result);
+                let trimmed = clean.trim();
                 if questions.is_empty() && trimmed.chars().count() < MIN_PLAN_CHARS {
                     let message = "The plan phase ended without producing a plan — the agent \
                                    stopped mid-turn. Retry to re-plan."

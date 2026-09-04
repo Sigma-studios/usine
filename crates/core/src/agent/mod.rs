@@ -7,6 +7,7 @@ pub mod block;
 pub mod commit;
 pub mod events;
 pub mod executor;
+pub mod fixes;
 pub mod handoff;
 pub mod investigate;
 pub mod plan;

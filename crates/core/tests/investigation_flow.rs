@@ -185,8 +185,13 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         let (mode, _, prompt) = &runs[1];
         assert_eq!(*mode, RunMode::Investigate);
         assert!(
-            prompt.contains(first_conclusion.trim()),
+            prompt.contains(usine_core::conclusion_prose(&first_conclusion).trim()),
             "the prior conclusion rides along on the retried follow-up"
+        );
+        assert!(
+            !prompt.contains("```usine-findings"),
+            "the conclusion's panel-facing blocks stay out of the prompt (the \
+             instruction still names the tag, but no block is quoted back)"
         );
         assert!(prompt.contains("How big does it get under real traffic?"));
     }

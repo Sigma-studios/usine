@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::block;
 use crate::domain::model::Provider;
 
 /// Appended to every plan-phase prompt so the agent surfaces decisions in a
@@ -43,6 +44,53 @@ pub fn plan_instruction(provider: Provider) -> String {
     }
 }
 
+/// One step of the plan, as the agent's own outline of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// A structured view of the plan the agent wrote out in prose: the same
+/// content, split so the approval screen can show the steps, the blast radius
+/// and the verification plan side by side instead of as one 200-line scroller.
+///
+/// Strictly a *view*. The prose plan remains the payload — it is what gets fed
+/// verbatim into the implement prompt and into every read-only run's background
+/// block — so a missing or garbled outline costs presentation, never work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanOutline {
+    #[serde(default)]
+    pub v: u8,
+    /// The headline bullets, matching the plan's own `TL;DR:`.
+    #[serde(default)]
+    pub tldr: Vec<String>,
+    #[serde(default)]
+    pub steps: Vec<PlanStep>,
+    /// Every file the plan expects to touch — the blast radius at a glance.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// How the result will be checked.
+    #[serde(default)]
+    pub verification: Vec<String>,
+    #[serde(default)]
+    pub risks: Vec<String>,
+}
+
+impl PlanOutline {
+    pub fn is_empty(&self) -> bool {
+        self.tldr.is_empty()
+            && self.steps.is_empty()
+            && self.files.is_empty()
+            && self.verification.is_empty()
+            && self.risks.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanQuestion {
     pub question: String,
@@ -50,17 +98,8 @@ pub struct PlanQuestion {
     pub options: Vec<String>,
 }
 
-const TAG: &str = "```usine-questions";
-
-/// Locate a complete fenced questions block: (block start, end past the
-/// closing fence, the JSON between them).
-fn find_block(plan: &str) -> Option<(usize, usize, &str)> {
-    let start = plan.find(TAG)?;
-    let after_tag = &plan[start + TAG.len()..];
-    let close_rel = after_tag.find("```")?;
-    let block_end = start + TAG.len() + close_rel + 3; // include the closing ```
-    Some((start, block_end, after_tag[..close_rel].trim()))
-}
+const TAG: &str = "usine-questions";
+const OUTLINE_TAG: &str = "usine-plan";
 
 /// Split a plan into (prose with the questions block removed, parsed questions).
 /// With no complete block, returns the plan unchanged and no questions. A
@@ -68,22 +107,34 @@ fn find_block(plan: &str) -> Option<(usize, usize, &str)> {
 /// questions then; see [`plan_block_malformed`]), so the garbage never badges
 /// the plan as questioned nor leaks into the implement prompt.
 pub fn parse_plan(plan: &str) -> (String, Vec<PlanQuestion>) {
-    parse_questions(plan)
+    let (prose, questions) = parse_questions(plan);
+    // The outline block is a view of this same prose, addressed to the approval
+    // screen. Stripping it here keeps it out of the implement prompt and out of
+    // every background block that quotes the plan.
+    (block::strip(&prose, OUTLINE_TAG), questions)
+}
+
+/// The agent's structured view of its own plan, when it emitted one. `None`
+/// when the block is missing, garbled, or vacuous — the prose plan is the
+/// payload either way.
+pub fn parse_plan_outline(plan: &str) -> Option<PlanOutline> {
+    let outline = block::parse::<PlanOutline>(plan, OUTLINE_TAG).0.ok()?;
+    (!outline.is_empty()).then_some(outline)
+}
+
+/// True when the plan carries a `usine-plan` block whose JSON doesn't parse.
+pub fn plan_outline_malformed(plan: &str) -> bool {
+    block::parse::<PlanOutline>(plan, OUTLINE_TAG)
+        .0
+        .is_malformed()
 }
 
 /// [`parse_plan`] under the name the non-plan callers use: the same
 /// `usine-questions` block is how a conflict-resolution run asks for a
 /// decision, and there is nothing plan-specific about splitting it out.
 pub fn parse_questions(text: &str) -> (String, Vec<PlanQuestion>) {
-    let plan = text;
-    let Some((start, block_end, json)) = find_block(plan) else {
-        return (plan.to_string(), Vec::new());
-    };
-    let questions: Vec<PlanQuestion> = serde_json::from_str(json).unwrap_or_default();
-    let mut cleaned = String::new();
-    cleaned.push_str(&plan[..start]);
-    cleaned.push_str(&plan[block_end..]);
-    (cleaned.trim().to_string(), questions)
+    let (parsed, prose) = block::parse::<Vec<PlanQuestion>>(text, TAG);
+    (prose, parsed.ok().unwrap_or_default())
 }
 
 /// True when the plan carries a questions block whose JSON doesn't parse — the
@@ -91,10 +142,9 @@ pub fn parse_questions(text: &str) -> (String, Vec<PlanQuestion>) {
 /// silently; the plan panel uses this to tell the user something was dropped.
 /// A valid-but-empty `[]` is not malformed.
 pub fn plan_block_malformed(plan: &str) -> bool {
-    match find_block(plan) {
-        Some((_, _, json)) => serde_json::from_str::<Vec<PlanQuestion>>(json).is_err(),
-        None => false,
-    }
+    block::parse::<Vec<PlanQuestion>>(plan, TAG)
+        .0
+        .is_malformed()
 }
 
 #[cfg(test)]
@@ -110,6 +160,50 @@ mod tests {
         assert_eq!(qs.len(), 1);
         assert_eq!(qs[0].question, "DB?");
         assert_eq!(qs[0].options, vec!["SQLite", "Postgres"]);
+    }
+
+    #[test]
+    fn the_outline_is_a_view_and_never_reaches_the_implement_prompt() {
+        let plan = "Here is the plan.\n\n```usine-plan\n{\"v\":1,\"tldr\":[\"Do it\"],\
+            \"steps\":[{\"title\":\"Extract\",\"detail\":\"Move it out\",\"files\":[\"a.rs\"]}],\
+            \"files\":[\"a.rs\"],\"verification\":[\"cargo test\"],\"risks\":[]}\n```\n";
+        let (clean, qs) = parse_plan(plan);
+        assert_eq!(
+            clean, "Here is the plan.",
+            "the block is stripped from the prose"
+        );
+        assert!(qs.is_empty());
+        let outline = parse_plan_outline(plan).unwrap();
+        assert_eq!(outline.tldr, vec!["Do it"]);
+        assert_eq!(outline.steps[0].files, vec!["a.rs"]);
+        assert_eq!(outline.verification, vec!["cargo test"]);
+        assert!(!plan_outline_malformed(plan));
+    }
+
+    #[test]
+    fn a_garbled_or_absent_outline_leaves_the_plan_alone() {
+        assert_eq!(parse_plan_outline("just a plan"), None);
+        assert!(!plan_outline_malformed("just a plan"));
+        let plan = "Plan.\n```usine-plan\nnot json\n```";
+        assert_eq!(parse_plan_outline(plan), None);
+        assert!(plan_outline_malformed(plan));
+        assert_eq!(
+            parse_plan(plan).0,
+            "Plan.",
+            "garbage never reaches the prompt"
+        );
+        // A block with nothing in it is not worth a tab.
+        assert_eq!(parse_plan_outline("```usine-plan\n{\"v\":1}\n```"), None);
+    }
+
+    #[test]
+    fn both_blocks_can_ride_along_together() {
+        let plan = "Plan.\n\n```usine-questions\n[{\"question\":\"DB?\",\"options\":[]}]\n```\n\n\
+            ```usine-plan\n{\"files\":[\"a.rs\"]}\n```";
+        let (clean, qs) = parse_plan(plan);
+        assert_eq!(clean, "Plan.");
+        assert_eq!(qs.len(), 1);
+        assert_eq!(parse_plan_outline(plan).unwrap().files, vec!["a.rs"]);
     }
 
     #[test]

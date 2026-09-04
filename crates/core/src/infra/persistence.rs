@@ -20,6 +20,7 @@ use native_model::{native_model, Model};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agent::fixes::{FixItem, FixReport};
 use crate::agent::handoff::Handoff;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{Card, CardAnswers, Project, QaExchange, ReviewComment, ReviewTask};
@@ -180,6 +181,18 @@ struct CardReviewRecord {
     /// cancelled or died. `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pending_qa: Vec<String>,
+    /// The findings a launched fix run set out to address (serialized
+    /// `Vec<FixItem>`), stashed until the run lands a commit — same rule as
+    /// `pending_qa`, so a cancelled run leaves no checklist claiming it was
+    /// asked for anything. `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pending_fix_items: String,
+    /// The last fix run's report (a serialized [`FixReport`]): what it was asked
+    /// for, joined to the outcomes it reported per finding. Shown at the merge
+    /// gate and on the Done panel. `#[serde(default)]` keeps older records
+    /// loadable.
+    #[serde(default)]
+    fix_outcomes: String,
 }
 
 /// The extra context of the current investigation round: the follow-up prompt
@@ -1091,6 +1104,65 @@ impl Store {
             self.mutate_review(card_id, |r| r.pending_qa = Vec::new())?;
         }
         Ok(entries)
+    }
+
+    // --- fix-run outcomes -----------------------------------------------
+
+    /// Stash the findings a fix run is about to address, so its reported
+    /// outcomes have something to be checked against when it lands. Stashed
+    /// rather than recorded, like [`Self::set_pending_fix_qa`]: a run that never
+    /// commits must leave no claim behind.
+    pub fn set_pending_fix_items(&self, card_id: Uuid, items: &[FixItem]) -> Result<()> {
+        let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".into());
+        self.mutate_review(card_id, |r| r.pending_fix_items = json)
+    }
+
+    /// Read and clear the stashed findings. Cleared on read so one run's
+    /// checklist can't describe the next; a run that never commits leaves them
+    /// for its retry.
+    pub fn take_pending_fix_items(&self, card_id: Uuid) -> Result<Vec<FixItem>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardReviewRecord> = r.get().primary(card_id.to_string())?;
+        let items: Vec<FixItem> = rec
+            .and_then(|r| serde_json::from_str(&r.pending_fix_items).ok())
+            .unwrap_or_default();
+        if !items.is_empty() {
+            self.mutate_review(card_id, |r| r.pending_fix_items = String::new())?;
+        }
+        Ok(items)
+    }
+
+    /// Store a fix run's report, or clear it (an empty one) so a re-run never
+    /// shows the previous attempt's checklist.
+    pub fn set_fix_report(&self, card_id: Uuid, report: &FixReport) -> Result<()> {
+        let json = if report.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(report).unwrap_or_default()
+        };
+        self.mutate_review(card_id, |r| r.fix_outcomes = json)
+    }
+
+    pub fn get_fix_report(&self, card_id: Uuid) -> Result<Option<FixReport>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardReviewRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.and_then(|r| serde_json::from_str::<FixReport>(&r.fix_outcomes).ok()))
+    }
+
+    /// All cards' fix reports, keyed by card id (loaded once at startup).
+    pub fn all_fix_reports(&self) -> Result<HashMap<Uuid, FixReport>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardReviewRecord>()?.all()? {
+            let rec = rec?;
+            let Ok(id) = Uuid::parse_str(&rec.card_id) else {
+                continue;
+            };
+            if let Ok(report) = serde_json::from_str::<FixReport>(&rec.fix_outcomes) {
+                out.insert(id, report);
+            }
+        }
+        Ok(out)
     }
 
     // --- review tasks (foreign PRs under review) ------------------------

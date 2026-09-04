@@ -104,7 +104,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
     rsx! {
         if let Some(handoff) = handoff {
-            super::HandoffPanel { handoff }
+            super::HandoffPanel { card_id: id, handoff }
         }
 
         if has_branch {
@@ -248,6 +248,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         if is_ready_for_pr {
             div { class: "section",
                 h3 { "Create pull request" }
+                // The self-review / validation fix checklist. It is written on
+                // the way here, and this is where the user decides to ship — the
+                // merge gate is too late to learn a picked finding was skipped.
+                super::FixOutcomes { card_id: id }
                 div { class: "field",
                     label { r#for: "pr-branch", "Branch (required)" }
                     input {

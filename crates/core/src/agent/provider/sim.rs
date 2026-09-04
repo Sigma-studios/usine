@@ -30,6 +30,19 @@ _Estimated: ~120 lines across 4 files._
   {\"question\": \"Which storage backend should this use?\", \"options\": [\"SQLite\", \"In-memory\", \"Postgres\"]},
   {\"question\": \"Should the feature be on by default?\", \"options\": [\"Yes\", \"No, behind a flag\"]}
 ]
+```
+
+```usine-plan
+{\"v\": 1,
+ \"tldr\": [\"Add the module behind a flag\", \"Adapt at the boundary so no call site moves\"],
+ \"steps\": [
+   {\"title\": \"Add the new module\", \"detail\": \"Setup, teardown and one public entry point.\", \"files\": [\"crates/core/src/newmod.rs\"]},
+   {\"title\": \"Wire it into the app\", \"detail\": \"Behind the flag, at startup.\", \"files\": [\"crates/app/src/main.rs\"]},
+   {\"title\": \"Cover it with tests\", \"detail\": \"Setup runs once; old records still load.\", \"files\": [\"crates/core/tests/newmod.rs\"]}
+ ],
+ \"files\": [\"crates/core/src/newmod.rs\", \"crates/app/src/main.rs\", \"crates/core/tests/newmod.rs\", \"README.md\"],
+ \"verification\": [\"cargo test -p usine-core\", \"Launch the app and create a card\"],
+ \"risks\": [\"The flag's default changes behaviour for existing installs.\"]}
 ```";
 
 pub struct SimProvider {
@@ -138,12 +151,24 @@ async fn simulate(
             // The hand-off block feeds the awaiting-review panel's recap.
             emit!(AgentEvent::Done {
                 result: "Implemented the change.\n\n```usine-handoff\n{\
-                    \"summary\":\"Added the new module and wired it into the app.\\nAdapted at the \
-                    boundary so the existing call sites stay untouched.\\nUpdated the docs; left \
-                    the changelog alone since the release notes are generated.\",\
-                    \"questions\":[\"The flag defaults to on — should it ship behind an opt-in instead?\"],\
-                    \"tests\":[\"Create a card and start it — the new module should log its setup once\",\
-                    \"Restart with an existing database — old records should still load\"]\
+                    \"v\":2,\
+                    \"summary\":\"TL;DR: wired the new module into the app behind a flag.\\n- The \
+                    adapter keeps every existing call site untouched.\\n- Docs updated; the \
+                    changelog is generated, so it was left alone.\",\
+                    \"changes\":[\
+                    {\"path\":\"crates/core/src/newmod.rs\",\"what\":\"New module: setup, teardown \
+                    and the one public entry point.\",\"kind\":\"feat\"},\
+                    {\"path\":\"crates/app/src/main.rs\",\"what\":\"Wires the module in at startup \
+                    behind the flag.\",\"kind\":\"feat\"},\
+                    {\"path\":\"README.md\",\"what\":\"Documents the flag.\",\"kind\":\"docs\"}],\
+                    \"tests\":[\
+                    {\"scenario\":\"Create a card and start it\",\"expect\":\"the new module logs \
+                    its setup exactly once\",\"verified\":true},\
+                    {\"scenario\":\"Restart with an existing database\",\"expect\":\"old records \
+                    still load, unmigrated\",\"verified\":false}],\
+                    \"risks\":[\"The flag defaults to on, so an existing install changes behaviour \
+                    on upgrade.\"],\
+                    \"questions\":[\"The flag defaults to on — should it ship behind an opt-in instead?\"]\
                     }\n```".into(),
                 cost_usd: 0.42,
                 usage: Usage {
@@ -161,8 +186,14 @@ async fn simulate(
                 text: "🧪 Re-running tests…".into()
             });
             pause!(500);
+            // The `usine-fixes` block reports per-finding outcomes against the
+            // ids the fix prompt carried — id 0 is the first self-review
+            // finding above, the one checked by default.
             emit!(AgentEvent::Done {
-                result: "Applied selected fixes.".into(),
+                result: "TL;DR: extracted the duplicated helper.\n- The shared logic now lives in                          `util.rs`; both call sites use it.\n- Left the naming nit alone, it                          reads fine in context.\n\n```usine-fixes\n{\
+                    \"v\":1,\
+                    \"outcomes\":[{\"id\":0,\"outcome\":\"partial\",\"note\":\"Extracted                     the helper, but the second call site still passes its own buffer — worth a                     follow-up.\"}]}\n```"
+                    .into(),
                 cost_usd: 0.12,
                 usage: Usage {
                     input_tokens: 4_000,
@@ -231,7 +262,19 @@ async fn simulate(
                     The cache is NOT bounded. Adding an LRU cap (~1k entries) at the insert site \
                     in `src/cache.rs:42` would fix both issues; the streaming clone should be \
                     skipped outright.\n\n\
-                    If you want, a follow-up could size the cap against production traffic."
+                    If you want, a follow-up could size the cap against production traffic.\n\n\
+                    ```usine-findings\n{\
+                    \"v\":1,\
+                    \"verdict\":\"The cache is NOT bounded; an LRU cap at the insert site fixes it.\",\
+                    \"findings\":[\
+                    {\"claim\":\"The request cache is keyed by URL and never evicted.\",\
+                    \"evidence\":[{\"path\":\"src/cache.rs\",\"line\":42}],\"confidence\":\"high\"},\
+                    {\"claim\":\"Streaming responses are cloned into the cache in full.\",\
+                    \"evidence\":[{\"path\":\"src/handler.rs\",\"line\":118}],\"confidence\":\"medium\"}],\
+                    \"open_questions\":[\"The right cap depends on production traffic, which is not \
+                    visible from the code.\"]}\n```\n\n\
+                    ```usine-questions\n[{\"question\":\"How should the cache be bounded?\",\
+                    \"options\":[\"LRU, ~1k entries\",\"Time-based eviction\",\"Both\"]}]\n```"
                     .into(),
                 cost_usd: 0.06,
                 usage: Usage {

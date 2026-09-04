@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::edit::{attach_from_clipboard, AttachButton, AttachmentChips};
 use crate::state::AppState;
 use crate::ui::drafts;
+use crate::ui::widgets::ArtifactText;
 
 /// The one line above the box, at every gate that renders this section. It used
 /// to be a two-line paragraph rewritten per stage — five near-identical
@@ -103,7 +104,7 @@ pub(super) fn AgentChatSection(
                                 div { class: "plan-box", "{ex.question}" }
                             }
                             div { class: "hint", "Answer" }
-                            div { class: "plan-box", "{ex.answer}" }
+                            ArtifactText { text: ex.answer.clone() }
                         }
                     }
                 }

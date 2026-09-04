@@ -5,16 +5,16 @@
 
 use dioxus::prelude::*;
 use usine_core::{
-    Card, CardState, CheckStatus, DesignSub, ExecutorCommand, Handoff, PrReviewSub, ReviewSub,
-    CONFLICT_INTERVENTION_ID,
+    Card, CardState, CheckStatus, DesignSub, DiffState, ExecutorCommand, Handoff, PrReviewSub,
+    ReviewSub, CONFLICT_INTERVENTION_ID,
 };
 use uuid::Uuid;
 
 use super::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
-use super::diffdialog::open_diff_dialog;
+use super::diffdialog::{open_diff_dialog, open_diff_dialog_at};
 use super::icons::IconDiff;
 use crate::state::{AppState, BoardMode};
-use crate::ui::widgets::provider_value;
+use crate::ui::widgets::{provider_value, same_path, ArtifactTabs, ArtifactText};
 use crate::ui::{Panel, PanelResizer};
 
 mod chat;
@@ -22,7 +22,7 @@ mod conclusion;
 mod done;
 mod edit;
 mod fixes;
-mod plan;
+pub(super) mod plan;
 mod pr_create;
 mod pr_review;
 mod review;
@@ -403,7 +403,7 @@ fn CardPanel(card: Card) -> Element {
                 }
                 if let Some(recap) = recap.clone() {
                     div { class: "hint", "What it got through" }
-                    div { class: "plan-box", "{recap}" }
+                    ArtifactText { text: recap }
                 }
                 button {
                     class: "btn subtle",
@@ -506,9 +506,13 @@ fn CardPanel(card: Card) -> Element {
                 if let Some(p) = card.pr.clone() {
                     PrLink { number: p.number, url: p.url }
                 }
+                FixOutcomes { card_id: id }
                 if let Some(recap) = recap.clone() {
                     div { class: "hint", "Fixes recap" }
-                    div { class: "plan-box", "{recap}" }
+                    ArtifactText {
+                        text: recap,
+                        on_path: move |path: String| open_diff_dialog_at(id, path),
+                    }
                 }
                 if pr_is_draft {
                     div { class: "hint", "This PR is still a draft — GitHub won't merge it." }
@@ -794,35 +798,343 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
     }
 }
 
-/// The implement run's note to whoever reviews it: a recap of the work done,
-/// what it wasn't sure about, and what's worth exercising by hand before the
-/// PR. Each part is omitted when the agent had nothing to say for it. Purely
-/// informative — to weigh in on an open question, use the Agent Chat.
+/// The implement run's note to whoever reviews it, tabbed by the kind of thing
+/// it is saying: the recap, the files it touched, what to exercise by hand, and
+/// what it is unsure about. A tab appears only when the agent filled it in, so a
+/// terse hand-off is still a single box. Purely informative — to weigh in on an
+/// open question, use the Agent Chat.
 #[component]
-pub(super) fn HandoffPanel(handoff: Handoff) -> Element {
+pub(super) fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
+    let sections: Vec<HandoffTab> = HandoffTab::ALL
+        .into_iter()
+        .filter(|tab| tab.has_content(&handoff))
+        .collect();
+    // Summary first when there is one — it is the orienting view — otherwise
+    // whatever the agent did fill in.
+    let mut active = use_signal(|| sections.first().copied().unwrap_or(HandoffTab::Summary));
+    let index = sections.iter().position(|t| *t == active()).unwrap_or(0);
+    let shown = sections.get(index).copied();
+
     rsx! {
         div { class: "section",
             h3 { "What was done" }
-            if !handoff.summary.is_empty() {
-                div { class: "plan-box", "{handoff.summary}" }
-            }
-            if !handoff.questions.is_empty() {
-                div { class: "hint", "Open questions" }
-                ul { class: "handoff-list",
-                    for (i, q) in handoff.questions.iter().enumerate() {
-                        li { key: "{i}", "{q}" }
-                    }
+            if handoff.malformed {
+                div { class: "hint",
+                    "The run attached a hand-off block that wasn't valid JSON, so it was dropped. \
+                     Its notes are in the transcript."
                 }
             }
-            if !handoff.tests.is_empty() {
-                div { class: "hint", "Worth testing" }
-                ul { class: "handoff-list",
-                    for (i, t) in handoff.tests.iter().enumerate() {
-                        li { key: "{i}", "{t}" }
+            if sections.len() > 1 {
+                ArtifactTabs {
+                    labels: sections.iter().map(|t| t.label().to_string()).collect::<Vec<_>>(),
+                    active: index,
+                    onselect: {
+                        let sections = sections.clone();
+                        move |i: usize| {
+                            if let Some(tab) = sections.get(i) {
+                                active.set(*tab);
+                            }
+                        }
+                    },
+                }
+            }
+            match shown {
+                Some(HandoffTab::Summary) => rsx! {
+                    ArtifactText {
+                        text: handoff.summary.clone(),
+                        on_path: move |path: String| open_diff_dialog_at(card_id, path),
+                    }
+                },
+                Some(HandoffTab::Changes) => rsx! {
+                    HandoffChanges { card_id, changes: handoff.changes.clone() }
+                },
+                Some(HandoffTab::Tests) => rsx! {
+                    ul { class: "handoff-list",
+                        for (i, t) in handoff.tests.iter().enumerate() {
+                            li { key: "{i}",
+                                if t.verified {
+                                    span { class: "badge verified", title: "The run exercised this itself", "✓ run" }
+                                }
+                                span { class: "handoff-scenario", "{t.scenario}" }
+                                if !t.expect.is_empty() {
+                                    span { class: "handoff-expect", " → {t.expect}" }
+                                }
+                            }
+                        }
+                    }
+                },
+                Some(HandoffTab::Risks) => rsx! {
+                    if !handoff.risks.is_empty() {
+                        ul { class: "handoff-list",
+                            for (i, r) in handoff.risks.iter().enumerate() {
+                                li { key: "{i}", "{r}" }
+                            }
+                        }
+                    }
+                    if !handoff.questions.is_empty() {
+                        div { class: "hint", "Open questions" }
+                        ul { class: "handoff-list",
+                            for (i, q) in handoff.questions.iter().enumerate() {
+                                li { key: "{i}", "{q}" }
+                            }
+                        }
+                    }
+                },
+                None => rsx! {},
+            }
+        }
+    }
+}
+
+/// The hand-off's sections, in reading order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandoffTab {
+    Summary,
+    Changes,
+    Tests,
+    Risks,
+}
+
+impl HandoffTab {
+    const ALL: [HandoffTab; 4] = [
+        HandoffTab::Summary,
+        HandoffTab::Changes,
+        HandoffTab::Tests,
+        HandoffTab::Risks,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            HandoffTab::Summary => "Summary",
+            HandoffTab::Changes => "Changes",
+            HandoffTab::Tests => "Test it",
+            HandoffTab::Risks => "Risks",
+        }
+    }
+
+    /// Whether this hand-off has anything to put under the tab. Computed from
+    /// the hand-off alone, never from the diff — the tab strip must not shift
+    /// under the user when the diff finishes computing.
+    fn has_content(self, h: &Handoff) -> bool {
+        match self {
+            HandoffTab::Summary => !h.summary.is_empty(),
+            HandoffTab::Changes => !h.changes.is_empty(),
+            HandoffTab::Tests => !h.tests.is_empty(),
+            HandoffTab::Risks => !h.risks.is_empty() || !h.questions.is_empty(),
+        }
+    }
+}
+
+/// The files the run says it touched, checked against the diff it actually
+/// produced: one row per really-changed file with the agent's description
+/// joined on, and a marker on anything it claimed that isn't in the diff.
+///
+/// The diff is requested on mount rather than on tab click, so the tab is
+/// instant instead of spinning — one `git diff` per card opened at the review
+/// gate, which is the point of being here.
+#[component]
+fn HandoffChanges(card_id: Uuid, changes: Vec<usine_core::Change>) -> Element {
+    let state = use_context::<AppState>();
+    let mut requested = use_signal(|| false);
+    use_effect(move || {
+        if requested() {
+            return;
+        }
+        if !state.diffs.read().contains_key(&card_id) {
+            requested.set(true);
+            state.send(ExecutorCommand::ComputeDiff { card_id });
+        }
+    });
+
+    let diff = state.diffs.read().get(&card_id).cloned();
+    // Real changed files first, each carrying whatever the agent said about it;
+    // then the claims that matched nothing.
+    let mut claimed: Vec<Option<usine_core::Change>> = changes.iter().cloned().map(Some).collect();
+    let mut rows: Vec<ChangeRow> = Vec::new();
+    if let Some(DiffState::Ready(data)) = &diff {
+        for file in &data.files {
+            let path = file
+                .new_path
+                .clone()
+                .or_else(|| file.old_path.clone())
+                .unwrap_or_default();
+            let what = claimed
+                .iter_mut()
+                .find(|c| c.as_ref().is_some_and(|c| same_path(&c.path, &path)))
+                .and_then(|slot| slot.take());
+            rows.push(ChangeRow {
+                path,
+                what: what.as_ref().map(|c| c.what.clone()).unwrap_or_default(),
+                kind: what.map(|c| c.kind).unwrap_or_default(),
+                stat: Some((file.status, file.added, file.removed)),
+            });
+        }
+    }
+    let unmatched_are_claims = matches!(diff, Some(DiffState::Ready(_)));
+    for change in claimed.into_iter().flatten() {
+        rows.push(ChangeRow {
+            path: change.path,
+            what: change.what,
+            kind: change.kind,
+            stat: None,
+        });
+    }
+
+    rsx! {
+        if matches!(diff, Some(DiffState::Computing)) || diff.is_none() {
+            div { class: "hint", "Checking the diff…" }
+        }
+        if let Some(DiffState::Failed(why)) = &diff {
+            div { class: "hint", "Couldn't read the diff ({why}) — showing the run's own list." }
+        }
+        div { class: "change-list",
+            for (i, row) in rows.iter().enumerate() {
+                div {
+                    key: "{i}",
+                    class: "change-row",
+                    onclick: {
+                        let path = row.path.clone();
+                        move |_| open_diff_dialog_at(card_id, path.clone())
+                    },
+                    div { class: "change-head",
+                        if let Some((status, added, removed)) = row.stat {
+                            span { class: "badge status", "{status_label(status)}" }
+                            span { class: "diffstat-add", "+{added}" }
+                            span { class: "diffstat-del", "−{removed}" }
+                        } else if unmatched_are_claims {
+                            span { class: "badge warn", title: "The run listed this file but it isn't in the diff", "not in the diff" }
+                        }
+                        span { class: "change-path", "{row.path}" }
+                        if !row.kind.is_empty() {
+                            span { class: "badge kind", "{row.kind}" }
+                        }
+                    }
+                    if !row.what.is_empty() {
+                        div { class: "change-what", "{row.what}" }
                     }
                 }
             }
         }
+    }
+}
+
+/// One row of the Changes tab: a path, what (if anything) the run said about it,
+/// and its real diffstat when the file is actually in the diff.
+struct ChangeRow {
+    path: String,
+    what: String,
+    kind: String,
+    stat: Option<(usine_core::FileStatus, u32, u32)>,
+}
+
+fn status_label(status: usine_core::FileStatus) -> &'static str {
+    match status {
+        usine_core::FileStatus::Added => "added",
+        usine_core::FileStatus::Deleted => "deleted",
+        usine_core::FileStatus::Modified => "modified",
+        usine_core::FileStatus::Renamed => "renamed",
+        usine_core::FileStatus::Copied => "copied",
+    }
+}
+
+/// What the last fix run was asked to do, and what it says it did — one row per
+/// finding the user ticked in the picker, with the run's outcome joined on by
+/// id. This is the answer to "I asked for four things; did four happen?", which
+/// the prose recap alone never gave at the gate where it matters.
+///
+/// Nothing here is posted anywhere. In particular a finding reported `skipped`
+/// still has its GitHub thread resolved on commit — that follows the
+/// checkboxes, not the outcomes; this panel is what makes it visible.
+#[component]
+pub(super) fn FixOutcomes(card_id: Uuid) -> Element {
+    let state = use_context::<AppState>();
+    let report = state.fix_reports.read().get(&card_id).cloned();
+    let Some(report) = report else {
+        return rsx! {};
+    };
+    let (addressed, asked) = report.tally();
+    let rows = report.rows();
+    rsx! {
+        div { class: "hint",
+            if asked > 0 {
+                "Fixes asked for — {addressed} of {asked} reported addressed"
+            } else {
+                "The run reported outcomes for findings that weren't picked"
+            }
+        }
+        if report.malformed {
+            div { class: "hint",
+                "The run attached an outcomes block that wasn't valid JSON, so it was dropped."
+            }
+        }
+        div { class: "fix-outcomes",
+            for (i, row) in rows.iter().enumerate() {
+                div {
+                    key: "{i}",
+                    class: "fix-outcome-row",
+                    onclick: {
+                        // Only rows that name a real file open the diff — a
+                        // review-body finding's path is a label, and scrolling
+                        // to it would open a modal that goes nowhere.
+                        let path = row
+                            .item
+                            .as_ref()
+                            .and_then(|i| i.diff_path())
+                            .map(str::to_string);
+                        move |_| {
+                            if let Some(path) = path.clone() {
+                                open_diff_dialog_at(card_id, path);
+                            }
+                        }
+                    },
+                    div { class: "fix-outcome-head",
+                        match &row.outcome {
+                            Some(o) => rsx! {
+                                span { class: "badge outcome-{o.outcome.label()}", "{o.outcome.label()}" }
+                            },
+                            None => rsx! {
+                                span {
+                                    class: "badge warn",
+                                    title: "You picked this one, but the run never said what it did about it",
+                                    "no outcome reported"
+                                }
+                            },
+                        }
+                        match &row.item {
+                            Some(item) => rsx! {
+                                if !item.severity.is_empty() {
+                                    span { class: "badge kind", "{item.severity}" }
+                                }
+                                span { class: "change-path", "{location(item)}" }
+                            },
+                            None => rsx! {
+                                span {
+                                    class: "badge warn",
+                                    title: "The run reported an id that wasn't in the picker",
+                                    "not picked"
+                                }
+                            },
+                        }
+                    }
+                    if let Some(item) = &row.item {
+                        div { class: "fix-outcome-label", "{item.label}" }
+                    }
+                    if let Some(o) = &row.outcome {
+                        if !o.note.is_empty() {
+                            div { class: "change-what", "{o.note}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where a picked finding lives, as the picker showed it.
+fn location(item: &usine_core::FixItem) -> String {
+    match item.line {
+        Some(line) => format!("{}:{}", item.path, line),
+        None => item.path.clone(),
     }
 }
 

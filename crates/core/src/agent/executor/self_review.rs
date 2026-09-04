@@ -121,6 +121,10 @@ impl Executor {
             ));
         }
         self.store.set_pending_fix_qa(card_id, &fix_qa)?;
+        // The other half of the same stash: the rows themselves, so the run's
+        // reported outcomes can be shown as a checklist against what was asked.
+        self.store
+            .set_pending_fix_items(card_id, &crate::agent::fixes::fix_items(&selected))?;
         // Isolate before the running-state transition, so a failure (e.g. a dirty
         // main repo) leaves the card recoverable in the fix picker.
         self.ensure_branch_worktree(card_id).await?;
