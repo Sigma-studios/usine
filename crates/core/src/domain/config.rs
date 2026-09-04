@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::model::{Effort, ModelSpec, Provider};
+use crate::domain::model::{Column, Effort, ModelSpec, Provider};
 
 /// The token replaced by a path in the configured commands that take one: the
 /// target directory in an "open in terminal/editor" command (see
@@ -344,6 +344,12 @@ pub struct AppSettings {
     /// [`Self::sidebar_width`].
     #[serde(default = "default_detail_width")]
     pub detail_width: u32,
+    /// Board lanes the user folded to a rail, by column. Pure UI layout state
+    /// like [`Self::sidebar_width`]; absent means every lane is open, so a
+    /// settings record written before this field — and a fresh install — starts
+    /// fully expanded.
+    #[serde(default)]
+    pub collapsed_columns: Vec<Column>,
 }
 
 /// Serde default for [`AppSettings::max_concurrent_runs`]: a settings record
@@ -386,6 +392,7 @@ impl AppSettings {
             max_concurrent_runs: default_max_concurrent_runs(),
             sidebar_width: default_sidebar_width(),
             detail_width: default_detail_width(),
+            collapsed_columns: Vec::new(),
         }
     }
 
@@ -464,6 +471,8 @@ mod tests {
         assert_eq!(s.default_review, None);
         // The concurrency cap defaults to 5, not 0 — 0 would mean unlimited.
         assert_eq!(s.max_concurrent_runs, 5);
+        // No folded lanes recorded means every board lane starts open.
+        assert!(s.collapsed_columns.is_empty());
     }
 
     #[test]
