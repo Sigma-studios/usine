@@ -532,14 +532,32 @@ fn push_plain(out: &mut Vec<MdInline>, plain: &mut String) {
     }
 }
 
+/// A path reference minus its trailing `:42`, when it carries one, plus whether
+/// it did. Agents write both forms interchangeably.
+fn split_line_suffix(word: &str) -> (&str, bool) {
+    match word.rsplit_once(':') {
+        Some((p, l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) => (p, true),
+        _ => (word, false),
+    }
+}
+
+/// Whether a path written by an agent names the file at `actual`. Tolerant of a
+/// shortened or extra-prefixed path and of a trailing `:line` — agents write
+/// repo-relative paths but sometimes shorten or prefix them, and a near miss
+/// should join (and scroll) rather than read as a phantom file.
+pub fn same_path(claimed: &str, actual: &str) -> bool {
+    let (claimed, _) = split_line_suffix(claimed.trim().trim_start_matches("./"));
+    !claimed.is_empty()
+        && (claimed == actual
+            || actual.ends_with(&format!("/{claimed}"))
+            || claimed.ends_with(&format!("/{actual}")))
+}
+
 /// Whether a word looks like a repo file reference — `src/cache.rs`,
 /// `crates/app/src/style.css:504`. Conservative on purpose: turning ordinary
 /// prose ("e.g.", "3.5") into chips would be worse than missing a reference.
 fn is_path_ref(word: &str) -> bool {
-    let (path, line) = match word.rsplit_once(':') {
-        Some((p, l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) => (p, true),
-        _ => (word, false),
-    };
+    let (path, line) = split_line_suffix(word);
     if path.len() < 4 || path.ends_with('/') {
         return false;
     }
@@ -563,6 +581,25 @@ fn is_path_ref(word: &str) -> bool {
 #[cfg(test)]
 mod md_tests {
     use super::*;
+
+    #[test]
+    fn matches_agent_paths_against_diff_paths() {
+        assert!(same_path("crates/app/src/lib.rs", "crates/app/src/lib.rs"));
+        // Shortened, extra-prefixed, `./`-prefixed, and `:line`-suffixed forms
+        // all name the same file — the diff dialog and the Changes tab must
+        // agree about that, which is why they share this one matcher.
+        assert!(same_path("src/lib.rs", "crates/app/src/lib.rs"));
+        assert!(same_path(
+            "./crates/app/src/lib.rs:42",
+            "crates/app/src/lib.rs"
+        ));
+        assert!(same_path(
+            "repo/crates/app/src/lib.rs",
+            "crates/app/src/lib.rs"
+        ));
+        assert!(!same_path("", "crates/app/src/lib.rs"));
+        assert!(!same_path("other/lib.rs", "crates/app/src/lib.rs"));
+    }
 
     #[test]
     fn splits_headings_lists_and_code() {

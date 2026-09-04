@@ -115,6 +115,18 @@ pub struct FixItem {
     pub severity: String,
 }
 
+/// The label a synthetic item built from a review's *body* carries in `path`.
+/// It names no file, so anything that treats `path` as a repo path (opening the
+/// diff at it, say) has to skip it.
+pub const REVIEW_BODY_PATH: &str = "PR review summary";
+
+impl FixItem {
+    /// The repo path this item points at, when it points at one at all.
+    pub fn diff_path(&self) -> Option<&str> {
+        (!self.path.is_empty() && self.path != REVIEW_BODY_PATH).then_some(self.path.as_str())
+    }
+}
+
 /// What a fix run was asked to do and what it reports having done. Stored per
 /// card once the run's commit is real.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,7 +212,7 @@ pub fn fix_items(selected: &[FixVerdict]) -> Vec<FixItem> {
             id: v.comment.id,
             label: crate::agent::executor::one_line_capped(&v.comment.body, 160),
             path: if v.comment.review_body_of.is_some() {
-                "PR review summary".to_string()
+                REVIEW_BODY_PATH.to_string()
             } else {
                 v.comment.path.clone()
             },

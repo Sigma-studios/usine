@@ -14,7 +14,7 @@ use super::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 use super::diffdialog::{open_diff_dialog, open_diff_dialog_at};
 use super::icons::IconDiff;
 use crate::state::{AppState, BoardMode};
-use crate::ui::widgets::{provider_value, ArtifactTabs, ArtifactText};
+use crate::ui::widgets::{provider_value, same_path, ArtifactTabs, ArtifactText};
 use crate::ui::{Panel, PanelResizer};
 
 mod chat;
@@ -1027,17 +1027,6 @@ struct ChangeRow {
     stat: Option<(usine_core::FileStatus, u32, u32)>,
 }
 
-/// Whether an agent-written path names the same file as a diff path. Agents
-/// write repo-relative paths but sometimes shorten or prefix them, and a near
-/// miss should still join rather than read as a phantom file.
-fn same_path(claimed: &str, actual: &str) -> bool {
-    let claimed = claimed.trim().trim_start_matches("./");
-    !claimed.is_empty()
-        && (claimed == actual
-            || actual.ends_with(&format!("/{claimed}"))
-            || claimed.ends_with(&format!("/{actual}")))
-}
-
 fn status_label(status: usine_core::FileStatus) -> &'static str {
     match status {
         usine_core::FileStatus::Added => "added",
@@ -1057,7 +1046,7 @@ fn status_label(status: usine_core::FileStatus) -> &'static str {
 /// still has its GitHub thread resolved on commit — that follows the
 /// checkboxes, not the outcomes; this panel is what makes it visible.
 #[component]
-fn FixOutcomes(card_id: Uuid) -> Element {
+pub(super) fn FixOutcomes(card_id: Uuid) -> Element {
     let state = use_context::<AppState>();
     let report = state.fix_reports.read().get(&card_id).cloned();
     let Some(report) = report else {
@@ -1084,10 +1073,17 @@ fn FixOutcomes(card_id: Uuid) -> Element {
                     key: "{i}",
                     class: "fix-outcome-row",
                     onclick: {
-                        let path = row.item.as_ref().map(|i| i.path.clone()).unwrap_or_default();
+                        // Only rows that name a real file open the diff — a
+                        // review-body finding's path is a label, and scrolling
+                        // to it would open a modal that goes nowhere.
+                        let path = row
+                            .item
+                            .as_ref()
+                            .and_then(|i| i.diff_path())
+                            .map(str::to_string);
                         move |_| {
-                            if !path.is_empty() {
-                                open_diff_dialog_at(card_id, path.clone());
+                            if let Some(path) = path.clone() {
+                                open_diff_dialog_at(card_id, path);
                             }
                         }
                     },

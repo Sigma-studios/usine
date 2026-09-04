@@ -346,7 +346,7 @@ fn DiffView(
             files
                 .files
                 .iter()
-                .position(|f| same_file(&file_path(f), &want))
+                .position(|f| crate::ui::widgets::same_path(&want, &file_path(f)))
                 .map(|fi| format!("difffile-{fi}"))
         });
         if let Some(anchor) = anchor {
@@ -818,19 +818,4 @@ fn sign(k: DiffLineKind) -> &'static str {
 
 fn gutter(n: Option<u32>) -> String {
     n.map(|n| n.to_string()).unwrap_or_default()
-}
-
-/// Whether a path written by an agent names the file at `actual`. Tolerant of a
-/// shortened or extra-prefixed path, and of a trailing `:line` — a near miss
-/// should still land on the file rather than silently not scroll.
-fn same_file(actual: &str, want: &str) -> bool {
-    let want = want.trim().trim_start_matches("./");
-    let want = match want.rsplit_once(':') {
-        Some((p, l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) => p,
-        _ => want,
-    };
-    !want.is_empty()
-        && (actual == want
-            || actual.ends_with(&format!("/{want}"))
-            || want.ends_with(&format!("/{actual}")))
 }

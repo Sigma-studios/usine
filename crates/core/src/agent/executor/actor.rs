@@ -607,11 +607,12 @@ async fn finalize_run(
     // validation) — the checklist is what makes an under-reported run visible.
     if !matches!(transition, Transition::AgentImplementDone) {
         let items = store.take_pending_fix_items(card_id).unwrap_or_default();
+        // An empty report clears the field: a later fix run that stashed nothing
+        // (or reported nothing) must not leave the previous run's checklist
+        // describing it.
         let report = crate::agent::fixes::fix_report(items, &result_text);
-        if !report.is_empty() {
-            let _ = store.set_fix_report(card_id, &report);
-            let _ = evt_tx.unbounded_send(ExecutorEvent::fix_report_updated(card_id, report));
-        }
+        let _ = store.set_fix_report(card_id, &report);
+        let _ = evt_tx.unbounded_send(ExecutorEvent::fix_report_updated(card_id, report));
     }
 
     // A PR fix run: keep the agent's summary as the fixes recap so the user can
@@ -1077,8 +1078,11 @@ pub(super) fn handle_event(
             const MIN_PLAN_CHARS: usize = 200;
             let fresh = store.get_card(card_id)?;
             if matches!(fresh.state, CardState::Designing(DesignSub::Running)) {
-                let (_, questions) = crate::agent::plan::parse_plan(&result);
-                let trimmed = result.trim();
+                // Measure the plan *prose*: the machine-facing outline block is
+                // stripped by `parse_plan`, so a bailed turn can't clear the
+                // floor on block payload alone.
+                let (clean, questions) = crate::agent::plan::parse_plan(&result);
+                let trimmed = clean.trim();
                 if questions.is_empty() && trimmed.chars().count() < MIN_PLAN_CHARS {
                     let message = "The plan phase ended without producing a plan — the agent \
                                    stopped mid-turn. Retry to re-plan."

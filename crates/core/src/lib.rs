@@ -29,7 +29,7 @@ pub use agent::executor::{
 };
 pub use agent::fixes::{
     fixes_block_malformed, parse_fix_outcomes, strip_fixes_block, FixItem, FixOutcome, FixReport,
-    FixRow, Outcome, FIX_RECAP_INSTRUCTION,
+    FixRow, Outcome, FIX_RECAP_INSTRUCTION, REVIEW_BODY_PATH,
 };
 pub use agent::handoff::{
     handoff_block_malformed, parse_handoff, strip_handoff_block, Change, Handoff, TestItem,
