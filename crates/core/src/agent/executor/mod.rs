@@ -587,6 +587,7 @@ impl Executor {
             ExecutorCommand::OpenWorktree { card_id, target } => {
                 self.open_worktree(card_id, target).await
             }
+            ExecutorCommand::OpenPath { card_id, path } => self.open_path(card_id, &path).await,
             ExecutorCommand::ComputeDiff { card_id } => self.compute_diff(card_id).await,
             ExecutorCommand::LoadTranscript { card_id } => self.load_transcript(card_id).await,
             ExecutorCommand::Cancel { card_id } => self.cancel(card_id).await,
@@ -1191,7 +1192,7 @@ fn revise_extra(plan: Option<&str>, feedback: &str) -> String {
 
 /// One bounded line for a qa_log entry: collapse whitespace/newlines and cap
 /// the length, so folding the log into a later prompt can't balloon it.
-fn one_line_capped(s: &str, max: usize) -> String {
+pub(crate) fn one_line_capped(s: &str, max: usize) -> String {
     let mut out = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if out.chars().count() > max {
         out = out.chars().take(max).collect();
@@ -1307,7 +1308,8 @@ fn question_extra(stage: &str, plan: Option<&str>, question: &str) -> String {
 }
 
 /// Build the fix-run prompt from the comments the user checked plus the
-/// free-form note they typed. Either side may be empty (the callers only launch
+/// free-form note they typed. Each bullet carries the finding's `(#id)` so the
+/// run can report per-finding outcomes against it. Either side may be empty (the callers only launch
 /// a run when at least one is non-empty), so both headers are conditional.
 ///
 /// Public so the fix picker can show — and let the user edit — the exact text
@@ -1337,9 +1339,13 @@ pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
             };
             let sev = crate::agent::review::severity_prefix(&v.severity);
             // Indent continuation lines so a multi-line comment stays one bullet.
+            // The trailing `(#id)` is what the run's `usine-fixes` block reports
+            // back against, so each finding's outcome joins to the row the user
+            // ticked (see `crate::agent::fixes`).
             out.push_str(&format!(
-                "- {sev}[{loc}] {}\n",
-                v.comment.body.trim().replace('\n', "\n  ")
+                "- {sev}[{loc}] {} (#{})\n",
+                v.comment.body.trim().replace('\n', "\n  "),
+                v.comment.id
             ));
             // What the reviewing agent made of this one — the user ticked the
             // box having read it, so it is the scope they agreed to.
@@ -1783,7 +1789,8 @@ mod tests {
         v.rationale = String::new();
         assert_eq!(
             fix_prompt(&[v], ""),
-            "Address the following review comments:\n- [src/a.rs:9] fix this\n"
+            "Address the following review comments:\n- [src/a.rs:9] fix this (#1)\n",
+            "the id marker is what the run's outcomes report back against"
         );
     }
 

@@ -56,7 +56,11 @@ impl Executor {
     ) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let prev = match &card.state {
-            CardState::Concluded { conclusion } => Some(conclusion.clone()),
+            // The prose only: the panel's own blocks must not be quoted back
+            // into the next round's prompt.
+            CardState::Concluded { conclusion } => {
+                Some(crate::agent::investigate::conclusion_prose(conclusion))
+            }
             _ => None,
         };
         // Build the extra from the qa_log BEFORE recording this round, so it
@@ -79,7 +83,10 @@ impl Executor {
             let CardState::Concluded { conclusion } = c.state.clone() else {
                 return Ok(());
             };
-            c.description = fold_findings(&c.description, &conclusion);
+            c.description = fold_findings(
+                &c.description,
+                &crate::agent::investigate::conclusion_prose(&conclusion),
+            );
             if !c.qa_log.is_empty() {
                 c.description = fold_qa(&c.description, &c.qa_log);
                 c.qa_log.clear();
@@ -308,7 +315,7 @@ impl Executor {
                     tail.push_str(crate::agent::handoff::HANDOFF_INSTRUCTION);
                 } else {
                     tail.push_str("\n\n");
-                    tail.push_str(crate::agent::handoff::FIX_RECAP_INSTRUCTION);
+                    tail.push_str(crate::agent::fixes::FIX_RECAP_INSTRUCTION);
                 }
                 Some(match extra {
                     Some(e) => format!("{e}\n\n{tail}"),
@@ -754,6 +761,16 @@ impl Executor {
         let _ = self.store.set_investigation_extra(card_id, None);
         let _ = self.store.set_fix_extra(card_id, None);
         let _ = self.store.take_pending_fix_qa(card_id);
+        let _ = self.store.take_pending_fix_items(card_id);
+        let _ = self
+            .store
+            .set_fix_report(card_id, &crate::agent::fixes::FixReport::default());
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::fix_report_updated(
+                card_id,
+                crate::agent::fixes::FixReport::default(),
+            ));
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
+use crate::agent::fixes::FixReport;
 use crate::agent::handoff::Handoff;
 use crate::agent::usage::UsageSnapshot;
 use crate::domain::config::AppSettings;
@@ -341,6 +342,11 @@ pub enum ExecutorCommand {
     /// card's isolated worktree when it has one, else the project's main
     /// checkout. Purely a convenience — no effect on the card's lifecycle state.
     OpenWorktree { card_id: Uuid, target: OpenTarget },
+    /// Open one file of a card's working copy in the configured editor — the
+    /// `file:line` chips in agent prose and in an investigation's findings.
+    /// `path` is repo-relative and comes from the agent, so it is resolved
+    /// against the working copy and refused if it escapes it.
+    OpenPath { card_id: Uuid, path: String },
     /// Compute the card's committed diff over its fork point (for the in-app diff
     /// viewer). Read-only; no effect on the card's lifecycle state. The result
     /// comes back as a `DiffUpdated` event.
@@ -460,6 +466,7 @@ impl ExecutorCommand {
             | ExecutorCommand::RelaunchPreview { card_id }
             | ExecutorCommand::EnsurePreview { card_id }
             | ExecutorCommand::OpenWorktree { card_id, .. }
+            | ExecutorCommand::OpenPath { card_id, .. }
             | ExecutorCommand::ComputeDiff { card_id }
             | ExecutorCommand::LoadTranscript { card_id }
             | ExecutorCommand::Cancel { card_id }
@@ -678,6 +685,10 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
+    /// A card's fix-run report changed (`card_id` on the event): the findings
+    /// the last fix run was asked to address, joined to the outcomes it
+    /// reported. An empty report means there is none and the UI drops its entry.
+    FixReportUpdated { report: FixReport },
     /// A card's Agent Chat log changed (`card_id` on the event) — a new answer
     /// appended, or the log superseded by a write run. Empty `exchanges` means
     /// it was cleared ("back to start") and the UI drops its entry.
@@ -827,6 +838,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id: Uuid::nil(),
             kind: ExecutorEventKind::ReviewTaskUpdated(Box::new(task)),
+        }
+    }
+    pub fn fix_report_updated(card_id: Uuid, report: FixReport) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::FixReportUpdated { report },
         }
     }
     pub fn recap_updated(card_id: Uuid, recap: impl Into<String>) -> Self {

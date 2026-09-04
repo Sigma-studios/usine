@@ -453,6 +453,10 @@ impl Executor {
             ));
         }
         self.store.set_pending_fix_qa(card_id, &fix_qa)?;
+        // The other half of the same stash: the rows themselves, so the run's
+        // reported outcomes can be shown as a checklist against what was asked.
+        self.store
+            .set_pending_fix_items(card_id, &crate::agent::fixes::fix_items(&checked))?;
         // Remember which comments this run addresses so their GitHub review
         // threads can be marked resolved once the fix lands (see `finalize_run`,
         // which emits `ResolveFixedComments` on completion). A note-only run has

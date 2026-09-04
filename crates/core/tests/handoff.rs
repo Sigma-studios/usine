@@ -283,10 +283,40 @@ fn storing_an_empty_hand_off_clears_the_previous_one() {
         summary: "Built it.".into(),
         questions: vec![],
         tests: vec!["Click the button".into()],
+        ..Default::default()
     };
     store.set_handoff(card.id, &handoff).unwrap();
     assert_eq!(store.all_handoffs().unwrap().get(&card.id), Some(&handoff));
 
     store.set_handoff(card.id, &Handoff::default()).unwrap();
     assert!(!store.all_handoffs().unwrap().contains_key(&card.id));
+}
+
+#[test]
+fn a_v1_hand_off_already_on_disk_still_reads_back() {
+    // Records written before the v2 schema hold `tests` as bare strings and no
+    // `v`/`changes`/`risks` — they must survive the upgrade, not vanish from the
+    // panel.
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/handoff-v1"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = Card::new(project.id, "c", "d", CardConfig::default());
+    store.upsert_card(&card).unwrap();
+
+    let v1: Handoff = serde_json::from_str(
+        r#"{"summary":"Built it.","questions":["Why?"],"tests":["[verified] Click the button"]}"#,
+    )
+    .expect("a v1 payload deserializes");
+    store.set_handoff(card.id, &v1).unwrap();
+
+    let back = store.get_handoff(card.id).unwrap().expect("stored");
+    assert_eq!(back.v, 1);
+    assert_eq!(back.summary, "Built it.");
+    assert_eq!(back.tests[0].scenario, "Click the button");
+    assert!(back.tests[0].verified, "the v1 prefix became a field");
+    assert!(back.changes.is_empty() && back.risks.is_empty());
 }
