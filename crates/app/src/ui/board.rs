@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use usine_core::{Card, Column};
 
 use super::card::CardView;
+use super::icons::IconChevronLeft;
 use super::ReviewBoard;
 use crate::state::{AppState, BoardMode, SelectedView};
 
@@ -27,6 +28,10 @@ pub fn Board() -> Element {
         cards.retain(|c| super::search::matches(&c.title, q));
     }
 
+    // Read the folded list once here rather than per lane, so a settings echo
+    // re-renders the board in one pass.
+    let collapsed = state.settings.read().collapsed_columns.clone();
+
     rsx! {
         div { class: "board",
             for (col , col_cards) in visible_columns(&cards, filter.is_some()) {
@@ -34,9 +39,21 @@ pub fn Board() -> Element {
                     key: "{col:?}",
                     column: col,
                     cards: col_cards,
+                    collapsed: collapsed.contains(&col),
                 }
             }
         }
+    }
+}
+
+/// Flip `col`'s entry in the persisted list of folded lanes. Absent = open,
+/// which is what makes "open by default" fall out of an empty (or missing)
+/// record.
+fn toggle_collapsed(list: &mut Vec<Column>, col: Column) {
+    if let Some(i) = list.iter().position(|c| *c == col) {
+        list.remove(i);
+    } else {
+        list.push(col);
     }
 }
 
@@ -87,17 +104,54 @@ fn visible_columns(cards: &[Card], keep_all: bool) -> Vec<(Column, Vec<Card>)> {
         .collect()
 }
 
+/// One lane. When `collapsed` the whole lane becomes a narrow rail — keeping
+/// its title and count, so it still reports what landed in it — and the rail
+/// itself is the button that reopens it.
 #[component]
-fn ColumnView(column: Column, cards: Vec<Card>) -> Element {
+fn ColumnView(column: Column, cards: Vec<Card>, collapsed: bool) -> Element {
+    let state = use_context::<AppState>();
     let title = column.title();
     let count = cards.len();
     let is_start = column == Column::StartingBlock;
+
+    let toggle = move |_| {
+        let mut s = state.settings.read().clone();
+        toggle_collapsed(&mut s.collapsed_columns, column);
+        state.save_settings(s);
+    };
+
+    if collapsed {
+        return rsx! {
+            div { class: "column collapsed",
+                button {
+                    class: "column-rail",
+                    title: "Expand {title}",
+                    aria_label: "Expand {title}",
+                    aria_expanded: "false",
+                    onclick: toggle,
+                    span { class: "column-toggle", IconChevronLeft {} }
+                    span { class: "column-count", "{count}" }
+                    span { class: "column-rail-title", "{title}" }
+                }
+            }
+        };
+    }
 
     rsx! {
         div { class: "column",
             div { class: "column-header", title: "{title}",
                 span { "{title}" }
-                span { class: "column-count", "{count}" }
+                div { class: "column-header-right",
+                    span { class: "column-count", "{count}" }
+                    button {
+                        class: "card-icon-btn column-toggle",
+                        title: "Collapse {title}",
+                        aria_label: "Collapse {title}",
+                        aria_expanded: "true",
+                        onclick: toggle,
+                        IconChevronLeft {}
+                    }
+                }
             }
             div { class: "column-body",
                 for card in cards.iter() {
@@ -198,6 +252,20 @@ mod tests {
         let cols: Vec<Column> = shown.iter().map(|(c, _)| *c).collect();
         assert_eq!(cols, Column::board().to_vec());
         assert!(shown.iter().all(|(_, c)| c.is_empty()));
+    }
+
+    #[test]
+    fn folding_a_lane_is_a_toggle_on_the_persisted_list() {
+        // Empty list = every lane open, which is the fresh-install state.
+        let mut list = Vec::new();
+        toggle_collapsed(&mut list, Column::Done);
+        assert_eq!(list, [Column::Done]);
+        // A second lane folds without disturbing the first.
+        toggle_collapsed(&mut list, Column::StartingBlock);
+        assert_eq!(list, [Column::Done, Column::StartingBlock]);
+        // Reopening removes only that lane.
+        toggle_collapsed(&mut list, Column::Done);
+        assert_eq!(list, [Column::StartingBlock]);
     }
 
     #[test]

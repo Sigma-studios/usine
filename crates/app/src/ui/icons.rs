@@ -73,3 +73,11 @@ pub(super) fn IconPaperclip() -> Element {
         }
     }
 }
+
+/// Fold a board lane to a rail (rotated 180° by CSS for the expand direction).
+#[component]
+pub(super) fn IconChevronLeft() -> Element {
+    rsx! {
+        Glyph { polyline { points: "15 18 9 12 15 6" } }
+    }
+}
