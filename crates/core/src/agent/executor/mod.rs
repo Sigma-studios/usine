@@ -1029,15 +1029,40 @@ fn self_review_worktree_path(repo: &Path, id: Uuid) -> PathBuf {
     worktree_path(repo, id).with_file_name(format!("{id}-selfreview"))
 }
 
-/// Best-effort removal of a card's throwaway detached self-review worktree. It's
-/// never persisted on the card, so it can only be found by its deterministic
-/// path; the card self-review actor calls this when its run ends by *any* means
-/// (done, cancel, error, timeout) so the scratch tree can't leak. A no-op when
-/// it isn't there.
+/// A short-lived, detached worktree path for a card's read-only DESIGN phase
+/// (plan / investigate / pre-worktree Q&A), cut at a freshly fetched
+/// `origin/<base>`. Distinct from both the card's real worktree and the
+/// self-review scratch (`{id}` vs `{id}-design` vs `{id}-selfreview`).
+fn design_worktree_path(repo: &Path, id: Uuid) -> PathBuf {
+    worktree_path(repo, id).with_file_name(format!("{id}-design"))
+}
+
+/// Best-effort removal of a card's throwaway detached self-review worktree.
+/// See [`cleanup_scratch_worktree`].
 pub(super) async fn cleanup_self_review_worktree(
     store: &Store,
     git: &Arc<dyn GitOps>,
     card_id: Uuid,
+) {
+    cleanup_scratch_worktree(store, git, card_id, self_review_worktree_path).await;
+}
+
+/// Best-effort removal of a card's throwaway detached design worktree.
+/// See [`cleanup_scratch_worktree`].
+pub(super) async fn cleanup_design_worktree(store: &Store, git: &Arc<dyn GitOps>, card_id: Uuid) {
+    cleanup_scratch_worktree(store, git, card_id, design_worktree_path).await;
+}
+
+/// Best-effort removal of one of a card's throwaway detached scratch worktrees.
+/// They're never persisted on the card, so they can only be found by their
+/// deterministic path; the run actor calls this when a run ends by *any* means
+/// (done, cancel, error, timeout) so the scratch tree can't leak. A no-op when
+/// it isn't there.
+async fn cleanup_scratch_worktree(
+    store: &Store,
+    git: &Arc<dyn GitOps>,
+    card_id: Uuid,
+    path_of: fn(&Path, Uuid) -> PathBuf,
 ) {
     let Ok(card) = store.get_card(card_id) else {
         return;
@@ -1045,7 +1070,7 @@ pub(super) async fn cleanup_self_review_worktree(
     let Ok(project) = store.get_project(card.project_id) else {
         return;
     };
-    let wt = self_review_worktree_path(&project.path, card_id);
+    let wt = path_of(&project.path, card_id);
     if wt.exists() {
         let _ = git.remove_worktree(&project.path, &wt).await;
         let _ = std::fs::remove_dir_all(&wt);
@@ -1056,8 +1081,9 @@ pub(super) async fn cleanup_self_review_worktree(
 /// question: the approved plan (for implement runs), the original question, and
 /// the answer, plus a note on how to continue. The note depends on the mode: a
 /// write run resumes in the card's worktree, which may hold the interrupted
-/// attempt's edits; a plan run is read-only in the main repo, where "partial
-/// changes" would wrongly point it at the user's own uncommitted work.
+/// attempt's edits; a design run is read-only in a pristine scratch tree cut at
+/// `origin/<base>`, where "partial changes" would point it at work that isn't
+/// there.
 fn answer_extra(
     pending: Option<&Intervention>,
     answer: &str,

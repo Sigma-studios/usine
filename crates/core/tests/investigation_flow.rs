@@ -1,6 +1,6 @@
 //! Proves the investigation lifecycle end to end through the executor: an
-//! "investigate only" card starts a read-only run in the main checkout (no
-//! worktree, no branch), parks on its conclusion, takes a follow-up round that
+//! "investigate only" card starts a read-only run in a throwaway design
+//! worktree (nothing persisted on the card), parks on its conclusion, takes a follow-up round that
 //! carries the prior conclusion as context, and converts — in place — into an
 //! implementation whose description holds the findings while keeping the cost.
 
@@ -122,7 +122,8 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         git: Arc::new(SimGit),
     });
 
-    // Start → a read-only investigate run in the MAIN checkout, then Concluded.
+    // Start → a read-only investigate run in a fresh design scratch tree, then
+    // Concluded.
     exec.send(ExecutorCommand::Start { card_id });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Concluded { .. })).await;
     assert!(card.needs_attention(), "the conclusion drives the badge");
@@ -138,7 +139,12 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         assert_eq!(runs.len(), 1);
         let (mode, dir, prompt) = &runs[0];
         assert_eq!(*mode, RunMode::Investigate);
-        assert_eq!(dir, &project.path, "runs in the main checkout");
+        assert_ne!(dir, &project.path, "never reads the user's main checkout");
+        assert!(
+            dir.file_name()
+                .is_some_and(|n| n == format!("{card_id}-design").as_str()),
+            "runs in the card's throwaway design worktree, got {dir:?}"
+        );
         assert!(
             prompt.contains("READ-ONLY investigation"),
             "the investigate instruction rides in the prompt"
