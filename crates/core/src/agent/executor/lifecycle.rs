@@ -21,8 +21,9 @@ impl Executor {
         }
     }
 
-    /// Launch a read-only investigation run: no worktree, no branch — it reads
-    /// the main checkout like a plan run. Shared by the initial start (from the
+    /// Launch a read-only investigation run: no worktree and no branch on the
+    /// card — it reads a throwaway scratch tree cut at a fresh `origin/<base>`,
+    /// like a plan run. Shared by the initial start (from the
     /// starting block) and the follow-up loop (from `Concluded`, with the prior
     /// rounds riding in `extra`).
     pub(super) async fn start_investigate(
@@ -201,8 +202,29 @@ impl Executor {
             RunMode::Implement | RunMode::ApplyFixes => card.config.implement.clone(),
         };
         let project_dir = match mode {
-            // Read-only pre-work runs (plan, investigate) read the main checkout.
-            RunMode::Plan | RunMode::Investigate => project.path.clone(),
+            // Read-only pre-work runs (plan, investigate) read a throwaway
+            // DETACHED worktree cut at a freshly fetched `origin/<base>` — the
+            // same cut point the implement phase uses. The main checkout sits
+            // wherever the last pull left it, and a plan written against a stale
+            // tree rides verbatim into the implement prompt. No fallback: a run
+            // that can't get a fresh tree fails loudly rather than quietly
+            // planning against stale code.
+            RunMode::Plan | RunMode::Investigate => {
+                match self
+                    .ensure_design_worktree(&card, &project, resume_session.is_some())
+                    .await
+                {
+                    Ok(wt) => wt,
+                    Err(e) => {
+                        return Err(self
+                            .fault_run(
+                                &card,
+                                format!("couldn't prepare a fresh design worktree: {e}"),
+                            )
+                            .await)
+                    }
+                }
+            }
             // Self-review is read-only, so run it in a throwaway DETACHED worktree
             // at the branch's committed HEAD. The card's own worktree is a valid
             // place too, but the detached scratch gives a clean view of exactly
@@ -216,12 +238,27 @@ impl Executor {
                         .clone()
                         .unwrap_or_else(|| project.path.clone())
                 }),
-            // Triage and Q&A are read-only — running in the main tree is
-            // harmless (a plan-stage question has no worktree yet).
-            RunMode::Triage | RunMode::Question => card
-                .worktree_path
-                .clone()
-                .unwrap_or_else(|| project.path.clone()),
+            // Triage and Q&A are read-only. Once the card has its own worktree
+            // they read that; before it exists (starting-block Agent Chat) they
+            // get the same fresh design scratch tree as a plan run, rather than
+            // whatever state the user's main checkout is in.
+            RunMode::Triage | RunMode::Question => match card.worktree_path.clone() {
+                Some(wt) => wt,
+                None => match self
+                    .ensure_design_worktree(&card, &project, resume_session.is_some())
+                    .await
+                {
+                    Ok(wt) => wt,
+                    Err(e) => {
+                        return Err(self
+                            .fault_run(
+                                &card,
+                                format!("couldn't prepare a fresh design worktree: {e}"),
+                            )
+                            .await)
+                    }
+                },
+            },
             // Write agents (implement / all fixes) must NEVER run in the user's main
             // working tree — they'd clobber it. Callers guarantee an isolated
             // worktree via `ensure_branch_worktree`; if one is somehow missing,
@@ -345,26 +382,9 @@ impl Executor {
         let handle = match provider.start(cfg).await {
             Ok(handle) => handle,
             Err(e) => {
-                // The caller already moved the card into a running state, but no
-                // run backs it (e.g. the CLI isn't installed). Mark it Failed so
-                // it's recoverable instead of stranded mid-column, then surface
-                // the error.
-                let demoted = apply_transition(
-                    &self.store,
-                    &self.evt_tx,
-                    card.id,
-                    Transition::AgentError {
-                        message: format!("failed to start run: {e}"),
-                    },
-                )
-                .is_ok();
-                // A `Failed` park `run_actor` never sees: a mid-gate launch
-                // (e.g. a validation fix run) deliberately kept the previous
-                // run's preview alive, so light-stop it here.
-                if demoted {
-                    self.reap_idle_preview(card.id).await;
-                }
-                return Err(e);
+                return Err(self
+                    .fault_run(&card, format!("failed to start run: {e}"))
+                    .await);
             }
         };
         lock(&self.runs).insert(card.id, (run_id, handle.control));
@@ -521,6 +541,94 @@ impl Executor {
         }
     }
 
+    /// Park a card whose launch failed before any run backed it. The caller
+    /// already moved it into a running state (`start_run` applies the transition
+    /// before `launch`), so a bare `Err` would strand it mid-column with nothing
+    /// running. `AgentError` is legal from every running state, so the card lands
+    /// in `Failed { previous }` and Retry recovers it. Returns the error to
+    /// return, which the dispatch loop turns into an error toast.
+    pub(super) async fn fault_run(&self, card: &Card, message: String) -> CoreError {
+        let demoted = apply_transition(
+            &self.store,
+            &self.evt_tx,
+            card.id,
+            Transition::AgentError {
+                message: message.clone(),
+            },
+        )
+        .is_ok();
+        // A `Failed` park `run_actor` never sees: a mid-gate launch (e.g. a
+        // validation fix run) deliberately kept the previous run's preview
+        // alive, so light-stop it here.
+        if demoted {
+            self.reap_idle_preview(card.id).await;
+        }
+        CoreError::other(message)
+    }
+
+    /// Fetch `origin` before a cut point is computed. Failure is non-fatal — the
+    /// last-fetched tracking ref (or the local branch) still lets work start —
+    /// but it must not be silent: an installed launch nulls stdout/stderr, so a
+    /// stale cut had no user-visible signal at all.
+    pub(super) async fn fetch_origin_or_toast(&self, card: &Card, project: &Project) {
+        let Err(e) = self.git.fetch(&project.path, "origin").await else {
+            return;
+        };
+        tracing::warn!("card {}: fetching origin failed: {e}", card.id);
+        // The app's reducer drops `card_id` and pushes toasts onto one global
+        // queue, so the text has to name the card itself. `Warning` persists
+        // until dismissed; info/success auto-dismiss.
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            card.id,
+            Severity::Warning,
+            format!(
+                "\u{201c}{}\u{201d}: couldn't refresh origin \u{2014} branching from the last \
+                 fetched origin/{}, which may be behind. {e}",
+                card.title,
+                project.config.effective_base_branch(),
+            ),
+        ));
+    }
+
+    /// Create a throwaway DETACHED worktree at a freshly fetched `origin/<base>`
+    /// for a read-only design run (plan / investigate / pre-worktree Q&A) to
+    /// read. The user's main checkout sits wherever their last pull left it, and
+    /// a plan written against a stale tree rides verbatim into the implement
+    /// prompt — so the design phase takes the same cut point the implement phase
+    /// does. Not persisted on the card: it's torn down when the run ends.
+    ///
+    /// Deliberately does NOT run the project's worktree setup script — design
+    /// runs are read-only and stay fast.
+    pub(super) async fn ensure_design_worktree(
+        &self,
+        card: &Card,
+        project: &Project,
+        resume: bool,
+    ) -> Result<PathBuf> {
+        let wt = design_worktree_path(&project.path, card.id);
+        // A `--resume` turn must land in the same cwd its conversation started
+        // in, so an existing tree is reused as-is rather than re-cut.
+        if resume && wt.exists() {
+            return Ok(wt);
+        }
+        self.fetch_origin_or_toast(card, project).await;
+        let base = crate::infra::git::remote_tracking_base(
+            &project.path,
+            project.config.effective_base_branch(),
+        );
+        // Clear any stale tree left by a run that never got to tear its own down.
+        if wt.exists() {
+            let _ = self.git.remove_worktree(&project.path, &wt).await;
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+        // DETACHED: the local counterpart of `origin/<base>` is normally checked
+        // out in the main tree, so a branch-claiming add would fail.
+        self.git
+            .worktree_add_detached(&project.path, &wt, &base)
+            .await?;
+        Ok(wt)
+    }
+
     /// Create the card's isolated worktree + branch and persist them onto the
     /// card. Shared by plan-approval and the "no plan" start path.
     ///
@@ -534,10 +642,9 @@ impl Executor {
         let project = self.store.get_project(card.project_id)?;
         // Refresh origin so the cut point is the *current* remote base, not
         // wherever it sat at the last pull. Non-fatal: offline, the last-fetched
-        // remote-tracking ref (or the local branch) still lets work start.
-        if let Err(e) = self.git.fetch(&project.path, "origin").await {
-            tracing::warn!("worktree for card {card_id}: fetching origin failed: {e}");
-        }
+        // remote-tracking ref (or the local branch) still lets work start — but
+        // the user gets a toast, since a silently stale cut is invisible.
+        self.fetch_origin_or_toast(&card, &project).await;
         let base = crate::infra::git::remote_tracking_base(
             &project.path,
             project.config.effective_base_branch(),
@@ -831,7 +938,7 @@ impl Executor {
     }
 
     /// Remove a card's git worktrees — its isolated one plus any leftover detached
-    /// self-review scratch tree — and, when `delete_branch` is set and the isolated
+    /// scratch trees (design, self-review) — and, when `delete_branch` is set and the isolated
     /// worktree is actually gone, its branch. Returns whether the isolated worktree
     /// is now removed, so callers can decide whether to keep pointing at it.
     /// Best-effort throughout; keyed off deterministic paths so it finds the
@@ -842,12 +949,17 @@ impl Executor {
         card: &Card,
         delete_branch: bool,
     ) -> bool {
-        // A self-review interrupted by a cancel/crash/quit can strand its detached
-        // scratch tree; nothing references it, so clean it by its known path.
-        let scratch = self_review_worktree_path(repo, card.id);
-        if scratch.exists() {
-            let _ = self.git.remove_worktree(repo, &scratch).await;
-            let _ = std::fs::remove_dir_all(&scratch);
+        // A design or self-review run interrupted by a cancel/crash/quit can strand
+        // its detached scratch tree; nothing references it, so clean it by its
+        // known path.
+        for scratch in [
+            self_review_worktree_path(repo, card.id),
+            design_worktree_path(repo, card.id),
+        ] {
+            if scratch.exists() {
+                let _ = self.git.remove_worktree(repo, &scratch).await;
+                let _ = std::fs::remove_dir_all(&scratch);
+            }
         }
         let mut worktree_gone = true;
         if let Some(worktree) = card.worktree_path.clone() {
