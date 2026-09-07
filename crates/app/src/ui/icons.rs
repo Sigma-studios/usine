@@ -74,9 +74,10 @@ pub(super) fn IconPaperclip() -> Element {
     }
 }
 
-/// Fold a board lane to a rail (rotated 180° by CSS for the expand direction).
+/// Disclosure chevron, drawn pointing left and rotated by CSS to point down
+/// (open) or right (folded).
 #[component]
-pub(super) fn IconChevronLeft() -> Element {
+pub(super) fn IconChevron() -> Element {
     rsx! {
         Glyph { polyline { points: "15 18 9 12 15 6" } }
     }
