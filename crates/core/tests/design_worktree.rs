@@ -3,15 +3,16 @@
 //! never the user's main checkout (which sits wherever their last pull left it).
 //!
 //! The first test runs against REAL git — `SimGit`'s worktree/fetch ops are
-//! no-ops, so only a real repo can prove the cut point. The other two cover the
-//! two degradation paths: a failed fetch warns but still runs, a failed worktree
-//! add fails the run instead of quietly falling back to the main checkout.
+//! no-ops, so only a real repo can prove the cut point. The rest cover the
+//! degradation paths: a failed fetch warns but still runs (and stays quiet for a
+//! local-only repo, whose fetch always fails), and a failed worktree add fails
+//! the run instead of quietly falling back to the main checkout.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardState, CoreError, DesignSub,
@@ -247,11 +248,112 @@ async fn a_plan_run_reads_a_fresh_origin_cut_not_the_main_checkout() {
     assert!(!git_out(&repo, &["worktree", "list"]).contains("-design"));
 }
 
+/// A provider that runs the simulator but reports itself ONE-SHOT, like the real
+/// CLIs: a mid-run question then tears the run down (and drops its runs-map
+/// entry) instead of staying attached.
+struct OneShotFactory;
+
+struct OneShotProvider(Arc<dyn AgentProvider>);
+
+#[async_trait::async_trait]
+impl AgentProvider for OneShotProvider {
+    fn provider(&self) -> Provider {
+        self.0.provider()
+    }
+    fn interactive(&self) -> bool {
+        false
+    }
+    async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
+        self.0.start(cfg).await
+    }
+}
+
+impl ProviderFactory for OneShotFactory {
+    fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
+        Arc::new(OneShotProvider(SimFactory.make(provider)))
+    }
+}
+
+/// Cancelling a design run parked on a question has to sweep the scratch tree:
+/// the one-shot run already dropped its runs-map entry when it tore down, so no
+/// actor is left to do it — and the tree deliberately survives that teardown so
+/// the user's answer can resume in the same cwd.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_parked_design_run_sweeps_its_scratch_tree() {
+    isolate_data_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "dev"]);
+    git(&repo, &["config", "user.email", "t@t.dev"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new("p", repo.clone(), ProjectConfig::default());
+    store.upsert_project(&project).unwrap();
+    let card = Card::new(project.id, "Plan it", "What now?", CardConfig::default());
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+
+    let (exec, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(OneShotFactory),
+        forge: Arc::new(usine_core::SimForge),
+        git: Arc::new(RealGit),
+    });
+
+    exec.send(ExecutorCommand::Start { card_id });
+    wait_for_state(&mut rx, |s| {
+        matches!(s, CardState::Designing(DesignSub::Intervention(_)))
+    })
+    .await;
+    // The tree survives the one-shot teardown (an answer would resume in it).
+    let scratch = design_dir(&repo, &format!("{card_id}-design"));
+    assert!(
+        scratch.exists(),
+        "the parked run keeps its tree for a resume"
+    );
+
+    exec.send(ExecutorCommand::Cancel { card_id });
+    wait_for_state(&mut rx, |s| matches!(s, CardState::StartingBlock)).await;
+    for _ in 0..100 {
+        if !scratch.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !scratch.exists(),
+        "cancelling the design phase sweeps its scratch tree"
+    );
+    assert!(!git_out(&repo, &["worktree", "list"]).contains("-design"));
+}
+
+/// The scratch tree's path, read off the only place it's observable from
+/// outside: `git worktree list`.
+fn design_dir(repo: &Path, needle: &str) -> PathBuf {
+    let list = git_out(repo, &["worktree", "list", "--porcelain"]);
+    for line in list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if path.ends_with(needle) {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    panic!("no design worktree registered:\n{list}");
+}
+
 /// A `GitOps` that delegates to `SimGit` except for the one call it is armed to
 /// fail. Only the trait's required methods need spelling out.
 struct FlakyGit {
     fail_fetch: bool,
     fail_detached_add: bool,
+    /// Whether the repo has an `origin` remote at all — a fetch failure only
+    /// toasts when it does (see `a_local_only_project_does_not_toast`).
+    has_origin: bool,
 }
 
 #[async_trait::async_trait]
@@ -282,6 +384,14 @@ impl GitOps for FlakyGit {
     }
     async fn delete_branch(&self, r: &Path, b: &str) -> Result<()> {
         SimGit.delete_branch(r, b).await
+    }
+    async fn remote_url(&self, _d: &Path, _remote: &str) -> Result<String> {
+        if self.has_origin {
+            Ok("https://example.invalid/p.git".into())
+        } else {
+            // What `git remote get-url origin` does in a repo with no remote.
+            Err(CoreError::other("No such remote 'origin'"))
+        }
     }
     async fn fetch(&self, d: &Path, remote: &str) -> Result<()> {
         if self.fail_fetch {
@@ -353,6 +463,7 @@ async fn a_failed_fetch_toasts_but_the_run_still_starts() {
         git: Arc::new(FlakyGit {
             fail_fetch: true,
             fail_detached_add: false,
+            has_origin: true,
         }),
     });
 
@@ -376,6 +487,61 @@ async fn a_failed_fetch_toasts_but_the_run_still_starts() {
     assert!(started.load(Ordering::SeqCst), "the run still started");
 }
 
+/// A project with no `origin` at all fails every fetch by construction — that's
+/// its steady state, not a stale cut. Toasting there would leave a persisting
+/// warning to dismiss on every single run, with text that isn't even true.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_only_project_does_not_toast_on_its_always_failing_fetch() {
+    isolate_data_dir();
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new("p", PathBuf::from("/tmp/p-local"), ProjectConfig::default());
+    store.upsert_project(&project).unwrap();
+    let card = Card::new(project.id, "Plan it", "go", CardConfig::default());
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let (exec, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(CountingFactory {
+            started: started.clone(),
+        }),
+        forge: Arc::new(usine_core::SimForge),
+        git: Arc::new(FlakyGit {
+            fail_fetch: true,
+            fail_detached_add: false,
+            has_origin: false,
+        }),
+    });
+
+    exec.send(ExecutorCommand::Start { card_id });
+    // Run to the same point the toasting test reaches, collecting every event.
+    let mut toasts = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "timed out waiting for the run");
+        let Ok(Some(evt)) = tokio::time::timeout(Duration::from_secs(10), rx.next()).await else {
+            panic!("event stream closed");
+        };
+        match &evt.kind {
+            ExecutorEventKind::Toast { severity, message } => {
+                toasts.push((*severity, message.clone()))
+            }
+            ExecutorEventKind::CardUpdated(c)
+                if matches!(c.state, CardState::Designing(DesignSub::Intervention(_))) =>
+            {
+                break
+            }
+            _ => {}
+        }
+    }
+    assert!(started.load(Ordering::SeqCst), "the run still started");
+    assert!(
+        !toasts.iter().any(|(sev, _)| *sev == Severity::Warning),
+        "no fetch warning for a repo with no origin: {toasts:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_uncreatable_design_worktree_fails_the_run_rather_than_reading_the_main_checkout() {
     isolate_data_dir();
@@ -396,6 +562,7 @@ async fn an_uncreatable_design_worktree_fails_the_run_rather_than_reading_the_ma
         git: Arc::new(FlakyGit {
             fail_fetch: false,
             fail_detached_add: true,
+            has_origin: true,
         }),
     });
 

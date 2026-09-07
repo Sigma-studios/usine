@@ -208,19 +208,14 @@ pub(super) async fn run_actor(
             reap_idle_preview_direct(&executor, card_id);
         }
     }
-    // Only clear the slot if it's still ours — a newer run for this card may have
-    // already replaced it.
-    let still_ours = {
-        let mut map = lock(&runs);
-        let ours = map
-            .get(&card_id)
-            .map(|(rid, _)| *rid == run_id)
-            .unwrap_or(false);
-        if ours {
-            map.remove(&card_id);
-        }
-        ours
-    };
+    // Is the card's current run still ours? A newer run may have already replaced
+    // it. Only *peeked* here: the slot is cleared after the scratch cleanup below,
+    // so a relaunch can't slip in between the two and have its fresh tree deleted
+    // by this outgoing actor.
+    let still_ours = lock(&runs)
+        .get(&card_id)
+        .map(|(rid, _)| *rid == run_id)
+        .unwrap_or(false);
     // The read-only runs (self-review, design) run in a throwaway detached scratch
     // worktree that only this actor knows the path to. Tear it down however the run
     // ended (done, cancel, error, timeout) so it can't leak — a no-op for every
@@ -235,6 +230,16 @@ pub(super) async fn run_actor(
                 cleanup_design_worktree(&store, &git, card_id).await
             }
             _ => {}
+        }
+        // Release the slot last, and only if it's *still* ours after the awaited
+        // cleanup — a relaunch that claimed the card meanwhile owns the entry.
+        let mut map = lock(&runs);
+        if map
+            .get(&card_id)
+            .map(|(rid, _)| *rid == run_id)
+            .unwrap_or(false)
+        {
+            map.remove(&card_id);
         }
     }
 }

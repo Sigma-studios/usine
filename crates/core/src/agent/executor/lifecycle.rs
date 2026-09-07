@@ -210,20 +210,8 @@ impl Executor {
             // that can't get a fresh tree fails loudly rather than quietly
             // planning against stale code.
             RunMode::Plan | RunMode::Investigate => {
-                match self
-                    .ensure_design_worktree(&card, &project, resume_session.is_some())
-                    .await
-                {
-                    Ok(wt) => wt,
-                    Err(e) => {
-                        return Err(self
-                            .fault_run(
-                                &card,
-                                format!("couldn't prepare a fresh design worktree: {e}"),
-                            )
-                            .await)
-                    }
-                }
+                self.design_dir_or_fault(&card, &project, resume_session.is_some())
+                    .await?
             }
             // Self-review is read-only, so run it in a throwaway DETACHED worktree
             // at the branch's committed HEAD. The card's own worktree is a valid
@@ -244,20 +232,10 @@ impl Executor {
             // whatever state the user's main checkout is in.
             RunMode::Triage | RunMode::Question => match card.worktree_path.clone() {
                 Some(wt) => wt,
-                None => match self
-                    .ensure_design_worktree(&card, &project, resume_session.is_some())
-                    .await
-                {
-                    Ok(wt) => wt,
-                    Err(e) => {
-                        return Err(self
-                            .fault_run(
-                                &card,
-                                format!("couldn't prepare a fresh design worktree: {e}"),
-                            )
-                            .await)
-                    }
-                },
+                None => {
+                    self.design_dir_or_fault(&card, &project, resume_session.is_some())
+                        .await?
+                }
             },
             // Write agents (implement / all fixes) must NEVER run in the user's main
             // working tree — they'd clobber it. Callers guarantee an isolated
@@ -575,6 +553,14 @@ impl Executor {
             return;
         };
         tracing::warn!("card {}: fetching origin failed: {e}", card.id);
+        // A project with no `origin` at all is a local-only repo, not a failed
+        // refresh: the fetch "failing" there is the steady state, and the toast's
+        // text ("branching from the last fetched origin/…") would be false. Keep
+        // the log line, skip the toast — otherwise every single run leaves a
+        // persisting warning for the user to dismiss.
+        if !self.has_origin(&project.path).await {
+            return;
+        }
         // The app's reducer drops `card_id` and pushes toasts onto one global
         // queue, so the text has to name the card itself. `Warning` persists
         // until dismissed; info/success auto-dismiss.
@@ -588,6 +574,37 @@ impl Executor {
                 project.config.effective_base_branch(),
             ),
         ));
+    }
+
+    /// [`Self::ensure_design_worktree`] for a launch: no fallback to the main
+    /// checkout — a design run that can't get a fresh tree parks the card in
+    /// `Failed` (recoverable with Retry) rather than quietly planning against
+    /// stale code. Shared by the plan/investigate and pre-worktree Q&A arms.
+    async fn design_dir_or_fault(
+        &self,
+        card: &Card,
+        project: &Project,
+        resume: bool,
+    ) -> Result<PathBuf> {
+        match self.ensure_design_worktree(card, project, resume).await {
+            Ok(wt) => Ok(wt),
+            Err(e) => Err(self
+                .fault_run(
+                    card,
+                    format!("couldn't prepare a fresh design worktree: {e}"),
+                )
+                .await),
+        }
+    }
+
+    /// Whether the repo has an `origin` remote configured. Backends that don't
+    /// model remotes report an empty URL and are treated as having none.
+    async fn has_origin(&self, repo: &Path) -> bool {
+        self.git
+            .remote_url(repo, "origin")
+            .await
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false)
     }
 
     /// Create a throwaway DETACHED worktree at a freshly fetched `origin/<base>`
@@ -617,8 +634,11 @@ impl Executor {
             project.config.effective_base_branch(),
         );
         // Clear any stale tree left by a run that never got to tear its own down.
+        // Retrying, like the card-worktree pre-clean: a dev server or indexer
+        // briefly holding the tree would otherwise leave a registered stale
+        // worktree and fail the run outright.
         if wt.exists() {
-            let _ = self.git.remove_worktree(&project.path, &wt).await;
+            let _ = self.remove_worktree_retrying(&project.path, &wt).await;
             let _ = std::fs::remove_dir_all(&wt);
         }
         // DETACHED: the local counterpart of `origin/<base>` is normally checked
@@ -779,6 +799,20 @@ impl Executor {
             )
         ) {
             self.discard_cancelled_run_edits(card_id, run_id).await;
+        }
+        // A one-shot design run parked on a question already dropped its runs-map
+        // entry when it tore down, so no actor is left to sweep its detached
+        // scratch tree — and `ensure_design_worktree` deliberately keeps an
+        // existing tree alive for the resumed answer. Cancelling abandons that
+        // conversation, so the tree is dead: remove it here. Skipped while a run
+        // is still live — that actor owns the path and cleans up itself.
+        if run_id.is_none()
+            && matches!(
+                prior,
+                CardState::Designing(_) | CardState::Investigating(_) | CardState::Answering { .. }
+            )
+        {
+            cleanup_design_worktree(&self.store, &self.git, card_id).await;
         }
         Ok(())
     }
