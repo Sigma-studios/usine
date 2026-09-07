@@ -208,21 +208,39 @@ pub(super) async fn run_actor(
             reap_idle_preview_direct(&executor, card_id);
         }
     }
-    // The self-review runs in a throwaway detached scratch worktree that only this
-    // actor knows the path to. Tear it down however the run ended (done, cancel,
-    // error, timeout) so it can't leak — a no-op for every other mode.
-    if matches!(mode, RunMode::Review) {
-        cleanup_self_review_worktree(&store, &git, card_id).await;
-    }
-    // Only clear the slot if it's still ours — a newer run for this card may have
-    // already replaced it.
-    let mut map = lock(&runs);
-    if map
+    // Is the card's current run still ours? A newer run may have already replaced
+    // it. Only *peeked* here: the slot is cleared after the scratch cleanup below,
+    // so a relaunch can't slip in between the two and have its fresh tree deleted
+    // by this outgoing actor.
+    let still_ours = lock(&runs)
         .get(&card_id)
         .map(|(rid, _)| *rid == run_id)
-        .unwrap_or(false)
-    {
-        map.remove(&card_id);
+        .unwrap_or(false);
+    // The read-only runs (self-review, design) run in a throwaway detached scratch
+    // worktree that only this actor knows the path to. Tear it down however the run
+    // ended (done, cancel, error, timeout) so it can't leak — a no-op for every
+    // other mode. Gated on the run still being ours: the scratch path is
+    // deterministic per card, so a retry can already have re-cut the same path for
+    // run N+1 while run N's actor is still unwinding, and an unguarded cleanup
+    // would delete the new run's tree out from under it.
+    if still_ours {
+        match mode {
+            RunMode::Review => cleanup_self_review_worktree(&store, &git, card_id).await,
+            RunMode::Plan | RunMode::Investigate | RunMode::Triage | RunMode::Question => {
+                cleanup_design_worktree(&store, &git, card_id).await
+            }
+            _ => {}
+        }
+        // Release the slot last, and only if it's *still* ours after the awaited
+        // cleanup — a relaunch that claimed the card meanwhile owns the entry.
+        let mut map = lock(&runs);
+        if map
+            .get(&card_id)
+            .map(|(rid, _)| *rid == run_id)
+            .unwrap_or(false)
+        {
+            map.remove(&card_id);
+        }
     }
 }
 

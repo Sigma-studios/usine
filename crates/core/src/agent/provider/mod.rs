@@ -38,8 +38,9 @@ pub enum RunMode {
     /// answers in prose, never editing files. Changes go through the request-
     /// changes flows instead.
     Question,
-    /// Read-only investigation/audit in the main checkout; the final response is
-    /// the conclusion the card parks on.
+    /// Read-only investigation/audit in a throwaway detached worktree cut at a
+    /// freshly fetched `origin/<base>`; the final response is the conclusion the
+    /// card parks on.
     Investigate,
 }
 
@@ -59,7 +60,9 @@ impl RunMode {
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub provider: Provider,
-    /// Working directory: the repo root for `Plan`, the worktree otherwise.
+    /// Working directory: the card's isolated worktree for write runs, a
+    /// throwaway detached scratch worktree for the read-only ones (a fresh
+    /// `origin/<base>` cut for design, the branch HEAD for self-review).
     pub project_dir: PathBuf,
     pub spec: ModelSpec,
     pub mode: RunMode,
