@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use usine_core::{Card, Column};
 
 use super::card::CardView;
-use super::icons::IconChevronLeft;
+use super::icons::IconChevron;
 use super::ReviewBoard;
 use crate::state::{AppState, BoardMode, SelectedView};
 
@@ -104,9 +104,9 @@ fn visible_columns(cards: &[Card], keep_all: bool) -> Vec<(Column, Vec<Card>)> {
         .collect()
 }
 
-/// One lane. When `collapsed` the whole lane becomes a narrow rail — keeping
-/// its title and count, so it still reports what landed in it — and the rail
-/// itself is the button that reopens it.
+/// One lane. When `collapsed` it keeps its header — title, count, chevron — so
+/// it still reports what landed in it, and only drops its cards; the whole
+/// folded header is the button that reopens it.
 #[component]
 fn ColumnView(column: Column, cards: Vec<Card>, collapsed: bool) -> Element {
     let state = use_context::<AppState>();
@@ -120,45 +120,52 @@ fn ColumnView(column: Column, cards: Vec<Card>, collapsed: bool) -> Element {
         state.save_settings(s);
     };
 
-    if collapsed {
-        return rsx! {
-            div { class: "column collapsed",
+    let class = if collapsed {
+        "column collapsed"
+    } else {
+        "column"
+    };
+
+    rsx! {
+        div { class: "{class}",
+            if collapsed {
+                // Folded: the header itself is the button that reopens the lane,
+                // so the chevron is drawn as a plain span — a button inside a
+                // button is invalid markup and would toggle twice on one click.
                 button {
-                    class: "column-rail",
+                    class: "column-header column-header-btn",
                     title: "Expand {title}",
                     aria_label: "Expand {title}",
                     aria_expanded: "false",
                     onclick: toggle,
-                    span { class: "column-toggle", IconChevronLeft {} }
-                    span { class: "column-count", "{count}" }
-                    span { class: "column-rail-title", "{title}" }
-                }
-            }
-        };
-    }
-
-    rsx! {
-        div { class: "column",
-            div { class: "column-header", title: "{title}",
-                span { "{title}" }
-                div { class: "column-header-right",
-                    span { class: "column-count", "{count}" }
-                    button {
-                        class: "card-icon-btn column-toggle",
-                        title: "Collapse {title}",
-                        aria_label: "Collapse {title}",
-                        aria_expanded: "true",
-                        onclick: toggle,
-                        IconChevronLeft {}
+                    span { class: "column-title", "{title}" }
+                    span { class: "column-header-right",
+                        span { class: "column-count", "{count}" }
+                        span { class: "column-toggle", IconChevron {} }
                     }
                 }
-            }
-            div { class: "column-body",
-                for card in cards.iter() {
-                    CardView { key: "{card.id}", card: card.clone() }
+            } else {
+                div { class: "column-header", title: "{title}",
+                    span { class: "column-title", "{title}" }
+                    div { class: "column-header-right",
+                        span { class: "column-count", "{count}" }
+                        button {
+                            class: "card-icon-btn column-toggle",
+                            title: "Collapse {title}",
+                            aria_label: "Collapse {title}",
+                            aria_expanded: "true",
+                            onclick: toggle,
+                            IconChevron {}
+                        }
+                    }
                 }
-                if is_start {
-                    AddCardButton {}
+                div { class: "column-body",
+                    for card in cards.iter() {
+                        CardView { key: "{card.id}", card: card.clone() }
+                    }
+                    if is_start {
+                        AddCardButton {}
+                    }
                 }
             }
         }

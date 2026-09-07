@@ -218,18 +218,30 @@ body.resizing .info-tip { visibility: hidden; opacity: 0; }
 .column-header-right { display: flex; align-items: center; gap: 4px; }
 /* Reuses .card-icon-btn's transparent/muted look, at header size — the second
    selector outranks `.card-icon-btn`'s own 26px box, which is declared later. */
-.column-toggle, .card-icon-btn.column-toggle { width: 22px; height: 22px; }
-/* A lane the user isn't watching folds to a labelled rail; the whole rail is
-   the button that reopens it. */
-.column.collapsed { width: 44px; min-width: 44px; }
-.column-rail {
-  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 10px;
-  padding: 10px 0; background: transparent; border: none; color: var(--muted);
-  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; overflow: hidden;
+.column-toggle, .card-icon-btn.column-toggle {
+  display: flex; align-items: center; justify-content: center; width: 22px; height: 22px;
 }
-.column-rail:hover { color: var(--text); }
-.column-rail .column-toggle { display: flex; align-items: center; justify-content: center; transform: rotate(180deg); }
-.column-rail-title { writing-mode: vertical-rl; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A folded lane keeps its header — title, count, and the chevron — and drops
+   only the cards, shrinking to the header instead of holding a 280px slot or
+   stretching an empty box down the board. */
+.column.collapsed { width: 160px; min-width: 160px; align-self: flex-start; }
+/* The whole folded header is the button that reopens the lane. */
+.column-header-btn {
+  width: 100%; background: transparent; border: none; border-radius: inherit;
+  color: inherit; font: inherit; font-weight: 600; font-size: 13px;
+  text-align: left; cursor: pointer;
+}
+.column-header-btn:hover { background: var(--surface-hover); }
+/* The folded chevron is a span, not a .card-icon-btn, so it needs the muted look. */
+.column-header-btn .column-toggle { color: var(--muted); }
+/* With no body under it, the header's rule would double up on the column border. */
+.column.collapsed .column-header { border-bottom: none; }
+/* 160px is narrower than some lane titles ("Starting block", "Self review"). */
+.column-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.column.collapsed .column-header-right { flex: none; }
+/* Disclosure direction: down when the cards show, right when they're folded. */
+.column-toggle svg { transform: rotate(-90deg); }
+.column.collapsed .column-toggle svg { transform: rotate(180deg); }
 
 /* ----- New card form ----- */
 .new-card { display: flex; flex-direction: column; gap: 6px; padding: 4px; }
