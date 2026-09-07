@@ -232,12 +232,14 @@ body.resizing .info-tip { visibility: hidden; opacity: 0; }
   text-align: left; cursor: pointer;
 }
 .column-header-btn:hover { background: var(--surface-hover); }
-/* The folded chevron is a span, not a .card-icon-btn, so it needs the muted look. */
+/* The folded chevron is a span, not a .card-icon-btn, so it needs the muted look
+   — and its own hover rule, since the button, not the span, is what's hovered. */
 .column-header-btn .column-toggle { color: var(--muted); }
-/* With no body under it, the header's rule would double up on the column border. */
-.column.collapsed .column-header { border-bottom: none; }
-/* 160px is narrower than some lane titles ("Starting block", "Self review"). */
-.column-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.column-header-btn:hover .column-toggle { color: var(--text); }
+/* 160px is narrower than some lane titles ("Starting block", "Self review").
+   `min-width: 0` is what lets the title shrink at all: without it a flex item
+   refuses to go below its longest word and shoves the count and chevron out. */
+.column-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .column.collapsed .column-header-right { flex: none; }
 /* Disclosure direction: down when the cards show, right when they're folded. */
 .column-toggle svg { transform: rotate(-90deg); }
