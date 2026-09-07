@@ -132,6 +132,16 @@ fn current(state: &AppState, panel: Panel) -> u32 {
     )
 }
 
+/// Classes for the grab strip. `has-tip` opts into the shared `.info-tip`
+/// reveal rule; `.panel-resizer.has-tip` in the stylesheet keeps that class
+/// from stealing the handle's `position` (see the tests below).
+fn handle_class(panel: Panel) -> &'static str {
+    match panel {
+        Panel::Sidebar => "panel-resizer panel-resizer-right has-tip",
+        Panel::Detail => "panel-resizer panel-resizer-left has-tip",
+    }
+}
+
 /// The grab strip on a panel's inner edge. Mouse dragging is handled by the
 /// delegated listener in [`PanelResizeHost`]; this component owns only the
 /// keyboard affordances, so the handle stays reachable without a pointer.
@@ -139,10 +149,7 @@ fn current(state: &AppState, panel: Panel) -> u32 {
 pub fn PanelResizer(panel: Panel) -> Element {
     let state = use_context::<AppState>();
     let spec = panel.spec();
-    let class = match panel {
-        Panel::Sidebar => "panel-resizer panel-resizer-right has-tip",
-        Panel::Detail => "panel-resizer panel-resizer-left has-tip",
-    };
+    let class = handle_class(panel);
 
     rsx! {
         div {
@@ -283,4 +290,22 @@ fn drag_js() -> String {
         dkey = d.key, dvar = d.var, dsel = d.selector, dmin = d.min, dmax = d.max,
         ddef = d.default, dcap = d.viewport_cap,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.has-tip { position: relative; }` sits later in the stylesheet at equal
+    /// specificity, so without the two-class override the handle loses its
+    /// absolute positioning and collapses to a zero-height, unhoverable box —
+    /// a failure that is silent everywhere else.
+    #[test]
+    fn resizer_position_survives_has_tip() {
+        for panel in [Panel::Sidebar, Panel::Detail] {
+            assert!(handle_class(panel).contains("has-tip"));
+            assert!(handle_class(panel).contains("panel-resizer"));
+        }
+        assert!(crate::CSS.contains(".panel-resizer.has-tip { position: absolute; }"));
+    }
 }

@@ -99,6 +99,11 @@ body {
   cursor: col-resize; z-index: 5; touch-action: none;
   background: transparent; transition: background 0.12s ease;
 }
+/* `.has-tip` (further down) also declares `position`, at equal specificity and
+   later in the file, so it would win and collapse this strip into a zero-height
+   in-flow flex item — unhoverable, hence no cursor, no highlight, no drag.
+   Pin the box with a two-class selector so source order stops mattering. */
+.panel-resizer.has-tip { position: absolute; }
 .panel-resizer-right { right: -3px; }
 .panel-resizer-left { left: -3px; }
 /* The drag listener marks `<body>` with the key of the handle in flight, so only
