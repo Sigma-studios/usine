@@ -1,8 +1,10 @@
 use dioxus::prelude::*;
-use usine_core::{Card, Column};
+use usine_core::{Card, Column, Project};
+use uuid::Uuid;
 
 use super::card::CardView;
 use super::icons::IconChevron;
+use super::newcard::NewCardIntent;
 use super::ReviewBoard;
 use crate::state::{AppState, BoardMode, SelectedView};
 
@@ -172,34 +174,64 @@ fn ColumnView(column: Column, cards: Vec<Card>, collapsed: bool) -> Element {
     }
 }
 
-/// Creates a blank card in the current project (or the first project in the
-/// global view) and opens it for editing. Lives at the bottom of the column.
+/// Where a new card goes when the starting-block buttons are clicked.
+#[derive(Debug, PartialEq)]
+enum NewCardTarget {
+    Project(Uuid),
+    Ask,
+}
+
+/// `None` = no projects at all (the caller shows the "Add a project" hint). A
+/// project view names its own target; the Home view asks, unless there is only
+/// one project and therefore nothing to ask about.
+fn new_card_target(view: SelectedView, projects: &[Project]) -> Option<NewCardTarget> {
+    match view {
+        SelectedView::Project(id) => Some(NewCardTarget::Project(id)),
+        SelectedView::Global => match projects {
+            [] => None,
+            [only] => Some(NewCardTarget::Project(only.id)),
+            _ => Some(NewCardTarget::Ask),
+        },
+    }
+}
+
+/// Creates a blank card and opens it for editing, or adopts an existing branch.
+/// In a project view both act on that project; from the Home view they ask
+/// which project first (unless there is only one). Lives at the bottom of the
+/// column.
 #[component]
 fn AddCardButton() -> Element {
     let state = use_context::<AppState>();
     let projects = state.projects.read().clone();
-    if projects.is_empty() {
+    let view = *state.selected_view.read();
+    let Some(target) = new_card_target(view, &projects) else {
         return rsx! {
             div { class: "hint center", "Add a project to create cards." }
         };
-    }
-    let target = match *state.selected_view.read() {
-        SelectedView::Project(id) => id,
-        SelectedView::Global => projects[0].id,
+    };
+    let target = match target {
+        NewCardTarget::Project(id) => Some(id),
+        NewCardTarget::Ask => None,
     };
 
     rsx! {
         button {
             class: "add-card",
-            onclick: move |_| state.create_card(target, String::new(), String::new()),
+            onclick: move |_| match target {
+                Some(id) => state.create_card(id, String::new(), String::new()),
+                None => super::newcard::open_project_picker(NewCardIntent::Blank),
+            },
             "+ Add card"
         }
         button {
             class: "add-card",
-            onclick: move |_| {
-                // Fetch first so the picker fills as the modal appears.
-                state.fetch_adopt_sources(target);
-                super::adoptdialog::open_adopt_dialog(target);
+            onclick: move |_| match target {
+                Some(id) => {
+                    // Fetch first so the picker fills as the modal appears.
+                    state.fetch_adopt_sources(id);
+                    super::adoptdialog::open_adopt_dialog(id);
+                }
+                None => super::newcard::open_project_picker(NewCardIntent::Adopt),
             },
             "⤵ Adopt branch…"
         }
@@ -209,8 +241,40 @@ fn AddCardButton() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use usine_core::{CardConfig, CardState};
-    use uuid::Uuid;
+
+    fn project(name: &str) -> Project {
+        Project {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            path: PathBuf::from("/tmp").join(name),
+            config: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_project_view_targets_its_own_project() {
+        let (a, b) = (project("a"), project("b"));
+        assert_eq!(
+            new_card_target(SelectedView::Project(b.id), &[a, b.clone()]),
+            Some(NewCardTarget::Project(b.id))
+        );
+    }
+
+    #[test]
+    fn home_asks_only_when_there_is_a_choice() {
+        let (a, b) = (project("a"), project("b"));
+        assert_eq!(new_card_target(SelectedView::Global, &[]), None);
+        assert_eq!(
+            new_card_target(SelectedView::Global, std::slice::from_ref(&a)),
+            Some(NewCardTarget::Project(a.id))
+        );
+        assert_eq!(
+            new_card_target(SelectedView::Global, &[a, b]),
+            Some(NewCardTarget::Ask)
+        );
+    }
 
     /// A card with a recognisable title, so assertions read as the column does.
     fn card(title: &str, state: CardState, blocked: bool, stamp: i64) -> Card {

@@ -30,7 +30,7 @@ use futures::StreamExt;
 use state::AppState;
 use toast::ToastHost;
 use ui::{
-    AdoptDialogHost, BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost,
+    AdoptDialogHost, BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost, NewCardHost,
     PanelResizeHost, ProjectSettingsModal, SearchHost, SettingsModal, ShortcutHost, Sidebar,
     UsageBar,
 };
@@ -348,6 +348,7 @@ fn App() -> Element {
         CardMenuHost {}
         ConfirmHost {}
         AdoptDialogHost {}
+        NewCardHost {}
         DiffDialogHost {}
         SettingsModal {}
         ProjectSettingsModal {}
