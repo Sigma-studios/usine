@@ -422,6 +422,17 @@ select option { background: var(--panel-2); color: var(--text); }
   position: relative;
   background: var(--panel);
   border-left: 1px solid var(--border); display: flex; flex-direction: column;
+  /* Agent text is arbitrary: findings quote identifiers, URLs and stack frames,
+     none of which offer a break opportunity, so at `normal` one long token runs
+     past the panel edge — and `.detail-body`'s `overflow-y: auto` turns that
+     into an invisible horizontal scroll (overlay scrollbars). `overflow-wrap`
+     is inherited, so one declaration covers the header, the banners and every
+     box in the body — in both CardDetail and ReviewDetail, which share these
+     classes. `anywhere`, not `break-word`: it also shrinks min-content, so the
+     flex rows inside `.comment` size to their text instead of being pushed wide
+     by one long word. Fenced code (`pre.md-code`) is unaffected: wrapping does
+     not apply to `white-space: pre`, so it keeps its own scroller. */
+  overflow-wrap: anywhere;
 }
 .detail-header { padding: 16px; border-bottom: 1px solid var(--border); }
 /* Title, then its diff button; the close button is pinned to the far right. */
@@ -456,9 +467,14 @@ select option { background: var(--panel-2); color: var(--text); }
    the width evenly — the message takes what is left. */
 .detail-banner .row > .spinner { flex: 0 0 auto; }
 .detail-banner .row span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The failure message is a bare `div`, not a `.row`; without this a long
+   "Run failed: …" would push Retry off the panel instead of wrapping. */
+.detail-banner > div { min-width: 0; }
 .detail-banner .btn { flex: 0 0 auto; }
 .detail-banner.danger { color: var(--red); border-bottom-color: var(--danger-border); }
-.detail-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+/* Vertical scroller only: pinning `overflow-x` keeps a stray wide child from
+   reintroducing the invisible sideways scroll `overflow-y: auto` would imply. */
+.detail-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
 .detail-close {
   margin-left: auto; flex: none; background: transparent; border: none;
   color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1;
@@ -763,6 +779,9 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
   border-left: 3px solid var(--accent); border-radius: 6px;
   font-family: system-ui, -apple-system, sans-serif; font-size: 12px;
   display: flex; flex-direction: column; gap: 6px; cursor: auto;
+  /* Same agent prose as the detail panel, but `.detail`'s inherited wrapping
+     does not reach the modal, and `.diff-main` clips overflow outright. */
+  overflow-wrap: anywhere;
 }
 /* Unchecked: it stays legible and editable, but reads as excluded. */
 .inline-comment.is-skipped { border-left-color: var(--border); opacity: 0.6; }
