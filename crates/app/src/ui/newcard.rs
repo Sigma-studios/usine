@@ -107,11 +107,11 @@ fn ProjectPicker(intent: NewCardIntent) -> Element {
                             }
                         }
                     }
-                }
-                // Same-named folders are told apart by path in the sidebar; do
-                // the same here so the choice is unambiguous.
-                if let Some(path) = path {
-                    div { class: "hint", "{path}" }
+                    // Same-named folders are told apart by path in the sidebar;
+                    // do the same here so the choice is unambiguous.
+                    if let Some(path) = path {
+                        div { class: "hint", "{path}" }
+                    }
                 }
                 div { class: "modal-actions",
                     button { class: "btn", onclick: move |_| dismiss(), "Cancel" }
