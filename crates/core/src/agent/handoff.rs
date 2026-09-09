@@ -74,26 +74,34 @@ right, say so there.\n";
 
 /// The `tests` bullet for a project that can run its app: the reviewer has this
 /// card's preview, so the checklist has to be executable in it — and only in
-/// it. The environment is re-created from scratch (setup script, fresh seed)
-/// when the reviewer restarts the preview, so a scenario leaning on a row the
-/// agent hand-made during its own run is dead on arrival; and preview ports are
-/// per-worktree, so a hard-coded URL is too.
+/// it. The environment is re-created from scratch when the reviewer restarts
+/// the preview, so a scenario leaning on a row the agent hand-made during its
+/// own run is dead on arrival; and preview ports are per-worktree, so a
+/// hard-coded URL is too.
+///
+/// The seed itself is hedged: all `local_app` proves is a `run_script`, while
+/// the setup script that would re-seed is auto-detected and optional — so a
+/// project can perfectly well have a runnable app and no seed at all, and
+/// asserting one as fact would box the agent in on a false premise about its
+/// own environment. The route and no-hard-coded-URL requirements hold
+/// unconditionally.
 const TESTS_SEEDED: &str = "\
 - `tests`: a hand-testing script for the reviewer, who will run this card's app locally — the same \
-worktree preview you had, but restarted from scratch: the setup script re-creates the environment \
-and re-seeds its data, so anything you created by hand during your run is gone. Every scenario \
-must be executable in that seeded local environment and nothing else — no production or staging \
-data, no hand-edited database rows, no account that does not exist in the seed. Be concrete: name \
-the path to open (a route like `/settings/billing`, never a hard-coded URL — the port is \
-per-worktree), the seeded account to sign in as with the exact credentials from the repo's own \
-seed/fixture data (never \"log in as an admin\"), and the seeded records to act on by the names \
-they carry in the seed. If the seed does not already contain the state a scenario needs, make \
-creating it the first steps of the scenario. `scenario` is what to do (sign in → route → \
-actions), `expect` is what should happen. Most important first, and favour what your automated \
-tests do not already cover: the risky paths, the edge cases you touched, the flows a regression \
-would hide in. Set `verified: true` only for a scenario you actually ran yourself in the app, as \
-written — it still deserves a human eye, but the reviewer should know it has been run once. Use \
-an empty array if the change has no observable behaviour.\n";
+worktree preview you had, but restarted from scratch: the setup re-creates the environment, \
+re-seeding its data if the project seeds any, so anything you created by hand during your run is \
+gone. Every scenario must be executable in that local environment and nothing else — no production \
+or staging data, no hand-edited database rows, and, where the project seeds data, no account or \
+record that does not exist in the seed. Be concrete: name the path to open (a route like \
+`/settings/billing`, never a hard-coded URL — the port is per-worktree), the account to sign in as \
+with the exact credentials the repo's own seed/fixture data gives it (never \"log in as an \
+admin\"), and the records to act on by the names they carry in the seed. If the seed does not \
+already contain the state a scenario needs, make creating it the first steps of the scenario. \
+`scenario` is what to do (sign in → route → actions), `expect` is what should happen. Most \
+important first, and favour what your automated tests do not already cover: the risky paths, the \
+edge cases you touched, the flows a regression would hide in. Set `verified: true` only for a \
+scenario you actually ran yourself in the app, as written — it still deserves a human eye, but the \
+reviewer should know it has been run once. Use an empty array if the change has no observable \
+behaviour.\n";
 
 /// The `tests` bullet for a project with no runnable app: same checklist, no
 /// environment to promise.
@@ -479,8 +487,8 @@ mod tests {
     fn only_the_local_app_variant_demands_the_seeded_environment() {
         let seeded = handoff_instruction(true);
         for phrase in [
-            "seeded local environment",
-            "re-seeds its data",
+            "executable in that local environment",
+            "if the project seeds any",
             "exact credentials",
             "seed/fixture data",
             "no hand-edited database rows",
