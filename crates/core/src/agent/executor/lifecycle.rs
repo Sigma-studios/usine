@@ -307,19 +307,21 @@ impl Executor {
         // variant choice and the dispatch below key off the same conditions, so
         // the agent is never told to test against an app that can't exist. An
         // implement run also hands off to the human who reviews it next — a
-        // recap, its open questions, and what to test — which the
+        // recap, its open questions, and what to test, that last list written
+        // against the card's seeded preview when there is one — which the
         // awaiting-review panel renders. Fix runs report through their own recap
         // instead, and are told their final message is it.
         let extra = match mode {
             RunMode::Implement | RunMode::ApplyFixes => {
                 let mut tail = String::new();
-                if let Some(run) = super::preview::run_command(&project.config) {
+                let run = super::preview::run_command(&project.config);
+                if let Some(run) = &run {
                     let has_ports = !project.config.preview_ports.is_empty();
                     let shot = project.config.screenshot_command();
                     let instruction = if project.config.auto_preview {
-                        crate::agent::testing::testing_instruction(&run, has_ports, shot)
+                        crate::agent::testing::testing_instruction(run, has_ports, shot)
                     } else {
-                        crate::agent::testing::testing_instruction_on_request(&run, has_ports, shot)
+                        crate::agent::testing::testing_instruction_on_request(run, has_ports, shot)
                     };
                     tail.push_str(&instruction);
                     tail.push_str("\n\n");
@@ -327,7 +329,7 @@ impl Executor {
                 tail.push_str(crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION);
                 if mode == RunMode::Implement {
                     tail.push_str("\n\n");
-                    tail.push_str(crate::agent::handoff::HANDOFF_INSTRUCTION);
+                    tail.push_str(&crate::agent::handoff::handoff_instruction(run.is_some()));
                 } else {
                     tail.push_str("\n\n");
                     tail.push_str(crate::agent::fixes::FIX_RECAP_INSTRUCTION);
