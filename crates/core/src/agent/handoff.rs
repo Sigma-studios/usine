@@ -7,7 +7,9 @@
 //!
 //! So the run is asked to append a fenced ` ```usine-handoff ` JSON block: a
 //! recap of the work done, the files it touched, any open questions, the risks
-//! it took, and the things worth testing by hand.
+//! it took, and the things worth testing by hand — that last list written
+//! against the card's own seeded preview environment, so the reviewer can run
+//! it as written (see [`handoff_instruction`]).
 //! [`parse_handoff`] pulls it out; the executor stores it on the card and the
 //! detail panel renders it beside the self-review and PR buttons. Same
 //! prompt-and-parse shape as [`crate::agent::commit`] and [`crate::agent::review`],
@@ -39,7 +41,23 @@ const VERSION: u8 = 2;
 /// Appended to implement runs (not to fix runs, which report through their own
 /// recap — see [`crate::agent::fixes`]). Kept provider-agnostic and
 /// self-contained.
-pub const HANDOFF_INSTRUCTION: &str = "\
+///
+/// `local_app` says whether the project can actually run its app — the same
+/// condition that gates [`crate::agent::testing::testing_instruction`]. When it
+/// can, the `tests` list is demanded against the card's own seeded preview:
+/// concrete routes, real seeded accounts, seeded records. When it can't (a
+/// library, a project with no `run_script`), the generic bullet stands, because
+/// there is no environment to point the reviewer at.
+pub fn handoff_instruction(local_app: bool) -> String {
+    let tests = if local_app {
+        TESTS_SEEDED
+    } else {
+        TESTS_GENERIC
+    };
+    format!("{HANDOFF_HEADER}{tests}{HANDOFF_TAIL}")
+}
+
+const HANDOFF_HEADER: &str = "\
 When you have finished making changes, hand the work off to the human who will review it. Emit a \
 fenced code block tagged `usine-handoff` containing a JSON object shaped like \
 {\"v\": 2, \"summary\": \"<what was done>\", \"changes\": [{\"path\": \"<file>\", \"what\": \
@@ -52,13 +70,50 @@ outcome, for someone who did not watch you work. Keep it short — the per-file 
 - `changes`: one entry per file you meaningfully touched, covering everything in the diff \
 (features, refactors, tests, docs, config). Say plainly in `what` anything you had to work \
 around or deliberately left out; if part of the task is unfinished, or you are unsure a change is \
-right, say so there.\n\
+right, say so there.\n";
+
+/// The `tests` bullet for a project that can run its app: the reviewer has this
+/// card's preview, so the checklist has to be executable in it — and only in
+/// it. The environment is re-created from scratch when the reviewer restarts
+/// the preview, so a scenario leaning on a row the agent hand-made during its
+/// own run is dead on arrival; and preview ports are per-worktree, so a
+/// hard-coded URL is too.
+///
+/// The seed itself is hedged: all `local_app` proves is a `run_script`, while
+/// the setup script that would re-seed is auto-detected and optional — so a
+/// project can perfectly well have a runnable app and no seed at all, and
+/// asserting one as fact would box the agent in on a false premise about its
+/// own environment. The route and no-hard-coded-URL requirements hold
+/// unconditionally.
+const TESTS_SEEDED: &str = "\
+- `tests`: a hand-testing script for the reviewer, who will run this card's app locally — the same \
+worktree preview you had, but restarted from scratch: the setup re-creates the environment, \
+re-seeding its data if the project seeds any, so anything you created by hand during your run is \
+gone. Every scenario must be executable in that local environment and nothing else — no production \
+or staging data, no hand-edited database rows, and, where the project seeds data, no account or \
+record that does not exist in the seed. Be concrete: name the path to open (a route like \
+`/settings/billing`, never a hard-coded URL — the port is per-worktree), the account to sign in as \
+with the exact credentials the repo's own seed/fixture data gives it (never \"log in as an \
+admin\"), and the records to act on by the names they carry in the seed. If the seed does not \
+already contain the state a scenario needs, make creating it the first steps of the scenario. \
+`scenario` is what to do (sign in → route → actions), `expect` is what should happen. Most \
+important first, and favour what your automated tests do not already cover: the risky paths, the \
+edge cases you touched, the flows a regression would hide in. Set `verified: true` only for a \
+scenario you actually ran yourself in the app, as written — it still deserves a human eye, but the \
+reviewer should know it has been run once. Use an empty array if the change has no observable \
+behaviour.\n";
+
+/// The `tests` bullet for a project with no runnable app: same checklist, no
+/// environment to promise.
+const TESTS_GENERIC: &str = "\
 - `tests`: what is worth checking by hand in the running app, most important first. `scenario` is \
 what to do, `expect` is what should happen. Favour what your automated tests do not already cover: \
 the risky paths, the edge cases you touched, the flows a regression would hide in. Set \
 `verified: true` only for a scenario you actually exercised yourself in the running app — it still \
 deserves a human eye, but the reviewer should know it has been run once. Use an empty array if \
-the change has no observable behaviour.\n\
+the change has no observable behaviour.\n";
+
+const HANDOFF_TAIL: &str = "\
 - `risks`: what could bite the reviewer or a user — a migration, a behaviour change, something \
 you could not test. Empty array if none.\n\
 - `questions`: what you genuinely want the author to weigh in on — a judgement call that could \
@@ -418,8 +473,39 @@ mod tests {
 
     #[test]
     fn the_instruction_states_the_v2_contract() {
-        for field in ["\"v\": 2", "changes", "risks", "verified"] {
-            assert!(HANDOFF_INSTRUCTION.contains(field), "missing {field}");
+        for local_app in [true, false] {
+            let s = handoff_instruction(local_app);
+            for field in ["\"v\": 2", "changes", "risks", "verified"] {
+                assert!(s.contains(field), "missing {field} (local_app={local_app})");
+            }
         }
+    }
+
+    /// The seeded variant is the whole point of the split: it may only be
+    /// promised where the reviewer actually has the card's preview to run.
+    #[test]
+    fn only_the_local_app_variant_demands_the_seeded_environment() {
+        let seeded = handoff_instruction(true);
+        for phrase in [
+            "executable in that local environment",
+            "if the project seeds any",
+            "exact credentials",
+            "seed/fixture data",
+            "no hand-edited database rows",
+            "never a hard-coded URL",
+        ] {
+            assert!(seeded.contains(phrase), "missing {phrase}");
+        }
+
+        let generic = handoff_instruction(false);
+        for phrase in ["seed", "credentials", "hard-coded URL"] {
+            assert!(
+                !generic.contains(phrase),
+                "the no-app variant must not mention {phrase}"
+            );
+        }
+        // …but it still asks for the same checklist.
+        assert!(generic.contains("worth checking by hand in the running app"));
+        assert!(generic.contains("most important first"));
     }
 }

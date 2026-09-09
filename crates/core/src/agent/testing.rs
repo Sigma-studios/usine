@@ -50,7 +50,7 @@ pub fn testing_instruction(run_script: &str, has_ports: bool, screenshot: Option
          restart it — it watch-reloads your edits. Once the app is up, `{PREVIEW_INFO_FILE}` in the \
          worktree root lists its local URLs. Setup (dependency install, an isolated database, port \
          allocation) can take a few minutes and the file only appears when the app process is \
-         launched, so if it is missing, keep working and check again later.\n{}\n\
+         launched, so if it is missing, keep working and check again later.\n{}\n{SEED_DATA}\n\
          Leave the app running when you finish — the tool that launched you stops it once the work \
          parks.",
         observation_route(has_ports, screenshot)
@@ -73,12 +73,32 @@ pub fn testing_instruction_on_request(
          while it comes up and watch for `{PREVIEW_INFO_FILE}` in the worktree root, which lists \
          its local URLs once the app process is launched. The tool that launched you owns that \
          process: do NOT start your own instance and do NOT stop or restart it — it watch-reloads \
-         your edits.\n{}\n\
+         your edits.\n{}\n{SEED_DATA}\n\
          Leave the app running when you finish — the tool that launched you stops it once the work \
          parks.",
         observation_route(has_ports, screenshot)
     )
 }
+
+/// The environment half of the in-app check, shared by both instruction
+/// variants: the worktree's app comes up on the project's own seed data, so
+/// that is what the agent must sign in with — inventing an account or poking
+/// the database by hand produces a scenario the reviewer cannot repeat, since
+/// `reap_idle_preview` tears the environment down and the next start re-creates
+/// it. Naming what it used is what makes the seeded `tests` list the hand-off
+/// asks for (see [`crate::agent::handoff::handoff_instruction`]) writable — but
+/// the ask is phrased mode-neutrally ("your report"), because
+/// `executor::lifecycle` appends this to fix runs too, and those report through
+/// [`crate::agent::fixes::FIX_RECAP_INSTRUCTION`] and emit no hand-off at all.
+/// The seed is hedged for the same reason as the hand-off's seeded `tests`
+/// bullet: a runnable app does not imply a setup script, let alone one that
+/// seeds.
+const SEED_DATA: &str = "The worktree's environment is created fresh for this run, seed data \
+     included if the project seeds any. When the app needs an account or existing records, use the \
+     repo's own seed/fixture data — find where it is defined (a seed script, fixtures, factories) \
+     and use those exact credentials and records rather than inventing an account or editing the \
+     database by hand. Note in your report which account and records you used, so the reviewer can \
+     repeat what you did.";
 
 /// The default way to capture a single window on the platform Usine is running
 /// on, used when the project names no screenshot command of its own.
@@ -264,6 +284,33 @@ mod tests {
         assert!(s.contains(PREVIEW_REQUEST_FILE));
         assert!(s.contains("screenshot"));
         assert!(!s.contains("curl"));
+    }
+
+    /// Whichever route the agent takes to the app, it gets there on the
+    /// project's own seed data — the hand-off's `tests` list depends on it. The
+    /// ask stays mode-neutral: fix runs get this text too and have no hand-off.
+    #[test]
+    fn every_variant_points_at_the_repos_seed_data() {
+        for s in [
+            testing_instruction("pnpm dev", true, None),
+            testing_instruction("cargo run", false, None),
+            testing_instruction_on_request("pnpm dev", true, None),
+            testing_instruction_on_request("cargo run", false, Some("./shot.sh")),
+        ] {
+            assert!(s.contains("seed/fixture data"));
+            assert!(s.contains("exact credentials"));
+            assert!(s.contains("rather than inventing an account"));
+            assert!(s.contains("Note in your report which account and records you used"));
+        }
+    }
+
+    /// Fix runs get this same text but emit a recap, never a hand-off block, so
+    /// the seed ask must not point them at one (`fixes` asserts as much of its
+    /// own instruction).
+    #[test]
+    fn the_seed_ask_is_mode_neutral() {
+        assert!(!SEED_DATA.contains("hand-off"));
+        assert!(!SEED_DATA.contains("`tests`"));
     }
 
     #[test]

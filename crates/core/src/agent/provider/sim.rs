@@ -162,10 +162,12 @@ async fn simulate(
                     behind the flag.\",\"kind\":\"feat\"},\
                     {\"path\":\"README.md\",\"what\":\"Documents the flag.\",\"kind\":\"docs\"}],\
                     \"tests\":[\
-                    {\"scenario\":\"Create a card and start it\",\"expect\":\"the new module logs \
-                    its setup exactly once\",\"verified\":true},\
-                    {\"scenario\":\"Restart with an existing database\",\"expect\":\"old records \
-                    still load, unmigrated\",\"verified\":false}],\
+                    {\"scenario\":\"Sign in as the seeded owner (owner@example.test / password) \
+                    and open /projects/demo\",\"expect\":\"the new module's panel renders with \
+                    the seeded project's three cards\",\"verified\":true},\
+                    {\"scenario\":\"Still signed in as that owner, open /projects/demo/settings \
+                    and turn the flag off\",\"expect\":\"the panel disappears and the seeded \
+                    cards still load\",\"verified\":false}],\
                     \"risks\":[\"The flag defaults to on, so an existing install changes behaviour \
                     on upgrade.\"],\
                     \"questions\":[\"The flag defaults to on — should it ship behind an opt-in instead?\"]\
