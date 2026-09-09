@@ -32,8 +32,8 @@ pub use agent::fixes::{
     FixRow, Outcome, FIX_RECAP_INSTRUCTION, REVIEW_BODY_PATH,
 };
 pub use agent::handoff::{
-    handoff_block_malformed, parse_handoff, strip_handoff_block, Change, Handoff, TestItem,
-    HANDOFF_INSTRUCTION,
+    handoff_block_malformed, handoff_instruction, parse_handoff, strip_handoff_block, Change,
+    Handoff, TestItem,
 };
 pub use agent::investigate::parse_findings;
 pub use agent::investigate::{
