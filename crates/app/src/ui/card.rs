@@ -43,6 +43,14 @@ pub fn CardView(card: Card) -> Element {
     let queued_pos = state.queue_position(id);
 
     let running = card.state.is_running();
+    // Only a running card shows Stop; `stop_destination` clones the state, so
+    // skip it for every idle card on the board.
+    let stop_message = match running.then(|| super::stop_destination(&card)).flatten() {
+        Some(dest) => {
+            format!("Stop the agent's current run? Its progress is discarded and the card returns to {dest}.")
+        }
+        None => "Stop the agent's current run? Its progress is discarded.".to_string(),
+    };
     let failed = card.state.is_failed();
     // The buttons dispatch on the state seen THROUGH a question run: asking
     // something used to strip the card of every action (and reflow the column)
@@ -574,7 +582,7 @@ pub fn CardView(card: Card) -> Element {
                                 e.stop_propagation();
                                 super::request_confirm(super::ConfirmRequest {
                                     title: "Stop the run?".into(),
-                                    message: "Stop the agent's current run? Its progress is discarded.".into(),
+                                    message: stop_message.clone(),
                                     confirm_label: "Stop".into(),
                                     danger: true,
                                     action: super::ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),

@@ -326,6 +326,12 @@ fn CardPanel(card: Card) -> Element {
     // before merging.
     let pending_bodies = card.pending_review_bodies().len();
     let recap = state.review_recaps.read().get(&id).cloned();
+    // Stop steps back to where the run was entered from (the plan, the review
+    // gate, the conclusion) — or the starting block after a fresh start.
+    let stop_message = format!(
+        "Stop the agent's current run? Its progress is discarded and the card returns to {}.",
+        crate::ui::stop_destination(&card).unwrap_or("the starting block")
+    );
 
     rsx! {
         if is_start {
@@ -362,7 +368,7 @@ fn CardPanel(card: Card) -> Element {
 
         // The main running phases used to render nothing actionable here; give
         // them a status line and a way out. Cancel drops the run's progress and
-        // returns the card to the starting block, hence the confirm.
+        // returns the card to where the run was entered from, hence the confirm.
         if let Some(phase) = match &card.state {
             CardState::Designing(DesignSub::Running) => Some("designing"),
             CardState::Investigating(usine_core::RunSub::Running) => Some("investigating"),
@@ -375,7 +381,7 @@ fn CardPanel(card: Card) -> Element {
                     class: "btn subtle",
                     onclick: move |_| request_confirm(ConfirmRequest {
                         title: "Stop the run?".into(),
-                        message: "Stop the agent's current run? Its progress is discarded and the card returns to the starting block.".into(),
+                        message: stop_message.clone(),
                         confirm_label: "Stop".into(),
                         danger: true,
                         action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),

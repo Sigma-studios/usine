@@ -36,7 +36,7 @@ use crate::domain::model::{
     Intervention, Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus,
     ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
 };
-use crate::domain::state_machine::{transition, Transition};
+use crate::domain::state_machine::{note_entry, stop_transition, transition, Transition};
 use crate::error::{CoreError, Result};
 use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState, ReviewScope};
 use crate::infra::git::{canonicalize_branch_case, sanitize_branch_name, GitOps, MergeOutcome};
@@ -828,7 +828,9 @@ fn apply_transition(
 /// (see `finalize_question`).
 fn persist_transition(store: &Store, card_id: Uuid, t: Transition) -> Result<Card> {
     store.mutate_card(card_id, |c| {
-        c.state = transition(&c.state, t)?;
+        let next = transition(&c.state, t)?;
+        note_entry(&c.state, &next, &mut c.entered_from);
+        c.state = next;
         c.updated_at = now_millis();
         Ok(())
     })
