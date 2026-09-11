@@ -899,7 +899,10 @@ impl Executor {
             return;
         };
         let parked = |c: &Card| {
-            matches!(c.state, CardState::Designing(DesignSub::AwaitingApproval { .. }))
+            matches!(
+                c.state,
+                CardState::Designing(DesignSub::AwaitingApproval { .. })
+            )
         };
         let Ok(card) = self.store.get_card(card_id) else {
             return;

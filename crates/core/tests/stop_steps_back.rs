@@ -16,9 +16,8 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, AgentEvent, AgentProvider, Card, CardConfig, CardState, DesignSub,
-    ExecutorCommand,
-    ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig, Provider,
-    ProviderFactory, RealGit, Result, ReviewSub, RunConfig, RunHandle, SimForge, Store,
+    ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig,
+    Provider, ProviderFactory, RealGit, Result, ReviewSub, RunConfig, RunHandle, SimForge, Store,
 };
 
 /// Keep anything the executor writes under the data dir out of the
@@ -281,14 +280,20 @@ async fn stop_back_to_the_plan_keeps_a_live_runs_worktree() {
     })
     .await;
     let approved = store.get_card(card_id).unwrap();
-    let wt = approved.worktree_path.clone().expect("approval cut a worktree");
+    let wt = approved
+        .worktree_path
+        .clone()
+        .expect("approval cut a worktree");
     assert!(wt.exists());
 
     exec.send(ExecutorCommand::Cancel { card_id });
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c)
             if c.id == card_id
-                && matches!(c.state, CardState::Designing(DesignSub::AwaitingApproval { .. })) =>
+                && matches!(
+                    c.state,
+                    CardState::Designing(DesignSub::AwaitingApproval { .. })
+                ) =>
         {
             Some(())
         }
