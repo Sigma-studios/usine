@@ -794,23 +794,28 @@ impl Executor {
             let _ = control.unbounded_send(RunControl::Cancel);
             *rid
         });
-        // An abandoned change request must not mark a later, unrelated run as
-        // a change run. Dropped before the transition, so nothing that sees the
-        // card parked can still find it; if the run beat the cancel, its
-        // finalize already consumed the stash and this is a no-op.
-        if matches!(
-            prior.effective(),
-            CardState::Implementing(_)
-                | CardState::PrReview(PrReviewSub::ApplyingChange | PrReviewSub::ApplyingFixes)
-        ) {
-            let _ = self.store.set_pending_change(card_id, "");
-        }
         // Tolerate the race where the run finished (and transitioned) a beat
         // before the cancel landed: there's simply nothing to cancel.
         match self.apply(card_id, Transition::Cancel) {
             Ok(_) => {}
             Err(CoreError::IllegalTransition(_)) => return Ok(()),
             Err(e) => return Err(e),
+        }
+        // An abandoned change request must not mark a later, unrelated run as
+        // a change run. Dropped only once the cancel has actually landed: a
+        // finalize racing this cancel still reads the note after its commit,
+        // and a run that just failed keeps it for its Retry. A cancelled run
+        // never finalizes, so nothing needs it gone any sooner.
+        if matches!(
+            prior.effective(),
+            CardState::Implementing(_)
+                | CardState::PrReview(
+                    PrReviewSub::ApplyingChange
+                        | PrReviewSub::ApplyingFixes
+                        | PrReviewSub::AwaitingAnswer(_)
+                )
+        ) {
+            let _ = self.store.set_pending_change(card_id, "");
         }
         // A cancelled fix/change run dies mid-write, leaving half-applied edits
         // uncommitted in the worktree. Discard them: the next fix run's

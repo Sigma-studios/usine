@@ -268,6 +268,14 @@ async fn cancelling_a_change_run_drops_its_request() {
 
     handle.send(ExecutorCommand::Cancel { card_id });
     wait_for_state(&mut rx, card_id, |s| !matches!(s, CardState::Implementing(_))).await;
+    // The request is dropped only after the cancel transition lands (which
+    // is what emits the state update above), so give it a beat.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while store.get_pending_change(card_id).unwrap().is_some()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(
         store.get_pending_change(card_id).unwrap(),
         None,
