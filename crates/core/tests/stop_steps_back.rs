@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, AgentEvent, AgentProvider, Card, CardConfig, CardState, ExecutorCommand,
+    spawn_executor, AgentEvent, AgentProvider, Card, CardConfig, CardState, DesignSub,
+    ExecutorCommand,
     ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig, Provider,
     ProviderFactory, RealGit, Result, ReviewSub, RunConfig, RunHandle, SimForge, Store,
 };
@@ -87,6 +88,43 @@ struct UntilCancelledFactory;
 impl ProviderFactory for UntilCancelledFactory {
     fn make(&self, _: Provider) -> Arc<dyn AgentProvider> {
         Arc::new(UntilCancelled)
+    }
+}
+
+/// An agent whose process shrugs off the cancel: its stream stays open, so
+/// the run keeps its runs-map slot well past the discard's grace period.
+struct IgnoresCancel;
+
+#[async_trait::async_trait]
+impl AgentProvider for IgnoresCancel {
+    fn provider(&self) -> Provider {
+        Provider::Claude
+    }
+    fn interactive(&self) -> bool {
+        false
+    }
+    async fn start(&self, _cfg: RunConfig) -> Result<RunHandle> {
+        let (evt_tx, evt_rx) = futures::channel::mpsc::unbounded();
+        let (ctl_tx, _ctl_rx) = futures::channel::mpsc::unbounded();
+        let _ = evt_tx.unbounded_send(AgentEvent::Started {
+            session_id: "sess-1".into(),
+        });
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(evt_tx);
+        });
+        Ok(RunHandle {
+            events: evt_rx.boxed(),
+            control: ctl_tx,
+        })
+    }
+}
+
+struct IgnoresCancelFactory;
+
+impl ProviderFactory for IgnoresCancelFactory {
+    fn make(&self, _: Provider) -> Arc<dyn AgentProvider> {
+        Arc::new(IgnoresCancel)
     }
 }
 
@@ -201,4 +239,72 @@ async fn stopping_a_change_run_keeps_the_committed_work() {
     );
     assert_eq!(card.branch.as_deref(), Some("usine/thing"));
     assert_eq!(card.worktree_path.as_deref(), Some(wt.as_path()));
+}
+
+/// Stop after approval steps back to the plan and undoes the approval's
+/// worktree — but never while the stopped run's process is still alive in
+/// the runs map: that tree is still being written to (and a re-Approve would
+/// be using the same path).
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_back_to_the_plan_keeps_a_live_runs_worktree() {
+    isolate_data_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "dev"]);
+    git(&repo, &["config", "user.email", "t@t.dev"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new("p", repo.clone(), ProjectConfig::default());
+    store.upsert_project(&project).unwrap();
+    let mut card = Card::new(project.id, "Thing", "Do the thing.", CardConfig::default());
+    card.state = CardState::Designing(DesignSub::AwaitingApproval {
+        plan: "Do the thing.".into(),
+    });
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+
+    let (exec, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(IgnoresCancelFactory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(RealGit),
+    });
+    exec.send(ExecutorCommand::ApprovePlan { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::AnswersUpdated { .. } if e.card_id == card_id => Some(()),
+        _ => None,
+    })
+    .await;
+    let approved = store.get_card(card_id).unwrap();
+    let wt = approved.worktree_path.clone().expect("approval cut a worktree");
+    assert!(wt.exists());
+
+    exec.send(ExecutorCommand::Cancel { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c)
+            if c.id == card_id
+                && matches!(c.state, CardState::Designing(DesignSub::AwaitingApproval { .. })) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    // Past the discard's 10s wait for the run to die, which it never does.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let card = store.get_card(card_id).unwrap();
+    assert!(matches!(
+        card.state,
+        CardState::Designing(DesignSub::AwaitingApproval { .. })
+    ));
+    assert_eq!(card.worktree_path.as_deref(), Some(wt.as_path()));
+    assert_eq!(card.branch, approved.branch);
+    assert!(wt.exists(), "a live run's worktree is left alone");
+    assert!(store.get_plan(card_id).unwrap().is_some());
 }

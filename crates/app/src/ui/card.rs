@@ -43,7 +43,9 @@ pub fn CardView(card: Card) -> Element {
     let queued_pos = state.queue_position(id);
 
     let running = card.state.is_running();
-    let stop_message = match super::stop_destination(&card) {
+    // Only a running card shows Stop; `stop_destination` clones the state, so
+    // skip it for every idle card on the board.
+    let stop_message = match running.then(|| super::stop_destination(&card)).flatten() {
         Some(dest) => {
             format!("Stop the agent's current run? Its progress is discarded and the card returns to {dest}.")
         }

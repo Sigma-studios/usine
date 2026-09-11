@@ -861,7 +861,7 @@ impl Executor {
                 landed.state,
                 CardState::Designing(DesignSub::AwaitingApproval { .. })
             ) {
-                self.undo_plan_approval(&landed).await;
+                self.undo_plan_approval(card_id).await;
             }
         }
         // A one-shot design run parked on a question already dropped its runs-map
@@ -886,12 +886,31 @@ impl Executor {
     /// approving again starts from a clean cut. The worktree is forgotten only
     /// once it's actually gone, like `back_to_start`; a leftover is cleared by
     /// the next approval's `cut_card_worktree` anyway.
-    async fn undo_plan_approval(&self, card: &Card) {
-        let card_id = card.id;
+    ///
+    /// Runs well after Stop landed (the wait for the old process, the preview
+    /// stop), and Stop holds no claim — so a re-Approve may have got in first.
+    /// Take the card's claim for the teardown (a re-Approve clicked meanwhile
+    /// is dropped as a duplicate), then back off unless the card is still
+    /// parked on its plan with no run in the slot: the worktree and branch
+    /// would otherwise be a live run's. Backing off leaves the leftovers to the
+    /// next approval's re-cut.
+    async fn undo_plan_approval(&self, card_id: Uuid) {
+        let Some(_claim) = super::claim(&self.in_flight, &self.evt_tx, card_id) else {
+            return;
+        };
+        let parked = |c: &Card| {
+            matches!(c.state, CardState::Designing(DesignSub::AwaitingApproval { .. }))
+        };
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        if !parked(&card) || lock(&self.runs).contains_key(&card_id) {
+            return;
+        }
         let _ = self.store.delete_plan(card_id);
         let worktree_gone = match self.store.get_project(card.project_id) {
             Ok(project) => {
-                self.teardown_card_worktrees(&project.path, card, true)
+                self.teardown_card_worktrees(&project.path, &card, true)
                     .await
             }
             Err(_) => true,
@@ -906,6 +925,11 @@ impl Executor {
             return;
         }
         if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+            if !parked(c) {
+                return Err(CoreError::IllegalTransition(
+                    "card left its plan during the undo".into(),
+                ));
+            }
             c.worktree_path = None;
             c.branch = None;
             c.updated_at = now_millis();
