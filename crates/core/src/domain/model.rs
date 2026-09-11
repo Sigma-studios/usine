@@ -1516,6 +1516,16 @@ pub struct Card {
     /// older records loadable.
     #[serde(default)]
     pub blocked_note: Option<String>,
+    /// The parked state this card was in when its current designing /
+    /// investigating / implementing run was entered (the plan awaiting
+    /// approval, a review-gate state, the conclusion), so Stop can step back to
+    /// it instead of to the starting block. `None` for a run started from the
+    /// starting block. Only meaningful while in one of those three phases;
+    /// survives a crash + Retry (which re-enters via `Failed`). Maintained by
+    /// [`note_entry`](crate::domain::state_machine::note_entry).
+    /// `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub entered_from: Option<CardState>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1553,6 +1563,7 @@ impl Card {
             mergeable_stale_since: None,
             blocked: false,
             blocked_note: None,
+            entered_from: None,
             created_at: now,
             updated_at: now,
         }

@@ -287,6 +287,65 @@ async fn cancelling_a_change_run_drops_its_request() {
         None,
         "a stale request must not turn a later run into a change run"
     );
+    // Stop steps back to the review gate it was asked from — not the starting
+    // block, whose next Start would re-cut the branch over the committed work.
+    let card = store.get_card(card_id).unwrap();
+    assert_eq!(
+        card.state,
+        CardState::AwaitingReview(ReviewSub::ReadyForReview)
+    );
+    assert_eq!(card.branch.as_deref(), Some("usine/thing"));
+    assert!(card.worktree_path.is_some());
+}
+
+/// Stopping the run an approval started steps back to the plan, and undoes
+/// what the approval set up, so approving again starts from a clean cut.
+#[tokio::test]
+async fn stopping_an_approved_plan_run_returns_to_the_plan() {
+    let store = Store::open_in_memory().unwrap();
+    let project = project(&store, "/tmp/change-recap-approve-stop");
+    let mut card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    let plan = CardState::Designing(usine_core::DesignSub::AwaitingApproval {
+        plan: "1. Paint it blue.".into(),
+    });
+    card.state = plan.clone();
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+
+    let factory = ScriptedFactory {
+        hang: true,
+        ..Default::default()
+    };
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(factory),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::ApprovePlan { card_id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::AnswersUpdated { .. } if e.card_id == card_id => Some(()),
+        _ => None,
+    })
+    .await;
+    let running = store.get_card(card_id).unwrap();
+    assert!(running.worktree_path.is_some() && running.branch.is_some());
+    assert!(store.get_plan(card_id).unwrap().is_some());
+
+    handle.send(ExecutorCommand::Cancel { card_id });
+    wait_for_state(&mut rx, card_id, |s| *s == plan).await;
+    // The approval's artifacts are undone just after the state lands.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while store.get_card(card_id).unwrap().worktree_path.is_some()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let card = store.get_card(card_id).unwrap();
+    assert_eq!(card.state, plan);
+    assert_eq!(card.worktree_path, None);
+    assert_eq!(card.branch, None);
+    assert_eq!(store.get_plan(card_id).unwrap(), None);
 }
 
 /// An agent that finishes with prose and no blocks at all — or, with `hang`,
@@ -312,12 +371,19 @@ impl AgentProvider for ScriptedProvider {
     }
     async fn start(&self, _cfg: RunConfig) -> Result<RunHandle> {
         let (evt_tx, evt_rx) = futures::channel::mpsc::unbounded();
-        let (ctl_tx, _ctl_rx) = futures::channel::mpsc::unbounded();
+        let (ctl_tx, mut ctl_rx) = futures::channel::mpsc::unbounded();
         let _ = evt_tx.unbounded_send(AgentEvent::Started {
             session_id: "sess-1".into(),
         });
         if self.hang {
             self.held.lock().unwrap().push(evt_tx);
+            // Like a real CLI killed on Stop, the stream ends once the run is
+            // cancelled — Stop's discard waits for exactly that.
+            let held = self.held.clone();
+            tokio::spawn(async move {
+                let _ = ctl_rx.next().await;
+                held.lock().unwrap().clear();
+            });
         } else {
             let _ = evt_tx.unbounded_send(AgentEvent::Done {
                 result: "Reworded the paragraph.".into(),

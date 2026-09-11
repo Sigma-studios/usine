@@ -96,6 +96,7 @@ impl Executor {
             c.state = transition(&c.state, Transition::ResetToStart)?;
             // The next run is a fresh conversation with the findings in-prompt.
             c.last_session = None;
+            c.entered_from = None;
             c.updated_at = now_millis();
             converted = true;
             Ok(())
@@ -794,13 +795,24 @@ impl Executor {
             let _ = control.unbounded_send(RunControl::Cancel);
             *rid
         });
+        // Step back to where the run was entered from (the plan, the review
+        // gate, the conclusion) when that's recorded, else to the starting
+        // block. Read and applied in one mutation so the target can't be stale.
         // Tolerate the race where the run finished (and transitioned) a beat
         // before the cancel landed: there's simply nothing to cancel.
-        match self.apply(card_id, Transition::Cancel) {
-            Ok(_) => {}
+        let landed = match self.store.mutate_card(card_id, |c| {
+            c.state = transition(&c.state, stop_transition(c))?;
+            c.entered_from = None;
+            c.updated_at = now_millis();
+            Ok(())
+        }) {
+            Ok(card) => card,
             Err(CoreError::IllegalTransition(_)) => return Ok(()),
             Err(e) => return Err(e),
-        }
+        };
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::updated(landed.clone()));
         // An abandoned change request must not mark a later, unrelated run as
         // a change run. Dropped only once the cancel has actually landed: a
         // finalize racing this cancel still reads the note after its commit,
@@ -821,20 +833,36 @@ impl Executor {
         // uncommitted in the worktree. Discard them: the next fix run's
         // `commit_all` (a `git add -A`) would otherwise sweep them into its own
         // commit — and, on an open PR, push them.
+        // A stopped implementing run never commits either, so discarding puts
+        // the worktree back at the commit it started from — the review gate's,
+        // when Stop steps back there.
         if matches!(
             prior,
-            CardState::AwaitingReview(
-                ReviewSub::ApplyingFixes | ReviewSub::FixingValidation { .. }
-            ) | CardState::PrReview(
-                PrReviewSub::ApplyingFixes
+            CardState::Implementing(_)
+                | CardState::AwaitingReview(
+                    ReviewSub::ApplyingFixes | ReviewSub::FixingValidation { .. }
+                )
+                | CardState::PrReview(
+                    PrReviewSub::ApplyingFixes
                     | PrReviewSub::ApplyingChange
                     // Abandoning an outstanding conflict question: unwind the
                     // half-resolved merge rather than leaving it for the next
                     // run's `git add -A` to sweep up.
                     | PrReviewSub::AwaitingAnswer(_)
-            )
+                )
         ) {
             self.discard_cancelled_run_edits(card_id, run_id).await;
+        }
+        if matches!(prior, CardState::Implementing(_)) {
+            // An implementing run auto-starts the card's preview and nothing
+            // else stops it on a cancel; park it like the pipeline does.
+            self.reap_idle_preview(card_id).await;
+            if matches!(
+                landed.state,
+                CardState::Designing(DesignSub::AwaitingApproval { .. })
+            ) {
+                self.undo_plan_approval(card_id).await;
+            }
         }
         // A one-shot design run parked on a question already dropped its runs-map
         // entry when it tore down, so no actor is left to sweep its detached
@@ -851,6 +879,67 @@ impl Executor {
             cleanup_design_worktree(&self.store, &self.git, card_id).await;
         }
         Ok(())
+    }
+
+    /// Stop stepped an implementing run back to its plan: undo what
+    /// `approve_plan` set up (the saved plan, the worktree and branch), so
+    /// approving again starts from a clean cut. The worktree is forgotten only
+    /// once it's actually gone, like `back_to_start`; a leftover is cleared by
+    /// the next approval's `cut_card_worktree` anyway.
+    ///
+    /// Runs well after Stop landed (the wait for the old process, the preview
+    /// stop), and Stop holds no claim — so a re-Approve may have got in first.
+    /// Take the card's claim for the teardown (a re-Approve clicked meanwhile
+    /// is dropped as a duplicate), then back off unless the card is still
+    /// parked on its plan with no run in the slot: the worktree and branch
+    /// would otherwise be a live run's. Backing off leaves the leftovers to the
+    /// next approval's re-cut.
+    async fn undo_plan_approval(&self, card_id: Uuid) {
+        let Some(_claim) = super::claim(&self.in_flight, &self.evt_tx, card_id) else {
+            return;
+        };
+        let parked = |c: &Card| {
+            matches!(
+                c.state,
+                CardState::Designing(DesignSub::AwaitingApproval { .. })
+            )
+        };
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        if !parked(&card) || lock(&self.runs).contains_key(&card_id) {
+            return;
+        }
+        let _ = self.store.delete_plan(card_id);
+        let worktree_gone = match self.store.get_project(card.project_id) {
+            Ok(project) => {
+                self.teardown_card_worktrees(&project.path, &card, true)
+                    .await
+            }
+            Err(_) => true,
+        };
+        if !worktree_gone {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                "Back to the plan, but its worktree couldn't be removed — \
+                 it will be cleared out on the next approval.",
+            ));
+            return;
+        }
+        if let Ok(updated) = self.store.mutate_card(card_id, |c| {
+            if !parked(c) {
+                return Err(CoreError::IllegalTransition(
+                    "card left its plan during the undo".into(),
+                ));
+            }
+            c.worktree_path = None;
+            c.branch = None;
+            c.updated_at = now_millis();
+            Ok(())
+        }) {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+        }
     }
 
     /// After cancelling a write run, wait for its child to actually die (the
@@ -960,6 +1049,7 @@ impl Executor {
             c.state = transition(&c.state, Transition::ResetToStart)?;
             // A genuine do-over: drop the run artifacts so the next Start is fresh.
             c.last_session = None;
+            c.entered_from = None;
             c.pr = None;
             // The PR-derived caches describe the PR just dropped; kept, a
             // brand-new PR from the next attempt would inherit them — e.g.

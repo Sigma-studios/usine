@@ -72,7 +72,10 @@ pub use domain::model::{
     ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread,
     RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,
 };
-pub use domain::state_machine::{transition, Transition, MAX_VALIDATION_ATTEMPTS};
+pub use domain::state_machine::{
+    stop_can_return_to, stop_target, stop_transition, transition, Transition,
+    MAX_VALIDATION_ATTEMPTS,
+};
 pub use error::{CoreError, Result};
 pub use infra::forge::{
     normalize_login, FailedCheck, Forge, GhForge, LivePrState, PrPushTarget, PrSummary,

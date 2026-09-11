@@ -7,7 +7,7 @@
 //! responsibility, keyed off the *resulting* state.
 
 use crate::domain::model::{
-    CardState, DesignSub, FixVerdict, Intervention, PrReviewSub, ReviewSub, RunSub,
+    Card, CardState, DesignSub, FixVerdict, Intervention, PrReviewSub, ReviewSub, RunSub,
 };
 use crate::error::{CoreError, Result};
 
@@ -61,6 +61,13 @@ pub enum Transition {
     /// in `Done`.
     Merge,
     Cancel,
+    /// Stop a designing / investigating / implementing run, stepping back to
+    /// the parked state it was entered from (the card's
+    /// [`entered_from`](crate::domain::model::Card::entered_from)) rather than
+    /// to the starting block. Only the targets [`stop_can_return_to`] allows
+    /// are honoured; anything else lands where a plain `Cancel` would. Built by
+    /// [`stop_transition`].
+    CancelTo(Box<CardState>),
     Retry,
     /// User-triggered "do-over": send the card back to the starting block from
     /// wherever it is, to re-run the task from a (possibly amended) prompt.
@@ -416,6 +423,13 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         (S::Designing(_), T::Cancel) => S::StartingBlock,
         (S::Investigating(_), T::Cancel) => S::StartingBlock,
         (S::Implementing(_), T::Cancel) => S::StartingBlock,
+        (s, T::CancelTo(prev)) if in_phase_run(s) => {
+            if stop_can_return_to(s, &prev) {
+                *prev
+            } else {
+                S::StartingBlock
+            }
+        }
         (S::AwaitingReview(ReviewSub::Reviewing), T::Cancel) => {
             S::AwaitingReview(ReviewSub::ReadyForReview)
         }
@@ -449,6 +463,75 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         }
     };
     Ok(next)
+}
+
+/// A designing / investigating / implementing run, live or parked on a
+/// mid-run question — the states Stop steps back from via `entered_from`.
+fn in_phase_run(s: &CardState) -> bool {
+    matches!(
+        s,
+        CardState::Designing(DesignSub::Running | DesignSub::Intervention(_))
+            | CardState::Investigating(RunSub::Running | RunSub::Intervention(_))
+            | CardState::Implementing(RunSub::Running | RunSub::Intervention(_))
+    )
+}
+
+/// Whether Stop on `running` may step back to `origin`: re-planning returns to
+/// the plan it rejected, an approved plan's implementation to that plan, a
+/// change request to the review-gate state it was asked from, and a follow-up
+/// investigation to its conclusion.
+pub fn stop_can_return_to(running: &CardState, origin: &CardState) -> bool {
+    use CardState as S;
+    match running {
+        S::Designing(_) => matches!(origin, S::Designing(DesignSub::AwaitingApproval { .. })),
+        S::Implementing(_) => matches!(
+            origin,
+            S::Designing(DesignSub::AwaitingApproval { .. })
+                | S::AwaitingReview(
+                    ReviewSub::ReadyForReview
+                        | ReviewSub::SelectingFixes { .. }
+                        | ReviewSub::ReadyForPr
+                        | ReviewSub::ValidationFailed { .. }
+                )
+        ),
+        S::Investigating(_) => matches!(origin, S::Concluded { .. }),
+        _ => false,
+    }
+}
+
+/// Keep `entered_from` in step with a `prev → next` move. Entering one of the
+/// three phases' `Running` from a parked state records that state (or clears
+/// it, when it isn't a legal Stop target — e.g. the starting block); landing
+/// in a parked state clears it. Moves within the run (intervention → running)
+/// and a crash + Retry (`Failed` → running) keep it.
+pub fn note_entry(prev: &CardState, next: &CardState, entered_from: &mut Option<CardState>) {
+    let parked = |s: &CardState| !s.is_running() && s.intervention().is_none() && !s.is_failed();
+    if parked(next) {
+        *entered_from = None;
+    } else if parked(prev)
+        && matches!(
+            next,
+            CardState::Designing(DesignSub::Running)
+                | CardState::Investigating(RunSub::Running)
+                | CardState::Implementing(RunSub::Running)
+        )
+    {
+        *entered_from = stop_can_return_to(next, prev).then(|| prev.clone());
+    }
+}
+
+/// The transition Stop applies to `card`: step back to where its current run
+/// was entered from, when that's recorded, else a plain `Cancel`.
+pub fn stop_transition(card: &Card) -> Transition {
+    match &card.entered_from {
+        Some(origin) if in_phase_run(&card.state) => Transition::CancelTo(Box::new(origin.clone())),
+        _ => Transition::Cancel,
+    }
+}
+
+/// Where Stop would land `card`, or `None` when it can't be stopped.
+pub fn stop_target(card: &Card) -> Option<CardState> {
+    transition(&card.state, stop_transition(card)).ok()
 }
 
 #[cfg(test)]
@@ -947,7 +1030,8 @@ mod tests {
         .unwrap();
         assert!(matches!(s, CardState::Concluded { .. }));
 
-        // Cancel returns to the starting block, like the other pre-work runs.
+        // A plain Cancel (fresh start) returns to the starting block, like the
+        // other pre-work runs.
         let running = CardState::Investigating(RunSub::Running);
         assert!(matches!(
             transition(&running, Transition::Cancel).unwrap(),
@@ -1370,5 +1454,148 @@ mod tests {
             let answered = transition(&retried, Transition::QuestionAnswered).unwrap();
             assert_eq!(answered, s);
         }
+    }
+
+    #[test]
+    fn stop_steps_back_to_where_the_run_was_entered_from() {
+        let plan = CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() });
+        let cases = [
+            (plan.clone(), Transition::RejectPlan),
+            (plan.clone(), Transition::ApprovePlan),
+            (
+                CardState::AwaitingReview(ReviewSub::ReadyForReview),
+                Transition::RequestChanges,
+            ),
+            (
+                CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts: vec![] }),
+                Transition::RequestChanges,
+            ),
+            (
+                CardState::AwaitingReview(ReviewSub::ReadyForPr),
+                Transition::RequestChanges,
+            ),
+            (
+                CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                    attempt: 3,
+                    output: "boom".into(),
+                }),
+                Transition::RequestChanges,
+            ),
+            (
+                CardState::Concluded {
+                    conclusion: "c".into(),
+                },
+                Transition::StartInvestigate,
+            ),
+        ];
+        for (origin, entry) in cases {
+            let mut card = Card::new(
+                uuid::Uuid::nil(),
+                "t",
+                "d",
+                crate::domain::config::CardConfig::default(),
+            );
+            card.state = transition(&origin, entry).unwrap();
+            note_entry(&origin, &card.state, &mut card.entered_from);
+            assert_eq!(
+                card.entered_from.as_ref(),
+                Some(&origin),
+                "{:?}",
+                card.state
+            );
+            assert!(matches!(stop_transition(&card), Transition::CancelTo(_)));
+            assert_eq!(stop_target(&card), Some(origin.clone()));
+            assert_eq!(
+                transition(&card.state, Transition::CancelTo(Box::new(origin.clone()))).unwrap(),
+                origin
+            );
+        }
+    }
+
+    #[test]
+    fn stop_after_a_fresh_start_goes_to_the_starting_block() {
+        for entry in [
+            Transition::StartPlan,
+            Transition::StartImplement,
+            Transition::StartInvestigate,
+        ] {
+            let mut card = Card::new(
+                uuid::Uuid::nil(),
+                "t",
+                "d",
+                crate::domain::config::CardConfig::default(),
+            );
+            // A stale origin from an earlier life must not survive a fresh start.
+            card.entered_from = Some(CardState::AwaitingReview(ReviewSub::ReadyForPr));
+            card.state = transition(&CardState::StartingBlock, entry).unwrap();
+            note_entry(
+                &CardState::StartingBlock,
+                &card.state,
+                &mut card.entered_from,
+            );
+            assert_eq!(card.entered_from, None);
+            assert!(matches!(stop_transition(&card), Transition::Cancel));
+            assert_eq!(stop_target(&card), Some(CardState::StartingBlock));
+        }
+    }
+
+    #[test]
+    fn entered_from_survives_the_run_and_clears_when_it_parks() {
+        let origin = CardState::AwaitingReview(ReviewSub::ReadyForReview);
+        let mut from = None;
+        let mut s = origin.clone();
+        for t in [
+            Transition::RequestChanges,
+            Transition::AgentNeedsInput(intervention()),
+            Transition::AnswerIntervention,
+            Transition::AgentError {
+                message: "x".into(),
+            },
+            Transition::Retry,
+        ] {
+            let next = transition(&s, t).unwrap();
+            note_entry(&s, &next, &mut from);
+            s = next;
+            assert_eq!(from.as_ref(), Some(&origin), "lost at {s:?}");
+        }
+        assert_eq!(s, CardState::Implementing(RunSub::Running));
+
+        // Parked on a mid-run question, Stop still steps back.
+        let parked = CardState::Implementing(RunSub::Intervention(intervention()));
+        assert_eq!(
+            transition(&parked, Transition::CancelTo(Box::new(origin.clone()))).unwrap(),
+            origin
+        );
+
+        // Finishing the run parks the card and forgets the origin.
+        let done = transition(&s, Transition::AgentImplementDone).unwrap();
+        note_entry(&s, &done, &mut from);
+        if !done.is_running() {
+            assert_eq!(from, None);
+        }
+    }
+
+    #[test]
+    fn cancel_to_only_honours_legal_targets() {
+        let concluded = CardState::Concluded {
+            conclusion: "c".into(),
+        };
+        // A target the phase can't have come from falls back to the start.
+        assert_eq!(
+            transition(
+                &CardState::Implementing(RunSub::Running),
+                Transition::CancelTo(Box::new(concluded.clone()))
+            )
+            .unwrap(),
+            CardState::StartingBlock
+        );
+        // Outside a phase's run there's nothing for it to stop.
+        assert!(transition(
+            &CardState::ReadyToMerge,
+            Transition::CancelTo(Box::new(concluded))
+        )
+        .is_err());
+        let plan = CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() });
+        assert!(transition(&plan, Transition::CancelTo(Box::new(plan.clone()))).is_err());
     }
 }
