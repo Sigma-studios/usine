@@ -38,6 +38,26 @@ pub use shortcuts::ShortcutHost;
 pub use sidebar::Sidebar;
 pub use usagebar::UsageBar;
 
+/// Where Stop would land `card`, as a phrase for the Stop confirms ("…and the
+/// card returns to {phrase}"). Both Stop buttons share it so they name the
+/// same destination the state machine picks.
+pub(crate) fn stop_destination(card: &usine_core::Card) -> Option<&'static str> {
+    use usine_core::{CardState, DesignSub, PrReviewSub, ReviewSub};
+    Some(match usine_core::stop_target(card)? {
+        CardState::StartingBlock => "the starting block",
+        CardState::Designing(DesignSub::AwaitingApproval { .. }) => {
+            "the plan awaiting your approval"
+        }
+        CardState::AwaitingReview(ReviewSub::ReadyForReview) => "review",
+        CardState::AwaitingReview(ReviewSub::SelectingFixes { .. }) => "the self-review picker",
+        CardState::AwaitingReview(ReviewSub::ReadyForPr) => "ready for PR",
+        CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => "the failed validation",
+        CardState::Concluded { .. } => "its conclusion",
+        CardState::PrReview(PrReviewSub::Idle) => "the PR gate",
+        _ => return None,
+    })
+}
+
 use usine_core::{DraftComment, ExecutorCommand, ReviewEvent, SEVERITY_LEVELS};
 use uuid::Uuid;
 
