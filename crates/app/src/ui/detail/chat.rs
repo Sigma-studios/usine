@@ -4,11 +4,12 @@
 //! returns the card to where it sits, with the answer rendered here.
 
 use dioxus::prelude::*;
-use usine_core::{CardState, DesignSub, ExecutorCommand, PrReviewSub, ReviewSub};
+use usine_core::{CardState, DesignSub, ExchangeKind, ExecutorCommand, PrReviewSub, ReviewSub};
 use uuid::Uuid;
 
 use super::edit::{attach_from_clipboard, AttachButton, AttachmentChips};
 use crate::state::AppState;
+use crate::ui::diffdialog::open_diff_dialog_at;
 use crate::ui::drafts;
 use crate::ui::widgets::ArtifactText;
 
@@ -67,15 +68,6 @@ pub(super) fn AgentChatSection(
     // Both sends therefore bump this generation, and the element is keyed with
     // it, so the clear lands as a fresh, empty element.
     let mut generation = use_signal(|| 0u32);
-    // The whole Q&A log: newest expanded, earlier ones collapsed behind a
-    // one-line summary of the question. A write run marks the log superseded,
-    // which collapses all of them without dropping any.
-    let log = state
-        .answers
-        .read()
-        .get(&card_id)
-        .cloned()
-        .unwrap_or_default();
     let blank = text.read().trim().is_empty();
     let request_title = request_title
         .unwrap_or_else(|| "Sends the work back to the agent with this text".to_string());
@@ -88,27 +80,7 @@ pub(super) fn AgentChatSection(
         div { class: "section",
             h3 { "Agent Chat" }
             div { class: "hint", "{hint}" }
-            if !log.exchanges.is_empty() {
-                div { class: "qa-log",
-                    // Newest first, and only it is ever rendered `open` — an
-                    // older row the user expanded keeps `open: false` in the
-                    // vdom, so no re-render force-collapses it.
-                    for (i , ex) in log.exchanges.iter().rev().enumerate() {
-                        details {
-                            key: "{ex.asked_at}",
-                            class: "qa-item",
-                            open: i == 0 && !log.superseded,
-                            summary { title: "{ex.question}", "{summary_line(&ex.question)}" }
-                            if !ex.question.is_empty() {
-                                div { class: "hint", "You asked" }
-                                div { class: "plan-box", "{ex.question}" }
-                            }
-                            div { class: "hint", "Answer" }
-                            ArtifactText { text: ex.answer.clone() }
-                        }
-                    }
-                }
-            }
+            ChatLog { card_id }
             AttachmentChips { card_id }
             // The attach control lives in the box it is evidence for: the
             // screenshot you paste at a gate belongs to the change you are
@@ -176,6 +148,73 @@ pub(super) fn AgentChatSection(
                         }
                     },
                     "Ask questions"
+                }
+            }
+        }
+    }
+}
+
+/// The card's Agent Chat log — answered questions and requested changes, one
+/// list: newest expanded, earlier ones collapsed behind a one-line summary.
+/// A write run marks the log superseded, which collapses a stale answer
+/// without dropping it; the latest change recap stays open through it, since
+/// a later fix run doesn't make "what your request changed" any less true.
+/// Renders nothing for an empty log. Read-only, so it can also sit on the
+/// running self-review / validation faces, which have no send box.
+#[component]
+pub(super) fn ChatLog(card_id: Uuid) -> Element {
+    let state = use_context::<AppState>();
+    let log = state
+        .answers
+        .read()
+        .get(&card_id)
+        .cloned()
+        .unwrap_or_default();
+    let newest_open = log
+        .exchanges
+        .last()
+        .is_some_and(|ex| !log.superseded || ex.kind == ExchangeKind::Change);
+    if log.exchanges.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "qa-log",
+            // Newest first, and only it is ever rendered `open` — an older row
+            // the user expanded keeps `open: false` in the vdom, so no
+            // re-render force-collapses it.
+            for (i , ex) in log.exchanges.iter().rev().enumerate() {
+                details {
+                    key: "{ex.asked_at}",
+                    class: "qa-item",
+                    open: i == 0 && newest_open,
+                    summary { title: "{ex.question}",
+                        if ex.kind == ExchangeKind::Change {
+                            span { class: "badge kind qa-kind", "Change" }
+                        }
+                        "{summary_line(&ex.question)}"
+                    }
+                    if ex.kind == ExchangeKind::Change {
+                        if !ex.question.is_empty() {
+                            div { class: "hint", "You requested" }
+                            div { class: "plan-box", "{ex.question}" }
+                        }
+                        div { class: "hint", "What changed" }
+                        if ex.answer.trim().is_empty() {
+                            div { class: "hint", "No recap — see the transcript." }
+                        } else {
+                            ArtifactText {
+                                text: ex.answer.clone(),
+                                on_path: move |path: String| open_diff_dialog_at(card_id, path),
+                            }
+                        }
+                    } else {
+                        if !ex.question.is_empty() {
+                            div { class: "hint", "You asked" }
+                            div { class: "plan-box", "{ex.question}" }
+                        }
+                        div { class: "hint", "Answer" }
+                        ArtifactText { text: ex.answer.clone() }
+                    }
                 }
             }
         }

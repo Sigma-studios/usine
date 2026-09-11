@@ -375,14 +375,26 @@ impl ReviewColumn {
 // Card state machine states
 // ---------------------------------------------------------------------------
 
-/// One completed Agent Chat exchange: what the user asked and the agent's
-/// prose answer. `asked_at` (millis, set when the answer lands) is the stable
-/// list key the panel renders with.
+/// What an Agent Chat exchange records: a read-only question and its answer,
+/// or a requested change and the recap of the run that applied it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExchangeKind {
+    #[default]
+    Question,
+    Change,
+}
+
+/// One completed Agent Chat exchange: what the user asked (or requested) and
+/// the agent's prose answer (or change recap). `asked_at` (millis, set when
+/// the answer lands) is the stable list key the panel renders with. `kind` is
+/// additive — rows written before change requests had one read as questions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QaExchange {
     pub question: String,
     pub answer: String,
     pub asked_at: i64,
+    #[serde(default)]
+    pub kind: ExchangeKind,
 }
 
 /// A card's Agent Chat log: every answered exchange, oldest first.
