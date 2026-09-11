@@ -23,7 +23,9 @@ use uuid::Uuid;
 use crate::agent::fixes::{FixItem, FixReport};
 use crate::agent::handoff::Handoff;
 use crate::domain::config::AppSettings;
-use crate::domain::model::{Card, CardAnswers, Project, QaExchange, ReviewComment, ReviewTask};
+use crate::domain::model::{
+    Card, CardAnswers, ExchangeKind, Project, QaExchange, ReviewComment, ReviewTask,
+};
 use crate::error::{CoreError, Result};
 
 // ---------------------------------------------------------------------------
@@ -256,6 +258,8 @@ struct DismissedReviewsRecord {
 /// `#[serde(default)]` fields — no version bump, the startup
 /// `canonicalize_records()` refresh rewrites old rows; `answer` is legacy, a
 /// pre-history row's single answer folded into `history` on read.
+/// `pending_change` is the same kind of stash as `question`, for the change
+/// request of an in-flight "Request changes" run (see [`Store::record_change`]).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[native_model(id = 12, version = 1, with = Json)]
 #[native_db]
@@ -269,6 +273,8 @@ struct CardAnswerRecord {
     history: Vec<QaExchange>,
     #[serde(default)]
     superseded: bool,
+    #[serde(default)]
+    pending_change: String,
 }
 
 impl CardAnswerRecord {
@@ -280,6 +286,7 @@ impl CardAnswerRecord {
                 question: self.question,
                 answer: self.answer,
                 asked_at: 0,
+                kind: ExchangeKind::Question,
             }]
         } else {
             self.history
@@ -688,6 +695,10 @@ impl Store {
             answer: String::new(),
             history: prior.exchanges,
             superseded: prior.superseded,
+            pending_change: old
+                .as_ref()
+                .map(|o| o.pending_change.clone())
+                .unwrap_or_default(),
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -718,6 +729,7 @@ impl Store {
             question: old.as_ref().map(|o| o.question.clone()).unwrap_or_default(),
             answer: answer.to_string(),
             asked_at: crate::now_millis(),
+            kind: ExchangeKind::Question,
         });
         let rec = CardAnswerRecord {
             card_id: card_id.to_string(),
@@ -725,6 +737,83 @@ impl Store {
             answer: String::new(),
             history,
             superseded: false,
+            pending_change: old
+                .as_ref()
+                .map(|o| o.pending_change.clone())
+                .unwrap_or_default(),
+        };
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// Stash the change request a starting "Request changes" run will apply;
+    /// [`Store::record_change`] turns it into a log entry when the run lands.
+    /// Its presence is also what marks the run as a change run (a recap of its
+    /// own instead of a new hand-off). An empty `feedback` clears the stash
+    /// without touching the log.
+    pub fn set_pending_change(&self, card_id: Uuid, feedback: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        match old {
+            Some(old) => {
+                let rec = CardAnswerRecord {
+                    pending_change: feedback.to_string(),
+                    ..old.clone()
+                };
+                rw.update(old, rec)?;
+            }
+            // Nothing to clear on a card that never had a record.
+            None if feedback.is_empty() => {}
+            None => rw.insert(CardAnswerRecord {
+                card_id: card_id.to_string(),
+                pending_change: feedback.to_string(),
+                ..Default::default()
+            })?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// The stashed change request of the in-flight change run.
+    pub fn get_pending_change(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardAnswerRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec
+            .map(|r| r.pending_change)
+            .filter(|s: &String| !s.is_empty()))
+    }
+
+    /// Append a change entry to the card's log: the stashed request paired with
+    /// the run's recap. Consumes the stash and clears `superseded` — the recap
+    /// describes the work as it now stands.
+    pub fn record_change(&self, card_id: Uuid, recap: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        let mut history = old
+            .as_ref()
+            .map(|o| o.clone().answers().exchanges)
+            .unwrap_or_default();
+        history.push(QaExchange {
+            question: old
+                .as_ref()
+                .map(|o| o.pending_change.clone())
+                .unwrap_or_default(),
+            answer: recap.to_string(),
+            asked_at: crate::now_millis(),
+            kind: ExchangeKind::Change,
+        });
+        let rec = CardAnswerRecord {
+            card_id: card_id.to_string(),
+            // A question stashed alongside is left for its own run to consume.
+            question: old.as_ref().map(|o| o.question.clone()).unwrap_or_default(),
+            answer: String::new(),
+            history,
+            superseded: false,
+            pending_change: String::new(),
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -1652,6 +1741,7 @@ mod tests {
                 answer: "old answer".into(),
                 history: Vec::new(),
                 superseded: false,
+                pending_change: String::new(),
             })
             .unwrap();
             rw.commit().unwrap();
@@ -1700,5 +1790,61 @@ mod tests {
         let log = store.get_answers(card_id).unwrap();
         assert_eq!(log.exchanges.len(), 1);
         assert_eq!(log.exchanges[0].question, "why?");
+    }
+
+    #[test]
+    fn a_recorded_change_joins_the_log_and_consumes_its_stash() {
+        let store = Store::open_in_memory().unwrap();
+        let card_id = Uuid::new_v4();
+        store.set_question(card_id, "why?").unwrap();
+        store.set_answer(card_id, "because").unwrap();
+        store.set_pending_change(card_id, "make it blue").unwrap();
+        // A write run starting supersedes the log in between.
+        store.supersede_answers(card_id).unwrap();
+        assert_eq!(
+            store.get_pending_change(card_id).unwrap().as_deref(),
+            Some("make it blue"),
+            "superseding keeps the stash"
+        );
+
+        store.record_change(card_id, "TL;DR: it is blue").unwrap();
+        let log = store.get_answers(card_id).unwrap();
+        assert!(!log.superseded, "the recap describes the current work");
+        assert_eq!(
+            log.exchanges
+                .iter()
+                .map(|x| (x.kind, x.question.as_str(), x.answer.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ExchangeKind::Question, "why?", "because"),
+                (ExchangeKind::Change, "make it blue", "TL;DR: it is blue"),
+            ]
+        );
+        assert_eq!(store.get_pending_change(card_id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_question_round_trip_keeps_the_pending_change() {
+        // `set_question`/`set_answer` rebuild the record; they must not drop a
+        // change request stashed beside it.
+        let store = Store::open_in_memory().unwrap();
+        let card_id = Uuid::new_v4();
+        store.set_pending_change(card_id, "make it blue").unwrap();
+        store.set_question(card_id, "why?").unwrap();
+        store.set_answer(card_id, "because").unwrap();
+        assert_eq!(
+            store.get_pending_change(card_id).unwrap().as_deref(),
+            Some("make it blue")
+        );
+        store.set_pending_change(card_id, "").unwrap();
+        assert_eq!(store.get_pending_change(card_id).unwrap(), None);
+        assert_eq!(store.get_answers(card_id).unwrap().exchanges.len(), 1);
+    }
+
+    #[test]
+    fn a_legacy_exchange_without_a_kind_reads_as_a_question() {
+        let ex: QaExchange =
+            serde_json::from_str(r#"{"question":"q","answer":"a","asked_at":1}"#).unwrap();
+        assert_eq!(ex.kind, ExchangeKind::Question);
     }
 }

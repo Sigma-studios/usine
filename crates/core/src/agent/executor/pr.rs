@@ -569,6 +569,11 @@ impl Executor {
         let plan = self.store.get_plan(card_id).unwrap_or(None);
         let extra = revise_extra(plan.as_deref(), &feedback);
         let card = self.apply(card_id, Transition::RequestChanges)?;
+        // Mark this as a change run only once it is really happening (the same
+        // order `ask_question` uses): `launch` asks for a change recap instead
+        // of a new hand-off, and `finalize_run` files that recap under this
+        // request in the Agent Chat log, leaving the original hand-off alone.
+        self.store.set_pending_change(card_id, feedback.trim())?;
         self.launch(card, RunMode::Implement, Some(extra), None)
             .await
     }
@@ -890,6 +895,9 @@ impl Executor {
         // faulted run can restate it (see `relaunch`).
         self.store.set_fix_extra(card_id, Some(&extra))?;
         let card = self.apply(card_id, Transition::RequestPostPrChange)?;
+        // As in `revise`: the recap lands in the Agent Chat log under this
+        // request, not over the merge gate's fixes recap.
+        self.store.set_pending_change(card_id, feedback.trim())?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
     }

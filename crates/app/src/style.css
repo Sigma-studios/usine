@@ -657,6 +657,8 @@ select option { background: var(--panel-2); color: var(--text); }
    newest is expanded; the rest collapse to their question on one line. */
 .qa-log { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .qa-item > summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Tells a requested change's recap apart from a question's answer. */
+.qa-item > summary > .qa-kind { margin-right: 6px; font-size: 10px; padding: 1px 6px; }
 /* The task the card was started from, collapsed once the card has moved on: it
    is reference material by then, not something to act on. */
 .task-collapsed > summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

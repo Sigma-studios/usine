@@ -310,7 +310,22 @@ impl Executor {
         // recap, its open questions, and what to test, that last list written
         // against the card's seeded preview when there is one — which the
         // awaiting-review panel renders. Fix runs report through their own recap
-        // instead, and are told their final message is it.
+        // instead, and are told their final message is it. A "Request changes"
+        // run (implement or post-PR) writes a change recap of its own instead
+        // of either: it lands in the Agent Chat log under the request, and the
+        // original hand-off / fixes recap stay as they were. Decided here, off
+        // the stashed request, so retries and resumes get it too. The request
+        // is what tells a post-PR change apart: from the merge gate it runs in
+        // `ApplyingFixes`, the same state as a comment-fix run.
+        let is_change_run = matches!(
+            card.state,
+            CardState::Implementing(_)
+                | CardState::PrReview(PrReviewSub::ApplyingChange | PrReviewSub::ApplyingFixes)
+        ) && self
+            .store
+            .get_pending_change(card.id)
+            .unwrap_or(None)
+            .is_some();
         let extra = match mode {
             RunMode::Implement | RunMode::ApplyFixes => {
                 let mut tail = String::new();
@@ -327,7 +342,10 @@ impl Executor {
                     tail.push_str("\n\n");
                 }
                 tail.push_str(crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION);
-                if mode == RunMode::Implement {
+                if is_change_run {
+                    tail.push_str("\n\n");
+                    tail.push_str(crate::agent::handoff::CHANGE_RECAP_INSTRUCTION);
+                } else if mode == RunMode::Implement {
                     tail.push_str("\n\n");
                     tail.push_str(&crate::agent::handoff::handoff_instruction(run.is_some()));
                 } else {
@@ -783,6 +801,22 @@ impl Executor {
             Err(CoreError::IllegalTransition(_)) => return Ok(()),
             Err(e) => return Err(e),
         }
+        // An abandoned change request must not mark a later, unrelated run as
+        // a change run. Dropped only once the cancel has actually landed: a
+        // finalize racing this cancel still reads the note after its commit,
+        // and a run that just failed keeps it for its Retry. A cancelled run
+        // never finalizes, so nothing needs it gone any sooner.
+        if matches!(
+            prior.effective(),
+            CardState::Implementing(_)
+                | CardState::PrReview(
+                    PrReviewSub::ApplyingChange
+                        | PrReviewSub::ApplyingFixes
+                        | PrReviewSub::AwaitingAnswer(_)
+                )
+        ) {
+            let _ = self.store.set_pending_change(card_id, "");
+        }
         // A cancelled fix/change run dies mid-write, leaving half-applied edits
         // uncommitted in the worktree. Discard them: the next fix run's
         // `commit_all` (a `git add -A`) would otherwise sweep them into its own
@@ -1161,9 +1195,21 @@ impl Executor {
             // the user's ask) was stashed at launch, so a retried follow-up
             // doesn't silently overwrite it with a re-answer of round one.
             RunMode::Investigate => self.store.get_investigation_extra(card_id).unwrap_or(None),
+            // A retried "Request changes" run restates the request: the resume
+            // note alone would have the agent find finished work and change
+            // nothing, the request forgotten.
             RunMode::Implement => {
                 let plan = self.store.get_plan(card_id).unwrap_or(None);
-                Some(resume_extra(plan.as_deref()))
+                Some(
+                    match self.store.get_pending_change(card_id).unwrap_or(None) {
+                        Some(fb) => format!(
+                            "{}\n\n{}",
+                            revise_extra(plan.as_deref(), &fb),
+                            resume_extra(None)
+                        ),
+                        None => resume_extra(plan.as_deref()),
+                    },
+                )
             }
             // A fix run's task lives entirely in its launch extra (the conflict
             // prompt, the picked review comments, a requested change, the

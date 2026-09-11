@@ -28,7 +28,7 @@ mod pr_review;
 mod review;
 mod transcript;
 
-use chat::AgentChatSection;
+use chat::{AgentChatSection, ChatLog};
 use conclusion::ConclusionPanel;
 use done::{DonePanel, OutcomeArtifacts};
 use edit::{Attachments, ConfigForm, EditableTask};

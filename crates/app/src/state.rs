@@ -1094,6 +1094,19 @@ fn seed_demo(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
             ..Default::default()
         },
     )?;
+    // A change requested at that gate: its recap sits in the Agent Chat log,
+    // and the hand-off above still describes the work as a whole.
+    store.set_pending_change(
+        awaiting.id,
+        "Pre-warm the theme in the background after the first paint instead.",
+    )?;
+    store.record_change(
+        awaiting.id,
+        "TL;DR: the theme now warms on a background thread after the first paint.\n\
+         - `crates/app/src/highlight.rs` spawns the warm-up; a diff opened before it \
+         finishes waits on it instead of loading twice.\n\nTo test:\n\
+         - Launch cold, wait a second, open a diff — highlighting is instant.",
+    )?;
 
     let mut ready = mk(
         "Bump dependencies",

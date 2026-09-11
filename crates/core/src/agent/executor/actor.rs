@@ -609,11 +609,29 @@ async fn finalize_run(
         )),
     );
 
+    // A "Request changes" run (implement, or a change on an open PR) reports
+    // under its request in the Agent Chat log, and leaves the original
+    // hand-off / fixes recap alone. The stashed request is what marks it — a
+    // merge-gate change runs in the same `ApplyingFixes` state as a PR
+    // comment-fix run, which never stashes one. Recorded before the
+    // transition, like the hand-off below, and even when the recap is empty so
+    // the request itself stays visible.
+    let is_change_run = matches!(
+        transition,
+        Transition::AgentImplementDone | Transition::AgentFixesDone
+    ) && store.get_pending_change(card_id).unwrap_or(None).is_some();
+    if is_change_run {
+        let _ = store.record_change(card_id, &summary);
+        if let Ok(answers) = store.get_answers(card_id) {
+            let _ = evt_tx.unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
+        }
+    }
+
     // An implement run hands off to whoever reviews it next. Store it (and emit it)
     // before the transition, so the card arrives at the awaiting-review gate with
     // its recap already in hand. A run that emitted no block clears the field
     // rather than leaving the previous attempt's recap describing this one.
-    if matches!(transition, Transition::AgentImplementDone) {
+    if matches!(transition, Transition::AgentImplementDone) && !is_change_run {
         let handoff = crate::agent::handoff::handoff_from_reply(&result_text);
         let _ = store.set_handoff(card_id, &handoff);
         let _ = evt_tx.unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
@@ -636,7 +654,7 @@ async fn finalize_run(
     // A PR fix run: keep the agent's summary as the fixes recap so the user can
     // react (e.g. if a fix was uncertain) before merging.
     let is_pr_fix = matches!(transition, Transition::AgentFixesDone);
-    if is_pr_fix && !summary.is_empty() {
+    if is_pr_fix && !is_change_run && !summary.is_empty() {
         let _ = store.set_review_recap(card_id, &summary);
         let _ = evt_tx.unbounded_send(ExecutorEvent::recap_updated(card_id, summary.clone()));
     }
