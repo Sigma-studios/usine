@@ -121,6 +121,16 @@ reasonably have gone the other way, an ambiguity in the task, an assumption you 
 an empty array if you have none; do NOT manufacture questions to fill it.\n\
 Be honest and specific — this is the note a careful engineer leaves a colleague, not a sales pitch.";
 
+/// Appended to a "Request changes" run instead of [`handoff_instruction`]: the
+/// original hand-off keeps describing the work as a whole, and this run's
+/// final message becomes its own entry in the Agent Chat log, under the
+/// request it answers.
+pub const CHANGE_RECAP_INSTRUCTION: &str = "\
+Your final message is shown to the user as the recap of this change request, beside their \
+request; the original hand-off for the task stays as it is, so do not restate it. Start with a \
+`TL;DR:` line followed by 1-3 bullet points (`- ` lines) covering only what this change did, then \
+optionally a short \"To test:\" list of what to check by hand. Do not emit a hand-off block.";
+
 /// One file the run touched, as the agent describes it. The path is a claim,
 /// not a fact: the panel cross-checks it against the computed diff and marks
 /// anything that isn't actually there.
@@ -469,6 +479,12 @@ mod tests {
             stripped.contains("```usine-commit"),
             "the commit block is another parser's to remove"
         );
+    }
+
+    #[test]
+    fn the_change_recap_instruction_never_asks_for_a_hand_off_block() {
+        assert!(!CHANGE_RECAP_INSTRUCTION.contains(TAG));
+        assert!(CHANGE_RECAP_INSTRUCTION.contains("TL;DR"));
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub use agent::fixes::{
 };
 pub use agent::handoff::{
     handoff_block_malformed, handoff_instruction, parse_handoff, strip_handoff_block, Change,
-    Handoff, TestItem,
+    Handoff, TestItem, CHANGE_RECAP_INSTRUCTION,
 };
 pub use agent::investigate::parse_findings;
 pub use agent::investigate::{
@@ -67,7 +67,7 @@ pub use diff::{
 pub use domain::config::{AppSettings, CardConfig, CardKind, PreviewPort, ProjectConfig};
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardAnswers, CardState, CheckStatus, Column, Cost,
-    DesignSub, DraftComment, Effort, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo,
+    DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo,
     PrReviewSub, PreviewStatus, PreviewUrl, Project, Provider, QaExchange, ReviewColumn,
     ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread,
     RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,

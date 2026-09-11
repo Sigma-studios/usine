@@ -101,6 +101,18 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         _ => None,
     };
     let handoff = state.handoffs.read().get(&id).cloned();
+    // A requested change lands here via the auto self-review, and so do the
+    // validation passes after it — none of which render the chat section. Keep
+    // its recap (and any answers) in view through them, read-only: no send box
+    // and no attach control, so `renders_chat` still holds.
+    let running_face =
+        is_self_reviewing || validating_attempt.is_some() || fixing_attempt.is_some();
+    let show_log = running_face
+        && state
+            .answers
+            .read()
+            .get(&id)
+            .is_some_and(|log| !log.exchanges.is_empty());
 
     rsx! {
         if let Some(handoff) = handoff {
@@ -241,6 +253,13 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },
+            }
+        }
+
+        if show_log {
+            div { class: "section",
+                h3 { "Agent Chat" }
+                super::ChatLog { card_id: id }
             }
         }
 
