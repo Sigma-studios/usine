@@ -146,7 +146,10 @@ async fn a_requested_change_gets_its_own_recap_and_keeps_the_hand_off() {
     let log = wait_for_change_entry(&mut rx, card_id).await;
     let entry = log.exchanges.last().unwrap();
     assert_eq!(entry.question, feedback, "the request, trimmed");
-    assert!(!entry.answer.is_empty(), "the run's recap is the entry's body");
+    assert!(
+        !entry.answer.is_empty(),
+        "the run's recap is the entry's body"
+    );
     assert!(
         !entry.answer.contains("usine-handoff"),
         "machine-facing blocks are stripped: {}",
@@ -267,7 +270,10 @@ async fn cancelling_a_change_run_drops_its_request() {
     );
 
     handle.send(ExecutorCommand::Cancel { card_id });
-    wait_for_state(&mut rx, card_id, |s| !matches!(s, CardState::Implementing(_))).await;
+    wait_for_state(&mut rx, card_id, |s| {
+        !matches!(s, CardState::Implementing(_))
+    })
+    .await;
     // The request is dropped only after the cancel transition lands (which
     // is what emits the state update above), so give it a beat.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);

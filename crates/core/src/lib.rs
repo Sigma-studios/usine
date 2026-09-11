@@ -67,8 +67,8 @@ pub use diff::{
 pub use domain::config::{AppSettings, CardConfig, CardKind, PreviewPort, ProjectConfig};
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardAnswers, CardState, CheckStatus, Column, Cost,
-    DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, Mergeable, ModelSpec, PrInfo,
-    PrReviewSub, PreviewStatus, PreviewUrl, Project, Provider, QaExchange, ReviewColumn,
+    DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, Mergeable, ModelSpec,
+    PrInfo, PrReviewSub, PreviewStatus, PreviewUrl, Project, Provider, QaExchange, ReviewColumn,
     ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread,
     RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,
 };

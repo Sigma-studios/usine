@@ -1200,14 +1200,16 @@ impl Executor {
             // nothing, the request forgotten.
             RunMode::Implement => {
                 let plan = self.store.get_plan(card_id).unwrap_or(None);
-                Some(match self.store.get_pending_change(card_id).unwrap_or(None) {
-                    Some(fb) => format!(
-                        "{}\n\n{}",
-                        revise_extra(plan.as_deref(), &fb),
-                        resume_extra(None)
-                    ),
-                    None => resume_extra(plan.as_deref()),
-                })
+                Some(
+                    match self.store.get_pending_change(card_id).unwrap_or(None) {
+                        Some(fb) => format!(
+                            "{}\n\n{}",
+                            revise_extra(plan.as_deref(), &fb),
+                            resume_extra(None)
+                        ),
+                        None => resume_extra(plan.as_deref()),
+                    },
+                )
             }
             // A fix run's task lives entirely in its launch extra (the conflict
             // prompt, the picked review comments, a requested change, the
