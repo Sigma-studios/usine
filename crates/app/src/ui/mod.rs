@@ -64,7 +64,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 // Re-exported so the event reducer in `state` can raise a dialog of its own (a
 // merge conflict is discovered by the executor, not by a click).
-pub(crate) use confirm::{request_confirm, ConfirmAction, ConfirmRequest};
+pub(crate) use confirm::{request_confirm, request_quit_confirm, ConfirmAction, ConfirmRequest};
 
 /// Scroll the detail panel to the section a board button names, so a button
 /// whose card is already open does something visible instead of re-selecting an

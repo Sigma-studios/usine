@@ -202,7 +202,12 @@ fn request_quit(state: AppState, window: &dioxus::desktop::DesktopContext) {
         list.push(format!("…and {} more", n - SHOWN));
     }
     let what = if n == 1 { "item is" } else { "items are" };
-    ui::request_confirm(ui::ConfirmRequest {
+    // The dialog lives inside the window: bring it back, or a Cmd+Q on a
+    // minimized/hidden window would look like it did nothing.
+    window.set_minimized(false);
+    window.set_visible(true);
+    window.set_focus();
+    ui::request_quit_confirm(ui::ConfirmRequest {
         title: "Quit Usine?".into(),
         message: format!(
             "{n} {what} still in progress:\n{}\n\nQuitting stops them; affected cards come back as interrupted with Resume.",
@@ -401,7 +406,7 @@ fn use_dock_badge(state: AppState) {
 #[component]
 fn App() -> Element {
     use dioxus::desktop::{
-        tao::event::Event, use_wry_event_handler, WindowCloseBehaviour, WindowEvent,
+        tao::event::Event, use_wry_event_handler, WindowEvent,
     };
 
     let state = use_context_provider(AppState::init);
@@ -449,10 +454,7 @@ fn App() -> Element {
         Event::WindowEvent {
             event: WindowEvent::CloseRequested,
             ..
-        } => {
-            window.set_close_behavior(WindowCloseBehaviour::WindowStays);
-            request_quit(state, &window);
-        }
+        } => request_quit(state, &window),
         _ => {}
     });
     #[cfg(target_os = "macos")]

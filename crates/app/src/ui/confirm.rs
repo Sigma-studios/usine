@@ -43,7 +43,24 @@ static CONFIRM: GlobalSignal<Option<ConfirmRequest>> = Signal::global(|| None);
 /// be reset by whoever opens one.
 static NOTE: GlobalSignal<String> = Signal::global(String::new);
 
+/// The dialog a quit prompt covered, with its typed note — put back when the
+/// quit prompt is dismissed. A close request can land at any moment, and
+/// shouldn't silently throw away a half-filled dialog.
+static COVERED: GlobalSignal<Option<(ConfirmRequest, String)>> = Signal::global(|| None);
+
 pub(crate) fn request_confirm(req: ConfirmRequest) {
+    *COVERED.write() = None;
+    *NOTE.write() = String::new();
+    *CONFIRM.write() = Some(req);
+}
+
+/// Raise the quit prompt over whatever dialog is open; cancelling it brings that
+/// dialog back. Re-raising over an open quit prompt keeps the original cover.
+pub(crate) fn request_quit_confirm(req: ConfirmRequest) {
+    let current = CONFIRM.peek().clone();
+    if let Some(open) = current.filter(|c| !matches!(c.action, ConfirmAction::Quit)) {
+        *COVERED.write() = Some((open, NOTE.peek().clone()));
+    }
     *NOTE.write() = String::new();
     *CONFIRM.write() = Some(req);
 }
@@ -57,7 +74,14 @@ pub(crate) fn request_confirm_with_note(req: ConfirmRequest, note: String) {
 }
 
 fn dismiss() {
-    *CONFIRM.write() = None;
+    let covered = COVERED.write().take();
+    match covered {
+        Some((req, note)) => {
+            *NOTE.write() = note;
+            *CONFIRM.write() = Some(req);
+        }
+        None => *CONFIRM.write() = None,
+    }
 }
 
 #[component]

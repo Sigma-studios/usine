@@ -3,7 +3,10 @@
 Upstream: `dioxus-desktop` **0.7.9** from crates.io, copied verbatim (the
 published package, so `Cargo.toml` is the normalized manifest) and wired in via
 `[patch.crates-io]` in the workspace `Cargo.toml`. The version number is kept so
-`Cargo.lock` keeps resolving.
+`Cargo.lock` keeps resolving. Files the build never reads were left out: the
+package's own `Cargo.lock`, `Cargo.toml.orig`, `headless_tests/` (and their
+`[[test]]` entries in `Cargo.toml`), `.vscode/`, `tsconfig.json` and the
+architecture diagram.
 
 ## Why
 
