@@ -55,28 +55,34 @@ pub fn UsageBar() -> Element {
         }
     });
     let snapshot = state.usage.read().clone();
-    // Review runs launch on the default provider, so that's where they count.
-    let review_provider = state.settings.read().default_provider;
-    let mut runs: Vec<(Uuid, Provider)> = state
-        .cards
-        .read()
-        .iter()
-        .filter(|card| runs_agent(&card.state))
-        .map(|card| (card.id, card.config.provider))
-        .collect();
-    runs.extend(
-        state
-            .review_tasks
+    // Cards and review tasks change constantly across every project; the memo
+    // soaks those updates up and only re-renders the bar when a count moves.
+    let running = use_memo(move || {
+        // Review runs launch on the default provider, so that's where they count.
+        let review_provider = state.settings.read().default_provider;
+        let mut runs: Vec<(Uuid, Provider)> = state
+            .cards
             .read()
-            .values()
-            .flatten()
-            .filter(|task| task.status.is_running())
-            .map(|task| (task.id, review_provider)),
-    );
-    let queued = state.run_queue.read();
-    let claude_running = running_count(Provider::Claude, &runs, &queued);
-    let codex_running = running_count(Provider::Codex, &runs, &queued);
-    drop(queued);
+            .iter()
+            .filter(|card| runs_agent(&card.state))
+            .map(|card| (card.id, card.config.provider))
+            .collect();
+        runs.extend(
+            state
+                .review_tasks
+                .read()
+                .values()
+                .flatten()
+                .filter(|task| task.status.is_running())
+                .map(|task| (task.id, review_provider)),
+        );
+        let queued = state.run_queue.read();
+        (
+            running_count(Provider::Claude, &runs, &queued),
+            running_count(Provider::Codex, &runs, &queued),
+        )
+    });
+    let (claude_running, codex_running) = running();
     let group = |usage: Option<ProviderUsage>, provider: Provider, running: usize| {
         let usage = usage.filter(has_visible_window);
         (usage.is_some() || running > 0).then(|| {
@@ -395,6 +401,10 @@ mod tests {
         assert!(!runs_agent(&CardState::AwaitingReview(
             ReviewSub::Validating { attempt: 1 }
         )));
+        assert!(runs_agent(&CardState::Answering {
+            previous: Box::new(CardState::ReadyToMerge),
+            question: "why?".into(),
+        }));
         assert!(!runs_agent(&CardState::StartingBlock));
     }
 
