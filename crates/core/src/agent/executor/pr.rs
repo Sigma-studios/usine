@@ -2,6 +2,7 @@
 //! PR, fetching + applying reviewer comments, marking ready, and merging.
 
 use super::*;
+use crate::infra::forge::normalize_reviewer;
 use crate::infra::git::is_dirty;
 use crate::PrInfo;
 
@@ -155,29 +156,24 @@ impl Executor {
                 draft,
             )
             .await;
-        let pr = match created {
-            Ok(pr) => pr,
+        // `Some(error)` when the PR was recovered after gh failed — reported in
+        // the closing toast in place of the plain success.
+        let (pr, gh_error) = match created {
+            Ok(pr) => (pr, None),
             // gh can fail *after* the PR exists — a refused reviewer request
             // (e.g. the author asking themselves), or a timeout — and every
             // retry then fails with "already exists". An open PR on this card's
             // branch is that PR, so record it rather than stranding the card.
             Err(err) => match self.forge.pr_for_head(&project.path, &head).await {
-                Ok(Some(existing)) => {
-                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
-                        card_id,
-                        Severity::Warning,
-                        format!(
-                            "PR #{} was opened, but gh reported an error: {err}",
-                            existing.number
-                        ),
-                    ));
-                    // Read back from GitHub, so its reviewer (possibly none,
-                    // when the request was refused) is authoritative.
+                // Read back from GitHub, so its reviewer (possibly none, when
+                // the request was refused or never sent) is authoritative.
+                Ok(Some(existing)) => (
                     PrInfo {
                         reviewer_recorded: true,
                         ..existing
-                    }
-                }
+                    },
+                    Some(err),
+                ),
                 _ => return Err(err),
             },
         };
@@ -216,19 +212,39 @@ impl Executor {
         // on a project with a configured one (see `PrInfo::effective_reviewer`).
         // A draft still advances: `ReadyToMerge` gates it behind "Mark ready".
         let card = self.store.get_card(card_id)?;
-        let reviewer = pr.effective_reviewer(project.config.reviewer.as_deref());
-        if card.no_reviewer_clears_merge(reviewer) {
+        let effective_reviewer = pr.effective_reviewer(project.config.reviewer.as_deref());
+        if card.no_reviewer_clears_merge(effective_reviewer) {
             self.apply(card_id, Transition::ReviewApproved)?;
             self.progress(card_id, "✔ no reviewer assigned — ready to merge");
         }
-        let msg = if draft {
+        // The recorded state, not the requested flag: a recovered PR's draft-ness
+        // is whatever GitHub reports.
+        let msg = if pr.state == "draft" {
             format!("Draft PR #{number} created — add screenshots on GitHub, then mark it ready.")
         } else {
             format!("PR #{number} created")
         };
+        let (severity, msg) = match gh_error {
+            None => (Severity::Success, msg),
+            Some(err) => {
+                // A reviewer the user picked but GitHub doesn't list was refused
+                // or never requested (gh killed mid-way) — and the card has just
+                // skipped the review gate because of it, so say so plainly.
+                let unrequested = match normalize_reviewer(reviewer.as_deref()) {
+                    Some(r) if pr.reviewer.is_none() => {
+                        format!(" Reviewer {r} was not requested — request them on GitHub.")
+                    }
+                    _ => String::new(),
+                };
+                (
+                    Severity::Warning,
+                    format!("{msg}, but gh reported an error: {err}.{unrequested}"),
+                )
+            }
+        };
         let _ = self
             .evt_tx
-            .unbounded_send(ExecutorEvent::toast(card_id, Severity::Success, msg));
+            .unbounded_send(ExecutorEvent::toast(card_id, severity, msg));
         Ok(())
     }
 

@@ -171,28 +171,24 @@ fn create_pr_with(
 async fn a_failed_create_recovers_the_open_pr_and_advances_without_a_reviewer() {
     let (store, card_id, _handle, mut rx) = create_pr_with(Some(open_pr(None)));
 
-    let mut warned = false;
-    wait_for(&mut rx, |e| {
-        if e.card_id != card_id {
-            return None;
+    // One closing toast: a warning in place of the success, carrying the gh
+    // error and naming the reviewer that never got asked.
+    let message = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast { severity, message } if e.card_id == card_id => {
+            assert_ne!(*severity, Severity::Success, "no success toast on recovery");
+            (*severity == Severity::Warning && message.contains("PR #42")).then(|| message.clone())
         }
-        match &e.kind {
-            ExecutorEventKind::Toast { severity, message }
-                if *severity == Severity::Warning && message.contains("PR #42") =>
-            {
-                warned = true;
-                None
-            }
-            ExecutorEventKind::CardUpdated(c) => {
-                matches!(c.state, CardState::ReadyToMerge).then_some(())
-            }
-            _ => None,
-        }
+        _ => None,
     })
     .await;
-    assert!(warned, "the gh error must still be surfaced as a warning");
+    assert!(message.contains("already exists"), "{message}");
+    assert!(
+        message.contains("Reviewer me was not requested"),
+        "{message}"
+    );
 
     let card = store.get_card(card_id).unwrap();
+    assert!(matches!(card.state, CardState::ReadyToMerge));
     let pr = card.pr.expect("the recovered PR is recorded on the card");
     assert_eq!(pr.number, 42);
     assert_eq!(pr.reviewer, None);

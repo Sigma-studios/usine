@@ -98,7 +98,7 @@ pub fn create_pr_args(
 
 /// The reviewer login to record on a created PR: trimmed, with the empty/absent
 /// case collapsed to `None` (matching the `--reviewer` arg being omitted).
-fn normalize_reviewer(reviewer: Option<&str>) -> Option<String> {
+pub fn normalize_reviewer(reviewer: Option<&str>) -> Option<String> {
     reviewer
         .map(str::trim)
         .filter(|r| !r.is_empty())
@@ -1081,9 +1081,12 @@ impl Forge for GhForge {
         reviewer: Option<&str>,
         draft: bool,
     ) -> Result<PrInfo> {
-        let out = run_gh(
+        // Labelled rather than echoing argv: the args hold the whole PR body,
+        // and this error reaches the user's toast.
+        let out = run_gh_as(
             repo,
             &create_pr_args(title, body, base, head, reviewer, draft),
+            "pr create",
         )
         .await?;
         // `gh pr create` prints the PR URL, but may emit tips/warnings on other
@@ -1174,14 +1177,14 @@ impl Forge for GhForge {
     }
 
     async fn list_reviewers(&self, repo: &Path) -> Result<Vec<String>> {
-        let out = run_gh(repo, &reviewers_args()).await?;
         // GitHub refuses the author as a PR's reviewer — and gh reports that
         // refusal only after opening the PR — so leave the signed-in user out.
-        // Best-effort: if the login can't be read, offer the full list.
-        let me = run_gh(repo, &viewer_login_args())
-            .await
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        // Best-effort: if the login can't be read, offer the full list. Both
+        // requests run concurrently so the picker waits on one round-trip.
+        let (list_args, viewer_args) = (reviewers_args(), viewer_login_args());
+        let (out, me) = tokio::join!(run_gh(repo, &list_args), run_gh(repo, &viewer_args));
+        let out = out?;
+        let me = me.map(|s| s.trim().to_string()).unwrap_or_default();
         Ok(out
             .lines()
             .map(|l| l.trim().to_string())
@@ -1541,10 +1544,12 @@ impl Forge for SimForge {
 /// stderr and puts the response body — the part that names *which* input the
 /// API refused — on stdout. Dropping stdout turns a self-explanatory 422 into
 /// a mystery.
-fn gh_failure_message(args: &[String], stdout: &[u8], stderr: &[u8]) -> String {
+///
+/// `cmd` names the command in the message — usually its full argv, but callers
+/// whose args carry bulky user text (a PR body) pass a short label instead.
+fn gh_failure_message(cmd: &str, stdout: &[u8], stderr: &[u8]) -> String {
     let mut msg = format!(
-        "gh {} failed: {}",
-        args.join(" "),
+        "gh {cmd} failed: {}",
         String::from_utf8_lossy(stderr).trim()
     );
     let body = String::from_utf8_lossy(stdout);
@@ -1557,6 +1562,11 @@ fn gh_failure_message(args: &[String], stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
+    run_gh_as(cwd, args, &args.join(" ")).await
+}
+
+/// [`run_gh`], naming the command `cmd` in its errors (see [`gh_failure_message`]).
+async fn run_gh_as(cwd: &Path, args: &[String], cmd: &str) -> Result<String> {
     // `kill_on_drop`: a timeout drops the future, and without it gh keeps
     // running — a timed-out `pr create` could still open the PR behind our back.
     let out = timeout(
@@ -1570,15 +1580,14 @@ async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
     .await
     .map_err(|_| {
         CoreError::forge(format!(
-            "gh {} timed out after {}s",
-            args.join(" "),
+            "gh {cmd} timed out after {}s",
             GH_TIMEOUT.as_secs()
         ))
     })?
     .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     if !out.status.success() {
         return Err(CoreError::forge(gh_failure_message(
-            args,
+            cmd,
             &out.stdout,
             &out.stderr,
         )));
@@ -1618,7 +1627,7 @@ async fn run_gh_stdin(cwd: &Path, args: &[String], stdin: &str) -> Result<String
         .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     if !out.status.success() {
         return Err(CoreError::forge(gh_failure_message(
-            args,
+            &args.join(" "),
             &out.stdout,
             &out.stderr,
         )));
@@ -2323,7 +2332,7 @@ mod tests {
     #[test]
     fn gh_failure_message_includes_the_stdout_error_body() {
         let msg = gh_failure_message(
-            &["api".into(), "x".into()],
+            "api x",
             br#"{"message":"Unprocessable Entity","errors":["line must be part of the diff"]}"#,
             b"gh: Unprocessable Entity (HTTP 422)\n",
         );
@@ -2333,7 +2342,7 @@ mod tests {
 
     #[test]
     fn gh_failure_message_skips_an_empty_stdout() {
-        let msg = gh_failure_message(&["pr".into()], b"", b"boom\n");
+        let msg = gh_failure_message("pr", b"", b"boom\n");
         assert_eq!(msg, "gh pr failed: boom");
     }
 }
