@@ -669,6 +669,26 @@ impl AppState {
             .map(|i| i + 1)
     }
 
+    /// Titles of the cards (all projects) and PR reviews whose work closing the
+    /// app would interrupt: an agent run in progress, a command mid git/GitHub
+    /// step (`busy`), or a launch waiting in the in-memory run queue. Previews
+    /// alone don't count — they restart freely and hold no agent work. Peeks, so
+    /// it's safe from event handlers and never subscribes a component.
+    pub fn active_work(&self) -> Vec<String> {
+        let busy = self.busy.peek();
+        let queued: HashSet<Uuid> = self.run_queue.peek().iter().map(|t| t.id()).collect();
+        let cards = self.cards.peek();
+        let reviews = self.review_tasks.peek();
+        let cards = cards
+            .iter()
+            .map(|c| (c.id, c.state.is_running(), c.title.clone()));
+        let reviews = reviews.values().flatten().map(|t| {
+            let title = format!("PR #{} {}", t.pr_number, t.pr_title);
+            (t.id, t.status.is_running(), title)
+        });
+        active_titles(cards.chain(reviews), &busy, &queued)
+    }
+
     /// The current computed diff state for a card, if one has been requested this
     /// session. `None` means the user hasn't opened the diff yet.
     pub fn diff(&self, card_id: Uuid) -> Option<DiffState> {
@@ -1304,6 +1324,55 @@ fn merge_loaded_transcript(live: &mut Vec<(i64, String)>, loaded: Vec<(i64, Stri
     }
     merged.extend(streamed);
     *live = merged;
+}
+
+/// The titles of `items` — `(id, running, title)` — that are running, busy or
+/// queued. Each item is listed once however many of those hold.
+fn active_titles(
+    items: impl IntoIterator<Item = (Uuid, bool, String)>,
+    busy: &HashSet<Uuid>,
+    queued: &HashSet<Uuid>,
+) -> Vec<String> {
+    items
+        .into_iter()
+        .filter(|(id, running, _)| *running || busy.contains(id) || queued.contains(id))
+        .map(|(_, _, title)| title)
+        .collect()
+}
+
+#[cfg(test)]
+mod active_work_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_active_is_empty() {
+        let items = vec![(Uuid::new_v4(), false, "idle".to_string())];
+        assert!(active_titles(items, &HashSet::new(), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn counts_running_busy_and_queued_once_each() {
+        let (running, busy, queued, both, idle) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let items = vec![
+            (running, true, "running".to_string()),
+            (busy, false, "busy".to_string()),
+            (queued, false, "queued".to_string()),
+            (both, true, "both".to_string()),
+            (idle, false, "idle".to_string()),
+        ];
+        let busy_set = HashSet::from([busy, both]);
+        let queued_set = HashSet::from([queued, both]);
+        assert_eq!(
+            active_titles(items, &busy_set, &queued_set),
+            ["running", "busy", "queued", "both"]
+        );
+    }
 }
 
 #[cfg(test)]

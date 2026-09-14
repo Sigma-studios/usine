@@ -22,6 +22,9 @@ pub(crate) enum ConfirmAction {
     /// Raised for *marking* and for editing an already-blocked card's message —
     /// both send `blocked: true`. Unmarking doesn't ask.
     BlockCard(Uuid),
+    /// Quit the app although work is still running (raised by a close/quit
+    /// request, see `request_quit` in `main.rs`).
+    Quit,
 }
 
 #[derive(Clone)]
@@ -153,6 +156,9 @@ pub fn ConfirmHost() -> Element {
                                         // Trim / blank -> None lives in `Card::set_blocked`.
                                         note: Some(NOTE.peek().clone()),
                                     })
+                                }
+                                ConfirmAction::Quit => {
+                                    crate::quit_app(&state.executor_handle(), &dioxus::desktop::window())
                                 }
                             }
                             dismiss();

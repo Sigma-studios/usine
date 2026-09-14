@@ -82,10 +82,15 @@ fn main() {
     if let Some(icon) = load_window_icon() {
         window = window.with_window_icon(Some(icon));
     }
-    let cfg = Config::new().with_window(window);
+    // Close requests are confirmed in-app while work is running — see the
+    // CloseRequested handler in `App`.
+    let cfg = Config::new()
+        .with_window(window)
+        .with_close_behaviour(dioxus::desktop::WindowCloseBehaviour::WindowStays);
     // Dioxus builds a default "Window / Edit" menu bar for every platform. On
     // macOS that lives in the system menu bar and carries the standard
-    // Cmd+C/V/Q shortcuts, so it stays; on Linux/Windows it is drawn *inside*
+    // Cmd+C/V/Q shortcuts, so it stays — as our copy, whose Quit goes through
+    // the running-work check (`app_menu`); on Linux/Windows it is drawn *inside*
     // the window as a GTK/Win32 menu strip above our own chrome, which looks
     // out of place and does nothing the app doesn't already do (the webview
     // handles clipboard keys itself). Drop it there — except in debug builds,
@@ -93,7 +98,132 @@ fn main() {
     // top.
     #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
     let cfg = cfg.with_menu(None);
+    #[cfg(target_os = "macos")]
+    let cfg = cfg.with_menu(Some(app_menu()));
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
+}
+
+/// Menu id of our Quit item (macOS), handled in `App`.
+#[cfg(target_os = "macos")]
+const QUIT_MENU_ID: &str = "usine-quit";
+
+/// Dioxus's default macOS menu bar (`menubar.rs` in dioxus-desktop 0.7.9, which
+/// keeps it private), with the predefined Quit — which sends AppKit's
+/// `terminate:` straight past the app — swapped for a plain Cmd+Q item that goes
+/// through `request_quit`. The Help ids are Dioxus's own, so it still handles
+/// them.
+#[cfg(target_os = "macos")]
+fn app_menu() -> dioxus::desktop::muda::Menu {
+    use dioxus::desktop::muda::accelerator::{Accelerator, Code, Modifiers};
+    use dioxus::desktop::muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let menu = Menu::new();
+    let quit = MenuItem::with_id(
+        QUIT_MENU_ID,
+        format!("Quit {}", app_display_name()),
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyQ)),
+    );
+    let window_menu = Submenu::new("Window", true);
+    window_menu
+        .append_items(&[
+            &PredefinedMenuItem::fullscreen(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::maximize(None),
+            &PredefinedMenuItem::minimize(None),
+            &PredefinedMenuItem::close_window(None),
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])
+        .unwrap();
+
+    let edit_menu = Submenu::new("Edit", true);
+    edit_menu
+        .append_items(&[
+            &PredefinedMenuItem::undo(None),
+            &PredefinedMenuItem::redo(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::select_all(None),
+        ])
+        .unwrap();
+
+    menu.append_items(&[&window_menu, &edit_menu]).unwrap();
+
+    if cfg!(debug_assertions) {
+        let help_menu = Submenu::new("Help", true);
+        help_menu
+            .append_items(&[
+                &MenuItem::with_id(
+                    "dioxus-toggle-dev-tools",
+                    "Toggle Developer Tools",
+                    true,
+                    None,
+                ),
+                &MenuItem::with_id(
+                    "dioxus-float-top",
+                    "Float on Top (dev mode only)",
+                    true,
+                    None,
+                ),
+            ])
+            .unwrap();
+        _ = menu.append_items(&[&help_menu]);
+        help_menu.set_as_help_menu_for_nsapp();
+    }
+    window_menu.set_as_windows_menu_for_nsapp();
+
+    menu
+}
+
+/// Close/quit request from the window or the Quit menu item: quit at once when
+/// nothing would be interrupted, otherwise ask first (`ConfirmAction::Quit`).
+/// Asking again while the dialog is open just re-raises the same dialog.
+fn request_quit(state: AppState, window: &dioxus::desktop::DesktopContext) {
+    let titles = state.active_work();
+    if titles.is_empty() {
+        quit_app(&state.executor_handle(), window);
+        return;
+    }
+    const SHOWN: usize = 5;
+    let n = titles.len();
+    let mut list: Vec<String> = titles
+        .iter()
+        .take(SHOWN)
+        .map(|t| format!("• {t}"))
+        .collect();
+    if n > SHOWN {
+        list.push(format!("…and {} more", n - SHOWN));
+    }
+    let what = if n == 1 { "item is" } else { "items are" };
+    ui::request_confirm(ui::ConfirmRequest {
+        title: "Quit Usine?".into(),
+        message: format!(
+            "{n} {what} still in progress:\n{}\n\nQuitting stops them; affected cards come back as interrupted with Resume.",
+            list.join("\n")
+        ),
+        confirm_label: "Quit anyway".into(),
+        danger: true,
+        action: ui::ConfirmAction::Quit,
+    });
+}
+
+/// Reap previews/validation, then really close the window — which exits the
+/// app, as it's the last one.
+pub(crate) fn quit_app(
+    exec: &usine_core::ExecutorHandle,
+    window: &dioxus::desktop::DesktopContext,
+) {
+    use dioxus::desktop::WindowCloseBehaviour;
+    exec.shutdown();
+    window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+    window.close();
 }
 
 /// Make the installed `usine` command act like a detached GUI launcher: when run
@@ -270,7 +400,9 @@ fn use_dock_badge(state: AppState) {
 
 #[component]
 fn App() -> Element {
-    use dioxus::desktop::{tao::event::Event, use_wry_event_handler, WindowEvent};
+    use dioxus::desktop::{
+        tao::event::Event, use_wry_event_handler, WindowCloseBehaviour, WindowEvent,
+    };
 
     let state = use_context_provider(AppState::init);
 
@@ -300,22 +432,38 @@ fn App() -> Element {
     // Reap running previews as the app closes. Previews run in their own process
     // groups (so a preview's whole tree can be reaped), which also detaches them
     // from the app's group — without this they outlive the app, holding ports and
-    // docker infra with no handle left to stop them. Fires on window close and on
-    // loop-destroyed (covers macOS Cmd+Q, which skips CloseRequested). Captures an
-    // owned handle so it never reads a signal while the runtime is tearing down.
+    // docker infra with no handle left to stop them.
+    //
+    // Closing is gated: the window starts as `WindowStays`, so a close request
+    // (red button, Cmd+W, Alt+F4) never closes it by itself. `request_quit`
+    // closes at once when nothing is active, and otherwise asks first — previews
+    // are only reaped once the user actually quits. macOS Cmd+Q skips
+    // CloseRequested, so our own menu routes it here too (see `app_menu`).
+    // LoopDestroyed stays as the safety net for exits we can't intercept (Dock
+    // Quit, logout); it only uses an owned handle, never reading a signal while
+    // the runtime is tearing down.
     let exec = state.executor_handle();
-    use_wry_event_handler(move |event, _| {
-        if matches!(
-            event,
-            Event::LoopDestroyed
-                | Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    ..
-                }
-        ) {
-            exec.shutdown();
+    let window = dioxus::desktop::window();
+    use_wry_event_handler(move |event, _| match event {
+        Event::LoopDestroyed => exec.shutdown(),
+        Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } => {
+            window.set_close_behavior(WindowCloseBehaviour::WindowStays);
+            request_quit(state, &window);
         }
+        _ => {}
     });
+    #[cfg(target_os = "macos")]
+    {
+        let window = dioxus::desktop::window();
+        dioxus::desktop::use_muda_event_handler(move |event| {
+            if event.id() == QUIT_MENU_ID {
+                request_quit(state, &window);
+            }
+        });
+    }
 
     // Debug-only keystroke-drop harness (inert unless `USINE_STRESS=1`).
     stress::use_stress(state);

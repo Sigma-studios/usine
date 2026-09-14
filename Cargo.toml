@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/app", "crates/cli"]
+exclude = ["vendor"]
+
+# Local copy of dioxus-desktop 0.7.9 adding `WindowCloseBehaviour::WindowStays`,
+# so a close request can be confirmed before the window goes away. See
+# `vendor/dioxus-desktop/VENDORED.md`.
+[patch.crates-io]
+dioxus-desktop = { path = "vendor/dioxus-desktop" }
 
 [workspace.package]
 version = "0.1.0"
