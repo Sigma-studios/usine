@@ -371,15 +371,61 @@ pub fn pr_view_args(head: &str) -> Vec<String> {
 }
 
 /// The open PR (if any) whose head is `head` — the adopt dialog's "this branch
-/// already has a PR" warning. `--json` fields cover a displayable [`PrInfo`].
+/// already has a PR" warning, and `create_pr`'s recovery when gh fails after the
+/// PR was opened. `--json` fields cover a full [`PrInfo`], including the draft
+/// flag and who GitHub actually asked to review.
 pub fn pr_for_head_args(head: &str) -> Vec<String> {
     vec![
         "pr".into(),
         "view".into(),
         head.into(),
         "--json".into(),
-        "number,url,title,state".into(),
+        "number,url,title,state,isDraft,reviewRequests".into(),
     ]
+}
+
+/// The signed-in user's login — kept out of the reviewer picker, since GitHub
+/// refuses to let a PR's author review it.
+pub fn viewer_login_args() -> Vec<String> {
+    vec!["api".into(), "user".into(), "--jq".into(), ".login".into()]
+}
+
+/// Read a [`pr_for_head_args`] response into a [`PrInfo`]: `None` unless it is
+/// an open PR. `reviewer` is the first *user* review request (team requests
+/// carry no login); `reviewer_recorded` is left for the caller to decide.
+pub fn parse_pr_for_head(v: &Value) -> Option<PrInfo> {
+    let number = v.get("number").and_then(Value::as_u64).unwrap_or(0);
+    if number == 0 {
+        return None;
+    }
+    let text = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    // A closed/merged PR is history, not a conflict worth warning about.
+    if !text("state").eq_ignore_ascii_case("open") {
+        return None;
+    }
+    let draft = v.get("isDraft").and_then(Value::as_bool).unwrap_or(false);
+    let reviewer = v
+        .get("reviewRequests")
+        .and_then(Value::as_array)
+        .and_then(|reqs| {
+            reqs.iter()
+                .filter_map(|r| r.get("login").and_then(Value::as_str))
+                .find(|l| !l.is_empty())
+        })
+        .map(str::to_string);
+    Some(PrInfo {
+        number,
+        url: text("url"),
+        title: text("title"),
+        state: if draft { "draft" } else { "open" }.to_string(),
+        reviewer,
+        reviewer_recorded: false,
+    })
 }
 
 /// A GitHub login as typed by a human, or `None` if it can't be one.
@@ -1011,9 +1057,10 @@ pub trait Forge: Send + Sync {
     }
 
     /// The open PR whose head branch is `head`, if one exists. Best-effort
-    /// dialog context (the adopt probe's "open PR" warning): "no PR" and "can't
-    /// tell" both come back `None`, so forges that don't model it — the sim,
-    /// test doubles — need no override.
+    /// context for the adopt probe's "open PR" warning, and for `create_pr`'s
+    /// recovery of a PR gh opened before failing: "no PR" and "can't tell" both
+    /// come back `None`, so forges that don't model it — the sim, test doubles —
+    /// need no override.
     async fn pr_for_head(&self, _repo: &Path, _head: &str) -> Result<Option<PrInfo>> {
         Ok(None)
     }
@@ -1128,10 +1175,17 @@ impl Forge for GhForge {
 
     async fn list_reviewers(&self, repo: &Path) -> Result<Vec<String>> {
         let out = run_gh(repo, &reviewers_args()).await?;
+        // GitHub refuses the author as a PR's reviewer — and gh reports that
+        // refusal only after opening the PR — so leave the signed-in user out.
+        // Best-effort: if the login can't be read, offer the full list.
+        let me = run_gh(repo, &viewer_login_args())
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         Ok(out
             .lines()
             .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
+            .filter(|l| !l.is_empty() && (me.is_empty() || !l.eq_ignore_ascii_case(&me)))
             .collect())
     }
 
@@ -1267,29 +1321,7 @@ impl Forge for GhForge {
             return Ok(None);
         };
         let v: Value = serde_json::from_str(&json)?;
-        let number = v.get("number").and_then(Value::as_u64).unwrap_or(0);
-        if number == 0 {
-            return Ok(None);
-        }
-        let text = |key: &str| {
-            v.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        // A closed/merged PR is history, not a conflict worth warning about.
-        let state = text("state");
-        if !state.eq_ignore_ascii_case("open") {
-            return Ok(None);
-        }
-        Ok(Some(PrInfo {
-            number,
-            url: text("url"),
-            title: text("title"),
-            state: state.to_lowercase(),
-            reviewer: None,
-            reviewer_recorded: false,
-        }))
+        Ok(parse_pr_for_head(&v))
     }
 }
 
@@ -1525,9 +1557,15 @@ fn gh_failure_message(args: &[String], stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 async fn run_gh(cwd: &Path, args: &[String]) -> Result<String> {
+    // `kill_on_drop`: a timeout drops the future, and without it gh keeps
+    // running — a timed-out `pr create` could still open the PR behind our back.
     let out = timeout(
         GH_TIMEOUT,
-        Command::new("gh").current_dir(cwd).args(args).output(),
+        Command::new("gh")
+            .current_dir(cwd)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .map_err(|_| {
@@ -1559,6 +1597,7 @@ async fn run_gh_stdin(cwd: &Path, args: &[String], stdin: &str) -> Result<String
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| CoreError::forge(format!("failed to run gh (is it installed?): {e}")))?;
     // Write the body and close stdin so gh stops reading.
@@ -1597,6 +1636,69 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--reviewer", "octocat"]));
         assert!(args.windows(2).any(|w| w == ["--base", "main"]));
         assert!(args.windows(2).any(|w| w == ["--head", "usine/x"]));
+    }
+
+    #[test]
+    fn pr_for_head_args_request_draft_and_review_requests() {
+        let args = pr_for_head_args("feat/x");
+        assert_eq!(&args[0..3], ["pr", "view", "feat/x"]);
+        let fields = args.last().unwrap();
+        for f in [
+            "number",
+            "url",
+            "title",
+            "state",
+            "isDraft",
+            "reviewRequests",
+        ] {
+            assert!(fields.split(',').any(|x| x == f), "missing {f}");
+        }
+    }
+
+    #[test]
+    fn parse_pr_for_head_reads_an_open_pr_and_its_user_reviewer() {
+        let v: Value = serde_json::from_str(
+            r#"{"number":42,"url":"https://github.com/o/r/pull/42","title":"T",
+                "state":"OPEN","isDraft":false,
+                "reviewRequests":[{"__typename":"User","login":"octocat"}]}"#,
+        )
+        .unwrap();
+        let pr = parse_pr_for_head(&v).unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+        assert_eq!(pr.state, "open");
+        assert_eq!(pr.reviewer.as_deref(), Some("octocat"));
+        assert!(!pr.reviewer_recorded);
+    }
+
+    #[test]
+    fn parse_pr_for_head_marks_drafts() {
+        let v: Value = serde_json::from_str(
+            r#"{"number":3,"url":"u","title":"T","state":"OPEN","isDraft":true,"reviewRequests":[]}"#,
+        )
+        .unwrap();
+        let pr = parse_pr_for_head(&v).unwrap();
+        assert_eq!(pr.state, "draft");
+        assert_eq!(pr.reviewer, None);
+    }
+
+    #[test]
+    fn parse_pr_for_head_skips_team_requests() {
+        let v: Value = serde_json::from_str(
+            r#"{"number":3,"url":"u","title":"T","state":"OPEN","isDraft":false,
+                "reviewRequests":[{"__typename":"Team","name":"core","slug":"core"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_pr_for_head(&v).unwrap().reviewer, None);
+    }
+
+    #[test]
+    fn parse_pr_for_head_ignores_closed_prs() {
+        let v: Value = serde_json::from_str(
+            r#"{"number":3,"url":"u","title":"T","state":"MERGED","isDraft":false,"reviewRequests":[]}"#,
+        )
+        .unwrap();
+        assert!(parse_pr_for_head(&v).is_none());
     }
 
     #[test]

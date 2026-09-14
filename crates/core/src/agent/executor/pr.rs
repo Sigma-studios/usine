@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::infra::git::is_dirty;
+use crate::PrInfo;
 
 /// Base for the synthetic ids given to review-*body* triage items. Far above
 /// any real GitHub comment id so they can't collide, but well below 2^53 so
@@ -142,7 +143,7 @@ impl Executor {
 
         // Draft PRs let the user add screenshots on GitHub (no API embeds images
         // in a PR body) then mark it ready; a non-draft opens straight for review.
-        let pr = self
+        let created = self
             .forge
             .create_pr(
                 &project.path,
@@ -153,7 +154,33 @@ impl Executor {
                 reviewer.as_deref(),
                 draft,
             )
-            .await?;
+            .await;
+        let pr = match created {
+            Ok(pr) => pr,
+            // gh can fail *after* the PR exists — a refused reviewer request
+            // (e.g. the author asking themselves), or a timeout — and every
+            // retry then fails with "already exists". An open PR on this card's
+            // branch is that PR, so record it rather than stranding the card.
+            Err(err) => match self.forge.pr_for_head(&project.path, &head).await {
+                Ok(Some(existing)) => {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                        card_id,
+                        Severity::Warning,
+                        format!(
+                            "PR #{} was opened, but gh reported an error: {err}",
+                            existing.number
+                        ),
+                    ));
+                    // Read back from GitHub, so its reviewer (possibly none,
+                    // when the request was refused) is authoritative.
+                    PrInfo {
+                        reviewer_recorded: true,
+                        ..existing
+                    }
+                }
+                _ => return Err(err),
+            },
+        };
 
         let number = pr.number;
         let expects_ci = project.expects_ci();
