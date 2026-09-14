@@ -405,9 +405,7 @@ fn use_dock_badge(state: AppState) {
 
 #[component]
 fn App() -> Element {
-    use dioxus::desktop::{
-        tao::event::Event, use_wry_event_handler, WindowEvent,
-    };
+    use dioxus::desktop::{tao::event::Event, use_wry_event_handler, WindowEvent};
 
     let state = use_context_provider(AppState::init);
 
