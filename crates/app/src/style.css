@@ -1067,6 +1067,7 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 .usage-group + .usage-group { border-left: 1px solid var(--border); padding-left: 14px; }
 .usage-gauge { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .usage-label { font-weight: 600; flex: none; }
+.usage-running { font-weight: 600; color: var(--text); flex: none; white-space: nowrap; }
 .usage-meter { width: 54px; height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; flex: none; }
 .usage-fill { height: 100%; border-radius: 3px; }
 .usage-fill.ok { background: var(--green); }

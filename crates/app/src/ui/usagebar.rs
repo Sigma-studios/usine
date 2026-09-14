@@ -7,11 +7,19 @@
 //! refresh button stays reachable exactly when the numbers never arrived. In
 //! demo mode the gauges show the simulator's mock numbers, which the button
 //! re-rolls.
+//!
+//! Next to each provider's badge sits a global "N running" count of the agent
+//! runs currently executing on it (every project's cards and PR review tasks),
+//! hidden at zero. A provider with running agents but no visible window still
+//! gets its segment, holding just the badge and the count.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
-use usine_core::{now_millis, Provider, ProviderUsage, RateLimitWindow};
+use usine_core::{
+    now_millis, CardState, Provider, ProviderUsage, QueuedTarget, RateLimitWindow, ReviewSub,
+};
+use uuid::Uuid;
 
 use crate::state::AppState;
 use crate::ui::widgets::provider_value;
@@ -47,19 +55,46 @@ pub fn UsageBar() -> Element {
         }
     });
     let snapshot = state.usage.read().clone();
-    let claude = snapshot.claude.filter(has_visible_window);
-    let codex = snapshot.codex.filter(has_visible_window);
+    // Cards and review tasks change constantly across every project; the memo
+    // soaks those updates up and only re-renders the bar when a count moves.
+    let running = use_memo(move || {
+        // Review runs launch on the default provider, so that's where they count.
+        let review_provider = state.settings.read().default_provider;
+        let mut runs: Vec<(Uuid, Provider)> = state
+            .cards
+            .read()
+            .iter()
+            .filter(|card| runs_agent(&card.state))
+            .map(|card| (card.id, card.config.provider))
+            .collect();
+        runs.extend(
+            state
+                .review_tasks
+                .read()
+                .values()
+                .flatten()
+                .filter(|task| task.status.is_running())
+                .map(|task| (task.id, review_provider)),
+        );
+        let queued = state.run_queue.read();
+        (
+            running_count(Provider::Claude, &runs, &queued),
+            running_count(Provider::Codex, &runs, &queued),
+        )
+    });
+    let (claude_running, codex_running) = running();
+    let group = |usage: Option<ProviderUsage>, provider: Provider, running: usize| {
+        let usage = usage.filter(has_visible_window);
+        (usage.is_some() || running > 0).then(|| {
+            let usage = usage.unwrap_or_default();
+            rsx! {
+                ProviderGauges { provider, usage, running }
+            }
+        })
+    };
+    let claude = group(snapshot.claude.clone(), Provider::Claude, claude_running);
+    let codex = group(snapshot.codex.clone(), Provider::Codex, codex_running);
     let empty = claude.is_none() && codex.is_none();
-    let claude = claude.map(|usage| {
-        rsx! {
-            ProviderGauges { provider: Provider::Claude, usage }
-        }
-    });
-    let codex = codex.map(|usage| {
-        rsx! {
-            ProviderGauges { provider: Provider::Codex, usage }
-        }
-    });
     // Read the ticker so the label re-renders with it.
     let _ = tick();
     let label = refreshed_label(snapshot.refreshed_at, now_millis());
@@ -156,6 +191,25 @@ fn refreshed_label(refreshed_at: Option<i64>, now_ms: i64) -> String {
     format!("Updated {relative} ({absolute})")
 }
 
+/// Whether a card in this state has an agent process running. The validate
+/// step runs the project's script, not an agent, so it doesn't count.
+fn runs_agent(state: &CardState) -> bool {
+    state.is_running()
+        && !matches!(
+            state,
+            CardState::AwaitingReview(ReviewSub::Validating { .. })
+        )
+}
+
+/// How many of the running `(id, provider)` pairs are on `provider`. A queued
+/// launch already sits in its running state but has no process yet, so it's
+/// skipped until its slot frees up.
+fn running_count(provider: Provider, runs: &[(Uuid, Provider)], queued: &[QueuedTarget]) -> usize {
+    runs.iter()
+        .filter(|(id, p)| *p == provider && !queued.iter().any(|t| t.id() == *id))
+        .count()
+}
+
 fn has_visible_window(usage: &ProviderUsage) -> bool {
     shown(usage.session.as_ref())
         || shown(usage.weekly.as_ref())
@@ -168,7 +222,7 @@ fn shown(window: Option<&RateLimitWindow>) -> bool {
 }
 
 #[component]
-fn ProviderGauges(provider: Provider, usage: ProviderUsage) -> Element {
+fn ProviderGauges(provider: Provider, usage: ProviderUsage, running: usize) -> Element {
     let name = provider.label();
     let class = provider_value(provider);
     let session = usage
@@ -189,6 +243,9 @@ fn ProviderGauges(provider: Provider, usage: ProviderUsage) -> Element {
     rsx! {
         div { class: "usage-group",
             span { class: "badge provider {class}", "{name}" }
+            if running > 0 {
+                span { class: "usage-running", "{running} running" }
+            }
             {session}
             {weekly}
             {weekly_model}
@@ -329,5 +386,41 @@ mod tests {
             ..Default::default()
         };
         assert!(!has_visible_window(&idle));
+    }
+
+    #[test]
+    fn agent_runs_count_but_the_validate_script_does_not() {
+        use usine_core::RunSub;
+        assert!(runs_agent(&CardState::Implementing(RunSub::Running)));
+        assert!(runs_agent(&CardState::AwaitingReview(
+            ReviewSub::FixingValidation {
+                attempt: 1,
+                output: String::new(),
+            }
+        )));
+        assert!(!runs_agent(&CardState::AwaitingReview(
+            ReviewSub::Validating { attempt: 1 }
+        )));
+        assert!(runs_agent(&CardState::Answering {
+            previous: Box::new(CardState::ReadyToMerge),
+            question: "why?".into(),
+        }));
+        assert!(!runs_agent(&CardState::StartingBlock));
+    }
+
+    #[test]
+    fn running_count_tallies_one_provider_and_skips_queued_launches() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let runs = [
+            (a, Provider::Claude),
+            (b, Provider::Claude),
+            (c, Provider::Codex),
+        ];
+        assert_eq!(running_count(Provider::Claude, &runs, &[]), 2);
+        assert_eq!(running_count(Provider::Codex, &runs, &[]), 1);
+        let queued = [QueuedTarget::Card(b), QueuedTarget::Review(c)];
+        assert_eq!(running_count(Provider::Claude, &runs, &queued), 1);
+        assert_eq!(running_count(Provider::Codex, &runs, &queued), 0);
+        assert_eq!(running_count(Provider::Claude, &[], &[]), 0);
     }
 }
