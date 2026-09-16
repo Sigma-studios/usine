@@ -128,7 +128,7 @@ pub(super) fn AgentChatSection(
                         let t = text.read().trim().to_string();
                         if !t.is_empty() || request_enabled_when_blank {
                             on_request.call(t);
-                            text.set(String::new());
+                            drafts::clear(card_id, "chat", text, String::new());
                             generation += 1;
                         }
                     },
@@ -143,7 +143,7 @@ pub(super) fn AgentChatSection(
                         let q = text.read().trim().to_string();
                         if !q.is_empty() {
                             state.send(ExecutorCommand::AskQuestion { card_id, question: q });
-                            text.set(String::new());
+                            drafts::clear(card_id, "chat", text, String::new());
                             generation += 1;
                         }
                     },

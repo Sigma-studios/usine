@@ -116,7 +116,7 @@ pub(super) fn PlanApproval(card_id: Uuid, plan: String) -> Element {
                     state.send(ExecutorCommand::RejectPlan { card_id, feedback: combined });
                     // The answers were consumed by this send-back; the replan's
                     // questions will be different.
-                    drafts::forget(card_id, "plan.answers");
+                    drafts::clear(card_id, "plan.answers", answers, vec![String::new(); n]);
                 }
             },
         }

@@ -94,8 +94,8 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
                     let combined = parts.join("\n\n");
                     if !combined.is_empty() {
                         state.send(ExecutorCommand::FollowUpInvestigation { card_id, feedback: combined });
-                        follow_up.set(String::new());
-                        drafts::forget(card_id, "investigate.answers");
+                        drafts::clear(card_id, "investigate.followup", follow_up, String::new());
+                        drafts::clear(card_id, "investigate.answers", answers, vec![String::new(); n]);
                     }
                 },
                 "Investigate further"
