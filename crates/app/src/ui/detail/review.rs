@@ -589,7 +589,7 @@ fn FixGate(
                     title: "Run the agent again, keeping the commits it already made",
                     onclick: move |_| {
                         state.revise_review_fix(review_id, note.read().clone());
-                        crate::ui::drafts::forget(review_id, "review.fixnote");
+                        crate::ui::drafts::clear(review_id, "review.fixnote", note, String::new());
                     },
                     "Redo with feedback"
                 }

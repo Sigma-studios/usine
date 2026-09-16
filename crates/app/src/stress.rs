@@ -672,6 +672,17 @@ if (!el) {{ dioxus.send("missing:{id}"); }} else {{
     .await
 }
 
+/// Click the button labelled `label` and report back at once, so the caller's
+/// state change races the mirror effect the way a real send's remount does.
+async fn click_button_then_leave(label: &str) -> String {
+    eval_str(&format!(
+        r#"const btn = [...document.querySelectorAll("button")]
+    .find((b) => b.textContent.trim() === {label:?});
+if (!btn) {{ dioxus.send("missing:button"); }} else {{ btn.click(); dioxus.send("ok"); }}"#
+    ))
+    .await
+}
+
 /// Strip the ` default=…` diagnostic tail [`read_value`] appends when a field's
 /// value and `defaultValue` disagree — expected for a controlled field.
 fn value_of(s: &str) -> &str {
@@ -792,9 +803,42 @@ dioxus.send("ok");"#,
         &new_q,
     );
 
+    // A *sent* answer must not come back: the send remounts the panel, often
+    // before the draft mirror effect runs, so the send itself has to clear.
+    set_state(app, &card, intervention("Question one?"), 900 * slow).await;
+    let _ = type_into("intervention-answer", "sent-answer", slow).await;
+    let out = click_button_then_leave("Send answer").await;
+    set_state(
+        app,
+        &card,
+        CardState::Implementing(usine_core::RunSub::Running),
+        300 * slow,
+    )
+    .await;
+    set_state(app, &card, intervention("Question one?"), 900 * slow).await;
+    let after_send = read_value("intervention-answer").await;
+    all_ok &= report(
+        "sent answer doesn't return",
+        out == "ok" && value_of(&after_send) == "=",
+        &format!("{out} {after_send}"),
+    );
+
     set_state(app, &card, CardState::ReadyToMerge, 700 * slow).await;
 
-    // 4. The search box still filters the board live, per keystroke.
+    // 3b. Same for the chat box: send, change state straight away, come back.
+    let _ = type_into("chat-input", "sent-feedback", slow).await;
+    let out = click_button_then_leave("Ask questions").await;
+    set_state(app, &card, CardState::Done, 300 * slow).await;
+    set_state(app, &card, CardState::ReadyToMerge, 900 * slow).await;
+    let after_send = read_value("chat-input").await;
+    let stored = drafts::peek(id, "chat");
+    all_ok &= report(
+        "sent chat text doesn't return",
+        out == "ok" && value_of(&after_send) == "=" && stored.is_none(),
+        &format!("{out} {after_send} stored={stored:?}"),
+    );
+
+    // 4.The search box still filters the board live, per keystroke.
     let out = eval_str(&format!(
         r#"{JS_SLEEP}
 const count = () => document.querySelectorAll(".board .card").length;
