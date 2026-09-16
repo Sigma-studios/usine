@@ -57,6 +57,10 @@ pub fn use_draft(
         let v = sig.read().clone();
         #[cfg(debug_assertions)]
         MIRROR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        if mirror_held() {
+            return;
+        }
         mirror_str(&mut DRAFTS.write(), key, v, &seeded);
     });
     sig
@@ -68,6 +72,18 @@ pub fn use_draft(
 /// mirroring altogether.
 #[cfg(debug_assertions)]
 pub static MIRROR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// While set, the mirror effects skip their write (they still subscribe). The
+/// sent-draft checks hold it across a send and the remount that follows, which
+/// pins the race a real send can lose — state change before the mirror effect —
+/// instead of hoping the scheduler loses it.
+#[cfg(debug_assertions)]
+pub static HOLD_MIRROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+fn mirror_held() -> bool {
+    HOLD_MIRROR.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Origin-keyed variant for working copies of agent output (fix verdicts, plan
 /// answers, an intervention's typed answer). The draft is stored alongside a
@@ -92,6 +108,10 @@ where
     let sig = use_signal(|| restore_typed::<T>(&DRAFTS.peek(), key, &init_fp).unwrap_or(init));
     use_effect(move || {
         let v = sig.read().clone();
+        #[cfg(debug_assertions)]
+        if mirror_held() {
+            return;
+        }
         mirror_typed(&mut DRAFTS.write(), key, &fp, &v, &seeded);
     });
     sig
@@ -246,7 +266,13 @@ mod tests {
 
         let k = key(Uuid::new_v4(), "plan.answers");
         let seed = vec![String::new(); 2];
-        mirror_typed(&mut map, k, "plan-v1", &vec!["a".to_string(), String::new()], &seed);
+        mirror_typed(
+            &mut map,
+            k,
+            "plan-v1",
+            &vec!["a".to_string(), String::new()],
+            &seed,
+        );
         map.remove(&k);
         mirror_typed(&mut map, k, "plan-v1", &seed.clone(), &seed);
         assert!(map.is_empty());

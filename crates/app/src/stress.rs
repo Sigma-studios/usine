@@ -90,6 +90,15 @@ fn num(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Set for the whole regression-check run: the checks click real send buttons
+/// on a synthetic card, and `AppState::send` drops commands while this is on so
+/// the executor never sees a card it doesn't know.
+static SWALLOW_SENDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn swallowing_sends() -> bool {
+    SWALLOW_SENDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the load generator is armed.
 pub fn enabled() -> bool {
     flag("USINE_STRESS")
@@ -672,15 +681,28 @@ if (!el) {{ dioxus.send("missing:{id}"); }} else {{
     .await
 }
 
-/// Click the button labelled `label` and report back at once, so the caller's
-/// state change races the mirror effect the way a real send's remount does.
-async fn click_button_then_leave(label: &str) -> String {
-    eval_str(&format!(
-        r#"const btn = [...document.querySelectorAll("button")]
+/// Send via the button labelled `label` with the draft mirror held, then run
+/// `leave` (the state change a real send causes) before releasing it. That is
+/// the losing side of the race — remount before the mirror effect — made
+/// certain, so only a send-time clear keeps the sent text from coming back.
+async fn send_then_leave(
+    label: &str,
+    slow: u64,
+    leave: impl std::future::Future<Output = ()>,
+) -> String {
+    use std::sync::atomic::Ordering;
+    drafts::HOLD_MIRROR.store(true, Ordering::Relaxed);
+    let out = eval_str(&format!(
+        r#"{JS_SLEEP}
+const btn = [...document.querySelectorAll("button")]
     .find((b) => b.textContent.trim() === {label:?});
-if (!btn) {{ dioxus.send("missing:button"); }} else {{ btn.click(); dioxus.send("ok"); }}"#
+if (!btn) {{ dioxus.send("missing:button"); }} else {{ btn.click(); await sleep({settle}); dioxus.send("ok"); }}"#,
+        settle = 300 * slow
     ))
-    .await
+    .await;
+    leave.await;
+    drafts::HOLD_MIRROR.store(false, Ordering::Relaxed);
+    out
 }
 
 /// Strip the ` default=…` diagnostic tail [`read_value`] appends when a field's
@@ -692,6 +714,7 @@ fn value_of(s: &str) -> &str {
 async fn run_checks(app: AppState, card: Card, slow: u64) {
     let id = card.id;
     let mut all_ok = true;
+    SWALLOW_SENDS.store(true, std::sync::atomic::Ordering::Relaxed);
     // The panel was only just selected; let it render before poking at it.
     pause(1500 * slow).await;
     println!("[check] --- regression checks (fix_a={}) ---", fix_a());
@@ -805,14 +828,18 @@ dioxus.send("ok");"#,
 
     // A *sent* answer must not come back: the send remounts the panel, often
     // before the draft mirror effect runs, so the send itself has to clear.
+    // The mirror is held across the send so this fails without that clear.
     set_state(app, &card, intervention("Question one?"), 900 * slow).await;
     let _ = type_into("intervention-answer", "sent-answer", slow).await;
-    let out = click_button_then_leave("Send answer").await;
-    set_state(
-        app,
-        &card,
-        CardState::Implementing(usine_core::RunSub::Running),
-        300 * slow,
+    let out = send_then_leave(
+        "Send answer",
+        slow,
+        set_state(
+            app,
+            &card,
+            CardState::Implementing(usine_core::RunSub::Running),
+            500 * slow,
+        ),
     )
     .await;
     set_state(app, &card, intervention("Question one?"), 900 * slow).await;
@@ -827,8 +854,12 @@ dioxus.send("ok");"#,
 
     // 3b. Same for the chat box: send, change state straight away, come back.
     let _ = type_into("chat-input", "sent-feedback", slow).await;
-    let out = click_button_then_leave("Ask questions").await;
-    set_state(app, &card, CardState::Done, 300 * slow).await;
+    let out = send_then_leave(
+        "Ask questions",
+        slow,
+        set_state(app, &card, CardState::Done, 500 * slow),
+    )
+    .await;
     set_state(app, &card, CardState::ReadyToMerge, 900 * slow).await;
     let after_send = read_value("chat-input").await;
     let stored = drafts::peek(id, "chat");
@@ -838,7 +869,7 @@ dioxus.send("ok");"#,
         &format!("{out} {after_send} stored={stored:?}"),
     );
 
-    // 4.The search box still filters the board live, per keystroke.
+    // 4. The search box still filters the board live, per keystroke.
     let out = eval_str(&format!(
         r#"{JS_SLEEP}
 const count = () => document.querySelectorAll(".board .card").length;

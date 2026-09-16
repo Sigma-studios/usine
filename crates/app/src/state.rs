@@ -273,6 +273,12 @@ impl AppState {
     }
 
     pub fn send(&self, cmd: ExecutorCommand) {
+        // The stress checks click real send buttons on a synthetic card the
+        // executor has never heard of; keep those commands out of it.
+        #[cfg(debug_assertions)]
+        if crate::stress::swallowing_sends() {
+            return;
+        }
         self.backend.read().exec.send(cmd);
     }
 
