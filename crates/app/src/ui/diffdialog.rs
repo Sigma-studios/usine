@@ -714,7 +714,7 @@ fn FixBar(review_id: Uuid, head_ref: String) -> Element {
                     title: "Run the agent again, keeping the commits it already made",
                     onclick: move |_| {
                         state.revise_review_fix(review_id, note.read().clone());
-                        super::drafts::forget(review_id, "review.fixnote");
+                        super::drafts::clear(review_id, "review.fixnote", note, String::new());
                         dismiss();
                     },
                     "Redo"

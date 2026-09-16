@@ -791,8 +791,8 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                             }
                             if !parts.is_empty() {
                                 state.send(ExecutorCommand::Answer { card_id, text: parts.join("\n\n") });
-                                selected.set(None);
-                                answer.set(String::new());
+                                crate::ui::drafts::clear(card_id, "intervention.option", selected, None);
+                                crate::ui::drafts::clear(card_id, "intervention.answer", answer, String::new());
                                 generation += 1;
                             }
                         },

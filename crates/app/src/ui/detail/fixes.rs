@@ -314,7 +314,7 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                         // verdicts, so the origin rule alone wouldn't clear.
                         drafts::forget(card_id, "fixes.verdicts");
                         drafts::forget(card_id, "fixes.task");
-                        note.set(String::new());
+                        drafts::clear(card_id, "fixes.note", note, String::new());
                     },
                     "{apply_label}"
                 }
@@ -336,11 +336,8 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                         title: if has_note { "Opens the PR without applying anything — your note is discarded" } else { "Apply nothing and open the PR" },
                         onclick: move |_| {
                             state.send(ExecutorCommand::SkipToPr { card_id });
-                            // The button promises the note is discarded; forget
-                            // the store entry too in case the panel unmounts
-                            // before the mirror effect sees the reset.
-                            note.set(String::new());
-                            drafts::forget(card_id, "fixes.note");
+                            // The button promises the note is discarded.
+                            drafts::clear(card_id, "fixes.note", note, String::new());
                             // The composed task mirrored that note; nothing was
                             // sent, so don't keep an edit of it either.
                             drafts::forget(card_id, "fixes.task");

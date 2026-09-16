@@ -9,7 +9,9 @@
 //!
 //! The rules that keep the map from ever showing stale data:
 //! - **Seed rule** — a value equal to its seed is *removed* from the map, so an
-//!   untouched or just-sent field never shadows fresher seeds on remount.
+//!   untouched field never shadows fresher seeds on remount. The rule runs
+//!   in an effect, though, and a send usually remounts the panel before that
+//!   effect gets to run — so send sites use [`clear`], never a bare reset.
 //! - **Origin rule** (`use_draft_of`) — a working copy of agent output is
 //!   stored alongside a fingerprint of the payload it edits; a new agent run
 //!   (new verdicts, a replanned plan, a different question) reseeds instead of
@@ -55,6 +57,10 @@ pub fn use_draft(
         let v = sig.read().clone();
         #[cfg(debug_assertions)]
         MIRROR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        if mirror_held() {
+            return;
+        }
         mirror_str(&mut DRAFTS.write(), key, v, &seeded);
     });
     sig
@@ -66,6 +72,18 @@ pub fn use_draft(
 /// mirroring altogether.
 #[cfg(debug_assertions)]
 pub static MIRROR_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// While set, the mirror effects skip their write (they still subscribe). The
+/// sent-draft checks hold it across a send and the remount that follows, which
+/// pins the race a real send can lose — state change before the mirror effect —
+/// instead of hoping the scheduler loses it.
+#[cfg(debug_assertions)]
+pub static HOLD_MIRROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+fn mirror_held() -> bool {
+    HOLD_MIRROR.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Origin-keyed variant for working copies of agent output (fix verdicts, plan
 /// answers, an intervention's typed answer). The draft is stored alongside a
@@ -90,6 +108,10 @@ where
     let sig = use_signal(|| restore_typed::<T>(&DRAFTS.peek(), key, &init_fp).unwrap_or(init));
     use_effect(move || {
         let v = sig.read().clone();
+        #[cfg(debug_assertions)]
+        if mirror_held() {
+            return;
+        }
         mirror_typed(&mut DRAFTS.write(), key, &fp, &v, &seeded);
     });
     sig
@@ -99,6 +121,15 @@ where
 /// seed (the confirm dialog fires the command, or the seed is nonempty).
 pub fn forget(owner: Uuid, field: &'static str) {
     DRAFTS.write().remove(&DraftKey { owner, field });
+}
+
+/// Clear a draft at send time: reset the signal *and* drop the store entry in
+/// the same handler. The mirror effect alone can't be trusted here — the send
+/// usually changes the card state, which remounts the panel before the effect
+/// runs, leaving the sent text to restore into the next step.
+pub fn clear<T: 'static>(owner: Uuid, field: &'static str, mut sig: Signal<T>, seed: T) {
+    sig.set(seed);
+    forget(owner, field);
 }
 
 /// Read one field's mirrored draft without subscribing. Debug-only: the
@@ -219,6 +250,31 @@ mod tests {
         mirror_typed(&mut map, k, "run-1", &vec!["edited".to_string()], &seed);
         assert_eq!(map.len(), 1);
         mirror_typed(&mut map, k, "run-1", &seed.clone(), &seed);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn late_mirror_of_the_seed_after_clear_leaves_nothing() {
+        // `clear` drops the entry first; the mirror effect may still run
+        // afterwards with the reset value, and must not resurrect anything.
+        let mut map = HashMap::new();
+        let k = key(Uuid::new_v4(), "chat");
+        mirror_str(&mut map, k, "sent feedback".into(), "");
+        map.remove(&k);
+        mirror_str(&mut map, k, String::new(), "");
+        assert_eq!(restore_str(&map, k), None);
+
+        let k = key(Uuid::new_v4(), "plan.answers");
+        let seed = vec![String::new(); 2];
+        mirror_typed(
+            &mut map,
+            k,
+            "plan-v1",
+            &vec!["a".to_string(), String::new()],
+            &seed,
+        );
+        map.remove(&k);
+        mirror_typed(&mut map, k, "plan-v1", &seed.clone(), &seed);
         assert!(map.is_empty());
     }
 
