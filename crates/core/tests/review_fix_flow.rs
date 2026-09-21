@@ -304,6 +304,7 @@ fn harness(target: PrPushTarget) -> Harness {
 fn same_repo_target() -> PrPushTarget {
     PrPushTarget {
         head_ref: "feat/cache".into(),
+        base_ref: "main".into(),
         cross_repo: false,
         head_repo: String::new(),
         maintainer_can_modify: false,
@@ -442,6 +443,7 @@ async fn publish_and_fix_pledges_then_gates_the_push() {
 async fn a_fork_without_maintainer_edits_posts_nothing() {
     let mut h = harness(PrPushTarget {
         head_ref: "feat/cache".into(),
+        base_ref: "main".into(),
         cross_repo: true,
         head_repo: "octocat/repo".into(),
         maintainer_can_modify: false,

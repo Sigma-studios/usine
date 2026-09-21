@@ -17,6 +17,7 @@ use crate::domain::model::{
     Card, CardAnswers, DraftComment, FixVerdict, PrInfo, PreviewStatus, PreviewUrl, Project,
     ReviewEvent, ReviewTask, Usage,
 };
+use crate::infra::forge::OpenPr;
 
 /// Severity for a user-facing toast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +211,17 @@ pub enum ExecutorCommand {
         description: String,
         retire_original: bool,
         dirty_action: DirtyAction,
+    },
+    /// Adopt open PR `pr_number` into a new card that takes the PR over: the
+    /// card attaches to the PR's own head branch (no `usine/` cut) and lands at
+    /// the PR-review stage, so every later push updates that same PR. Refused
+    /// for forks, PRs targeting another base, and a local head that is checked
+    /// out or has diverged from the remote.
+    AdoptPr {
+        project_id: Uuid,
+        pr_number: u64,
+        title: String,
+        description: String,
     },
 
     // --- PR review workflow (reviewing other contributors' PRs) ----------
@@ -505,6 +517,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ListAdoptSources { .. }
             | ExecutorCommand::ProbeAdoptSource { .. }
             | ExecutorCommand::AdoptBranch { .. }
+            | ExecutorCommand::AdoptPr { .. }
             | ExecutorCommand::AddProject { .. }
             | ExecutorCommand::SaveProject { .. }
             | ExecutorCommand::DeleteProject { .. }
@@ -668,9 +681,14 @@ pub enum ExecutorEventKind {
         project_id: Uuid,
         logins: Vec<String>,
     },
-    /// A project's adoptable branches (project-scoped; the adopt dialog's
-    /// picker replaces its list).
-    AdoptSources { project_id: Uuid, refs: Vec<String> },
+    /// A project's adoptable branches and open PRs (project-scoped; the adopt
+    /// dialog's picker replaces its lists). A PR's head never also appears in
+    /// `refs`.
+    AdoptSources {
+        project_id: Uuid,
+        refs: Vec<String>,
+        prs: Vec<OpenPr>,
+    },
     /// What probing one adopt candidate found (project-scoped; the dialog
     /// matches `probe.source_ref` against its current pick to drop stale
     /// responses).
@@ -816,10 +834,14 @@ impl ExecutorEvent {
             kind: ExecutorEventKind::PrAuthors { project_id, logins },
         }
     }
-    pub fn adopt_sources(project_id: Uuid, refs: Vec<String>) -> Self {
+    pub fn adopt_sources(project_id: Uuid, refs: Vec<String>, prs: Vec<OpenPr>) -> Self {
         ExecutorEvent {
             card_id: Uuid::nil(),
-            kind: ExecutorEventKind::AdoptSources { project_id, refs },
+            kind: ExecutorEventKind::AdoptSources {
+                project_id,
+                refs,
+                prs,
+            },
         }
     }
     pub fn adopt_probe(project_id: Uuid, probe: AdoptProbe) -> Self {

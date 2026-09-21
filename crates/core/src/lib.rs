@@ -78,7 +78,7 @@ pub use domain::state_machine::{
 };
 pub use error::{CoreError, Result};
 pub use infra::forge::{
-    normalize_login, FailedCheck, Forge, GhForge, LivePrState, PrPushTarget, PrSummary,
+    normalize_login, FailedCheck, Forge, GhForge, LivePrState, OpenPr, PrPushTarget, PrSummary,
     ReviewScope, SimForge,
 };
 pub use infra::git::{

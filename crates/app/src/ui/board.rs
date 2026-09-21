@@ -195,7 +195,8 @@ fn new_card_target(view: SelectedView, projects: &[Project]) -> Option<NewCardTa
     }
 }
 
-/// Creates a blank card and opens it for editing, or adopts an existing branch.
+/// Creates a blank card and opens it for editing, or adopts an existing branch
+/// or PR.
 /// In a project view both act on that project; from the Home view they ask
 /// which project first (unless there is only one). Lives at the bottom of the
 /// column.
@@ -233,7 +234,7 @@ fn AddCardButton() -> Element {
                 }
                 None => super::newcard::open_project_picker(NewCardIntent::Adopt),
             },
-            "⤵ Adopt branch…"
+            "⤵ Adopt branch/PR…"
         }
     }
 }

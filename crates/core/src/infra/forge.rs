@@ -60,6 +60,28 @@ pub struct FailedCheck {
     pub url: String,
 }
 
+/// An open PR on this repo that a card could adopt — the adopt dialog's
+/// "Pull requests" group. Carries everything the dialog prefills from, so
+/// picking one needs no probe round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPr {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub url: String,
+    /// The PR description, as written by the author.
+    pub body: String,
+    pub draft: bool,
+    /// Whether the head lives on a fork (not adoptable: we can't push to it
+    /// as the card's own branch).
+    pub cross_repo: bool,
+    /// Whether the signed-in user authored it. `false` when the login can't be
+    /// read — the dialog then merely shows an extra warning.
+    pub mine: bool,
+}
+
 /// Cap on any single `gh` invocation so a hung command (auth prompt, network
 /// stall) can't block a run actor indefinitely.
 const GH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -186,6 +208,8 @@ pub fn parse_live_pr_state(json: &str) -> Option<LivePrState> {
 pub struct PrPushTarget {
     /// The PR's head branch name, as the target repo holds it.
     pub head_ref: String,
+    /// The branch the PR targets (empty when the forge didn't say).
+    pub base_ref: String,
     /// Whether the head is on a fork rather than this repo.
     pub cross_repo: bool,
     /// `owner/repo` of the head repository (forks only; empty otherwise).
@@ -209,7 +233,8 @@ pub fn pr_push_target_args(pr_number: u64) -> Vec<String> {
         "view".into(),
         pr_number.to_string(),
         "--json".into(),
-        "headRefName,isCrossRepository,headRepository,headRepositoryOwner,maintainerCanModify"
+        "headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner,\
+         maintainerCanModify"
             .into(),
     ]
 }
@@ -239,6 +264,11 @@ pub fn parse_push_target(json: &str) -> Option<PrPushTarget> {
     };
     Some(PrPushTarget {
         head_ref: head_ref.to_string(),
+        base_ref: v
+            .get("baseRefName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         cross_repo: v
             .get("isCrossRepository")
             .and_then(Value::as_bool)
@@ -382,6 +412,59 @@ pub fn pr_for_head_args(head: &str) -> Vec<String> {
         "--json".into(),
         "number,url,title,state,isDraft,reviewRequests".into(),
     ]
+}
+
+/// Every open PR on the repo, with what the adopt dialog lists and prefills.
+/// `--limit 100` for the same reason as [`review_prs_args`]: the default of 30
+/// would silently truncate a busy repo's listing.
+pub fn open_prs_args() -> Vec<String> {
+    vec![
+        "pr".into(),
+        "list".into(),
+        "--state".into(),
+        "open".into(),
+        "--limit".into(),
+        "100".into(),
+        "--json".into(),
+        "number,title,author,headRefName,baseRefName,url,body,isDraft,isCrossRepository".into(),
+    ]
+}
+
+/// Read an [`open_prs_args`] listing into [`OpenPr`]s, marking the ones
+/// `viewer` authored (case-insensitively — GitHub logins are). Entries without
+/// a number or a head branch are dropped: there is nothing to adopt.
+pub fn parse_open_prs(value: &Value, viewer: &str) -> Vec<OpenPr> {
+    let text = |p: &Value, key: &str| {
+        p.pointer(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            let author = text(p, "/author/login");
+            OpenPr {
+                number: p.get("number").and_then(Value::as_u64).unwrap_or(0),
+                title: text(p, "/title"),
+                mine: !viewer.is_empty() && author.eq_ignore_ascii_case(viewer),
+                author,
+                head_ref: text(p, "/headRefName"),
+                base_ref: text(p, "/baseRefName"),
+                url: text(p, "/url"),
+                body: text(p, "/body"),
+                draft: p.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+                cross_repo: p
+                    .get("isCrossRepository")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }
+        })
+        .filter(|p| p.number != 0 && !p.head_ref.is_empty())
+        .collect()
 }
 
 /// The signed-in user's login — kept out of the reviewer picker, since GitHub
@@ -1064,6 +1147,18 @@ pub trait Forge: Send + Sync {
     async fn pr_for_head(&self, _repo: &Path, _head: &str) -> Result<Option<PrInfo>> {
         Ok(None)
     }
+
+    /// Every open PR on the repo — the adopt dialog's "Pull requests" group.
+    /// Defaulted to none so test doubles need no override.
+    async fn list_open_prs(&self, _repo: &Path) -> Result<Vec<OpenPr>> {
+        Ok(Vec::new())
+    }
+
+    /// PR `pr_number` as a [`PrInfo`], `None` unless it is open. What PR
+    /// adoption records on the card; the default ("can't tell") refuses it.
+    async fn pr_by_number(&self, _repo: &Path, _pr_number: u64) -> Result<Option<PrInfo>> {
+        Ok(None)
+    }
 }
 
 /// Real GitHub forge via the `gh` CLI.
@@ -1326,11 +1421,42 @@ impl Forge for GhForge {
         let v: Value = serde_json::from_str(&json)?;
         Ok(parse_pr_for_head(&v))
     }
+
+    async fn list_open_prs(&self, repo: &Path) -> Result<Vec<OpenPr>> {
+        // The viewer's login only orders the list and flags "not yours", so a
+        // failed lookup degrades to an unflagged listing rather than an error.
+        let (list_args, viewer_args) = (open_prs_args(), viewer_login_args());
+        let (out, me) = tokio::join!(run_gh(repo, &list_args), run_gh(repo, &viewer_args));
+        let value: Value = serde_json::from_str(&out?)?;
+        let me = me.map(|s| s.trim().to_string()).unwrap_or_default();
+        let mut prs = parse_open_prs(&value, &me);
+        // The user's own PRs first — the ones they most plausibly opened on
+        // another machine. Stable, so gh's newest-first order holds within.
+        prs.sort_by_key(|p| !p.mine);
+        Ok(prs)
+    }
+
+    async fn pr_by_number(&self, repo: &Path, pr_number: u64) -> Result<Option<PrInfo>> {
+        // Unlike `pr_for_head`, a failure here is an error, not "no PR": the
+        // caller must tell "closed" from "couldn't ask". `gh pr view` takes a
+        // number as readily as a branch.
+        let json = run_gh(repo, &pr_for_head_args(&pr_number.to_string())).await?;
+        let v: Value = serde_json::from_str(&json)?;
+        Ok(parse_pr_for_head(&v))
+    }
 }
 
 /// Simulated forge for Phase A: canned PR + review comments so the PR-review
 /// column is fully navigable without GitHub.
 pub struct SimForge;
+
+impl SimForge {
+    /// The open PR the sim offers for adoption. Its head only resolves if the
+    /// project's repo really has `origin/feature/sim-pr` — adoption checks git
+    /// for real, even in the sim.
+    pub const OPEN_PR: u64 = 57;
+    pub const OPEN_PR_HEAD: &'static str = "feature/sim-pr";
+}
 
 #[async_trait]
 impl Forge for SimForge {
@@ -1442,12 +1568,46 @@ impl Forge for SimForge {
     }
 
     /// A same-repo, pushable head, so "publish & fix" runs end to end in the sim.
-    async fn pr_push_target(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
+    async fn pr_push_target(&self, repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
+        let head_ref = if pr_number == Self::OPEN_PR {
+            Self::OPEN_PR_HEAD.to_string()
+        } else {
+            format!("sim/pr-{pr_number}")
+        };
         Ok(Some(PrPushTarget {
-            head_ref: format!("sim/pr-{pr_number}"),
+            head_ref,
+            base_ref: crate::infra::git::detect_base_branch(repo),
             cross_repo: false,
             head_repo: String::new(),
             maintainer_can_modify: true,
+        }))
+    }
+
+    async fn list_open_prs(&self, repo: &Path) -> Result<Vec<OpenPr>> {
+        Ok(vec![OpenPr {
+            number: Self::OPEN_PR,
+            title: "Speed up the sim dashboard".into(),
+            author: "you".into(),
+            head_ref: Self::OPEN_PR_HEAD.into(),
+            // Whatever the repo's base is, so the listing's "targets the
+            // project base" filter keeps it.
+            base_ref: crate::infra::git::detect_base_branch(repo),
+            url: format!("https://github.com/example/repo/pull/{}", Self::OPEN_PR),
+            body: "Opened from another machine: memoizes the dashboard queries.".into(),
+            draft: false,
+            cross_repo: false,
+            mine: true,
+        }])
+    }
+
+    async fn pr_by_number(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrInfo>> {
+        Ok((pr_number == Self::OPEN_PR).then(|| PrInfo {
+            number: pr_number,
+            url: format!("https://github.com/example/repo/pull/{pr_number}"),
+            title: "Speed up the sim dashboard".into(),
+            state: "open".into(),
+            reviewer: Some("octocat".into()),
+            reviewer_recorded: false,
         }))
     }
 
@@ -1699,6 +1859,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parse_pr_for_head(&v).unwrap().reviewer, None);
+    }
+
+    #[test]
+    fn parse_open_prs_reads_forks_drafts_and_empty_bodies() {
+        let v: Value = serde_json::from_str(
+            r#"[
+                {"number":7,"title":"Mine","author":{"login":"Me"},"headRefName":"feat/a",
+                 "baseRefName":"main","url":"u7","body":"","isDraft":true,
+                 "isCrossRepository":false},
+                {"number":8,"title":"Fork","author":{"login":"other"},"headRefName":"patch-1",
+                 "baseRefName":"main","url":"u8","body":"why","isDraft":false,
+                 "isCrossRepository":true},
+                {"number":0,"headRefName":"junk"},
+                {"number":9,"headRefName":""}
+            ]"#,
+        )
+        .unwrap();
+        let prs = parse_open_prs(&v, "me");
+        assert_eq!(prs.len(), 2, "entries without a number or head are dropped");
+        assert_eq!(prs[0].head_ref, "feat/a");
+        assert!(prs[0].draft && !prs[0].cross_repo);
+        assert!(prs[0].body.is_empty());
+        assert!(prs[0].mine, "author match is case-insensitive");
+        assert!(prs[1].cross_repo && !prs[1].draft && !prs[1].mine);
+        assert_eq!(prs[1].body, "why");
+        // An unknown viewer flags nothing as mine.
+        assert!(parse_open_prs(&v, "").iter().all(|p| !p.mine));
+    }
+
+    #[test]
+    fn open_prs_args_list_open_prs_with_fork_and_draft_flags() {
+        let args = open_prs_args();
+        assert_eq!(&args[0..4], ["pr", "list", "--state", "open"]);
+        assert!(args.windows(2).any(|w| w == ["--limit", "100"]));
+        let fields = args.last().unwrap();
+        for f in [
+            "headRefName",
+            "baseRefName",
+            "isDraft",
+            "isCrossRepository",
+            "body",
+        ] {
+            assert!(fields.split(',').any(|x| x == f), "missing {f}");
+        }
     }
 
     #[test]
@@ -2231,12 +2435,15 @@ mod tests {
     fn push_target_reads_a_same_repo_pr_as_pushable() {
         let args = pr_push_target_args(7);
         assert!(args.iter().any(|a| a.contains("maintainerCanModify")));
+        assert!(args.last().unwrap().split(',').any(|f| f == "baseRefName"));
         let t = parse_push_target(
-            r#"{"headRefName":"feat/x","isCrossRepository":false,"maintainerCanModify":false,
+            r#"{"headRefName":"feat/x","baseRefName":"dev","isCrossRepository":false,
+                "maintainerCanModify":false,
                 "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"me"}}"#,
         )
         .expect("parsed");
         assert_eq!(t.head_ref, "feat/x");
+        assert_eq!(t.base_ref, "dev");
         assert!(t.pushable(), "our own repo is always pushable");
     }
 
