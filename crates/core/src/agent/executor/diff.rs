@@ -96,11 +96,7 @@ impl Executor {
         // Non-fatal: while the branch is checked out in the review worktree the
         // fetch is refused, but the branch is right there to diff — only if the
         // diff itself then fails is this surfaced as the root cause.
-        let fetch_err = self
-            .git
-            .fetch_pr(&project.path, task.pr_number, &branch)
-            .await
-            .err();
+        let fetch_err = self.fetch_review_head(&project, &task, &branch).await.err();
         if let Some(e) = &fetch_err {
             tracing::warn!(
                 "review diff: fetching PR #{} failed, diffing the local branch as-is: {e}",

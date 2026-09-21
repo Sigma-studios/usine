@@ -3,7 +3,7 @@
 //! app-wide config (open-in commands, run cap).
 
 use dioxus::prelude::*;
-use usine_core::{normalize_login, CardConfig, PreviewPort, Project};
+use usine_core::{CardConfig, ForgeKind, PreviewPort, Project, AZURE_DEVOPS_PAT_ENV};
 use uuid::Uuid;
 
 use super::widgets::{
@@ -346,20 +346,29 @@ pub fn ProjectSettingsModal() -> Element {
 /// 5-minute poll — `SaveProject` runs inline in the dispatcher, ahead of the
 /// spawned scan, so the scan is guaranteed to see the saved config.
 ///
-/// The input is normalized first (`@login` and pasted profile URLs are
-/// accepted) and rejected if it can't be a GitHub login: it ends up
-/// interpolated into a `gh --search` query, where a space would turn the rest
-/// into a free-text term and quietly empty the board. `Err` carries the message
-/// to show; an already-pinned login is a silent no-op.
+/// The input is normalized for the project's forge first and rejected if it
+/// can't be a handle there. On GitHub (`@login` and pasted profile URLs are
+/// accepted) it ends up interpolated into a `gh --search` query, where a space
+/// would turn the rest into a free-text term and quietly empty the board; on
+/// Azure DevOps it must be an email (or `DOMAIN\user`), since that is what
+/// PR authors are matched on. `Err` carries the message to show; an
+/// already-pinned handle is a silent no-op.
 fn add_contributor(state: AppState, project: &Project, input: &str) -> Result<(), String> {
-    let Some(login) = normalize_login(input) else {
+    let forge = project.config.effective_forge();
+    let Some(login) = forge.normalize_identity(input) else {
         return Err(if input.trim().is_empty() {
-            "Enter a GitHub login.".into()
+            format!("Enter a {}.", forge.identity_label())
         } else {
-            format!(
-                "“{}” isn’t a GitHub login — letters, digits and hyphens only.",
-                input.trim()
-            )
+            match forge {
+                ForgeKind::GitHub => format!(
+                    "“{}” isn’t a GitHub login — letters, digits and hyphens only.",
+                    input.trim()
+                ),
+                ForgeKind::AzureDevOps => format!(
+                    "“{}” isn’t an Azure DevOps user — enter their email address.",
+                    input.trim()
+                ),
+            }
         });
     };
     if project
@@ -426,6 +435,12 @@ fn ReviewsTab(pid: Uuid) -> Element {
         .get(&pid)
         .cloned()
         .unwrap_or_default();
+    let forge = project.config.effective_forge();
+    let identity_label = forge.identity_label();
+    let collaborators_label = match forge {
+        ForgeKind::GitHub => "Collaborators",
+        ForgeKind::AzureDevOps => "Team members",
+    };
     let contributors = project.config.review_contributors.clone();
     let track_all = project.config.review_all_contributors;
     let current_reviewer = project.config.reviewer.clone().unwrap_or_default();
@@ -448,6 +463,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
     let mut manual_push = use_push_back(manual.read().clone());
 
     rsx! {
+        CodeHostSection { project: project.clone() }
         div { class: "section",
             div { class: "field-header",
                 div { class: "field-title",
@@ -536,7 +552,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
                             // Nothing came back at all — an unauthenticated gh, or
                             // a repo with no open PRs. Don't claim the lists are
                             // exhausted by what's already selected.
-                            "No one found — type a login below"
+                            "No one found — type one below"
                         } else {
                             "Everyone found is already selected"
                         }
@@ -549,7 +565,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
                         }
                     }
                     if !collab_opts.is_empty() {
-                        optgroup { label: "Collaborators",
+                        optgroup { label: "{collaborators_label}",
                             for login in collab_opts.iter() {
                                 option { key: "{login}", value: "{login}", "{login}" }
                             }
@@ -567,7 +583,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
                         input {
                             key: "{g}",
                             r#type: "text",
-                            placeholder: "GitHub login",
+                            placeholder: "{identity_label}",
                             initial_value: "{manual.peek()}",
                             // The only push-back here is that clear, and it
                             // follows an Enter or a click in this row — so the
@@ -606,7 +622,12 @@ fn ReviewsTab(pid: Uuid) -> Element {
                     }
                 }
                 if manual_err().is_empty() {
-                    div { class: "hint", "Not listed? Type any GitHub login — fork contributors aren't repo collaborators." }
+                    div { class: "hint",
+                        match forge {
+                            ForgeKind::GitHub => "Not listed? Type any GitHub login — fork contributors aren't repo collaborators.",
+                            ForgeKind::AzureDevOps => "Not listed? Type their Azure DevOps email.",
+                        }
+                    }
                 } else {
                     div { class: "hint error", "{manual_err}" }
                 }
@@ -623,7 +644,7 @@ fn ReviewsTab(pid: Uuid) -> Element {
                 div { class: "field",
                     input {
                         r#type: "text",
-                        placeholder: "GitHub username",
+                        placeholder: "{identity_label}",
                         value: "{current_reviewer}",
                         onchange: {
                             let project = project.clone();
@@ -688,6 +709,75 @@ fn ReviewsTab(pid: Uuid) -> Element {
                     },
                 }
                 div { class: "hint", "Leave blank to auto-detect (dev → main → master)." }
+            }
+        }
+    }
+}
+
+/// Which code host the project's PRs live on: detected from `origin` at every
+/// startup, with a pin for a remote detection can't place. Changing it
+/// re-reads the people lists, which come from the host.
+#[component]
+fn CodeHostSection(project: Project) -> Element {
+    let state = use_context::<AppState>();
+    let pid = project.id;
+    let detected = project
+        .config
+        .detected_forge
+        .map(ForgeKind::display_name)
+        .unwrap_or("not recognized");
+    let pinned = project.config.pinned_forge;
+    let value = |k: Option<ForgeKind>| match k {
+        None => "auto",
+        Some(ForgeKind::GitHub) => "github",
+        Some(ForgeKind::AzureDevOps) => "azure_devops",
+    };
+    rsx! {
+        div { class: "section",
+            div { class: "field-header",
+                div { class: "field-title",
+                    h3 { "Code host" }
+                    InfoIcon { tip: "Where this project's pull requests live. Detected from the repo's origin remote; pin it if detection can't place your remote." }
+                }
+            }
+            div { class: "field",
+                select {
+                    class: "add-select",
+                    value: "{value(pinned)}",
+                    onchange: {
+                        let project = project.clone();
+                        move |e: Event<FormData>| {
+                            let mut p = project.clone();
+                            p.config.pinned_forge = match e.value().as_str() {
+                                "github" => Some(ForgeKind::GitHub),
+                                "azure_devops" => Some(ForgeKind::AzureDevOps),
+                                _ => None,
+                            };
+                            state.save_project(p);
+                            state.fetch_reviewers(pid);
+                            state.fetch_pr_authors(pid);
+                        }
+                    },
+                    option { value: "auto", selected: pinned.is_none(), "Auto-detect (currently {detected})" }
+                    for kind in ForgeKind::all() {
+                        option {
+                            key: "{value(Some(kind))}",
+                            value: "{value(Some(kind))}",
+                            selected: pinned == Some(kind),
+                            "{kind.display_name()}"
+                        }
+                    }
+                }
+                match project.config.effective_forge() {
+                    ForgeKind::GitHub => rsx! {
+                        div { class: "hint", "Uses your `gh` CLI login." }
+                    },
+                    ForgeKind::AzureDevOps => rsx! {
+                        div { class: "hint",
+                            "Uses a personal access token in {AZURE_DEVOPS_PAT_ENV} (Code: read & write), or the Azure CLI's `az login`."
+                        }
+                    },
+                }
             }
         }
     }

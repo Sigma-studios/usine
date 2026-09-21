@@ -15,6 +15,9 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
     let project_id = card.project_id;
+    let forge = state.forge_of(project_id);
+    let host = forge.display_name();
+    let identity_label = forge.identity_label();
     // The form fields are drafts: typed-but-unsent text survives deselects and
     // the card moving between the parked states. The seeded ones (title,
     // reviewer) stay live-fresh until actually touched, per the seed rule.
@@ -328,7 +331,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                         } else {
                             input {
                                 id: "pr-reviewer",
-                                placeholder: "GitHub username",
+                                placeholder: "{identity_label}",
                                 initial_value: "{reviewer.peek()}",
                                 oninput: move |e| reviewer.set(e.value()),
                             }
@@ -353,8 +356,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                                 crate::ui::confirm_then_send(
                                     state,
                                     "Create pull request",
-                                    "Rename the branch (if changed), push it, and open a pull request \
-                                     ready for review on GitHub?".to_string(),
+                                    format!(
+                                        "Rename the branch (if changed), push it, and open a pull request \
+                                         ready for review on {host}?"
+                                    ),
                                     "Create PR",
                                     ExecutorCommand::CreatePr {
                                         card_id: id,
@@ -379,8 +384,10 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                                 crate::ui::confirm_then_send(
                                     state,
                                     "Create draft pull request",
-                                    "Rename the branch (if changed), push it, and open a draft pull request \
-                                     on GitHub? You can add screenshots and mark it ready afterwards.".to_string(),
+                                    format!(
+                                        "Rename the branch (if changed), push it, and open a draft pull request \
+                                         on {host}? You can add screenshots and mark it ready afterwards."
+                                    ),
                                     "Create draft PR",
                                     ExecutorCommand::CreatePr {
                                         card_id: id,
@@ -401,7 +408,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,
-                request_title: "The agent picks the work back up in the card's worktree, before anything is pushed to GitHub",
+                request_title: "The agent picks the work back up in the card's worktree, before anything is pushed to {host}",
                 on_request: move |fb: String| {
                     state.send(ExecutorCommand::ReviseImplementation { card_id: id, feedback: fb });
                 },

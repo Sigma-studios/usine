@@ -25,11 +25,13 @@ pub use agent::events::{
     OpenTarget, QueuedTarget, RunControl, Severity,
 };
 pub use agent::executor::{
-    fix_prompt, spawn as spawn_executor, ExecutorConfig, ExecutorHandle, CONFLICT_INTERVENTION_ID,
+    fix_prompt, spawn as spawn_executor, spawn_with_forges as spawn_executor_with_forges,
+    ExecutorConfig, ExecutorHandle, CONFLICT_INTERVENTION_ID,
 };
 pub use agent::fixes::{
-    fixes_block_malformed, parse_fix_outcomes, strip_fixes_block, FixItem, FixOutcome, FixReport,
-    FixRow, Outcome, FIX_RECAP_INSTRUCTION, REVIEW_BODY_PATH,
+    comment_location, fixes_block_malformed, parse_fix_outcomes, strip_fixes_block, FixItem,
+    FixOutcome, FixReport, FixRow, Outcome, FIX_RECAP_INSTRUCTION, PR_CONVERSATION_PATH,
+    REVIEW_BODY_PATH,
 };
 pub use agent::handoff::{
     handoff_block_malformed, handoff_instruction, parse_handoff, strip_handoff_block, Change,
@@ -64,13 +66,15 @@ pub use diff::{
     anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, DiffData, DiffFile,
     DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
 };
-pub use domain::config::{AppSettings, CardConfig, CardKind, PreviewPort, ProjectConfig};
+pub use domain::config::{
+    AppSettings, CardConfig, CardKind, ForgeKind, PreviewPort, ProjectConfig,
+};
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardAnswers, CardState, CheckStatus, Column, Cost,
     DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, Mergeable, ModelSpec,
-    PrInfo, PrReviewSub, PreviewStatus, PreviewUrl, Project, Provider, QaExchange, ReviewColumn,
-    ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread,
-    RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,
+    PrInfo, PrReviewSub, PrState, PreviewStatus, PreviewUrl, Project, Provider, QaExchange,
+    ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask,
+    ReviewThread, RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,
 };
 pub use domain::state_machine::{
     stop_can_return_to, stop_target, stop_transition, transition, Transition,
@@ -78,8 +82,9 @@ pub use domain::state_machine::{
 };
 pub use error::{CoreError, Result};
 pub use infra::forge::{
-    normalize_login, FailedCheck, Forge, GhForge, LivePrState, PrPushTarget, PrSummary,
-    ReviewScope, SimForge,
+    detect_forge, normalize_azure_identity, normalize_login, parse_remote, AzureForges, AzureRepo,
+    FailedCheck, Forge, ForgeFactory, ForgeRegistry, GhForge, LivePrState, PrPushTarget, PrSummary,
+    RemoteForge, ReviewScope, SimForge, AZURE_DEVOPS_PAT_ENV,
 };
 pub use infra::git::{
     remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,

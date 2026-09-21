@@ -3,6 +3,8 @@
 //! Modes:
 //!   usine-cli                  — drive a card through the whole pipeline with the simulator
 //!   usine-cli github           — live GitHub forge test (creates a throwaway repo)
+//!   usine-cli azure <clone> [--merge] — live Azure DevOps forge test against an
+//!                                existing clone (opens a draft PR; merges it with --merge)
 //!   usine-cli real-plan <dir> <task...>  — run a real `claude` plan over <dir>
 //!   usine-cli mcp              — relay stdio to the running app's MCP socket
 
@@ -12,10 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, AppSettings, Card, CardState, DesignSub, Effort, ExecutorCommand,
-    ExecutorConfig, ExecutorEventKind, Forge, GhForge, GitOps, ModelSpec, PrReviewSub, Project,
-    ProjectConfig, Provider, RealGit, ReviewSub, RunConfig, RunMode, SimFactory, SimForge, SimGit,
-    Store,
+    spawn_executor, AppSettings, AzureForges, Card, CardState, DesignSub, Effort, ExecutorCommand,
+    ExecutorConfig, ExecutorEventKind, Forge, ForgeFactory, GhForge, GitOps, ModelSpec,
+    PrReviewSub, Project, ProjectConfig, Provider, RealGit, ReviewSub, RunConfig, RunMode,
+    SimFactory, SimForge, SimGit, Store,
 };
 
 #[tokio::main]
@@ -36,6 +38,13 @@ async fn main() -> anyhow::Result<()> {
             "this build has no MCP relay: it was compiled without the `mcp` feature or for a non-Unix target"
         ),
         Some("github") => github_smoke().await,
+        Some("azure") => {
+            let repo = PathBuf::from(
+                args.get(1)
+                    .expect("usage: usine-cli azure <path-to-an-azure-devops-clone> [--merge]"),
+            );
+            azure_smoke(&repo, args.iter().any(|a| a == "--merge")).await
+        }
         Some("real-e2e") => real_e2e().await,
         Some("inspect-db") => {
             let path = PathBuf::from(args.get(1).expect("usage: usine-cli inspect-db <path>"));
@@ -585,6 +594,94 @@ async fn github_smoke() -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_dir_all(&repo);
     println!("\n✔ GitHub integration test complete");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Live Azure DevOps forge test
+// ---------------------------------------------------------------------------
+
+/// Exercise the Azure DevOps forge end to end against a real repository: push a
+/// throwaway branch, open a PR, read back everything the executor polls, post a
+/// note — and, with `--merge`, complete the PR and delete the branch. Without
+/// it the PR is left as an open draft for you to abandon, so a smoke test never
+/// lands anything on a real repo's base branch by default.
+async fn azure_smoke(repo: &Path, merge: bool) -> anyhow::Result<()> {
+    let forge = AzureForges::new().for_repo(repo)?;
+    let git = RealGit;
+    let base = usine_core::infra::git::detect_base_branch(repo);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let branch = format!("usine/azure-smoke-{secs}");
+    let worktree = std::env::temp_dir().join(format!("usine-azure-smoke-{secs}"));
+
+    println!("• creating worktree + branch {branch} off {base}");
+    git.create_worktree(repo, &branch, &worktree, &base).await?;
+    std::fs::write(
+        worktree.join("USINE_AZURE_SMOKE.md"),
+        "An automated change from `usine-cli azure`.\n",
+    )?;
+    git.commit_all(&worktree, "usine: Azure DevOps smoke test")
+        .await?;
+    git.push(&worktree, &branch).await?;
+
+    println!("• opening a draft PR");
+    let pr = forge
+        .create_pr(
+            repo,
+            "Usine Azure DevOps smoke test",
+            "Opened by `usine-cli azure`. Safe to abandon.",
+            &base,
+            &branch,
+            None,
+            true,
+        )
+        .await?;
+    println!("  PR !{} — {}", pr.number, pr.url);
+
+    let n = pr.number;
+    println!("• reading it back");
+    println!("  live state:  {:?}", forge.pr_live_state(repo, n).await?);
+    println!("  mergeable:   {:?}", forge.merge_status(repo, n).await?);
+    println!("  checks:      {:?}", forge.pr_checks(repo, n).await?.0);
+    println!(
+        "  comments:    {}",
+        forge.fetch_comments(repo, n).await?.len()
+    );
+    println!(
+        "  threads:     {}",
+        forge.list_threads(repo, n).await?.len()
+    );
+    println!(
+        "  reviews:     {:?}",
+        forge.list_submitted_reviews(repo, n).await?
+    );
+    println!("  reviewers:   {:?}", forge.list_reviewers(repo).await?);
+    println!("  PR authors:  {:?}", forge.list_pr_authors(repo).await?);
+    println!(
+        "  for head:    {:?}",
+        forge.pr_for_head(repo, &branch).await?.map(|p| p.number)
+    );
+
+    println!("• posting a note on the PR");
+    forge
+        .comment_on_pr(repo, n, "Note from the Usine Azure DevOps smoke test.")
+        .await?;
+
+    if merge {
+        println!("• publishing and completing the PR");
+        forge.mark_ready(repo, n).await?;
+        forge.merge(repo, n).await?;
+        println!("  merged ✔");
+        forge.delete_remote_branch(repo, &branch).await?;
+        println!("• deleted origin/{branch}");
+    } else {
+        println!(
+            "• left the draft PR open — abandon it on Azure DevOps: {}",
+            pr.url
+        );
+    }
+    let _ = git.remove_worktree(repo, &worktree).await;
+    println!("\n✔ Azure DevOps integration test complete");
     Ok(())
 }
 

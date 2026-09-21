@@ -234,6 +234,7 @@ async fn create_project(
     });
     let config = ProjectConfig {
         base_branch: crate::infra::git::detect_base_branch(&path),
+        detected_forge: crate::infra::forge::detect_forge(&path),
         ..Default::default()
     };
     let project = Project::new(name, path, config);

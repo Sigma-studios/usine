@@ -70,7 +70,7 @@ impl Executor {
                 }
             }
             open_pr = self
-                .forge
+                .forge_for(&project)
                 .pr_for_head(&project.path, local)
                 .await
                 .unwrap_or(None);

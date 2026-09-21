@@ -5,8 +5,8 @@
 
 use dioxus::prelude::*;
 use usine_core::{
-    Card, CardState, CheckStatus, DesignSub, DiffState, ExecutorCommand, Handoff, PrReviewSub,
-    ReviewSub, CONFLICT_INTERVENTION_ID,
+    Card, CardState, CheckStatus, DesignSub, DiffState, ExecutorCommand, ForgeKind, Handoff,
+    PrReviewSub, ReviewSub, CONFLICT_INTERVENTION_ID,
 };
 use uuid::Uuid;
 
@@ -295,6 +295,8 @@ fn EditableTitle(card_id: Uuid, title: String) -> Element {
 fn CardPanel(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
+    let forge = state.forge_of(card.project_id);
+    let host = forge.display_name();
 
     // The gate sections dispatch on the state seen THROUGH a question or a
     // fault (`effective()`), so neither takes the panel away — the banner in
@@ -310,7 +312,7 @@ fn CardPanel(card: Card) -> Element {
     let pr_is_draft = card
         .pr
         .as_ref()
-        .map(|p| p.state == "draft")
+        .map(|p| p.state == usine_core::PrState::Draft)
         .unwrap_or(false);
     // Delete the head branch when merging — on by default.
     let mut delete_branch = use_signal(|| true);
@@ -510,7 +512,7 @@ fn CardPanel(card: Card) -> Element {
             div { class: "section",
                 h3 { "Merge" }
                 if let Some(p) = card.pr.clone() {
-                    PrLink { number: p.number, url: p.url }
+                    PrLink { number: p.number, url: p.url, forge }
                 }
                 FixOutcomes { card_id: id }
                 if let Some(recap) = recap.clone() {
@@ -521,10 +523,10 @@ fn CardPanel(card: Card) -> Element {
                     }
                 }
                 if pr_is_draft {
-                    div { class: "hint", "This PR is still a draft — GitHub won't merge it." }
+                    div { class: "hint", "This PR is still a draft — {host} won't merge it." }
                     button {
                         class: "btn primary",
-                        title: "Flips the PR from draft to ready for review on GitHub; the merge button comes back once it is",
+                        title: "Flips the PR from draft to ready for review on {host}; the merge button comes back once it is",
                         onclick: move |_| state.send(ExecutorCommand::MarkPrReady { card_id: id }),
                         "Mark ready for review"
                     }
@@ -574,7 +576,7 @@ fn CardPanel(card: Card) -> Element {
                         div { class: "option-row",
                             button {
                                 class: "btn primary",
-                                title: "The agent merges the base branch into this one in the card's worktree, resolves the conflicts and pushes. Nothing is published unless it succeeds; GitHub can't merge a conflicting PR either way.",
+                                title: "The agent merges the base branch into this one in the card's worktree, resolves the conflicts and pushes. Nothing is published unless it succeeds; {host} can't merge a conflicting PR either way.",
                                 onclick: move |_| state.send(ExecutorCommand::ResolveConflicts { card_id: id }),
                                 "Resolve conflicts with AI"
                             }
@@ -653,7 +655,7 @@ fn CardPanel(card: Card) -> Element {
                                 onclick: move |_| super::confirm_then_send(
                                     state,
                                     "Merge pull request",
-                                    "Merge this pull request into the base branch on GitHub? This can't be undone.".to_string(),
+                                    format!("Merge this pull request into the base branch on {host}? This can't be undone."),
                                     "Merge",
                                     ExecutorCommand::Merge { card_id: id, delete_branch: delete_branch(), force: false },
                                 ),
@@ -676,7 +678,7 @@ fn CardPanel(card: Card) -> Element {
             div { class: "section",
                 h3 { if *merged { "Merged without review" } else { "PR closed" } }
                 if let Some(p) = card.pr.clone() {
-                    PrLink { number: p.number, url: p.url }
+                    PrLink { number: p.number, url: p.url, forge }
                 }
                 div {
                     class: "hint",
@@ -686,9 +688,9 @@ fn CardPanel(card: Card) -> Element {
                         "The branch was left alone in case the work is still wanted. Mark the card done, or send it back to start, from the card menu."
                     },
                     if *merged {
-                        "Merged on GitHub before its review finished here."
+                        "Merged on {host} before its review finished here."
                     } else {
-                        "Closed on GitHub without merging."
+                        "Closed on {host} without merging."
                     }
                 }
             }
@@ -1145,13 +1147,15 @@ fn location(item: &usine_core::FixItem) -> String {
 }
 
 /// A card's pull request, rendered identically wherever it shows up (the merge
-/// gate and the PR-review phase): the number on its own line and a link that
-/// opens the PR on GitHub.
+/// gate and the PR-review phase): the number on its own line, in the host's own
+/// notation (`#7`, `!7`), and a link that opens the PR there.
 #[component]
-pub(super) fn PrLink(number: u64, url: String) -> Element {
+pub(super) fn PrLink(number: u64, url: String, forge: ForgeKind) -> Element {
+    let pr = forge.pr_ref(number);
+    let host = forge.display_name();
     rsx! {
-        div { "PR #{number}" }
-        a { class: "wt-path", href: "{url}", target: "_blank", rel: "noreferrer", "Open on GitHub ↗" }
+        div { "PR {pr}" }
+        a { class: "wt-path", href: "{url}", target: "_blank", rel: "noreferrer", "Open on {host} ↗" }
     }
 }
 

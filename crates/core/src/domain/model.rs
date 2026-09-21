@@ -907,13 +907,85 @@ impl ReviewSummary {
     }
 }
 
+/// A PR's lifecycle state as last recorded on the card. Serialized as the
+/// lowercase strings cards have always stored (`"open"`, `"draft"`, …), so
+/// records written when this was a bare `String` load unchanged; decoding is
+/// case-insensitive and anything unrecognized reads as `Open` — the state
+/// that moves nothing — rather than failing the whole card.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrState {
+    #[default]
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    /// The open state matching a forge's draft flag.
+    pub fn open(draft: bool) -> Self {
+        if draft {
+            PrState::Draft
+        } else {
+            PrState::Open
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Draft => "draft",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }
+    }
+
+    /// Case-insensitive parse; unknown input is `Open` (see the type docs).
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "draft" => PrState::Draft,
+            "merged" => PrState::Merged,
+            "closed" => PrState::Closed,
+            _ => PrState::Open,
+        }
+    }
+}
+
+impl std::fmt::Display for PrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lets fixtures keep writing `state: "open".into()`.
+impl From<&str> for PrState {
+    fn from(s: &str) -> Self {
+        PrState::parse(s)
+    }
+}
+
+/// Compares against the stored spelling (`"open"`, `"draft"`, …), so a check
+/// written against the string form still reads naturally.
+impl PartialEq<&str> for PrState {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other)
+    }
+}
+
+impl<'de> Deserialize<'de> for PrState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(PrState::parse(&String::deserialize(d)?))
+    }
+}
+
 /// Metadata about a created pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrInfo {
     pub number: u64,
     pub url: String,
     pub title: String,
-    pub state: String,
+    pub state: PrState,
     /// The GitHub login requested to review this PR when it was opened. Anchors
     /// the reviewer-comment count that drives the dock badge — comparing comment
     /// authors against this, not a project-wide setting, so a later config change
@@ -1359,14 +1431,15 @@ impl Project {
     /// Whether a PR opened on this project will get CI checks. Prefers what has
     /// actually been observed on this project's PRs
     /// ([`ProjectConfig::ci_checks`](crate::domain::config::ProjectConfig::ci_checks));
-    /// until anything has been, falls back to asking the checkout whether it has
-    /// any GitHub Actions workflow at all. Drives the optimistic "CI is in
-    /// flight" the merge gate needs in the seconds after a push, before GitHub
-    /// has registered the run.
+    /// until anything has been, falls back to asking the checkout whether it
+    /// carries CI configuration for its forge at all (GitHub Actions workflows,
+    /// Azure Pipelines YAML). Drives the optimistic "CI is in flight" the merge
+    /// gate needs in the seconds after a push, before the forge has registered
+    /// the run.
     pub fn expects_ci(&self) -> bool {
         self.config
             .ci_checks
-            .unwrap_or_else(|| crate::infra::forge::repo_has_workflows(&self.path))
+            .unwrap_or_else(|| self.config.effective_forge().expects_ci_offline(&self.path))
     }
 
     pub fn new(
@@ -1757,7 +1830,7 @@ impl Card {
                 // is unmergeable whatever its build says, and "Mark ready" is
                 // the only thing on offer — reading "waiting on CI" beside it
                 // pointed at a wait that isn't the blocker.
-                if self.pr.as_ref().is_some_and(|p| p.state == "draft") {
+                if self.pr.as_ref().is_some_and(|p| p.state == PrState::Draft) {
                     "draft PR"
                 } else if self.mergeable.is_conflicting() {
                     "conflicts"

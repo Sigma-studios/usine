@@ -71,7 +71,7 @@ impl Executor {
             };
             let reviewer = reviewer.as_deref();
             let (comments, reviews, unanswered, checks, mergeable, live) =
-                match self.fetch_review_status(&project.path, pr_number).await {
+                match self.fetch_review_status(project, pr_number).await {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!("PR-comment poll: refresh for #{pr_number} failed: {e}");
@@ -243,7 +243,10 @@ impl Executor {
                 .iter()
                 .filter_map(|c| c.pr.as_ref().map(|p| p.number))
                 .collect();
-            let prs = self.forge.list_review_prs(&project.path, scope).await?;
+            let prs = self
+                .forge_for(&project)
+                .list_review_prs(&project.path, scope)
+                .await?;
             // Read the board *after* the round trip: the listing is a second
             // old, and a task started or dismissed meanwhile must not be
             // duplicated or resurrected.
@@ -319,7 +322,7 @@ impl Executor {
                     continue;
                 }
                 match self
-                    .forge
+                    .forge_for(&project)
                     .pr_live_state(&project.path, task.pr_number)
                     .await
                 {
@@ -366,9 +369,17 @@ impl Executor {
         // reviewed instead; only the pending fix is lost.
         let had_fix = task.status.fix_gate().is_some();
         if had_fix {
+            let host = self
+                .store
+                .get_project(task.project_id)
+                .map(|p| p.config.effective_forge())
+                .unwrap_or_default()
+                .display_name();
             self.review_progress(
                 task.id,
-                "The PR closed on GitHub before the fix was pushed — the fix was dropped.",
+                &format!(
+                    "The PR closed on {host} before the fix was pushed — the fix was dropped."
+                ),
             );
         }
         let updated = self.store.mutate_review_task(task.id, |t| {
@@ -531,6 +542,53 @@ impl Executor {
         Ok(())
     }
 
+    /// [`pr_ref`] for a review task's PR, for the few paths that don't have
+    /// its project at hand. Falls back to GitHub's `#n` if the project is gone.
+    fn task_pr_ref(&self, task: &ReviewTask) -> String {
+        match self.store.get_project(task.project_id) {
+            Ok(project) => pr_ref(&project, task.pr_number),
+            Err(_) => format!("#{}", task.pr_number),
+        }
+    }
+
+    /// Fetch a contributor PR's head into `local_branch`: GitHub's
+    /// `pull/<n>/head` ref (which reaches fork heads too), or the source
+    /// branch itself on a forge that publishes no head ref (Azure DevOps —
+    /// see [`crate::ForgeKind::pr_fetch_ref`]).
+    pub(super) async fn fetch_review_head(
+        &self,
+        project: &Project,
+        task: &ReviewTask,
+        local_branch: &str,
+    ) -> Result<()> {
+        match project
+            .config
+            .effective_forge()
+            .pr_fetch_ref(&task.head_ref)
+        {
+            None => {
+                self.git
+                    .fetch_pr(&project.path, task.pr_number, local_branch)
+                    .await
+            }
+            Some(src) => match self.git.fetch_ref(&project.path, &src, local_branch).await {
+                Ok(()) => Ok(()),
+                // A fork's branch isn't on `origin`. Azure still publishes the
+                // PR's *merge* ref — the head merged into the target — whose
+                // three-dot diff against the base is exactly the PR's changes,
+                // which is all a review reads. (A fork is never pushable, so
+                // nothing will try to push this checkout back.)
+                Err(e) => {
+                    let merge_ref = format!("refs/pull/{}/merge", task.pr_number);
+                    self.git
+                        .fetch_ref(&project.path, &merge_ref, local_branch)
+                        .await
+                        .map_err(|_| e)
+                }
+            },
+        }
+    }
+
     /// Materialize the PR's checkout, returning its path.
     ///
     /// Shared by the review run, the preview, and the open-in-editor/terminal
@@ -573,9 +631,11 @@ impl Executor {
             let _ = std::fs::remove_dir_all(&wt);
         }
 
-        self.review_progress(review_id, &format!("Fetching PR #{}…", task.pr_number));
-        self.git
-            .fetch_pr(&project.path, task.pr_number, &local_branch)
+        self.review_progress(
+            review_id,
+            &format!("Fetching PR {}…", pr_ref(&project, task.pr_number)),
+        );
+        self.fetch_review_head(&project, &task, &local_branch)
             .await?;
         // Refresh the remote-tracking refs as well, so the `origin/<base>` the
         // review agent diffs against is the branch the PR actually targets
@@ -615,11 +675,13 @@ impl Executor {
             task.base_ref.clone()
         };
         let mut prompt = format!(
-            "You are reviewing pull request #{} \"{}\" by @{}. The PR targets `{base}`; read its \
+            "You are reviewing pull request {} \"{}\" by @{}. The PR targets `{base}`; read its \
              changes with `git diff origin/{base}...HEAD` (three dots — the fork point). Use \
              `origin/{base}`, never a local `{base}` branch: the local one can be behind, which \
              would show other people's already-merged commits as part of this PR.",
-            task.pr_number, task.pr_title, task.author
+            pr_ref(project, task.pr_number),
+            task.pr_title,
+            task.author
         );
         // The user's steering goes in the run's own turn, after the PR's identity
         // and before the standing guidance: it says what matters *on this PR*,
@@ -700,7 +762,7 @@ impl Executor {
         };
         let (inline, body) = fold_unanchorable(diff.as_ref(), selected, body);
         let folded = n_selected - inline.len();
-        self.forge
+        self.forge_for(project)
             .submit_review(&project.path, task.pr_number, event, &body, &inline)
             .await?;
         Ok(folded)
@@ -750,11 +812,14 @@ impl Executor {
         // Say when comments rode the summary instead of the diff — the confirm
         // dialog promised N inline comments, and silence would read as loss.
         let toast = if folded == 0 {
-            format!("Review published on PR #{}", task.pr_number)
+            format!(
+                "Review published on PR {}",
+                pr_ref(&project, task.pr_number)
+            )
         } else {
             format!(
-                "Review published on PR #{} ({folded} comment(s) folded into the summary)",
-                task.pr_number
+                "Review published on PR {} ({folded} comment(s) folded into the summary)",
+                pr_ref(&project, task.pr_number)
             )
         };
         let _ =
@@ -799,16 +864,26 @@ impl Executor {
         // Can we keep the promise? A `None` here is "the forge can't tell" (the
         // sim, a test double), which is not a reason to refuse.
         if let Some(target) = self
-            .forge
+            .forge_for(&project)
             .pr_push_target(&project.path, task.pr_number)
             .await?
         {
             if !target.pushable() {
-                return Err(CoreError::other(format!(
-                    "@{} hasn't allowed maintainer edits on this fork, so the fix couldn't be \
-                     pushed — publish the review without fixes, or ask them to enable it",
-                    task.author
-                )));
+                // Azure DevOps has no "allow edits by maintainers": a fork's
+                // branch is its author's alone, so there is nothing to ask for.
+                let msg = match project.config.effective_forge() {
+                    crate::ForgeKind::AzureDevOps => format!(
+                        "@{}'s PR comes from a fork, which Azure DevOps doesn't let maintainers \
+                         push to — publish the review without fixes",
+                        task.author
+                    ),
+                    crate::ForgeKind::GitHub => format!(
+                        "@{} hasn't allowed maintainer edits on this fork, so the fix couldn't \
+                         be pushed — publish the review without fixes, or ask them to enable it",
+                        task.author
+                    ),
+                };
+                return Err(CoreError::other(msg));
             }
         }
 
@@ -844,16 +919,19 @@ impl Executor {
         self.review_progress(
             review_id,
             &format!(
-                "✔ review published on #{} — fixing {n} comment(s) myself",
-                task.pr_number
+                "✔ review published on {} — fixing {n} comment(s) myself",
+                pr_ref(&project, task.pr_number)
             ),
         );
         let toast = if folded == 0 {
-            format!("Review published on PR #{} — fixing it now", task.pr_number)
+            format!(
+                "Review published on PR {} — fixing it now",
+                pr_ref(&project, task.pr_number)
+            )
         } else {
             format!(
-                "Review published on PR #{} ({folded} comment(s) folded into the summary) — fixing it now",
-                task.pr_number
+                "Review published on PR {} ({folded} comment(s) folded into the summary) — fixing it now",
+                pr_ref(&project, task.pr_number)
             )
         };
         let _ =
@@ -897,14 +975,21 @@ impl Executor {
         };
         let base = task.diff_base(project.config.effective_base_branch());
         let prompt = format!(
-            "You are working on pull request #{} \"{}\" by @{}, checked out on its own branch. \
+            "You are working on pull request {} \"{}\" by @{}, checked out on its own branch. \
              The PR targets `{base}`; its changes are the commits on this branch beyond \
              `origin/{base}` (`git diff origin/{base}...HEAD`).",
-            task.pr_number, task.pr_title, task.author
+            pr_ref(project, task.pr_number),
+            task.pr_title,
+            task.author
         );
         let extra = format!(
             "{}\n\n{}",
-            crate::agent::review::review_fix_prompt(task.pr_number, &task.author, comments, note),
+            crate::agent::review::review_fix_prompt(
+                &pr_ref(project, task.pr_number),
+                &task.author,
+                comments,
+                note
+            ),
             crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION
         );
         let settings = self.store.settings()?;
@@ -959,8 +1044,13 @@ impl Executor {
             return;
         };
 
-        let message = crate::agent::commit::parse_commit_message(&result_text)
-            .unwrap_or_else(|| format!("fix: address review comments on #{}", task.pr_number));
+        let message =
+            crate::agent::commit::parse_commit_message(&result_text).unwrap_or_else(|| {
+                format!(
+                    "fix: address review comments on {}",
+                    self.task_pr_ref(&task)
+                )
+            });
         let committed = match self.git.commit_all(&wt, &message).await {
             Ok(c) => c,
             Err(e) => {
@@ -1019,8 +1109,8 @@ impl Executor {
             Uuid::nil(),
             Severity::Success,
             format!(
-                "Fix ready for PR #{} — review the diff before it's pushed",
-                task.pr_number
+                "Fix ready for PR {} — review the diff before it's pushed",
+                self.task_pr_ref(&task)
             ),
         ));
     }
@@ -1053,14 +1143,14 @@ impl Executor {
         // failure here is fatal on purpose — guessing "same repo" would push the
         // fix onto a branch of *our* repo, which is nobody's PR.
         let target = self
-            .forge
+            .forge_for(&project)
             .pr_push_target(&project.path, task.pr_number)
             .await
             .map_err(|e| {
                 CoreError::other(format!(
-                    "couldn't re-read where PR #{} wants its push ({e}) — the fix is still \
+                    "couldn't re-read where PR {} wants its push ({e}) — the fix is still \
                      committed in the checkout, so try again",
-                    task.pr_number
+                    pr_ref(&project, task.pr_number)
                 ))
             })?;
         let head_ref = target
@@ -1080,9 +1170,10 @@ impl Executor {
                 }
                 if t.head_repo.is_empty() {
                     return Err(CoreError::other(format!(
-                        "PR #{}'s fork is gone from GitHub, so there's nowhere to push the fix. \
+                        "PR {}'s fork is gone from {}, so there's nowhere to push the fix. \
                          Discard it and reply on the PR instead.",
-                        task.pr_number
+                        pr_ref(&project, task.pr_number),
+                        project.config.effective_forge().display_name()
                     )));
                 }
                 let origin = self
@@ -1124,7 +1215,7 @@ impl Executor {
             format!("Pushed `{sha}` — I've addressed the {n} comment(s) I said I'd handle.")
         };
         if let Err(e) = self
-            .forge
+            .forge_for(&project)
             .comment_on_pr(&project.path, task.pr_number, &note)
             .await
         {
@@ -1149,7 +1240,10 @@ impl Executor {
         let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
             Uuid::nil(),
             Severity::Success,
-            format!("Fix pushed to {head_ref} on PR #{}", task.pr_number),
+            format!(
+                "Fix pushed to {head_ref} on PR {}",
+                pr_ref(&project, task.pr_number)
+            ),
         ));
         Ok(())
     }
@@ -1230,7 +1324,7 @@ impl Executor {
     /// courtesy, not a reason to keep the fix alive.
     async fn retract_fix_pledge(&self, task: &ReviewTask, project: &Project) {
         if let Err(e) = self
-            .forge
+            .forge_for(project)
             .comment_on_pr(
                 &project.path,
                 task.pr_number,
