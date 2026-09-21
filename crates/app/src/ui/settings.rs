@@ -979,9 +979,9 @@ fn NotificationsTab(pid: Uuid) -> Element {
                         checked: project.config.notifications_muted,
                         onchange: {
                             let project = project.clone();
-                            move |_| {
+                            move |e: FormEvent| {
                                 let mut p = project.clone();
-                                p.config.notifications_muted = !p.config.notifications_muted;
+                                p.config.notifications_muted = e.checked();
                                 state.save_project(p);
                             }
                         },

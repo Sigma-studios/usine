@@ -769,7 +769,7 @@ impl AppState {
         (waiting, urgent)
     }
 
-    /// Total review tasks needing attention across all projects (dock badge).
+    /// Total review tasks needing attention across unmuted projects (dock badge).
     /// Only called from the macOS-only dock badge effect, so it's dead code on
     /// other platforms.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
