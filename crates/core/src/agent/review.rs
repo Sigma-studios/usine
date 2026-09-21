@@ -47,8 +47,10 @@ assessment of how serious the comment's underlying issue is — one of \"critica
 as your recommendation; `reply` is the message posted on the comment when the user chooses NOT to \
 fix it — a polite, one- or two-sentence explanation. An item located at \"PR review summary\" is \
 not an inline comment but the body of a submitted review (often a full report): judge whether the \
-concerns it raises are worth acting on; no reply can be posted on it. Include exactly one item per \
-comment id listed.";
+concerns it raises are worth acting on; no reply can be posted on it. An item located at \"PR \
+conversation\" is a comment on the pull request as a whole rather than on a line: judge it the same \
+way; a reply is posted on it like on any inline comment. Include exactly one item per comment id \
+listed.";
 
 /// Built-in review guidance used when the project has no `review.md`.
 pub const DEFAULT_REVIEW_PROMPT: &str = "\
@@ -452,15 +454,10 @@ fn opens_a_block(body: &str) -> bool {
 /// the change should be the smallest one that answers each comment.
 ///
 /// `note` is the user's feedback on a redo; empty on the first pass.
-pub fn review_fix_prompt(
-    pr_number: u64,
-    author: &str,
-    comments: &[DraftComment],
-    note: &str,
-) -> String {
+pub fn review_fix_prompt(pr: &str, author: &str, comments: &[DraftComment], note: &str) -> String {
     let mut out = format!(
         "You are the maintainer of this repository. You have just published a review on pull \
-         request #{pr_number} by @{author}, and told the author that you would fix the following \
+         request {pr} by @{author}, and told the author that you would fix the following \
          comments yourself. This checkout is that PR's own branch. Address every comment:\n"
     );
     for c in comments {
@@ -808,7 +805,7 @@ mod tests {
     fn fix_prompt_omits_the_level_for_an_unrated_comment() {
         let mut d = draft("a.rs", Some(3), "Guard this unwrap.");
         d.severity = String::new();
-        let p = review_fix_prompt(1, "octocat", std::slice::from_ref(&d), "");
+        let p = review_fix_prompt("#1", "octocat", std::slice::from_ref(&d), "");
         assert!(p.contains("- [a.rs:3] Guard this unwrap."));
     }
 
@@ -818,7 +815,7 @@ mod tests {
             draft("a.rs", Some(3), "Guard this unwrap."),
             draft("b.rs", None, "Stale doc."),
         ];
-        let p = review_fix_prompt(123, "octocat", &drafts, "  keep the helper private  ");
+        let p = review_fix_prompt("#123", "octocat", &drafts, "  keep the helper private  ");
         assert!(p.contains("#123"));
         assert!(p.contains("@octocat"));
         assert!(p.contains("- [medium] [a.rs:3] Guard this unwrap."));
@@ -832,7 +829,7 @@ mod tests {
 
     #[test]
     fn fix_prompt_omits_the_feedback_block_without_a_note() {
-        let p = review_fix_prompt(7, "hubot", &[draft("a.rs", Some(1), "x")], "   ");
+        let p = review_fix_prompt("#7", "hubot", &[draft("a.rs", Some(1), "x")], "   ");
         assert!(!p.contains("left this feedback"));
     }
 }

@@ -11,7 +11,7 @@
 //! every downstream agent run (review, fixes) reads as the statement of intent.
 
 use dioxus::prelude::*;
-use usine_core::{DirtyAction, OpenPr};
+use usine_core::{DirtyAction, ForgeKind, OpenPr};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -58,13 +58,16 @@ fn title_from_ref(source_ref: &str) -> String {
         .replace(['-', '_'], " ")
 }
 
-/// `#n title — head (author)[, draft]`: enough to recognise a PR in a native
-/// select, which can't style its options.
-fn pr_label(pr: &OpenPr) -> String {
+/// `#n title — head (author)[, draft]` (`!n` on Azure): enough to recognise a
+/// PR in a native select, which can't style its options.
+fn pr_label(forge: ForgeKind, pr: &OpenPr) -> String {
     let draft = if pr.draft { ", draft" } else { "" };
     format!(
-        "#{} {} — {} ({}{draft})",
-        pr.number, pr.title, pr.head_ref, pr.author
+        "{} {} — {} ({}{draft})",
+        forge.pr_ref(pr.number),
+        pr.title,
+        pr.head_ref,
+        pr.author
     )
 }
 
@@ -82,6 +85,7 @@ pub fn AdoptDialogHost() -> Element {
 #[component]
 fn AdoptDialog(project_id: Uuid) -> Element {
     let state = use_context::<AppState>();
+    let forge = state.forge_of(project_id);
     let mut source = use_signal(String::new);
     let mut title = use_signal(String::new);
     let mut description = use_signal(String::new);
@@ -261,7 +265,7 @@ fn AdoptDialog(project_id: Uuid) -> Element {
                                         option {
                                             value: "pr:{p.number}",
                                             selected: pick == Pick::Pr(p.number),
-                                            {pr_label(p)}
+                                            {pr_label(forge, p)}
                                         }
                                     }
                                 }
@@ -282,7 +286,7 @@ fn AdoptDialog(project_id: Uuid) -> Element {
                     }
                     if let Some(pr) = picked_pr.as_ref() {
                         div { class: "hint",
-                            "The card takes over PR #{pr.number} at the PR-review stage (no self-review); fixes are pushed to `{pr.head_ref}`."
+                            "The card takes over PR {forge.pr_ref(pr.number)} at the PR-review stage (no self-review); fixes are pushed to `{pr.head_ref}`."
                         }
                         if !pr.mine {
                             div { class: "hint warn",
@@ -302,7 +306,7 @@ fn AdoptDialog(project_id: Uuid) -> Element {
                     }
                     if let Some(pr) = open_pr {
                         div { class: "hint warn",
-                            "PR #{pr.number} is open on this branch — pick it under Pull requests to adopt the PR itself."
+                            "PR {forge.pr_ref(pr.number)} is open on this branch — pick it under Pull requests to adopt the PR itself."
                         }
                     }
                     if let Some(path) = dirty {
@@ -384,7 +388,7 @@ fn AdoptDialog(project_id: Uuid) -> Element {
                         disabled: !can_submit,
                         onclick: submit,
                         match &pick {
-                            Pick::Pr(n) => format!("Adopt PR #{n}"),
+                            Pick::Pr(n) => format!("Adopt PR {}", forge.pr_ref(*n)),
                             _ => "Adopt into self-review".to_string(),
                         }
                     }

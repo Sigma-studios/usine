@@ -38,7 +38,7 @@ use crate::domain::model::{
 };
 use crate::domain::state_machine::{note_entry, stop_transition, transition, Transition};
 use crate::error::{CoreError, Result};
-use crate::infra::forge::{run_id_from_url, FailedCheck, Forge, LivePrState, ReviewScope};
+use crate::infra::forge::{FailedCheck, Forge, ForgeRegistry, LivePrState, ReviewScope};
 use crate::infra::git::{canonicalize_branch_case, sanitize_branch_name, GitOps, MergeOutcome};
 use crate::infra::persistence::Store;
 
@@ -102,13 +102,28 @@ impl ExecutorHandle {
 pub struct ExecutorConfig {
     pub store: Store,
     pub providers: Arc<dyn ProviderFactory>,
+    /// The forge every project uses under [`spawn`]. [`spawn_with_forges`]
+    /// takes a [`ForgeRegistry`] instead, which picks one per project.
     pub forge: Arc<dyn Forge>,
     pub git: Arc<dyn GitOps>,
 }
 
-/// Spawn the executor on its own thread + Tokio runtime. Returns the command
-/// handle and the event receiver the UI drains.
+/// Spawn the executor on its own thread + Tokio runtime, with `config.forge`
+/// serving every project. Returns the command handle and the event receiver
+/// the UI drains.
 pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<ExecutorEvent>) {
+    let forges = ForgeRegistry::new(Arc::clone(&config.forge));
+    spawn_with_forges(config, forges)
+}
+
+/// [`spawn`], with each project's PRs going through the forge `forges`
+/// resolves for it (its [`crate::ForgeKind`]) — how the app serves GitHub and
+/// Azure DevOps projects side by side. `config.forge` is unused here — pass
+/// [`ForgeRegistry::default_forge`].
+pub fn spawn_with_forges(
+    config: ExecutorConfig,
+    forges: ForgeRegistry,
+) -> (ExecutorHandle, UnboundedReceiver<ExecutorEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded::<ExecutorCommand>();
     let (evt_tx, evt_rx) = mpsc::unbounded::<ExecutorEvent>();
     // Clone for the executor itself, so run actors can re-dispatch commands
@@ -136,7 +151,7 @@ pub fn spawn(config: ExecutorConfig) -> (ExecutorHandle, UnboundedReceiver<Execu
                 let executor = Arc::new_cyclic(|self_ref| Executor {
                     store: config.store,
                     providers: config.providers,
-                    forge: config.forge,
+                    forges,
                     git: config.git,
                     evt_tx,
                     cmd_tx: cmd_tx_internal,
@@ -258,6 +273,13 @@ const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const MERGEABILITY_ATTEMPTS: usize = 3;
 const MERGEABILITY_POLL: Duration = Duration::from_secs(2);
 
+/// How `project`'s forge writes a reference to PR `n` in text — `#n` on
+/// GitHub, `!n` on Azure DevOps (where `#n` links a work item). For every
+/// message that names a PR: toasts, prompts, commit messages, posted comments.
+fn pr_ref(project: &Project, n: u64) -> String {
+    project.config.effective_forge().pr_ref(n)
+}
+
 /// Lock a mutex, recovering the guard even if a previous holder panicked, so one
 /// panic can't poison the lock and cascade-panic the whole executor thread.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -320,7 +342,8 @@ type ScanLocks = Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>;
 struct Executor {
     store: Store,
     providers: Arc<dyn ProviderFactory>,
-    forge: Arc<dyn Forge>,
+    /// Resolves each project's forge — always go through [`Self::forge_for`].
+    forges: ForgeRegistry,
     git: Arc<dyn GitOps>,
     evt_tx: UnboundedSender<ExecutorEvent>,
     cmd_tx: UnboundedSender<ExecutorCommand>,
@@ -352,6 +375,11 @@ struct Executor {
     self_ref: Weak<Executor>,
 }
 impl Executor {
+    /// The forge `project`'s PR operations go through (see [`ForgeRegistry`]).
+    fn forge_for(&self, project: &Project) -> Arc<dyn Forge> {
+        self.forges.for_project(project)
+    }
+
     /// Drain commands. Fast DB-only commands (the UI's CRUD) run *inline* so they
     /// stay ordered — a `Start` queued right after a `CreateCard` must see the
     /// persisted card. Slower commands (agent runs, git/forge effects) are
@@ -1366,14 +1394,7 @@ pub fn fix_prompt(selected: &[FixVerdict], note: &str) -> String {
         }
         out.push_str(":\n");
         for v in selected {
-            let loc = if v.comment.review_body_of.is_some() {
-                "PR review summary".to_string()
-            } else {
-                match v.comment.line {
-                    Some(line) => format!("{}:{}", v.comment.path, line),
-                    None => v.comment.path.clone(),
-                }
-            };
+            let loc = crate::agent::fixes::comment_location(&v.comment);
             let sev = crate::agent::review::severity_prefix(&v.severity);
             // Indent continuation lines so a multi-line comment stays one bullet.
             // The trailing `(#id)` is what the run's `usine-fixes` block reports
@@ -1525,18 +1546,25 @@ fn conflict_intervention(questions: &[crate::agent::plan::PlanQuestion]) -> Inte
 /// to "make CI pass" is to weaken the failing test or the workflow itself, and
 /// both must be ruled out explicitly. `logs` maps a run's display name to the
 /// (already tail-capped) failed-step log fetched for it; fix runs have network
-/// and the user's `gh` auth, so the agent is invited to dig deeper itself when
-/// the tails aren't enough.
+/// and the user's forge auth, so the agent is invited to dig deeper itself
+/// (with the forge's own tooling, [`crate::ForgeKind::ci_hint`]) when the tails
+/// aren't enough.
 ///
 /// The logs are third-party-influenced text (dependency install output, test
 /// output) pasted into the prompt of a fully-privileged run, i.e. a prompt-
 /// injection vector — so they're framed explicitly as untrusted data to
 /// diagnose, never instructions to follow, and the framing comes AFTER the
 /// logs so it's the last word on them.
-fn checks_fix_prompt(pr_number: u64, failed: &[FailedCheck], logs: &[(String, String)]) -> String {
+fn checks_fix_prompt(
+    forge: crate::ForgeKind,
+    pr_number: u64,
+    failed: &[FailedCheck],
+    logs: &[(String, String)],
+) -> String {
     let mut s = format!(
-        "This branch's pull request (#{pr_number}) cannot be merged: its CI checks are \
-         failing.\n\nFailing checks:\n"
+        "This branch's pull request ({}) cannot be merged: its CI checks are \
+         failing.\n\nFailing checks:\n",
+        forge.pr_ref(pr_number)
     );
     for check in failed {
         s.push_str("- ");
@@ -1564,10 +1592,10 @@ fn checks_fix_prompt(pr_number: u64, failed: &[FailedCheck], logs: &[(String, St
              this prompt.\n",
         );
     }
+    s.push_str("\nInvestigate the failures and fix their root cause in this branch. ");
+    s.push_str(forge.ci_hint());
     s.push_str(
-        "\nInvestigate the failures and fix their root cause in this branch. You can inspect \
-         CI yourself with `gh pr checks` and `gh run view <run-id> --log-failed` if you need \
-         more than the logs above.\n\n\
+        "\n\n\
          Do NOT weaken, skip, or delete tests or lints to get past them, and do NOT edit the \
          CI workflow or its configuration to make it pass. Do not push — your changes are \
          committed and pushed for you when the run ends, which re-runs the checks.",
@@ -1691,15 +1719,9 @@ fn triage_prompt(comments: &[crate::domain::model::ReviewComment]) -> String {
     let mut s = String::from("Pull-request review comments to triage:\n\n");
     for c in comments {
         // A review-body item has no path/line; its location is the review
-        // itself (the instruction explains what that means to the agent).
-        let loc = if c.review_body_of.is_some() {
-            "PR review summary".to_string()
-        } else {
-            match c.line {
-                Some(l) => format!("{}:{}", c.path, l),
-                None => c.path.clone(),
-            }
-        };
+        // itself, and a file-less thread's is the PR's conversation (the
+        // instruction explains what both mean to the agent).
+        let loc = crate::agent::fixes::comment_location(c);
         // Indent continuation lines so a multi-line comment stays one item and
         // can't masquerade as the next id in the list.
         s.push_str(&format!(
@@ -1902,8 +1924,9 @@ mod tests {
             "CI".to_string(),
             "assertion failed: left == right".to_string(),
         )];
-        let p = checks_fix_prompt(7, &failed, &logs);
+        let p = checks_fix_prompt(crate::ForgeKind::GitHub, 7, &failed, &logs);
         assert!(p.contains("#7"));
+        assert!(p.contains("gh run view"), "GitHub points at its own CLI");
         assert!(p.contains("CI / test"));
         assert!(p.contains("https://github.com/o/r/actions/runs/42/job/7"));
         assert!(p.contains("assertion failed"));
@@ -1914,6 +1937,21 @@ mod tests {
         assert!(p.contains("Do NOT weaken"));
         assert!(p.contains("do NOT edit the CI workflow"));
         assert!(p.contains("Do not push"));
+    }
+
+    /// On Azure DevOps `#7` would link work item 7, and `gh` means nothing.
+    #[test]
+    fn checks_fix_prompt_speaks_the_projects_forge() {
+        let failed = vec![FailedCheck {
+            name: "Build".into(),
+            workflow: String::new(),
+            url: "https://dev.azure.com/o/p/_build/results?buildId=9".into(),
+        }];
+        let p = checks_fix_prompt(crate::ForgeKind::AzureDevOps, 7, &failed, &[]);
+        assert!(p.contains("(!7)"), "{p}");
+        assert!(!p.contains("#7"));
+        assert!(!p.contains("gh "));
+        assert!(p.contains("Do NOT weaken"));
     }
 
     #[test]

@@ -142,6 +142,52 @@ pub struct PreviewPort {
     pub base: u16,
 }
 
+/// The code host a project's pull requests live on. Detected from the repo's
+/// `origin` remote at every startup ([`ProjectConfig::detected_forge`]) and
+/// overridable in settings ([`ProjectConfig::pinned_forge`]); read it through
+/// [`ProjectConfig::effective_forge`]. GitHub is the default — every project
+/// recorded before this existed deserializes to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ForgeKind {
+    #[default]
+    #[serde(rename = "github")]
+    GitHub,
+    #[serde(rename = "azure_devops")]
+    AzureDevOps,
+}
+
+impl ForgeKind {
+    pub fn all() -> [ForgeKind; 2] {
+        [ForgeKind::GitHub, ForgeKind::AzureDevOps]
+    }
+
+    /// The host's name as the UI says it ("Open on GitHub", "… on Azure DevOps").
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "GitHub",
+            ForgeKind::AzureDevOps => "Azure DevOps",
+        }
+    }
+
+    /// How the host itself writes a reference to PR `n` in text. On Azure
+    /// DevOps `#n` links *work item* n, so PRs are `!n` there — a commit
+    /// message or comment saying `#n` would link the wrong thing.
+    pub fn pr_ref(self, n: u64) -> String {
+        match self {
+            ForgeKind::GitHub => format!("#{n}"),
+            ForgeKind::AzureDevOps => format!("!{n}"),
+        }
+    }
+
+    /// What a person's handle on this host looks like, for input placeholders.
+    pub fn identity_label(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "GitHub login",
+            ForgeKind::AzureDevOps => "Azure DevOps email",
+        }
+    }
+}
+
 /// Per-project forge settings (reviewer, base branch) and the preview/worktree
 /// scripts that let the app be run straight from a card's worktree. Model
 /// defaults are *not* here — they come live from [`AppSettings`] (records
@@ -150,8 +196,22 @@ pub struct PreviewPort {
 /// `#[serde(default)]` on the newer fields covers the other direction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
-    /// GitHub username to request as reviewer on created PRs.
+    /// The forge's handle (a GitHub login, an Azure DevOps email) of the
+    /// person to request as reviewer on created PRs.
     pub reviewer: Option<String>,
+    /// The code host detected from the repo's `origin` remote, refreshed at
+    /// every startup like [`Self::base_branch`]. `None` when the remote is
+    /// missing or unrecognized. Never read this directly — go through
+    /// [`Self::effective_forge`], which lets a user pin win.
+    #[serde(default)]
+    pub detected_forge: Option<ForgeKind>,
+    /// User-pinned code host, for a remote detection can't place (an SSH host
+    /// alias, a proxy). Wins over [`Self::detected_forge`] when set. Pinned to
+    /// Azure DevOps, the remote's *path* still has to name the repository
+    /// (`v3/{org}/{project}/{repo}` or `{org}/{project}/_git/{repo}`), but on
+    /// any host — see [`crate::infra::forge::parse_azure_remote`].
+    #[serde(default)]
+    pub pinned_forge: Option<ForgeKind>,
     /// Auto-detected base branch, refreshed from the repo at every startup.
     /// Never read this directly for git/PR operations — go through
     /// [`Self::effective_base_branch`], which lets a user pin win.
@@ -170,7 +230,8 @@ pub struct ProjectConfig {
     /// push, before GitHub has registered the run.
     #[serde(default)]
     pub ci_checks: Option<bool>,
-    /// GitHub logins whose open PRs should surface in the PR-review workflow.
+    /// Forge handles (GitHub logins, Azure DevOps emails) whose open PRs should
+    /// surface in the PR-review workflow.
     /// Picked from the same collaborator list as `reviewer`.
     #[serde(default)]
     pub review_contributors: Vec<String>,
@@ -260,6 +321,14 @@ impl ProjectConfig {
         self.review_all_contributors || !self.review_contributors.is_empty()
     }
 
+    /// The code host every PR operation on this project goes through: the
+    /// user's pin when set, else what `origin` looks like, else GitHub.
+    pub fn effective_forge(&self) -> ForgeKind {
+        self.pinned_forge
+            .or(self.detected_forge)
+            .unwrap_or_default()
+    }
+
     pub fn effective_base_branch(&self) -> &str {
         self.pinned_base_branch
             .as_deref()
@@ -292,6 +361,8 @@ impl Default for ProjectConfig {
     fn default() -> Self {
         ProjectConfig {
             reviewer: None,
+            detected_forge: None,
+            pinned_forge: None,
             base_branch: "dev".to_string(),
             pinned_base_branch: None,
             ci_checks: None,

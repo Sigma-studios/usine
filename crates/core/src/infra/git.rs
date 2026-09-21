@@ -64,6 +64,28 @@ pub fn fetch_pr_args(pr_number: u64, local_branch: &str) -> Vec<String> {
     ]
 }
 
+/// Force-fetch `src` from `origin` into `local_branch` (the `+` overwrites a
+/// branch left by an earlier fetch — re-reviewing after the author pushed).
+pub fn fetch_ref_args(src: &str, local_branch: &str) -> Vec<String> {
+    vec![
+        "fetch".into(),
+        "origin".into(),
+        format!("+{src}:{local_branch}"),
+    ]
+}
+
+/// Point `local_branch` at the second parent — the PR's source head — of a
+/// merge commit just fetched into `FETCH_HEAD` (see
+/// [`GitOps::fetch_merge_source`]).
+pub fn branch_to_merge_source_args(local_branch: &str) -> Vec<String> {
+    vec![
+        "branch".into(),
+        "-f".into(),
+        local_branch.into(),
+        "FETCH_HEAD^2".into(),
+    ]
+}
+
 /// Attach a DETACHED worktree at `commitish` (claims no branch), so it works even
 /// when `commitish` is a branch already checked out in another working tree. Used
 /// to run the read-only self-review off the branch's committed HEAD without
@@ -375,6 +397,32 @@ pub trait GitOps: Send + Sync {
     async fn worktree_add_detached(&self, repo: &Path, path: &Path, commitish: &str) -> Result<()>;
     /// Fetch a PR's head into a local branch (works for forks via the pull ref).
     async fn fetch_pr(&self, repo: &Path, pr_number: u64, local_branch: &str) -> Result<()>;
+    /// Force-fetch the remote ref `src` (e.g. `refs/heads/feat/x`) from `origin`
+    /// into `local_branch` — how a PR head is fetched on a forge with no
+    /// `pull/<n>/head` ref (see [`crate::ForgeKind::pr_fetch_ref`]). Defaulted
+    /// so test doubles that never meet such a forge needn't implement it.
+    async fn fetch_ref(&self, _repo: &Path, src: &str, _local_branch: &str) -> Result<()> {
+        Err(crate::error::CoreError::other(format!(
+            "this git backend can't fetch {src}"
+        )))
+    }
+    /// Fetch `merge_ref` — a forge's PR *merge* commit (source head merged into
+    /// the target) — from `origin` and point `local_branch` at the source head,
+    /// its second parent. How a fork PR's head is reached when the forge
+    /// publishes only the merge ref: the merge commit's own lines would drift
+    /// from the source's wherever the target also changed a file, and review
+    /// comments are anchored on the source's lines. Defaulted like
+    /// [`Self::fetch_ref`].
+    async fn fetch_merge_source(
+        &self,
+        _repo: &Path,
+        merge_ref: &str,
+        _local_branch: &str,
+    ) -> Result<()> {
+        Err(crate::error::CoreError::other(format!(
+            "this git backend can't fetch {merge_ref}"
+        )))
+    }
     /// Move HEAD to `gitref` while keeping the working tree, so committed work
     /// becomes uncommitted changes — `git reset HEAD^`, generalized to any ref.
     async fn reset_mixed(&self, dir: &Path, gitref: &str) -> Result<()>;
@@ -508,6 +556,24 @@ impl GitOps for RealGit {
 
     async fn fetch_pr(&self, repo: &Path, pr_number: u64, local_branch: &str) -> Result<()> {
         run_git(repo, &fetch_pr_args(pr_number, local_branch))
+            .await
+            .map(|_| ())
+    }
+
+    async fn fetch_ref(&self, repo: &Path, src: &str, local_branch: &str) -> Result<()> {
+        run_git(repo, &fetch_ref_args(src, local_branch))
+            .await
+            .map(|_| ())
+    }
+
+    async fn fetch_merge_source(
+        &self,
+        repo: &Path,
+        merge_ref: &str,
+        local_branch: &str,
+    ) -> Result<()> {
+        run_git(repo, &["fetch".into(), "origin".into(), merge_ref.into()]).await?;
+        run_git(repo, &branch_to_merge_source_args(local_branch))
             .await
             .map(|_| ())
     }
@@ -752,6 +818,9 @@ impl GitOps for SimGit {
     async fn fetch_pr(&self, _: &Path, _: u64, _: &str) -> Result<()> {
         Ok(())
     }
+    async fn fetch_ref(&self, _: &Path, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
     async fn reset_mixed(&self, _: &Path, _: &str) -> Result<()> {
         Ok(())
     }
@@ -827,6 +896,14 @@ pub fn current_branch(repo: &Path) -> Result<String> {
     let r = git2::Repository::open(repo)?;
     let head = r.head()?;
     Ok(head.shorthand().unwrap_or("HEAD").to_string())
+}
+
+/// The URL of the repo's `origin` remote, if it has one — read from the git
+/// config directly, so it's cheap enough to ask on every forge resolution.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let r = git2::Repository::open(repo).ok()?;
+    let remote = r.find_remote("origin").ok()?;
+    remote.url().ok().map(str::to_string)
 }
 
 /// The branch new worktrees should fork from (and PRs should target).

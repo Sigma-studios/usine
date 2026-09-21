@@ -173,10 +173,15 @@ fn confirm_publish_review(
         finish_review_validation();
         return;
     }
+    let host = state
+        .review_task(review_id)
+        .map(|t| state.forge_of(t.project_id))
+        .unwrap_or_default()
+        .display_name();
     request_confirm(ConfirmRequest {
         title: "Publish review".into(),
         message: format!(
-            "Submit {what} to GitHub as “{}”? This posts on the contributor's pull \
+            "Submit {what} to {host} as “{}”? This posts on the contributor's pull \
              request under your account and can't be undone from here.",
             event.label()
         ),
@@ -259,11 +264,16 @@ pub(crate) fn confirm_discard_review_fix(review_id: Uuid) {
 /// publishing a drafted review: it's the same POST, just with no comments and
 /// no summary.
 pub(crate) fn confirm_approve_review(state: AppState, review_id: Uuid, pr_number: u64) {
+    let pr = state
+        .review_task(review_id)
+        .map(|t| state.forge_of(t.project_id))
+        .unwrap_or_default()
+        .pr_ref(pr_number);
     confirm_then_send(
         state,
         "Approve pull request",
         format!(
-            "Approve PR #{pr_number} without running a review agent? The approval posts \
+            "Approve PR {pr} without running a review agent? The approval posts \
              on the contributor's pull request under your account and can't be undone \
              from here."
         ),
@@ -309,7 +319,7 @@ pub(crate) fn confirm_discard_review(review_id: Uuid) {
     request_confirm(ConfirmRequest {
         title: "Discard review".into(),
         message: "Throw away these drafted comments and drop the PR from the board? \
-                  Nothing is posted to GitHub, and the PR won't reappear on a later scan."
+                  Nothing is posted on the PR, and it won't reappear on a later scan."
             .into(),
         confirm_label: "Discard".into(),
         danger: true,

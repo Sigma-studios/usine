@@ -30,6 +30,8 @@ pub fn ReviewDetail() -> Element {
         Some(task) => {
             let id = task.id;
             let project = state.project_name(task.project_id);
+            let forge = state.forge_of(task.project_id);
+            let host = forge.display_name();
             let status = task.status.status_label();
             let cost = task.cost;
             let status_key = status_discriminant(&task.status);
@@ -62,8 +64,8 @@ pub fn ReviewDetail() -> Element {
                                 href: "{url}",
                                 target: "_blank",
                                 rel: "noreferrer",
-                                title: "Open pull request on GitHub",
-                                "#{task.pr_number}"
+                                title: "Open pull request on {host}",
+                                "{forge.pr_ref(task.pr_number)}"
                             }
                             span { class: "badge", "@{task.author}" }
                             span { class: "badge status", "{status}" }
@@ -102,6 +104,7 @@ pub fn ReviewDetail() -> Element {
 fn ReviewPanel(task: ReviewTask) -> Element {
     let state = use_context::<AppState>();
     let id = task.id;
+    let host = state.forge_of(task.project_id).display_name();
     // Steering for the run this panel can start, seeded from what the last one
     // used so a retry starts from the same instruction instead of a blank box.
     // A draft, so a half-typed instruction survives deselects and the panel's
@@ -182,7 +185,7 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                         }
                         button {
                             class: "btn",
-                            title: "Approve on GitHub without running the review agent",
+                            title: "Approve on {host} without running the review agent",
                             onclick: move |_| crate::ui::confirm_approve_review(state, id, task.pr_number),
                             "Approve"
                         }
@@ -216,7 +219,7 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                 div { class: "section",
                     h3 { "Review" }
                     div { class: "reviewed-tag", "✓ published" }
-                    div { class: "hint", "This review was submitted to GitHub." }
+                    div { class: "hint", "This review was submitted to {host}." }
                 }
             },
             ReviewStatus::Fixing { comments, .. } => rsx! {
@@ -224,7 +227,7 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     h3 { "Fixing" }
                     div { class: "reviewed-tag", "✓ published" }
                     div { class: "hint",
-                        "The review is already on GitHub — each comment says you'll fix it yourself.                          An agent is applying the {comments.len()} comment(s) you took on, in the PR's                          own checkout. Nothing is pushed until you've read the diff."
+                        "The review is already on {host} — each comment says you'll fix it yourself.                          An agent is applying the {comments.len()} comment(s) you took on, in the PR's                          own checkout. Nothing is pushed until you've read the diff."
                     }
                 }
             },
@@ -243,9 +246,9 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     h3 { "Review" }
                     div { class: "hint",
                         if *merged {
-                            "This PR was merged on GitHub before the review finished — nothing left to review. Dismiss it once acknowledged; if the PR is reopened, it returns to the queue on the next refresh."
+                            "This PR was merged on {host} before the review finished — nothing left to review. Dismiss it once acknowledged; if the PR is reopened, it returns to the queue on the next refresh."
                         } else {
-                            "This PR was closed on GitHub without merging — nothing left to review. Dismiss it once acknowledged; if the PR is reopened, it returns to the queue on the next refresh."
+                            "This PR was closed on {host} without merging — nothing left to review. Dismiss it once acknowledged; if the PR is reopened, it returns to the queue on the next refresh."
                         }
                     }
                     button {
@@ -535,6 +538,11 @@ fn FixGate(
     failure: Option<String>,
 ) -> Element {
     let state = use_context::<AppState>();
+    let host = state
+        .review_task(review_id)
+        .map(|t| state.forge_of(t.project_id))
+        .unwrap_or_default()
+        .display_name();
     // The redo note. A draft so a half-typed instruction survives a deselect;
     // the panel remounts (and so reseeds this to empty) when the status changes.
     let mut note = crate::ui::drafts::use_draft(review_id, "review.fixnote", String::new);
@@ -548,7 +556,7 @@ fn FixGate(
                 div { class: "question", "The fix run failed: {message}" }
             }
             div { class: "hint",
-                "The review is on GitHub and says you'll fix these {comment_count} comment(s)                  yourself. The fix is committed in the PR's checkout — nothing has been pushed."
+                "The review is on {host} and says you'll fix these {comment_count} comment(s)                  yourself. The fix is committed in the PR's checkout — nothing has been pushed."
             }
             if !summary.trim().is_empty() {
                 div { class: "pr-body", "{summary}" }

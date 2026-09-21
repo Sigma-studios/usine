@@ -111,6 +111,8 @@ enum PreviewTools {
 fn ReviewTaskCard(task: ReviewTask) -> Element {
     let state = use_context::<AppState>();
     let id = task.id;
+    let forge = state.forge_of(task.project_id);
+    let host = forge.display_name();
     let selected = *state.selected_review.read() == Some(id);
     // Same gap the card board covers: `StartReview` / `PublishReview` do their
     // git and forge work *before* the status changes, so between the click and
@@ -207,12 +209,12 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
                         href: "{task.url}",
                         target: "_blank",
                         rel: "noreferrer",
-                        title: "Open pull request on GitHub",
+                        title: "Open pull request on {host}",
                         // Don't let a click on the link also select the card
                         // (its Enter activation is already shielded by the
                         // card-top keydown handler above).
                         onclick: move |e| e.stop_propagation(),
-                        "#{task.pr_number}"
+                        "{forge.pr_ref(task.pr_number)}"
                     }
                     "{task.pr_title}"
                 }

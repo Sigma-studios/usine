@@ -12,12 +12,12 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
-    spawn_executor, AdoptProbe, AppSettings, Card, CardAnswers, CardState, Change, DesignSub,
-    DiffState, DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind,
-    ExecutorHandle, FixItem, FixOutcome, FixReport, Forge, GhForge, GitOps, Handoff, OpenPr,
-    Outcome, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig, Provider, ProviderFactory,
-    QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory,
-    SimForge, SimGit, Store, TestItem, UsageSnapshot,
+    spawn_executor_with_forges, AdoptProbe, AppSettings, Card, CardAnswers, CardState, Change,
+    DesignSub, DiffState, DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent,
+    ExecutorEventKind, ExecutorHandle, FixItem, FixOutcome, FixReport, ForgeKind, ForgeRegistry,
+    GitOps, Handoff, OpenPr, Outcome, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig,
+    Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub,
+    Severity, SimFactory, SimForge, SimGit, Store, TestItem, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -215,7 +215,7 @@ impl AppState {
             review_tasks.entry(t.project_id).or_default().push(t);
         }
 
-        let (providers, forge, git) = backends();
+        let (providers, forges, git) = backends();
         // The MCP server needs its own handle, taken before the store moves
         // into the executor. Skipped on the in-memory fallback: serving off it
         // would answer with a board nothing can ever write to, and in the
@@ -226,12 +226,15 @@ impl AppState {
         #[cfg(not(all(feature = "mcp", unix)))]
         let _ = persisted;
         // The executor takes the store; the UI keeps no handle of its own.
-        let (exec, rx) = spawn_executor(ExecutorConfig {
-            store,
-            providers,
-            forge,
-            git,
-        });
+        let (exec, rx) = spawn_executor_with_forges(
+            ExecutorConfig {
+                store,
+                providers,
+                forge: forges.default_forge(),
+                git,
+            },
+            forges,
+        );
         // Local MCP surface over the board: read projects/cards/plans, create
         // projects/cards — nothing that starts an agent. Own thread and
         // runtime; compiled out with `--no-default-features`.
@@ -240,7 +243,10 @@ impl AppState {
             usine_core::mcp::spawn(store, exec.command_sender(), demo_mode());
         }
         if demo_mode() {
-            push_toast(Severity::Info, "Demo mode — agents & GitHub are simulated");
+            push_toast(
+                Severity::Info,
+                "Demo mode — agents & code hosts are simulated",
+            );
         }
 
         AppState {
@@ -946,6 +952,7 @@ impl AppState {
         // Fork worktrees from the repo's integration branch (prefers `dev`).
         if !demo_mode() {
             config.base_branch = usine_core::infra::git::detect_base_branch(&path);
+            config.detected_forge = usine_core::detect_forge(&path);
         }
         let project = Project::new(name, path, config);
         let id = project.id;
@@ -1042,6 +1049,17 @@ impl AppState {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "—".into())
     }
+
+    /// The code host a project's PRs live on — what every "on GitHub" /
+    /// "on Azure DevOps" in the UI names. GitHub for an unknown project.
+    pub fn forge_of(&self, project_id: Uuid) -> ForgeKind {
+        self.projects
+            .read()
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.config.effective_forge())
+            .unwrap_or_default()
+    }
 }
 
 /// The app runs the real `claude`/`codex`/`gh`/`git` by default. Opting into
@@ -1054,11 +1072,22 @@ pub(crate) fn demo_mode() -> bool {
         .unwrap_or(false)
 }
 
-fn backends() -> (Arc<dyn ProviderFactory>, Arc<dyn Forge>, Arc<dyn GitOps>) {
+/// The providers, forges and git the executor drives. Real mode resolves each
+/// project's forge from its kind — GitHub via `gh`, Azure DevOps over REST;
+/// demo mode's one simulated forge serves every project.
+fn backends() -> (Arc<dyn ProviderFactory>, ForgeRegistry, Arc<dyn GitOps>) {
     if demo_mode() {
-        (Arc::new(SimFactory), Arc::new(SimForge), Arc::new(SimGit))
+        (
+            Arc::new(SimFactory),
+            ForgeRegistry::new(Arc::new(SimForge)),
+            Arc::new(SimGit),
+        )
     } else {
-        (Arc::new(RealFactory), Arc::new(GhForge), Arc::new(RealGit))
+        (
+            Arc::new(RealFactory),
+            ForgeRegistry::real(),
+            Arc::new(RealGit),
+        )
     }
 }
 

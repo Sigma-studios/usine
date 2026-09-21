@@ -26,9 +26,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
     spawn_executor, Card, CardState, DraftComment, ExecutorCommand, ExecutorConfig, ExecutorEvent,
-    ExecutorEventKind, Forge, Mergeable, OpenPr, PrInfo, PrPushTarget, PrReviewSub, PrSummary,
-    Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewScope, ReviewSummary,
-    ReviewThread, Severity, SimFactory, SimForge, Store,
+    ExecutorEventKind, Forge, Mergeable, OpenPr, PrInfo, PrPushTarget, PrReviewSub, PrState,
+    PrSummary, Project, ProjectConfig, RealGit, ReviewComment, ReviewEvent, ReviewScope,
+    ReviewSummary, ReviewThread, Severity, SimFactory, SimForge, Store,
 };
 
 const PR: u64 = 7;
@@ -83,7 +83,7 @@ impl Forge for PrForge {
             number: n,
             url: "u".into(),
             title: "Remote work".into(),
-            state: "open".into(),
+            state: PrState::Open,
             reviewer: self.reviewer.clone(),
             reviewer_recorded: false,
         }))

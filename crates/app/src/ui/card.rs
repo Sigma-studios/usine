@@ -28,6 +28,8 @@ enum PreviewTools {
 pub fn CardView(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
+    let forge = state.forge_of(card.project_id);
+    let host = forge.display_name();
     let selected = *state.selected_card.read() == Some(id);
 
     // A lifecycle command is in flight for this card. Its git/forge work runs
@@ -147,7 +149,7 @@ pub fn CardView(card: Card) -> Element {
     let pr_is_draft = card
         .pr
         .as_ref()
-        .map(|p| p.state == "draft")
+        .map(|p| p.state == usine_core::PrState::Draft)
         .unwrap_or(false);
     // Surface the PR from the board itself — until now only the detail panel
     // showed it, while the review board already prefixes its cards with #N.
@@ -372,13 +374,13 @@ pub fn CardView(card: Card) -> Element {
                         href: "{url}",
                         target: "_blank",
                         rel: "noreferrer",
-                        title: "Open pull request on GitHub",
+                        title: "Open pull request on {host}",
                         // Don't let a click on the link also select the card, and
                         // shield its Enter activation from the card's onkeydown
                         // (which prevents the default action).
                         onclick: move |e| e.stop_propagation(),
                         onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
-                        "#{number}"
+                        "{forge.pr_ref(number)}"
                     }
                 }
                 // The PR's CI state, once it has one and any check reported —
@@ -562,7 +564,7 @@ pub fn CardView(card: Card) -> Element {
                                         // The board button has always deleted the
                                         // branch (the panel offers a checkbox);
                                         // say so, since the action can't be undone.
-                                        "Merge this pull request into the base branch on GitHub and delete its branch? This can't be undone.".to_string(),
+                                        format!("Merge this pull request into the base branch on {host} and delete its branch? This can't be undone."),
                                         "Merge",
                                         ExecutorCommand::Merge { card_id: id, delete_branch: true, force: false },
                                     );
