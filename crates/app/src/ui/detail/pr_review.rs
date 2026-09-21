@@ -12,10 +12,12 @@ use crate::ui::{request_confirm, ConfirmAction, ConfirmRequest};
 pub(super) fn PrReviewPanel(card: Card) -> Element {
     let state = use_context::<AppState>();
     let id = card.id;
+    let forge = state.forge_of(card.project_id);
+    let host = forge.display_name();
     let is_draft = card
         .pr
         .as_ref()
-        .map(|p| p.state == "draft")
+        .map(|p| p.state == usine_core::PrState::Draft)
         .unwrap_or(false);
     // Triage needs something to triage: any review comment, from the assigned
     // reviewer or another one (the dock badge stays the assigned reviewer's job,
@@ -64,20 +66,20 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
                 // that no longer exists when nothing has been submitted.
                 button {
                     class: "btn icon",
-                    title: "Re-read the PR's reviews, comments and checks from GitHub",
+                    title: "Re-read the PR's reviews, comments and checks from {host}",
                     "aria-label": "Refresh review status",
                     onclick: move |_| state.fetch_reviews(id),
                     "↻"
                 }
             }
             if let Some(p) = card.pr.clone() {
-                super::PrLink { number: p.number, url: p.url }
+                super::PrLink { number: p.number, url: p.url, forge }
             }
             if is_draft {
-                div { class: "hint", "This PR is a draft — GitHub won't merge it." }
+                div { class: "hint", "This PR is a draft — {host} won't merge it." }
                 button {
                     class: "btn primary",
-                    title: "Add any screenshots and finish the description on GitHub first; this flips it to ready for review",
+                    title: "Add any screenshots and finish the description on {host} first; this flips it to ready for review",
                     onclick: move |_| state.send(ExecutorCommand::MarkPrReady { card_id: id }),
                     "Mark ready for review"
                 }

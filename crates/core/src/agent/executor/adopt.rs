@@ -39,7 +39,7 @@ impl Executor {
         let owned = self.card_branches(project_id);
         let refs = adopt_source_refs(&all, base, &owned);
         // Best-effort: offline or unauthed, the branches still load.
-        let prs = match self.forge.list_open_prs(&project.path).await {
+        let prs = match self.forge_for(&project).list_open_prs(&project.path).await {
             Ok(prs) => prs,
             Err(e) => {
                 tracing::warn!("listing open PRs to adopt failed: {e}");
@@ -87,7 +87,7 @@ impl Executor {
                 }
             }
             open_pr = self
-                .forge
+                .forge_for(&project)
                 .pr_for_head(&project.path, local)
                 .await
                 .unwrap_or(None);
@@ -289,36 +289,39 @@ impl Executor {
         description: String,
     ) -> Result<()> {
         let project = self.store.get_project(project_id)?;
+        let forge = self.forge_for(&project);
+        let label = pr_ref(&project, pr_number);
         // Refresh origin so the head's remote-tracking ref exists and is
         // current. Non-fatal, as in `adopt_branch`.
         if let Err(e) = self.git.fetch(&project.path, "origin").await {
-            tracing::warn!("adopt PR #{pr_number}: fetching origin failed: {e}");
+            tracing::warn!("adopt PR {label}: fetching origin failed: {e}");
         }
-        let target = self
-            .forge
+        let target = forge
             .pr_push_target(&project.path, pr_number)
             .await?
             .ok_or_else(|| {
-                CoreError::other(format!("couldn't read PR #{pr_number} from the forge"))
+                CoreError::other(format!(
+                    "couldn't read PR {label} from {}",
+                    project.config.effective_forge().display_name()
+                ))
             })?;
         if target.cross_repo {
             return Err(CoreError::other(format!(
-                "cannot adopt PR #{pr_number}: PRs from forks can't be adopted — review them \
+                "cannot adopt PR {label}: PRs from forks can't be adopted — review them \
                  from the PR-review board instead"
             )));
         }
         let base = project.config.effective_base_branch();
         if !target.base_ref.is_empty() && target.base_ref != base {
             return Err(CoreError::other(format!(
-                "cannot adopt PR #{pr_number}: it targets `{}`, not the project's base `{base}`",
+                "cannot adopt PR {label}: it targets `{}`, not the project's base `{base}`",
                 target.base_ref
             )));
         }
-        let pr = self
-            .forge
+        let pr = forge
             .pr_by_number(&project.path, pr_number)
             .await?
-            .ok_or_else(|| CoreError::other(format!("PR #{pr_number} is no longer open")))?;
+            .ok_or_else(|| CoreError::other(format!("PR {label} is no longer open")))?;
         let title = title.trim().to_string();
         if title.is_empty() {
             return Err(CoreError::other("a title is required to adopt a PR"));
@@ -332,7 +335,7 @@ impl Executor {
         let head = target.head_ref;
         if let Some(refusal) = self.adopt_pr_refusal(&project, &head, pr_number) {
             return Err(CoreError::other(format!(
-                "cannot adopt PR #{pr_number}: {refusal}"
+                "cannot adopt PR {label}: {refusal}"
             )));
         }
         // The card's worktree must own the head branch: git won't check one
@@ -340,7 +343,7 @@ impl Executor {
         // the cross-card contamination `finalize_run` guards against.
         if let Some(path) = checkout_of_branch(&project.path, &head) {
             return Err(CoreError::other(format!(
-                "cannot adopt PR #{pr_number}: `{head}` is checked out at {} — switch that \
+                "cannot adopt PR {label}: `{head}` is checked out at {} — switch that \
                  checkout to another branch first",
                 path.display()
             )));
@@ -364,7 +367,7 @@ impl Executor {
             }
             Some(Relation::Diverged) => {
                 return Err(CoreError::other(format!(
-                    "cannot adopt PR #{pr_number}: your local `{head}` and `origin/{head}` have \
+                    "cannot adopt PR {label}: your local `{head}` and `origin/{head}` have \
                      diverged — reconcile them (or delete the local branch) first"
                 )));
             }
@@ -383,7 +386,7 @@ impl Executor {
                     if let Err(e) = self.git.push(&worktree, &head).await {
                         let _ = self.git.remove_worktree(&project.path, &worktree).await;
                         return Err(CoreError::other(format!(
-                            "cannot adopt PR #{pr_number}: pushing your local commits on \
+                            "cannot adopt PR {label}: pushing your local commits on \
                              `{head}` failed: {e}"
                         )));
                     }
@@ -412,7 +415,7 @@ impl Executor {
         let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
             card.id,
             Severity::Success,
-            format!("Adopted PR #{pr_number} — now tracking its review"),
+            format!("Adopted PR {label} — now tracking its review"),
         ));
 
         // Pull the PR's comments, reviews, checks and mergeability now rather
@@ -423,7 +426,7 @@ impl Executor {
         // transition; best-effort, since the poll catches up.
         if let Some(_guard) = claim(&self.in_flight, &self.evt_tx, card.id) {
             if let Err(e) = self.list_reviews(card.id).await {
-                tracing::warn!("adopt PR #{pr_number}: first review refresh failed: {e}");
+                tracing::warn!("adopt PR {label}: first review refresh failed: {e}");
             }
         }
         Ok(())

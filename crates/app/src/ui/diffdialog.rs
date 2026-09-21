@@ -447,7 +447,8 @@ fn DiffView(
             div { class: "diff-main",
                 // Comments the agent anchored somewhere this diff doesn't cover
                 // (a line outside any hunk, or a path that isn't in the change).
-                // GitHub rejects inline comments off the diff, so these would fail
+                // Forges reject (GitHub) or misplace (Azure DevOps) inline comments
+                // off the diff, so these would fail
                 // to post — surface them for editing instead of hiding them.
                 if !anchors.unplaced.is_empty() {
                     div { class: "diff-unplaced",

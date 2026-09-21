@@ -9,6 +9,7 @@ use crate::domain::config::AppSettings;
 use crate::domain::model::{now_millis, Provider, ReviewStatus};
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::Result;
+use crate::infra::forge::detect_forge;
 use crate::infra::git::detect_base_branch;
 use crate::infra::paths::worktrees_root;
 use crate::infra::persistence::Store;
@@ -124,17 +125,19 @@ pub fn reconcile_interrupted_reviews(store: &Store, message: &str) -> Result<usi
     Ok(reconciled)
 }
 
-/// Keep each project's *detected* base branch in sync with what its repo
-/// actually has. This only refreshes `base_branch`; a user pin
-/// (`pinned_base_branch`) lives beside it, is never touched here, and wins at
-/// read time via `effective_base_branch()`. Returns how many projects were
-/// updated.
+/// Keep each project's *detected* base branch and forge in sync with what its
+/// repo actually has. This only refreshes `base_branch` and `detected_forge`;
+/// the user pins (`pinned_base_branch`, `pinned_forge`) live beside them, are
+/// never touched here, and win at read time via `effective_base_branch()` /
+/// `effective_forge()`. Returns how many projects were updated.
 pub fn sync_base_branches(store: &Store) -> Result<usize> {
     let mut updated = 0;
     for mut project in store.list_projects()? {
         let detected = detect_base_branch(&project.path);
-        if detected != project.config.base_branch {
+        let forge = detect_forge(&project.path);
+        if detected != project.config.base_branch || forge != project.config.detected_forge {
             project.config.base_branch = detected;
+            project.config.detected_forge = forge;
             store.upsert_project(&project)?;
             updated += 1;
         }

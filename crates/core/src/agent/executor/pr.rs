@@ -4,7 +4,7 @@
 use super::*;
 use crate::infra::forge::normalize_reviewer;
 use crate::infra::git::is_dirty;
-use crate::PrInfo;
+use crate::{PrInfo, PrState};
 
 /// Base for the synthetic ids given to review-*body* triage items. Far above
 /// any real GitHub comment id so they can't collide, but well below 2^53 so
@@ -145,7 +145,7 @@ impl Executor {
         // Draft PRs let the user add screenshots on GitHub (no API embeds images
         // in a PR body) then mark it ready; a non-draft opens straight for review.
         let created = self
-            .forge
+            .forge_for(&project)
             .create_pr(
                 &project.path,
                 &title,
@@ -164,7 +164,11 @@ impl Executor {
             // (e.g. the author asking themselves), or a timeout — and every
             // retry then fails with "already exists". An open PR on this card's
             // branch is that PR, so record it rather than stranding the card.
-            Err(err) => match self.forge.pr_for_head(&project.path, &head).await {
+            Err(err) => match self
+                .forge_for(&project)
+                .pr_for_head(&project.path, &head)
+                .await
+            {
                 // Read back from GitHub, so its reviewer (possibly none, when
                 // the request was refused or never sent) is authoritative.
                 Ok(Some(existing)) => (
@@ -219,26 +223,36 @@ impl Executor {
         }
         // The recorded state, not the requested flag: a recovered PR's draft-ness
         // is whatever GitHub reports.
-        let msg = if pr.state == "draft" {
-            format!("Draft PR #{number} created — add screenshots on GitHub, then mark it ready.")
+        let kind = project.config.effective_forge();
+        let msg = if pr.state == PrState::Draft {
+            format!(
+                "Draft PR {} created — add screenshots on {}, then mark it ready.",
+                kind.pr_ref(number),
+                kind.display_name()
+            )
         } else {
-            format!("PR #{number} created")
+            format!("PR {} created", kind.pr_ref(number))
         };
         let (severity, msg) = match gh_error {
             None => (Severity::Success, msg),
             Some(err) => {
-                // A reviewer the user picked but GitHub doesn't list was refused
-                // or never requested (gh killed mid-way) — and the card has just
-                // skipped the review gate because of it, so say so plainly.
+                // A reviewer the user picked but the forge doesn't list was
+                // refused or never requested (the call died mid-way) — and the
+                // card has just skipped the review gate because of it, so say
+                // so plainly.
                 let unrequested = match normalize_reviewer(reviewer.as_deref()) {
-                    Some(r) if pr.reviewer.is_none() => {
-                        format!(" Reviewer {r} was not requested — request them on GitHub.")
-                    }
+                    Some(r) if pr.reviewer.is_none() => format!(
+                        " Reviewer {r} was not requested — request them on {}.",
+                        kind.display_name()
+                    ),
                     _ => String::new(),
                 };
                 (
                     Severity::Warning,
-                    format!("{msg}, but gh reported an error: {err}.{unrequested}"),
+                    format!(
+                        "{msg}, but {} reported an error: {err}.{unrequested}",
+                        kind.display_name()
+                    ),
                 )
             }
         };
@@ -267,8 +281,15 @@ impl Executor {
         // Talk to the forge BEFORE the running-state transition, so a failed
         // fetch leaves the card where it was (the PR gate, the fix picker, or
         // the merge gate — all recoverable) instead of stranded mid-fetch.
-        let comments = self.forge.fetch_comments(&project.path, pr_number).await?;
-        let items = match self.forge.list_threads(&project.path, pr_number).await {
+        let comments = self
+            .forge_for(&project)
+            .fetch_comments(&project.path, pr_number)
+            .await?;
+        let items = match self
+            .forge_for(&project)
+            .list_threads(&project.path, pr_number)
+            .await
+        {
             Ok(threads) => {
                 // Keep the freshly-learned unanswered count on the card, so the
                 // merge gate's "reevaluate" offer tracks what this fetch saw.
@@ -301,7 +322,7 @@ impl Executor {
         // with the comments. Best-effort — a hiccup falls back to what the card
         // already knows rather than blocking the triage of inline comments.
         let reviews = match self
-            .forge
+            .forge_for(&project)
             .list_submitted_reviews(&project.path, pr_number)
             .await
         {
@@ -399,18 +420,21 @@ impl Executor {
         let (checked, ignored): (Vec<FixVerdict>, Vec<FixVerdict>) =
             verdicts.into_iter().partition(|v| v.selected);
 
-        // Reply to the ignored comments with the agent's short explanation
+        // Answer the ignored comments with the agent's short explanation
         // (best-effort — a failed reply shouldn't block applying the fixes).
-        // A review-body item never gets one: GitHub has no reply endpoint for
-        // a review body (its synthetic id isn't a real comment id).
+        // `decline_comment` also closes the thread as "won't fix" where the
+        // forge models that (Azure DevOps, whose comment policy would
+        // otherwise block the merge on it). A review-body item never gets
+        // one: GitHub has no reply endpoint for a review body (its synthetic
+        // id isn't a real comment id).
         if let Some(pr) = pr_number {
+            let forge = self.forge_for(&project);
             for v in &ignored {
                 if v.comment.review_body_of.is_some() || v.reply.trim().is_empty() {
                     continue;
                 }
-                match self
-                    .forge
-                    .reply_to_comment(&project.path, pr, v.comment.id, &v.reply)
+                match forge
+                    .decline_comment(&project.path, pr, v.comment.id, &v.reply)
                     .await
                 {
                     // Keep the decision on the restart log: a later reset run
@@ -538,7 +562,11 @@ impl Executor {
         };
         if !ids.is_empty() {
             let project = self.store.get_project(card.project_id)?;
-            match self.forge.resolve_threads(&project.path, pr, &ids).await {
+            match self
+                .forge_for(&project)
+                .resolve_threads(&project.path, pr, &ids)
+                .await
+            {
                 Ok(0) => {}
                 Ok(n) => self.progress(card_id, &format!("✔ resolved {n} review thread(s)")),
                 Err(e) => {
@@ -666,7 +694,10 @@ impl Executor {
     /// Project-scoped, so it emits a `Reviewers` event rather than a card update.
     pub(super) async fn list_reviewers(&self, project_id: Uuid) -> Result<()> {
         let project = self.store.get_project(project_id)?;
-        let logins = self.forge.list_reviewers(&project.path).await?;
+        let logins = self
+            .forge_for(&project)
+            .list_reviewers(&project.path)
+            .await?;
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::reviewers(project_id, logins));
@@ -678,7 +709,10 @@ impl Executor {
     /// collaborator list can't. Project-scoped: emits a `PrAuthors` event.
     pub(super) async fn list_pr_authors(&self, project_id: Uuid) -> Result<()> {
         let project = self.store.get_project(project_id)?;
-        let logins = self.forge.list_pr_authors(&project.path).await?;
+        let logins = self
+            .forge_for(&project)
+            .list_pr_authors(&project.path)
+            .await?;
         let _ = self
             .evt_tx
             .unbounded_send(ExecutorEvent::pr_authors(project_id, logins));
@@ -698,7 +732,7 @@ impl Executor {
     /// (`None` = can't tell), feeding [`Self::reconcile_pr_live_state`].
     pub(super) async fn fetch_review_status(
         &self,
-        repo: &Path,
+        project: &Project,
         pr_number: u64,
     ) -> Result<(
         Vec<ReviewComment>,
@@ -708,9 +742,11 @@ impl Executor {
         Option<Mergeable>,
         Option<LivePrState>,
     )> {
-        let comments = self.forge.fetch_comments(repo, pr_number).await?;
-        let reviews = self.forge.list_submitted_reviews(repo, pr_number).await?;
-        let unanswered = match self.forge.list_threads(repo, pr_number).await {
+        let forge = self.forge_for(project);
+        let repo = &project.path;
+        let comments = forge.fetch_comments(repo, pr_number).await?;
+        let reviews = forge.list_submitted_reviews(repo, pr_number).await?;
+        let unanswered = match forge.list_threads(repo, pr_number).await {
             Ok(threads) => Some(threads.iter().filter(|t| t.is_unanswered()).count()),
             Err(e) => {
                 tracing::warn!(
@@ -719,14 +755,14 @@ impl Executor {
                 None
             }
         };
-        let checks = match self.forge.pr_checks(repo, pr_number).await {
+        let checks = match forge.pr_checks(repo, pr_number).await {
             Ok((status, _)) => Some(status),
             Err(e) => {
                 tracing::warn!("review-status refresh: couldn't read checks for #{pr_number}: {e}");
                 None
             }
         };
-        let mergeable = match self.forge.merge_status(repo, pr_number).await {
+        let mergeable = match forge.merge_status(repo, pr_number).await {
             Ok(m) => Some(m),
             Err(e) => {
                 tracing::warn!(
@@ -735,7 +771,7 @@ impl Executor {
                 None
             }
         };
-        let live = match self.forge.pr_live_state(repo, pr_number).await {
+        let live = match forge.pr_live_state(repo, pr_number).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -765,7 +801,7 @@ impl Executor {
             .effective_reviewer(project.config.reviewer.as_deref())
             .map(str::to_string);
         let (comments, reviews, unanswered, checks, mergeable, live) =
-            self.fetch_review_status(&project.path, pr.number).await?;
+            self.fetch_review_status(&project, pr.number).await?;
         // A PR merged or closed on GitHub retires the card before any count
         // mutation or auto-advance — nothing below applies to a gone PR.
         if self.reconcile_pr_live_state(card_id, live).await? {
@@ -896,10 +932,12 @@ impl Executor {
             .as_ref()
             .map(|p| p.number)
             .ok_or_else(|| CoreError::other("card has no PR to mark ready"))?;
-        self.forge.mark_ready(&project.path, pr).await?;
+        self.forge_for(&project)
+            .mark_ready(&project.path, pr)
+            .await?;
         let updated = self.store.mutate_card(card_id, |c| {
             if let Some(pr) = &mut c.pr {
-                pr.state = "open".into();
+                pr.state = PrState::Open;
             }
             c.updated_at = now_millis();
             Ok(())
@@ -995,7 +1033,11 @@ impl Executor {
         }
 
         if !force {
-            if let Ok((read, failed)) = self.forge.pr_checks(&project.path, pr_number).await {
+            if let Ok((read, failed)) = self
+                .forge_for(&project)
+                .pr_checks(&project.path, pr_number)
+                .await
+            {
                 // An empty rollup inside the registration grace still means "the
                 // build is starting", so a merge asked for in that window is
                 // refused with the usual "still running" toast rather than
@@ -1012,7 +1054,7 @@ impl Executor {
                 // never reach `Done` via Merge.
                 if matches!(status, CheckStatus::Failing | CheckStatus::Pending)
                     && !self
-                        .forge
+                        .forge_for(&project)
                         .is_merged(&project.path, pr_number)
                         .await
                         .unwrap_or(false)
@@ -1049,9 +1091,13 @@ impl Executor {
         // A PR merged by an earlier attempt (or on GitHub directly) can't be
         // merged again — but the card still needs to reach `Done` and shed its
         // worktree. Ask the forge rather than matching on gh's error text.
-        if let Err(e) = self.forge.merge(&project.path, pr_number).await {
+        if let Err(e) = self
+            .forge_for(&project)
+            .merge(&project.path, pr_number)
+            .await
+        {
             if !self
-                .forge
+                .forge_for(&project)
                 .is_merged(&project.path, pr_number)
                 .await
                 .unwrap_or(false)
@@ -1060,7 +1106,7 @@ impl Executor {
                 // read as an error: it's a fixable state, and the agent that wrote
                 // the branch can resolve it. Offer that instead, leaving the card
                 // in `ReadyToMerge` to merge again once the branch is updated.
-                if self.pr_conflicts(&project.path, pr_number).await {
+                if self.pr_conflicts(&project, pr_number).await {
                     // Gate the board's merge button right away — waiting for the
                     // next poll tick would leave it offering the merge that just
                     // failed.
@@ -1081,7 +1127,7 @@ impl Executor {
         // transition's `CardUpdated` carries both changes in one event.
         self.store.mutate_card(card_id, |c| {
             if let Some(p) = &mut c.pr {
-                p.state = "merged".into();
+                p.state = PrState::Merged;
             }
             Ok(())
         })?;
@@ -1102,7 +1148,11 @@ impl Executor {
                 } else {
                     left_behind.push("local branch (worktree still holds it)".to_string());
                 }
-                if let Err(e) = self.forge.delete_remote_branch(&project.path, branch).await {
+                if let Err(e) = self
+                    .forge_for(&project)
+                    .delete_remote_branch(&project.path, branch)
+                    .await
+                {
                     left_behind.push(format!("remote branch ({e})"));
                 }
             }
@@ -1203,11 +1253,16 @@ impl Executor {
         let Some(pr) = card.pr.clone() else {
             return Ok(false);
         };
-        let sync_pr_state = |target: &str| -> Result<()> {
+        let kind = self
+            .store
+            .get_project(card.project_id)
+            .map(|p| p.config.effective_forge())
+            .unwrap_or_default();
+        let sync_pr_state = |target: PrState| -> Result<()> {
             if pr.state != target {
                 let updated = self.store.mutate_card(card_id, |c| {
                     if let Some(p) = &mut c.pr {
-                        p.state = target.to_string();
+                        p.state = target;
                     }
                     Ok(())
                 })?;
@@ -1219,7 +1274,7 @@ impl Executor {
             // Bonus fix: a draft marked ready (or flipped back) on GitHub keeps
             // the card's badge honest without moving anything.
             LivePrState::Open { draft } => {
-                sync_pr_state(if draft { "draft" } else { "open" })?;
+                sync_pr_state(PrState::open(draft))?;
                 Ok(false)
             }
             LivePrState::Merged => {
@@ -1229,19 +1284,24 @@ impl Executor {
                 ) {
                     return Ok(false);
                 }
-                sync_pr_state("merged")?;
+                sync_pr_state(PrState::Merged)?;
                 let (message, transition) = if matches!(card.state, CardState::ReadyToMerge) {
                     // Review passed — the external merge finishes the card the
                     // same way our own merge would.
                     (
-                        format!("PR #{} was merged on GitHub — marked done", pr.number),
+                        format!(
+                            "PR {} was merged on {} — marked done",
+                            kind.pr_ref(pr.number),
+                            kind.display_name()
+                        ),
                         Transition::Merge,
                     )
                 } else {
                     (
                         format!(
-                            "PR #{} was merged on GitHub before its review finished",
-                            pr.number
+                            "PR {} was merged on {} before its review finished",
+                            kind.pr_ref(pr.number),
+                            kind.display_name()
                         ),
                         Transition::PrMergedExternally,
                     )
@@ -1258,12 +1318,16 @@ impl Executor {
                 ) {
                     return Ok(false);
                 }
-                sync_pr_state("closed")?;
+                sync_pr_state(PrState::Closed)?;
                 self.apply(card_id, Transition::PrClosedExternally)?;
                 let (_, left_behind) = self.cleanup_terminal_pr_worktree(card_id, true).await;
                 self.toast_reconciled(
                     card_id,
-                    format!("PR #{} was closed on GitHub without merging", pr.number),
+                    format!(
+                        "PR {} was closed on {} without merging",
+                        kind.pr_ref(pr.number),
+                        kind.display_name()
+                    ),
                     left_behind,
                 );
                 Ok(true)
@@ -1293,9 +1357,10 @@ impl Executor {
     /// computed yet" for "no conflict". Only a definite `CONFLICTING` claims the
     /// conflict — every other answer (and any error reaching the forge) leaves
     /// the original merge error to surface as itself.
-    async fn pr_conflicts(&self, repo: &Path, pr_number: u64) -> bool {
+    async fn pr_conflicts(&self, project: &Project, pr_number: u64) -> bool {
+        let forge = self.forge_for(project);
         for attempt in 0..MERGEABILITY_ATTEMPTS {
-            match self.forge.merge_status(repo, pr_number).await {
+            match forge.merge_status(&project.path, pr_number).await {
                 Ok(Mergeable::Conflicting) => return true,
                 Ok(Mergeable::Unknown) => {}
                 Ok(Mergeable::Clean) | Err(_) => return false,
@@ -1336,7 +1401,11 @@ impl Executor {
         // commit and re-trigger CI on a PR that was already mergeable. Anything
         // less definite (still conflicting, not yet computed, or a forge error)
         // proceeds: the local merge below finds the real answer either way.
-        if let Ok(Mergeable::Clean) = self.forge.merge_status(&project.path, pr_number).await {
+        if let Ok(Mergeable::Clean) = self
+            .forge_for(&project)
+            .merge_status(&project.path, pr_number)
+            .await
+        {
             self.persist_mergeable(card_id, Mergeable::Clean);
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                 card_id,
@@ -1511,7 +1580,11 @@ impl Executor {
             let Some(pr_number) = card.pr.as_ref().map(|p| p.number) else {
                 continue;
             };
-            let read = match self.forge.pr_checks(&project.path, pr_number).await {
+            let read = match self
+                .forge_for(project)
+                .pr_checks(&project.path, pr_number)
+                .await
+            {
                 Ok((status, _)) => status,
                 Err(e) => {
                     tracing::warn!("CI poll: reading checks of #{pr_number} failed: {e}");
@@ -1592,7 +1665,10 @@ impl Executor {
 
         // Re-read rather than trusting the dialog's snapshot: a re-run or a
         // teammate's push may have gone green since, and a run is not free.
-        let (status, failed) = self.forge.pr_checks(&project.path, pr_number).await?;
+        let (status, failed) = self
+            .forge_for(&project)
+            .pr_checks(&project.path, pr_number)
+            .await?;
         self.persist_checks(card_id, status);
         if status != CheckStatus::Failing {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
@@ -1609,33 +1685,16 @@ impl Executor {
         self.ensure_branch_worktree(card_id).await?;
 
         // Pull the failed runs' logs for the prompt — best-effort: a check
-        // whose URL isn't a GitHub Actions run (or a failed fetch) just means
-        // less context, and the agent can dig with `gh` itself.
+        // the forge has no log for (or a failed fetch) just means less
+        // context, and the agent can dig with the forge's tooling itself.
         self.progress(card_id, "Fetching failing checks' logs…");
-        let mut logs: Vec<(String, String)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for check in &failed {
-            let Some(run_id) = run_id_from_url(&check.url) else {
-                continue;
-            };
-            if !seen.insert(run_id) {
-                continue;
-            }
-            match self.forge.failed_run_log(&project.path, run_id).await {
-                Ok(log) if !log.trim().is_empty() => {
-                    let name = if check.workflow.is_empty() {
-                        check.name.clone()
-                    } else {
-                        check.workflow.clone()
-                    };
-                    logs.push((name, log_tail(&log, 200, 16 * 1024)));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("fix checks: couldn't fetch log of run {run_id}: {e}");
-                }
-            }
-        }
+        let logs: Vec<(String, String)> = self
+            .forge_for(&project)
+            .failed_check_logs(&project.path, &failed)
+            .await
+            .into_iter()
+            .map(|(name, log)| (name, log_tail(&log, 200, 16 * 1024)))
+            .collect();
 
         self.progress(
             card_id,
@@ -1644,7 +1703,7 @@ impl Executor {
                 failed.len()
             ),
         );
-        let extra = checks_fix_prompt(pr_number, &failed, &logs);
+        let extra = checks_fix_prompt(project.config.effective_forge(), pr_number, &failed, &logs);
         // Stash the task before entering the running state, so a retry of a
         // faulted run can restate it (see `relaunch`).
         self.store.set_fix_extra(card_id, Some(&extra))?;

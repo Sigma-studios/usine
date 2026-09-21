@@ -16,17 +16,18 @@ use crate::ui::widgets::ArtifactText;
 /// one (an investigation, say) has nothing to show here and keeps its old panel.
 #[component]
 pub(super) fn DonePanel(card: Card) -> Element {
+    let state = use_context::<AppState>();
     let pr = card.pr.clone();
     let branch = card.branch.clone();
     rsx! {
         if let Some(p) = pr {
             div { class: "section",
                 h3 { "Outcome" }
-                PrLink { number: p.number, url: p.url }
+                PrLink { number: p.number, url: p.url, forge: state.forge_of(card.project_id) }
                 // A card can also reach Done via "Mark done" with the PR still
                 // open, so report the record rather than assuming a merge.
                 div { class: "card-meta",
-                    if p.state == "merged" {
+                    if p.state == usine_core::PrState::Merged {
                         span { class: "badge merged", "✓ Merged" }
                     } else {
                         span { class: "badge status", "{p.state}" }

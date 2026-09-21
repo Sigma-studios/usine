@@ -93,17 +93,11 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
                 {
                     let cid = v.comment.id;
                     let checked = v.selected;
-                    // A synthetic item built from a review's *body* has no
-                    // path/line — label it the way the prompts do.
+                    // A synthetic item built from a review's *body*, or a
+                    // comment on the PR as a whole, has no path/line — label it
+                    // the way the prompts do.
                     let is_review_body = v.comment.review_body_of.is_some();
-                    let path = if is_review_body {
-                        usine_core::REVIEW_BODY_PATH.to_string()
-                    } else {
-                        match v.comment.line {
-                            Some(l) => format!("{}:{}", v.comment.path, l),
-                            None => v.comment.path.clone(),
-                        }
-                    };
+                    let path = usine_core::comment_location(&v.comment);
                     let body = v.comment.body.clone();
                     let rationale = v.rationale.clone();
                     // The triage filler for a comment the agent returned no

@@ -24,6 +24,11 @@ native_model = "0.4.20"
 # Matches the redb `native_db` links against — only to tell the "database
 # already open" (single-writer lock) failure apart from other open errors.
 redb = "2.6.3"
+# The Azure DevOps forge's REST client (GitHub goes through the `gh` CLI).
+# native-tls rather than reqwest's default rustls/aws-lc: it is the TLS stack
+# the app already links (via dioxus' websocket dependency), so this adds no
+# second one and no C/cmake build of aws-lc.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 # Splits a user-configured open-in-terminal/editor command into argv (respecting
@@ -45,3 +50,6 @@ uuid = { workspace = true, features = ["serde"] }
 # Tests implement `AgentProvider` (an async-trait trait) to simulate failures.
 async-trait = "0.1.89"
 tempfile = "3.27.0"
+# The Azure DevOps forge's tests serve a fake Azure over a local socket, with
+# or without the `mcp` feature's `tokio/net`.
+tokio = { workspace = true, features = ["net"] }

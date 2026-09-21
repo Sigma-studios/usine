@@ -61,7 +61,18 @@ authenticated on your `PATH`:
 
 - the [`claude`](https://docs.claude.com/en/docs/claude-code) CLI and/or the
   `codex` CLI, depending on the provider you pick per card,
-- `git`, and `gh` (the GitHub CLI) for the pull-request integration.
+- `git`, plus the pull-request integration for your projects' code host:
+  - **GitHub** — `gh` (the GitHub CLI), logged in with `gh auth login`;
+  - **Azure DevOps** (Azure Repos) — a personal access token with the *Code
+    (read & write)* scope in `AZURE_DEVOPS_EXT_PAT`, or the Azure CLI signed
+    in with `az login`. No token is stored by Usine.
+
+Each project's code host is detected from its `origin` remote (GitHub, or
+`dev.azure.com` / `*.visualstudio.com` for Azure DevOps Services) and can be
+pinned under the project's settings → Reviews → Code host — for instance
+an SSH host alias (`git@azure-work:v3/org/project/repo`) pinned to Azure
+DevOps, whose path still names the repository; projects on different hosts live side by side on one board. Azure DevOps Server
+(on-premises) isn't supported.
 
 If you only want to explore the UI, use `USINE_SIM=1` — none of the above are
 needed.
@@ -119,6 +130,7 @@ the executor, used for smoke tests and live integration tests:
 ```sh
 cargo run -p usine-cli                       # simulated end-to-end pipeline
 cargo run -p usine-cli github                # live GitHub forge test (throwaway repo)
+cargo run -p usine-cli azure <clone> [--merge]  # live Azure DevOps forge test on an existing clone
 cargo run -p usine-cli real-e2e              # full real run through the executor
 cargo run -p usine-cli real-plan <dir> <task...>   # one real `claude` plan over <dir>
 cargo run -p usine-cli mcp                   # relay stdio to a running app's MCP socket
@@ -203,7 +215,8 @@ The workspace is split into three crates:
 - **`usine-core`** (lib `usine_core`) — UI-agnostic domain logic. It owns the
   domain model, the pure card
   [state machine](crates/core/src/state_machine.rs), typed persistence (via
-  `native_db`), git and forge (GitHub via `gh`) integration, the provider
+  `native_db`), git and forge integration (GitHub via `gh`, Azure DevOps over
+  its REST API — one `Forge` trait, resolved per project), the provider
   abstraction, and the async **executor** that ties them together. It has **no
   UI dependencies**. `src/mcp` is a self-contained, feature-gated
   [MCP server](#mcp-server) over the board.
@@ -217,8 +230,9 @@ The workspace is split into three crates:
 the executor; the executor logic is identical regardless of which it gets. Phase
 A injects simulators (`SimFactory` / `SimForge` / `SimGit`) so the whole pipeline
 runs with no agents, tokens, or network. Phase B injects the real backends
-(`RealFactory` / `GhForge` / `RealGit`), which shell out to the real
-`claude`/`codex` CLIs, `git`, and `gh`.
+(`RealFactory` / `ForgeRegistry::real()` / `RealGit`), which shell out to the
+real `claude`/`codex` CLIs, `git`, and `gh`, and call Azure DevOps' REST API for
+Azure projects.
 
 **Threading.** The executor runs on its own background thread with a dedicated
 multi-threaded Tokio runtime, communicating with the UI entirely over channels

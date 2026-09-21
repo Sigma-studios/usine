@@ -120,10 +120,34 @@ pub struct FixItem {
 /// diff at it, say) has to skip it.
 pub const REVIEW_BODY_PATH: &str = "PR review summary";
 
+/// The label a comment on the PR's conversation — attached to no file, like an
+/// Azure DevOps general thread — carries where a location is shown. Unlike a
+/// review body it is a real thread: it can be replied to and resolved.
+pub const PR_CONVERSATION_PATH: &str = "PR conversation";
+
+/// Where a review comment sits, as prompts and pickers show it: `path:line`,
+/// a bare `path` for a line-less comment, or one of the two labels above for
+/// the feedback that names no file.
+pub fn comment_location(c: &crate::domain::model::ReviewComment) -> String {
+    if c.review_body_of.is_some() {
+        REVIEW_BODY_PATH.to_string()
+    } else if c.path.is_empty() {
+        PR_CONVERSATION_PATH.to_string()
+    } else {
+        match c.line {
+            Some(line) => format!("{}:{}", c.path, line),
+            None => c.path.clone(),
+        }
+    }
+}
+
 impl FixItem {
     /// The repo path this item points at, when it points at one at all.
     pub fn diff_path(&self) -> Option<&str> {
-        (!self.path.is_empty() && self.path != REVIEW_BODY_PATH).then_some(self.path.as_str())
+        (!self.path.is_empty()
+            && self.path != REVIEW_BODY_PATH
+            && self.path != PR_CONVERSATION_PATH)
+            .then_some(self.path.as_str())
     }
 }
 
@@ -213,6 +237,8 @@ pub fn fix_items(selected: &[FixVerdict]) -> Vec<FixItem> {
             label: crate::agent::executor::one_line_capped(&v.comment.body, 160),
             path: if v.comment.review_body_of.is_some() {
                 REVIEW_BODY_PATH.to_string()
+            } else if v.comment.path.is_empty() {
+                PR_CONVERSATION_PATH.to_string()
             } else {
                 v.comment.path.clone()
             },

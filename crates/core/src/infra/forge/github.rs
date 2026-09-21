@@ -1,10 +1,13 @@
-//! Forge integration (GitHub) via the `gh` CLI.
+//! GitHub, through the `gh` CLI.
 //!
 //! We shell out to `gh`, reusing the user's existing `gh auth` — no token is
 //! stored by this app. `gh` is used for create/merge; inline review comments
 //! come from `gh api repos/{owner}/{repo}/pulls/<n>/comments` (the `{owner}`/
 //! `{repo}` placeholders are auto-filled by `gh` from the repo's remote), since
 //! `gh pr view` does not expose inline line comments.
+//!
+//! The argv builders and response parsers are pure and unit-tested; only
+//! [`GhForge`] and the `run_gh*` helpers touch a process.
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,73 +17,15 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use super::{
+    normalize_reviewer, FailedCheck, Forge, LivePrState, OpenPr, PrPushTarget, PrSummary,
+    ReviewScope,
+};
 use crate::domain::model::{
-    CheckStatus, DraftComment, Mergeable, PrInfo, ReviewComment, ReviewEvent, ReviewSummary,
-    ReviewThread,
+    CheckStatus, DraftComment, Mergeable, PrInfo, PrState, ReviewComment, ReviewEvent,
+    ReviewSummary, ReviewThread,
 };
 use crate::error::{CoreError, Result};
-
-/// A one-line summary of an open PR discovered by the review poll.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrSummary {
-    pub number: u64,
-    pub title: String,
-    pub author: String,
-    pub head_ref: String,
-    pub base_ref: String,
-    pub url: String,
-    /// The PR description, as written by the author.
-    pub body: String,
-    /// Rolled-up CI state (see [`rollup_status`]).
-    pub checks: CheckStatus,
-    /// Whether it merges cleanly into its base.
-    pub mergeable: Mergeable,
-}
-
-/// A PR's live lifecycle state on the forge, as opposed to the snapshot taken
-/// at creation. What the reconciliation passes read to notice a PR that was
-/// merged or closed on GitHub directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LivePrState {
-    Open { draft: bool },
-    Merged,
-    Closed,
-}
-
-/// One failing check from a PR's `statusCheckRollup` — enough to name it in a
-/// dialog and (via `url`, when it points at a GitHub Actions run) fetch its
-/// failed-step log for the fixing agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailedCheck {
-    /// The check's name (e.g. `test`), or the status context (e.g. `ci/lint`).
-    pub name: String,
-    /// The workflow the check belongs to, when reported (`CheckRun`s only).
-    pub workflow: String,
-    /// The check's details page — an Actions run URL for GitHub Actions checks.
-    pub url: String,
-}
-
-/// An open PR on this repo that a card could adopt — the adopt dialog's
-/// "Pull requests" group. Carries everything the dialog prefills from, so
-/// picking one needs no probe round-trip.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenPr {
-    pub number: u64,
-    pub title: String,
-    pub author: String,
-    pub head_ref: String,
-    pub base_ref: String,
-    pub url: String,
-    /// The PR description, as written by the author.
-    pub body: String,
-    pub draft: bool,
-    /// Whether the head lives on a fork (not adoptable: we can't push to it
-    /// as the card's own branch).
-    pub cross_repo: bool,
-    /// Whether the signed-in user authored it. `false` when the login can't be
-    /// read — the dialog then merely shows an extra warning.
-    pub mine: bool,
-}
 
 /// Cap on any single `gh` invocation so a hung command (auth prompt, network
 /// stall) can't block a run actor indefinitely.
@@ -118,15 +63,6 @@ pub fn create_pr_args(
     args
 }
 
-/// The reviewer login to record on a created PR: trimmed, with the empty/absent
-/// case collapsed to `None` (matching the `--reviewer` arg being omitted).
-pub fn normalize_reviewer(reviewer: Option<&str>) -> Option<String> {
-    reviewer
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .map(str::to_string)
-}
-
 /// List a repo's collaborators (the people who can be requested as reviewers).
 /// One paginated `gh api` call; `{owner}/{repo}` are auto-filled from the remote.
 pub fn reviewers_args() -> Vec<String> {
@@ -139,11 +75,31 @@ pub fn reviewers_args() -> Vec<String> {
     ]
 }
 
+/// Every inline review comment on the PR. `--paginate` because the endpoint
+/// pages at 30 by default — without it a busy PR's later comments (and the
+/// threads they belong to) silently never reached triage. `per_page=100`
+/// keeps that to one request for nearly every PR. The pages come back as
+/// back-to-back JSON arrays; see [`parse_paged_array`].
 pub fn comments_args(pr_number: u64) -> Vec<String> {
     vec![
         "api".into(),
-        format!("repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments"),
+        "--paginate".into(),
+        format!("repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments?per_page=100"),
     ]
+}
+
+/// Flatten `gh api --paginate` output — one JSON array per page, written back
+/// to back (`[…][…]`) — into one list. A single page parses the same way.
+/// (`--slurp` would wrap the pages, but only newer `gh` releases have it.)
+pub fn parse_paged_array(out: &str) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    for page in serde_json::Deserializer::from_str(out).into_iter::<Value>() {
+        match page? {
+            Value::Array(items) => all.extend(items),
+            other => all.push(other),
+        }
+    }
+    Ok(all)
 }
 
 /// Squash-merge the PR. Deliberately *without* `--delete-branch`: `gh` deletes
@@ -199,30 +155,6 @@ pub fn parse_live_pr_state(json: &str) -> Option<LivePrState> {
         "MERGED" => Some(LivePrState::Merged),
         "CLOSED" => Some(LivePrState::Closed),
         _ => None,
-    }
-}
-
-/// Where a PR's head branch lives, and whether we may push to it — what
-/// "I'll fix this myself" needs to know *before* the promise is made.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrPushTarget {
-    /// The PR's head branch name, as the target repo holds it.
-    pub head_ref: String,
-    /// The branch the PR targets (empty when the forge didn't say).
-    pub base_ref: String,
-    /// Whether the head is on a fork rather than this repo.
-    pub cross_repo: bool,
-    /// `owner/repo` of the head repository (forks only; empty otherwise).
-    pub head_repo: String,
-    /// Whether the author ticked "allow edits by maintainers".
-    pub maintainer_can_modify: bool,
-}
-
-impl PrPushTarget {
-    /// Whether a maintainer may push to this head: always for a same-repo
-    /// branch, only with the author's consent for a fork.
-    pub fn pushable(&self) -> bool {
-        !self.cross_repo || self.maintainer_can_modify
     }
 }
 
@@ -505,7 +437,7 @@ pub fn parse_pr_for_head(v: &Value) -> Option<PrInfo> {
         number,
         url: text("url"),
         title: text("title"),
-        state: if draft { "draft" } else { "open" }.to_string(),
+        state: PrState::open(draft),
         reviewer,
         reviewer_recorded: false,
     })
@@ -536,15 +468,6 @@ pub fn normalize_login(input: &str) -> Option<String> {
         && !login.ends_with('-')
         && !login.contains("--");
     valid.then(|| login.to_string())
-}
-
-/// Which open PRs the review board should track.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReviewScope {
-    /// Only PRs authored by these logins.
-    Authors(Vec<String>),
-    /// Every open PR except the current user's own.
-    Everyone,
 }
 
 /// Open PRs in `scope` that the current user hasn't yet reviewed.
@@ -853,6 +776,16 @@ pub fn run_log_args(run_id: u64) -> Vec<String> {
     ]
 }
 
+/// How a failing check is named above its log in the fix prompt: the
+/// workflow when it reports one (the unit a run's log covers), else the check.
+pub fn check_display_name(check: &FailedCheck) -> String {
+    if check.workflow.is_empty() {
+        check.name.clone()
+    } else {
+        check.workflow.clone()
+    }
+}
+
 /// Map GitHub's `mergeable` enum onto [`Mergeable`]. Anything other than the two
 /// definitive answers (notably `UNKNOWN`, returned while GitHub computes the
 /// merge, and the empty output of a PR that has vanished) stays `Unknown` so
@@ -1006,161 +939,6 @@ pub fn name_with_owner_args() -> Vec<String> {
     ]
 }
 
-// --- trait (real + simulated) ----------------------------------------------
-
-#[async_trait]
-pub trait Forge: Send + Sync {
-    #[allow(clippy::too_many_arguments)]
-    async fn create_pr(
-        &self,
-        repo: &Path,
-        title: &str,
-        body: &str,
-        base: &str,
-        head: &str,
-        reviewer: Option<&str>,
-        draft: bool,
-    ) -> Result<PrInfo>;
-
-    async fn fetch_comments(&self, repo: &Path, pr_number: u64) -> Result<Vec<ReviewComment>>;
-
-    /// Open PRs in `scope` that the current user hasn't yet reviewed.
-    async fn list_review_prs(&self, repo: &Path, scope: ReviewScope) -> Result<Vec<PrSummary>>;
-
-    /// Submit a review (a batch of inline comments + an overall verdict) on a PR.
-    async fn submit_review(
-        &self,
-        repo: &Path,
-        pr_number: u64,
-        event: ReviewEvent,
-        body: &str,
-        comments: &[DraftComment],
-    ) -> Result<()>;
-
-    /// GitHub logins that can be requested as PR reviewers on this repo.
-    async fn list_reviewers(&self, repo: &Path) -> Result<Vec<String>>;
-
-    /// GitHub logins with an open PR on this repo — the contributor picker's
-    /// suggestions, which collaborators alone miss entirely for fork PRs.
-    /// Defaulted rather than required: test doubles never call it.
-    async fn list_pr_authors(&self, _repo: &Path) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-
-    /// The latest submitted review per reviewer (who actually reviewed).
-    async fn list_submitted_reviews(
-        &self,
-        repo: &Path,
-        pr_number: u64,
-    ) -> Result<Vec<ReviewSummary>>;
-
-    /// Post a reply on a specific PR review comment.
-    async fn reply_to_comment(
-        &self,
-        repo: &Path,
-        pr_number: u64,
-        comment_id: u64,
-        body: &str,
-    ) -> Result<()>;
-
-    /// Flip a draft PR to ready-for-review.
-    async fn mark_ready(&self, repo: &Path, pr_number: u64) -> Result<()>;
-
-    /// Squash-merge the PR. Branch cleanup is the caller's job (see `merge_args`).
-    async fn merge(&self, repo: &Path, pr_number: u64) -> Result<()>;
-
-    /// Whether the PR is already merged on the forge. Used to recover a merge
-    /// whose local cleanup failed after the merge itself landed.
-    async fn is_merged(&self, repo: &Path, pr_number: u64) -> Result<bool>;
-
-    /// Whether the PR still merges cleanly onto its base. Asked after a failed
-    /// merge to recognize a conflict, and by the background poll to gate the
-    /// merge button. `Unknown` is a real answer, not an error: GitHub recomputes
-    /// mergeability asynchronously after every push, and reports `UNKNOWN` until
-    /// it lands — a caller that needs certainty must poll.
-    async fn merge_status(&self, repo: &Path, pr_number: u64) -> Result<Mergeable>;
-
-    /// Delete the PR's head branch on the remote.
-    async fn delete_remote_branch(&self, repo: &Path, branch: &str) -> Result<()>;
-
-    /// Mark the review threads of the given comments *resolved* on the PR. Best
-    /// effort: unknown or already-resolved threads are skipped. Returns how many
-    /// threads were newly resolved.
-    async fn resolve_threads(
-        &self,
-        repo: &Path,
-        pr_number: u64,
-        comment_ids: &[u64],
-    ) -> Result<usize>;
-
-    /// List the PR's review threads (resolved flag, comment ids, who spoke
-    /// last). This is what tells an answered comment from one still awaiting a
-    /// reaction — the flat comment list can't.
-    async fn list_threads(&self, repo: &Path, pr_number: u64) -> Result<Vec<ReviewThread>>;
-
-    /// The PR's rolled-up CI state plus the failing checks, if any. Defaults to
-    /// "no checks" so forges that don't model CI (the sim, test doubles) keep
-    /// merging unimpeded.
-    async fn pr_checks(
-        &self,
-        _repo: &Path,
-        _pr_number: u64,
-    ) -> Result<(CheckStatus, Vec<FailedCheck>)> {
-        Ok((CheckStatus::None, Vec::new()))
-    }
-
-    /// The failed-step log of one GitHub Actions run. Best-effort context for
-    /// the fixing agent; the default has nothing to offer.
-    async fn failed_run_log(&self, _repo: &Path, _run_id: u64) -> Result<String> {
-        Ok(String::new())
-    }
-
-    /// The PR's live lifecycle state on the forge. `Ok(None)` means "can't
-    /// tell" and is the default, so forges that don't model it (the sim, test
-    /// doubles) leave every card and task untouched. A transport failure is an
-    /// `Err`, never `Closed` — a network hiccup must not move or tear down
-    /// anything.
-    async fn pr_live_state(&self, _repo: &Path, _pr_number: u64) -> Result<Option<LivePrState>> {
-        Ok(None)
-    }
-
-    /// Where the PR's head branch lives and whether we may push to it.
-    /// `Ok(None)` means "can't tell" and is the default, so forges that don't
-    /// model it leave the caller to proceed on its own judgement.
-    async fn pr_push_target(&self, _repo: &Path, _pr_number: u64) -> Result<Option<PrPushTarget>> {
-        Ok(None)
-    }
-
-    /// Post a plain comment on the PR's conversation (not a review). Used to
-    /// follow up on a published review — "pushed the fix", or "on reflection
-    /// I'm leaving these to you". Defaults to a no-op for forges that don't
-    /// model it.
-    async fn comment_on_pr(&self, _repo: &Path, _pr_number: u64, _body: &str) -> Result<()> {
-        Ok(())
-    }
-
-    /// The open PR whose head branch is `head`, if one exists. Best-effort
-    /// context for the adopt probe's "open PR" warning, and for `create_pr`'s
-    /// recovery of a PR gh opened before failing: "no PR" and "can't tell" both
-    /// come back `None`, so forges that don't model it — the sim, test doubles —
-    /// need no override.
-    async fn pr_for_head(&self, _repo: &Path, _head: &str) -> Result<Option<PrInfo>> {
-        Ok(None)
-    }
-
-    /// Every open PR on the repo — the adopt dialog's "Pull requests" group.
-    /// Defaulted to none so test doubles need no override.
-    async fn list_open_prs(&self, _repo: &Path) -> Result<Vec<OpenPr>> {
-        Ok(Vec::new())
-    }
-
-    /// PR `pr_number` as a [`PrInfo`], `None` unless it is open. What PR
-    /// adoption records on the card; the default ("can't tell") refuses it.
-    async fn pr_by_number(&self, _repo: &Path, _pr_number: u64) -> Result<Option<PrInfo>> {
-        Ok(None)
-    }
-}
-
 /// Real GitHub forge via the `gh` CLI.
 pub struct GhForge;
 
@@ -1208,7 +986,7 @@ impl Forge for GhForge {
             number,
             url,
             title: title.to_string(),
-            state: if draft { "draft" } else { "open" }.to_string(),
+            state: PrState::open(draft),
             reviewer: normalize_reviewer(reviewer),
             reviewer_recorded: true,
         })
@@ -1216,8 +994,7 @@ impl Forge for GhForge {
 
     async fn fetch_comments(&self, repo: &Path, pr_number: u64) -> Result<Vec<ReviewComment>> {
         let json = run_gh(repo, &comments_args(pr_number)).await?;
-        let value: Value = serde_json::from_str(&json)?;
-        let arr = value.as_array().cloned().unwrap_or_default();
+        let arr = parse_paged_array(&json)?;
         Ok(arr
             .iter()
             .map(|c| ReviewComment {
@@ -1390,8 +1167,31 @@ impl Forge for GhForge {
         Ok((rollup_status(&rollup), rollup_failures(&rollup)))
     }
 
-    async fn failed_run_log(&self, repo: &Path, run_id: u64) -> Result<String> {
-        run_gh(repo, &run_log_args(run_id)).await
+    async fn failed_check_logs(
+        &self,
+        repo: &Path,
+        failed: &[FailedCheck],
+    ) -> Vec<(String, String)> {
+        // One log per Actions run: several failing jobs of one workflow share
+        // a run, and its `--log-failed` output already covers all of them. A
+        // check whose URL isn't an Actions run (a third-party status) has no
+        // log to fetch here.
+        let mut logs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for check in failed {
+            let Some(run_id) = run_id_from_url(&check.url) else {
+                continue;
+            };
+            if !seen.insert(run_id) {
+                continue;
+            }
+            match run_gh(repo, &run_log_args(run_id)).await {
+                Ok(log) if !log.trim().is_empty() => logs.push((check_display_name(check), log)),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("fix checks: couldn't fetch log of run {run_id}: {e}"),
+            }
+        }
+        logs
     }
 
     async fn pr_live_state(&self, repo: &Path, pr_number: u64) -> Result<Option<LivePrState>> {
@@ -1443,259 +1243,6 @@ impl Forge for GhForge {
         let json = run_gh(repo, &pr_for_head_args(&pr_number.to_string())).await?;
         let v: Value = serde_json::from_str(&json)?;
         Ok(parse_pr_for_head(&v))
-    }
-}
-
-/// Simulated forge for Phase A: canned PR + review comments so the PR-review
-/// column is fully navigable without GitHub.
-pub struct SimForge;
-
-impl SimForge {
-    /// The open PR the sim offers for adoption. Its head only resolves if the
-    /// project's repo really has `origin/feature/sim-pr` — adoption checks git
-    /// for real, even in the sim.
-    pub const OPEN_PR: u64 = 57;
-    pub const OPEN_PR_HEAD: &'static str = "feature/sim-pr";
-}
-
-#[async_trait]
-impl Forge for SimForge {
-    async fn create_pr(
-        &self,
-        _repo: &Path,
-        title: &str,
-        _body: &str,
-        _base: &str,
-        _head: &str,
-        reviewer: Option<&str>,
-        draft: bool,
-    ) -> Result<PrInfo> {
-        Ok(PrInfo {
-            number: 42,
-            url: "https://github.com/example/repo/pull/42".to_string(),
-            title: title.to_string(),
-            state: if draft { "draft" } else { "open" }.to_string(),
-            reviewer: normalize_reviewer(reviewer),
-            reviewer_recorded: true,
-        })
-    }
-
-    async fn fetch_comments(&self, _repo: &Path, _pr_number: u64) -> Result<Vec<ReviewComment>> {
-        Ok(vec![
-            ReviewComment {
-                id: 1,
-                author: "reviewer".into(),
-                path: "src/lib.rs".into(),
-                line: Some(12),
-                body: "Consider extracting this into a helper function.".into(),
-                review_body_of: None,
-            },
-            ReviewComment {
-                id: 2,
-                author: "reviewer".into(),
-                path: "src/main.rs".into(),
-                line: Some(48),
-                body: "Nit: typo in this comment.".into(),
-                review_body_of: None,
-            },
-            ReviewComment {
-                id: 3,
-                author: "reviewer".into(),
-                path: "src/db.rs".into(),
-                line: Some(5),
-                body: "This `unwrap()` could panic on malformed input.".into(),
-                review_body_of: None,
-            },
-        ])
-    }
-
-    async fn list_review_prs(&self, _repo: &Path, scope: ReviewScope) -> Result<Vec<PrSummary>> {
-        let mut prs = vec![
-            PrSummary {
-                number: 101,
-                title: "Add caching layer".into(),
-                author: "octocat".into(),
-                head_ref: "feat/cache".into(),
-                base_ref: "main".into(),
-                url: "https://github.com/example/repo/pull/101".into(),
-                body: "Adds an LRU in front of the resolver so repeated lookups \
-                       stop hitting the database.\n\n- bounded at 10k entries\n\
-                       - invalidated on write"
-                    .into(),
-                checks: CheckStatus::Passing,
-                mergeable: Mergeable::Clean,
-            },
-            PrSummary {
-                number: 102,
-                title: "Fix flaky integration test".into(),
-                author: "hubot".into(),
-                head_ref: "fix/flaky".into(),
-                base_ref: "main".into(),
-                url: "https://github.com/example/repo/pull/102".into(),
-                body: "The fixture raced the seeder; awaits it explicitly now.".into(),
-                checks: CheckStatus::Failing,
-                mergeable: Mergeable::Conflicting,
-            },
-        ];
-        // "Everyone" mode must be visibly different in the simulator: a PR by
-        // someone who is *not* a collaborator, i.e. exactly the fork
-        // contributor the pinned-author path can never reach.
-        if scope == ReviewScope::Everyone {
-            prs.push(PrSummary {
-                number: 103,
-                title: "Typo in the onboarding guide".into(),
-                author: "outside-contributor".into(),
-                head_ref: "docs/typo".into(),
-                base_ref: "main".into(),
-                url: "https://github.com/example/repo/pull/103".into(),
-                body: "Drive-by fix from a fork — the author isn't a repo collaborator.".into(),
-                checks: CheckStatus::Passing,
-                mergeable: Mergeable::Clean,
-            });
-        }
-        Ok(prs)
-    }
-
-    async fn submit_review(
-        &self,
-        _repo: &Path,
-        _pr_number: u64,
-        _event: ReviewEvent,
-        _body: &str,
-        _comments: &[DraftComment],
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// A same-repo, pushable head, so "publish & fix" runs end to end in the sim.
-    async fn pr_push_target(&self, repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
-        let head_ref = if pr_number == Self::OPEN_PR {
-            Self::OPEN_PR_HEAD.to_string()
-        } else {
-            format!("sim/pr-{pr_number}")
-        };
-        Ok(Some(PrPushTarget {
-            head_ref,
-            base_ref: crate::infra::git::detect_base_branch(repo),
-            cross_repo: false,
-            head_repo: String::new(),
-            maintainer_can_modify: true,
-        }))
-    }
-
-    async fn list_open_prs(&self, repo: &Path) -> Result<Vec<OpenPr>> {
-        Ok(vec![OpenPr {
-            number: Self::OPEN_PR,
-            title: "Speed up the sim dashboard".into(),
-            author: "you".into(),
-            head_ref: Self::OPEN_PR_HEAD.into(),
-            // Whatever the repo's base is, so the listing's "targets the
-            // project base" filter keeps it.
-            base_ref: crate::infra::git::detect_base_branch(repo),
-            url: format!("https://github.com/example/repo/pull/{}", Self::OPEN_PR),
-            body: "Opened from another machine: memoizes the dashboard queries.".into(),
-            draft: false,
-            cross_repo: false,
-            mine: true,
-        }])
-    }
-
-    async fn pr_by_number(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrInfo>> {
-        Ok((pr_number == Self::OPEN_PR).then(|| PrInfo {
-            number: pr_number,
-            url: format!("https://github.com/example/repo/pull/{pr_number}"),
-            title: "Speed up the sim dashboard".into(),
-            state: "open".into(),
-            reviewer: Some("octocat".into()),
-            reviewer_recorded: false,
-        }))
-    }
-
-    async fn list_reviewers(&self, _repo: &Path) -> Result<Vec<String>> {
-        Ok(vec!["octocat".into(), "hubot".into(), "monalisa".into()])
-    }
-
-    async fn list_pr_authors(&self, _repo: &Path) -> Result<Vec<String>> {
-        // `outside-contributor` and `drive-by` are deliberately absent from
-        // `list_reviewers` — they're what the picker gains over collaborators.
-        Ok(vec![
-            "octocat".into(),
-            "outside-contributor".into(),
-            "drive-by".into(),
-        ])
-    }
-
-    async fn list_submitted_reviews(
-        &self,
-        _repo: &Path,
-        _pr_number: u64,
-    ) -> Result<Vec<ReviewSummary>> {
-        Ok(vec![
-            ReviewSummary::new("octocat", "CHANGES_REQUESTED"),
-            // A body-only review — the bot-report shape: no inline comments,
-            // the whole report in the summary text.
-            ReviewSummary {
-                author: "gemini-code-assist".into(),
-                state: "COMMENTED".into(),
-                body: "## Review summary\n\nThe change looks reasonable overall. \
-                       One concern: the retry loop has no backoff, which could \
-                       hammer the endpoint under sustained failure."
-                    .into(),
-                submitted_at: "2026-01-01T00:00:00Z".into(),
-            },
-        ])
-    }
-
-    async fn reply_to_comment(
-        &self,
-        _repo: &Path,
-        _pr_number: u64,
-        _comment_id: u64,
-        _body: &str,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn mark_ready(&self, _repo: &Path, _pr_number: u64) -> Result<()> {
-        Ok(())
-    }
-
-    async fn merge(&self, _repo: &Path, _pr_number: u64) -> Result<()> {
-        Ok(())
-    }
-
-    async fn is_merged(&self, _repo: &Path, _pr_number: u64) -> Result<bool> {
-        Ok(true)
-    }
-
-    async fn merge_status(&self, _repo: &Path, _pr_number: u64) -> Result<Mergeable> {
-        Ok(Mergeable::Clean)
-    }
-
-    async fn delete_remote_branch(&self, _repo: &Path, _branch: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn resolve_threads(
-        &self,
-        _repo: &Path,
-        _pr_number: u64,
-        _comment_ids: &[u64],
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn list_threads(&self, _repo: &Path, _pr_number: u64) -> Result<Vec<ReviewThread>> {
-        // One unresolved, reviewer-last thread per canned comment, so the sim
-        // triage sees exactly the comments `fetch_comments` returns.
-        Ok((1..=3)
-            .map(|id| ReviewThread {
-                id: format!("SIMTHREAD_{id}"),
-                resolved: false,
-                comment_ids: vec![id],
-                last_by_viewer: false,
-            })
-            .collect())
     }
 }
 
@@ -1835,7 +1382,7 @@ mod tests {
         let pr = parse_pr_for_head(&v).unwrap();
         assert_eq!(pr.number, 42);
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
-        assert_eq!(pr.state, "open");
+        assert_eq!(pr.state, PrState::Open);
         assert_eq!(pr.reviewer.as_deref(), Some("octocat"));
         assert!(!pr.reviewer_recorded);
     }
@@ -1847,7 +1394,7 @@ mod tests {
         )
         .unwrap();
         let pr = parse_pr_for_head(&v).unwrap();
-        assert_eq!(pr.state, "draft");
+        assert_eq!(pr.state, PrState::Draft);
         assert_eq!(pr.reviewer, None);
     }
 
@@ -2169,10 +1716,23 @@ mod tests {
     }
 
     #[test]
-    fn comments_uses_gh_api_placeholders() {
+    fn comments_uses_gh_api_placeholders_and_paginates() {
         let args = comments_args(7);
         assert_eq!(args[0], "api");
-        assert_eq!(args[1], "repos/{owner}/{repo}/pulls/7/comments");
+        assert!(args.contains(&"--paginate".to_string()));
+        assert_eq!(
+            args.last().unwrap(),
+            "repos/{owner}/{repo}/pulls/7/comments?per_page=100"
+        );
+    }
+
+    #[test]
+    fn paged_output_is_flattened_across_pages() {
+        let items = parse_paged_array("[{\"id\":1},{\"id\":2}]\n[{\"id\":3}]").unwrap();
+        let ids: Vec<u64> = items.iter().filter_map(|v| v["id"].as_u64()).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(parse_paged_array("[]").unwrap().is_empty());
+        assert!(parse_paged_array("[1,").is_err());
     }
 
     #[test]
