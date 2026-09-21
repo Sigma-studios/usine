@@ -378,7 +378,8 @@ fn set_macos_display_name(name: &str) -> bool {
 
 /// Reflect the number of cards waiting on the user as the macOS dock badge —
 /// the little red circle. Reactive: re-runs whenever the card list changes and
-/// clears the badge when nothing needs attention. Uses tao's
+/// clears the badge when nothing needs attention. Projects whose
+/// notifications are muted are left out. Uses tao's
 /// [`WindowExtMacOS::set_badge_label`] (cross-platform tao has no single badge
 /// API — it's `set_badge_label` on macOS, `set_badge_count` on Unix — so this
 /// is macOS-only for now). AppKit requires the main thread, which is where
@@ -388,15 +389,9 @@ fn use_dock_badge(state: AppState) {
     use dioxus::desktop::tao::platform::macos::WindowExtMacOS;
     let window = dioxus::desktop::window();
     use_effect(move || {
-        let cards = state
-            .cards
-            .read()
-            .iter()
-            .filter(|c| c.needs_attention())
-            .count();
-        // PRs waiting on the user's review count toward the badge too.
-        let reviews = state.review_attention_count();
-        let count = cards + reviews;
+        // PRs waiting on the user's review count toward the badge too; muted
+        // projects count toward neither.
+        let count = state.card_attention_count() + state.review_attention_count();
         window
             .window
             .set_badge_label((count > 0).then(|| count.to_string()));

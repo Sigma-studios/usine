@@ -54,10 +54,21 @@ pub fn Sidebar() -> Element {
                         let name = project.name.clone();
                         let name_for_msg = name.clone();
                         let active = matches!(view, SelectedView::Project(id) if id == pid);
-                        let class = if active { "nav-item active" } else { "nav-item" };
+                        let muted = project.config.notifications_muted;
+                        let class = match (active, muted) {
+                            (true, true) => "nav-item active muted",
+                            (true, false) => "nav-item active",
+                            (false, true) => "nav-item muted",
+                            (false, false) => "nav-item",
+                        };
                         let path = project.path.display().to_string();
-                        let review_count = state.project_review_count(pid);
-                        let (attention_count, urgent_count) = state.project_attention_counts(pid);
+                        // A muted project raises no attention signals: zeroing
+                        // the counts leaves an idle dot, no count and no eye badge.
+                        let (review_count, (attention_count, urgent_count)) = if muted {
+                            (0, (0, 0))
+                        } else {
+                            (state.project_review_count(pid), state.project_attention_counts(pid))
+                        };
                         // Three-state health dot: red = failed / agent question,
                         // accent = waiting on you, dim = idle.
                         let dot_class = if urgent_count > 0 {
@@ -75,6 +86,29 @@ pub fn Sidebar() -> Element {
                                 onclick: move |_| state.select_view(SelectedView::Project(pid)),
                                 span { class: "{dot_class}" }
                                 span { class: "proj-name", "{name}" }
+                                // Indicator only: a click falls through to the row.
+                                if muted {
+                                    span {
+                                        class: "proj-mute",
+                                        title: "Notifications muted",
+                                        "aria-label": "Notifications muted",
+                                        svg {
+                                            width: "13",
+                                            height: "13",
+                                            view_box: "0 0 24 24",
+                                            fill: "none",
+                                            stroke: "currentColor",
+                                            stroke_width: "2",
+                                            stroke_linecap: "round",
+                                            stroke_linejoin: "round",
+                                            path { d: "M13.73 21a2 2 0 0 1-3.46 0" }
+                                            path { d: "M18.63 13A17.89 17.89 0 0 1 18 8" }
+                                            path { d: "M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14" }
+                                            path { d: "M18 8a6 6 0 0 0-9.33-5" }
+                                            line { x1: "1", y1: "1", x2: "23", y2: "23" }
+                                        }
+                                    }
+                                }
                                 if attention_count > 0 {
                                     span {
                                         class: "proj-count",

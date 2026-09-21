@@ -230,6 +230,11 @@ pub struct ProjectConfig {
     /// guidance, which may simply not work.
     #[serde(default)]
     pub screenshot_script: Option<String>,
+    /// Leave this project out of the attention signals (dock badge, sidebar
+    /// count/dot/review badge). Purely a UI preference; cards still park and
+    /// sort by attention on the board as usual.
+    #[serde(default)]
+    pub notifications_muted: bool,
 }
 
 /// Serde default for [`ProjectConfig::auto_preview`]: a project config stored
@@ -300,6 +305,7 @@ impl Default for ProjectConfig {
             preview_ports: Vec::new(),
             auto_preview: true,
             screenshot_script: None,
+            notifications_muted: false,
         }
     }
 }
@@ -498,6 +504,8 @@ mod tests {
         // ceiling it ran under, not a zero deadline.
         assert_eq!(c.validate_timeout(), Duration::from_secs(30 * 60));
         assert_eq!(c.screenshot_command(), None);
+        // Projects stored before muting existed start unmuted.
+        assert!(!c.notifications_muted);
     }
 
     #[test]
