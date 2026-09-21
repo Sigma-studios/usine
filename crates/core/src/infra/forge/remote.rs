@@ -69,14 +69,7 @@ impl AzureRepo {
 /// - `{org}@vs-ssh.visualstudio.com:v3/{org}/{project}/{repo}`.
 pub fn parse_remote(url: &str) -> Option<RemoteForge> {
     let (host, path) = split_host_path(url)?;
-    let segments: Vec<String> = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(decode_segment)
-        .collect();
+    let segments = path_segments(&path);
     let seg: Vec<&str> = segments.iter().map(String::as_str).collect();
 
     if host == "github.com" || host.ends_with(".github.com") {
@@ -108,6 +101,44 @@ pub fn parse_remote(url: &str) -> Option<RemoteForge> {
         };
     }
     None
+}
+
+/// The Azure DevOps repository a remote addresses, for a project whose code host
+/// is *pinned* to Azure DevOps: every shape [`parse_remote`] accepts, plus the
+/// same path shapes on any host — an SSH host alias (`azure-work:v3/o/p/r`) or
+/// a proxy (`https://git.corp/o/p/_git/r`) — which detection leaves unplaced.
+/// Only the org-in-path shapes qualify: a legacy `{org}.visualstudio.com` path
+/// behind an alias no longer says which organization it belongs to.
+pub fn parse_azure_remote(url: &str) -> Option<AzureRepo> {
+    match parse_remote(url) {
+        Some(RemoteForge::AzureDevOps(repo)) => return Some(repo),
+        Some(RemoteForge::GitHub) => return None,
+        None => {}
+    }
+    let (_, path) = split_host_path(url)?;
+    let segments = path_segments(&path);
+    let found = match segments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [v, org, project, repo] if v.eq_ignore_ascii_case("v3") => azure(org, project, repo),
+        // A proxy may mount the service under a prefix of its own.
+        [.., org, project, "_git", repo] => azure(org, project, repo),
+        [.., org, "_git", repo] => azure(org, repo, repo),
+        _ => None,
+    };
+    match found? {
+        RemoteForge::AzureDevOps(repo) => Some(repo),
+        RemoteForge::GitHub => None,
+    }
+}
+
+/// A URL path's non-empty segments, percent-decoded, query and fragment dropped.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(decode_segment)
+        .collect()
 }
 
 fn azure(org: &str, project: &str, repo: &str) -> Option<RemoteForge> {
@@ -244,6 +275,42 @@ mod tests {
             "/local/path/to/repo",
         ] {
             assert_eq!(parse_remote(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_pinned_azure_remote_is_read_on_any_host() {
+        let want = Some(AzureRepo {
+            org: "fabrikam".into(),
+            project: "Fiber Tests".into(),
+            repo: "FiberRepo".into(),
+        });
+        for url in [
+            "git@azure-work:v3/fabrikam/Fiber%20Tests/FiberRepo",
+            "azure-work:v3/fabrikam/Fiber%20Tests/FiberRepo.git",
+            "ssh://git@azure-work:2222/v3/fabrikam/Fiber%20Tests/FiberRepo",
+            "https://git.corp.example/fabrikam/Fiber%20Tests/_git/FiberRepo",
+            "https://git.corp.example/azure/fabrikam/Fiber%20Tests/_git/FiberRepo",
+            "https://dev.azure.com/fabrikam/Fiber%20Tests/_git/FiberRepo",
+        ] {
+            assert_eq!(parse_azure_remote(url), want, "{url}");
+        }
+        assert_eq!(
+            parse_azure_remote("https://git.corp.example/fabrikam/_git/Web"),
+            Some(AzureRepo {
+                org: "fabrikam".into(),
+                project: "Web".into(),
+                repo: "Web".into(),
+            })
+        );
+        for url in [
+            "git@github.com:o/r.git",
+            "git@work-gh:o/r.git",
+            "https://git.corp.example/o/r",
+            "https://git.corp.example/_git/r",
+            "/local/path/to/repo",
+        ] {
+            assert_eq!(parse_azure_remote(url), None, "{url}");
         }
     }
 

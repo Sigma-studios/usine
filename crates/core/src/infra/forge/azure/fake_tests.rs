@@ -480,8 +480,16 @@ async fn checks_roll_up_build_policies_and_posted_statuses() {
         "GET",
         &format!("{GIT}/pullRequests/22/statuses"),
         vec![(200, json!({ "value": [
-            { "id": 1, "state": "failed", "context": { "genre": "sonar", "name": "quality" }, "targetUrl": "https://sonar/1" },
+            { "id": 1, "state": "failed", "iterationId": 1, "context": { "genre": "sonar", "name": "quality" }, "targetUrl": "https://sonar/1" },
         ]}))],
+    );
+    fake.on(
+        "GET",
+        &format!("{GIT}/pullRequests/22/iterations"),
+        vec![(
+            200,
+            json!({ "value": [ { "id": 1, "createdDate": "2024-05-01T10:00:00Z" } ] }),
+        )],
     );
     let (status, failed) = forge.pr_checks(repo(), 22).await.unwrap();
     assert_eq!(status, CheckStatus::Failing);

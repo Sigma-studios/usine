@@ -19,7 +19,8 @@
 //! - completing a PR is asynchronous and policy-gated, so [`Forge::merge`]
 //!   waits for the merge to land and names the blocking policies otherwise;
 //! - CI is the PR's build-validation and status policies plus posted statuses,
-//!   with a stale green build read as pending.
+//!   with a stale green build — or a status posted before the latest push —
+//!   read as pending.
 //!
 //! The executor reads a PR's comments, reviews, threads, checks,
 //! mergeability and live state back to back on every poll; the PR and its
@@ -40,7 +41,7 @@ use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::{json, Value};
 
-use super::remote::{encode_segment, parse_remote, AzureRepo, RemoteForge};
+use super::remote::{encode_segment, parse_azure_remote, AzureRepo};
 use super::{
     FailedCheck, Forge, ForgeFactory, LivePrState, OpenPr, PrPushTarget, PrSummary, ReviewScope,
 };
@@ -179,11 +180,15 @@ impl ForgeFactory for AzureForges {
     fn for_repo(&self, repo: &Path) -> Result<Arc<dyn Forge>> {
         let url = crate::infra::git::origin_url(repo)
             .ok_or_else(|| CoreError::forge("the repository has no `origin` remote"))?;
-        match parse_remote(&url) {
-            Some(RemoteForge::AzureDevOps(coords)) => Ok(self.for_coords(coords)),
-            _ => Err(CoreError::forge(format!(
-                "`origin` ({url}) isn't an Azure DevOps repository — fix the remote, or set \
-                 the project's code host back to GitHub in its settings"
+        // Reached only for a project whose host is Azure DevOps — detected, or
+        // pinned for a remote detection can't place — so the path shapes are
+        // read on any host.
+        match parse_azure_remote(&url) {
+            Some(coords) => Ok(self.for_coords(coords)),
+            None => Err(CoreError::forge(format!(
+                "`origin` ({url}) isn't an Azure DevOps repository — its path needs the \
+                 `v3/{{org}}/{{project}}/{{repo}}` or `{{org}}/{{project}}/_git/{{repo}}` shape; \
+                 fix the remote, or set the project's code host back to GitHub in its settings"
             ))),
         }
     }
@@ -196,6 +201,7 @@ enum Read {
     Threads,
     Evaluations,
     Statuses,
+    Iterations,
 }
 
 /// One Azure Repos repository.
@@ -283,6 +289,11 @@ impl AzureForge {
             .await
     }
 
+    async fn get_iterations(&self, pr: u64) -> Result<Value> {
+        self.read(pr, Read::Iterations, self.pr_sub_url(pr, "iterations"))
+            .await
+    }
+
     /// The PR's policy evaluations. Policies hang off the *project* (by id)
     /// and the PR's artifact id; the endpoint only exists as a preview.
     async fn get_evaluations(&self, pr: u64, pr_json: &Value) -> Result<Value> {
@@ -332,7 +343,14 @@ impl AzureForge {
         let pr_json = self.get_pr(pr).await?;
         let mut signals =
             wire::policy_signals(&self.repo, &self.get_evaluations(pr, &pr_json).await?);
-        signals.extend(wire::status_signals(&self.get_statuses(pr).await?));
+        let statuses = self.get_statuses(pr).await?;
+        // Which push is current only matters once something posted a status.
+        let current = if wire::pr_list(&statuses).is_empty() {
+            None
+        } else {
+            wire::latest_iteration(&self.get_iterations(pr).await?)
+        };
+        signals.extend(wire::status_signals(&statuses, current.as_ref()));
         Ok(wire::rollup(&signals))
     }
 
@@ -623,7 +641,13 @@ impl Forge for AzureForge {
         let head = pr
             .pointer("/lastMergeSourceCommit/commitId")
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                CoreError::forge(format!(
+                    "PR !{pr_number} has no source commit yet — Azure DevOps is still \
+                     processing its last push; retry in a moment"
+                ))
+            })?
             .to_string();
         let patched = self
             .http()
@@ -976,6 +1000,11 @@ mod tests {
         assert!(err.contains("isn't an Azure DevOps repository"), "{err}");
         repo.remote_set_url("origin", "https://dev.azure.com/o/p/_git/r")
             .unwrap();
+        assert!(AzureForges::new().for_repo(dir.path()).is_ok());
+        // An SSH host alias: detection can't place it, a pin must still work.
+        repo.remote_set_url("origin", "git@azure-work:v3/o/p/r")
+            .unwrap();
+        assert_eq!(crate::infra::forge::detect_forge(dir.path()), None);
         assert!(AzureForges::new().for_repo(dir.path()).is_ok());
     }
 

@@ -206,7 +206,10 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub detected_forge: Option<ForgeKind>,
     /// User-pinned code host, for a remote detection can't place (an SSH host
-    /// alias, a proxy). Wins over [`Self::detected_forge`] when set.
+    /// alias, a proxy). Wins over [`Self::detected_forge`] when set. Pinned to
+    /// Azure DevOps, the remote's *path* still has to name the repository
+    /// (`v3/{org}/{project}/{repo}` or `{org}/{project}/_git/{repo}`), but on
+    /// any host — see [`crate::infra::forge::parse_azure_remote`].
     #[serde(default)]
     pub pinned_forge: Option<ForgeKind>,
     /// Auto-detected base branch, refreshed from the repo at every startup.

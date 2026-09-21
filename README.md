@@ -69,8 +69,9 @@ authenticated on your `PATH`:
 
 Each project's code host is detected from its `origin` remote (GitHub, or
 `dev.azure.com` / `*.visualstudio.com` for Azure DevOps Services) and can be
-pinned under the project's settings → Reviews → Code host; projects on
-different hosts live side by side on one board. Azure DevOps Server
+pinned under the project's settings → Reviews → Code host — for instance
+an SSH host alias (`git@azure-work:v3/org/project/repo`) pinned to Azure
+DevOps, whose path still names the repository; projects on different hosts live side by side on one board. Azure DevOps Server
 (on-premises) isn't supported.
 
 If you only want to explore the UI, use `USINE_SIM=1` — none of the above are

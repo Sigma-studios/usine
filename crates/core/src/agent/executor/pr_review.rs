@@ -574,14 +574,15 @@ impl Executor {
             Some(src) => match self.git.fetch_ref(&project.path, &src, local_branch).await {
                 Ok(()) => Ok(()),
                 // A fork's branch isn't on `origin`. Azure still publishes the
-                // PR's *merge* ref — the head merged into the target — whose
-                // three-dot diff against the base is exactly the PR's changes,
-                // which is all a review reads. (A fork is never pushable, so
-                // nothing will try to push this checkout back.)
+                // PR's *merge* ref — the head merged into the target — and the
+                // fork's head is that merge commit's second parent, so the
+                // checkout (and the lines review comments anchor on) is the
+                // source's own, not the merged result's. (A fork is never
+                // pushable, so nothing will try to push this checkout back.)
                 Err(e) => {
                     let merge_ref = format!("refs/pull/{}/merge", task.pr_number);
                     self.git
-                        .fetch_ref(&project.path, &merge_ref, local_branch)
+                        .fetch_merge_source(&project.path, &merge_ref, local_branch)
                         .await
                         .map_err(|_| e)
                 }

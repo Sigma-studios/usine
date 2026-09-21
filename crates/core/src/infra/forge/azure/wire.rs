@@ -173,8 +173,10 @@ pub fn create_pr_body(
 
 /// The body that completes (merges) a PR: squash, and never let Azure delete
 /// the source branch — the executor deletes it itself, after the card's
-/// worktree is gone (see `Executor::merge`). `lastMergeSourceCommit` guards
-/// against completing a head newer than the one we checked.
+/// worktree is gone (see `Executor::merge`). `lastMergeSourceCommit` is
+/// Azure's concurrency token, taken from a read made just before the PATCH: it
+/// only makes Azure refuse a push that raced that read — it does *not* pin the
+/// head CI and review were judged on (the merge gate's own checks do that).
 pub fn complete_pr_body(last_merge_source_commit: &str) -> Value {
     json!({
         "status": "completed",
@@ -712,10 +714,37 @@ pub fn policy_signals(repo: &AzureRepo, value: &Value) -> Vec<Signal> {
         .collect()
 }
 
+/// A PR's newest iteration (one per push): what a posted status must belong
+/// to for its result to count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Iteration {
+    pub id: u64,
+    pub created: String,
+}
+
+/// The newest of a PR's iterations, `None` when the list is empty.
+pub fn latest_iteration(value: &Value) -> Option<Iteration> {
+    pr_list(value)
+        .iter()
+        .filter_map(|it| {
+            Some(Iteration {
+                id: it.get("id").and_then(Value::as_u64)?,
+                created: text(it, "createdDate"),
+            })
+        })
+        .max_by_key(|it| it.id)
+}
+
 /// The CI signals among a PR's statuses (posted by external services): the
 /// latest status per context — a service re-posting `pending` then
 /// `succeeded` leaves both in the list.
-pub fn status_signals(value: &Value) -> Vec<Signal> {
+///
+/// A status from before `current` (the newest push) reads as pending, like a
+/// stale build policy: right after a push the previous push's `succeeded`
+/// would otherwise clear the merge gate until the service posts again. An
+/// iteration status says which push it belongs to; a PR-level one is placed by
+/// its date.
+pub fn status_signals(value: &Value, current: Option<&Iteration>) -> Vec<Signal> {
     let list = pr_list(value);
     let mut latest: Vec<(String, u64, &Value)> = Vec::new();
     for s in &list {
@@ -744,6 +773,7 @@ pub fn status_signals(value: &Value) -> Vec<Signal> {
         .filter_map(|(key, _, s)| {
             let status = match s.get("state").and_then(Value::as_str).unwrap_or("") {
                 "pending" => CheckStatus::Pending,
+                _ if current.is_some_and(|it| status_is_stale(s, it)) => CheckStatus::Pending,
                 "succeeded" => CheckStatus::Passing,
                 "failed" | "error" => CheckStatus::Failing,
                 _ => return None,
@@ -758,6 +788,30 @@ pub fn status_signals(value: &Value) -> Vec<Signal> {
             })
         })
         .collect()
+}
+
+/// Whether status `s` was posted for a push older than `current`.
+fn status_is_stale(s: &Value, current: &Iteration) -> bool {
+    if let Some(iteration) = s.get("iterationId").and_then(Value::as_u64) {
+        return iteration < current.id;
+    }
+    let posted = s
+        .get("updatedDate")
+        .or_else(|| s.get("creationDate"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match (timestamp_key(posted), timestamp_key(&current.created)) {
+        (Some(posted), Some(pushed)) => posted < pushed,
+        _ => false,
+    }
+}
+
+/// An Azure timestamp (`2024-05-01T10:00:00.1234567Z`, UTC, with a varying
+/// number of fraction digits) as a key that orders chronologically.
+fn timestamp_key(ts: &str) -> Option<(String, String)> {
+    let ts = ts.strip_suffix('Z')?;
+    let (secs, frac) = ts.split_once('.').unwrap_or((ts, ""));
+    (secs.len() == 19).then(|| (secs.to_string(), format!("{frac:0<9}")))
 }
 
 /// Roll signals up like GitHub's check rollup: failure outranks pending,
@@ -1198,12 +1252,42 @@ mod tests {
             { "id": 3, "state": "failed", "context": { "genre": "ci", "name": "test" }, "targetUrl": "https://ci/3" },
             { "id": 4, "state": "notApplicable", "context": { "name": "other" } },
         ]});
-        let signals = status_signals(&v);
+        let signals = status_signals(&v, None);
         assert_eq!(signals.len(), 2);
         let (status, failed) = rollup(&signals);
         assert_eq!(status, CheckStatus::Failing);
         assert_eq!(failed[0].name, "ci/test");
         assert_eq!(failed[0].url, "https://ci/3");
+    }
+
+    #[test]
+    fn statuses_from_an_earlier_push_read_pending() {
+        let iterations = json!({ "value": [
+            { "id": 1, "createdDate": "2024-05-01T10:00:00.5Z" },
+            { "id": 2, "createdDate": "2024-05-01T11:00:00.25Z" },
+        ]});
+        let current = latest_iteration(&iterations).unwrap();
+        assert_eq!(current.id, 2);
+        let status = |extra: Value| {
+            let mut s = json!({ "id": 1, "state": "succeeded", "context": { "name": "sonar" } });
+            s.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            rollup(&status_signals(&json!({ "value": [s] }), Some(&current))).0
+        };
+        assert_eq!(status(json!({ "iterationId": 1 })), CheckStatus::Pending);
+        assert_eq!(status(json!({ "iterationId": 2 })), CheckStatus::Passing);
+        assert_eq!(
+            status(json!({ "creationDate": "2024-05-01T10:30:00Z" })),
+            CheckStatus::Pending
+        );
+        // Fraction digits vary: .3 is later than .25.
+        assert_eq!(
+            status(json!({ "creationDate": "2024-05-01T11:00:00.3Z" })),
+            CheckStatus::Passing
+        );
+        assert_eq!(status(json!({})), CheckStatus::Passing, "undated: trusted");
+        assert_eq!(latest_iteration(&json!({ "value": [] })), None);
     }
 
     #[test]

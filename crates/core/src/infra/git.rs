@@ -74,6 +74,18 @@ pub fn fetch_ref_args(src: &str, local_branch: &str) -> Vec<String> {
     ]
 }
 
+/// Point `local_branch` at the second parent — the PR's source head — of a
+/// merge commit just fetched into `FETCH_HEAD` (see
+/// [`GitOps::fetch_merge_source`]).
+pub fn branch_to_merge_source_args(local_branch: &str) -> Vec<String> {
+    vec![
+        "branch".into(),
+        "-f".into(),
+        local_branch.into(),
+        "FETCH_HEAD^2".into(),
+    ]
+}
+
 /// Attach a DETACHED worktree at `commitish` (claims no branch), so it works even
 /// when `commitish` is a branch already checked out in another working tree. Used
 /// to run the read-only self-review off the branch's committed HEAD without
@@ -394,6 +406,23 @@ pub trait GitOps: Send + Sync {
             "this git backend can't fetch {src}"
         )))
     }
+    /// Fetch `merge_ref` — a forge's PR *merge* commit (source head merged into
+    /// the target) — from `origin` and point `local_branch` at the source head,
+    /// its second parent. How a fork PR's head is reached when the forge
+    /// publishes only the merge ref: the merge commit's own lines would drift
+    /// from the source's wherever the target also changed a file, and review
+    /// comments are anchored on the source's lines. Defaulted like
+    /// [`Self::fetch_ref`].
+    async fn fetch_merge_source(
+        &self,
+        _repo: &Path,
+        merge_ref: &str,
+        _local_branch: &str,
+    ) -> Result<()> {
+        Err(crate::error::CoreError::other(format!(
+            "this git backend can't fetch {merge_ref}"
+        )))
+    }
     /// Move HEAD to `gitref` while keeping the working tree, so committed work
     /// becomes uncommitted changes — `git reset HEAD^`, generalized to any ref.
     async fn reset_mixed(&self, dir: &Path, gitref: &str) -> Result<()>;
@@ -533,6 +562,18 @@ impl GitOps for RealGit {
 
     async fn fetch_ref(&self, repo: &Path, src: &str, local_branch: &str) -> Result<()> {
         run_git(repo, &fetch_ref_args(src, local_branch))
+            .await
+            .map(|_| ())
+    }
+
+    async fn fetch_merge_source(
+        &self,
+        repo: &Path,
+        merge_ref: &str,
+        local_branch: &str,
+    ) -> Result<()> {
+        run_git(repo, &["fetch".into(), "origin".into(), merge_ref.into()]).await?;
+        run_git(repo, &branch_to_merge_source_args(local_branch))
             .await
             .map(|_| ())
     }

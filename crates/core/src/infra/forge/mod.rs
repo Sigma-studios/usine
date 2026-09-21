@@ -44,7 +44,7 @@ pub use azure::{
     normalize_azure_identity, AzureForge, AzureForges, PAT_ENV as AZURE_DEVOPS_PAT_ENV,
 };
 pub use github::*;
-pub use remote::{parse_remote, AzureRepo, RemoteForge};
+pub use remote::{parse_azure_remote, parse_remote, AzureRepo, RemoteForge};
 pub use sim::SimForge;
 
 /// A one-line summary of an open PR discovered by the review poll.
