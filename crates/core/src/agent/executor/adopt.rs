@@ -369,14 +369,25 @@ impl Executor {
                 )));
             }
             Some(relation) => {
-                // Behind: catch up to what the PR shows. Ahead or same: keep
-                // it — unpushed commits go out with the card's next push.
+                // Behind: catch up to what the PR shows. Same: nothing to do.
                 if relation == Relation::Behind {
                     force_branch(&project.path, &head, &remote)?;
                 }
                 self.git
                     .worktree_add_existing(&project.path, &head, &worktree)
                     .await?;
+                // Ahead: publish the unpushed commits now. Left local, an
+                // in-app Merge would merge the PR without them and then
+                // force-delete the branch that held them.
+                if relation == Relation::Ahead {
+                    if let Err(e) = self.git.push(&worktree, &head).await {
+                        let _ = self.git.remove_worktree(&project.path, &worktree).await;
+                        return Err(CoreError::other(format!(
+                            "cannot adopt PR #{pr_number}: pushing your local commits on \
+                             `{head}` failed: {e}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -386,10 +397,12 @@ impl Executor {
         card.state = CardState::PrReview(PrReviewSub::Idle);
         card.branch = Some(head);
         card.worktree_path = Some(worktree);
-        // Read back from the forge, so its reviewer (possibly none) is
-        // authoritative — the same stance as `create_pr`'s recovery.
+        // The forge only lists *pending* review requests — a reviewer who
+        // already submitted drops off — so a missing one is "unknown", not
+        // "explicitly none": leave it unrecorded so the project's configured
+        // reviewer still applies.
         card.pr = Some(PrInfo {
-            reviewer_recorded: true,
+            reviewer_recorded: pr.reviewer.is_some(),
             ..pr
         });
         self.store.upsert_card(&card)?;

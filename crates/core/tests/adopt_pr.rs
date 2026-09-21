@@ -5,7 +5,10 @@
 //! The invariants under test:
 //! - adoption attaches the card to the PR head (no `usine/` cut) and lands it
 //!   at the PR-review stage — or the merge gate when nobody is asked to review;
-//! - a local head behind the remote is fast-forwarded, one ahead is kept;
+//! - a local head behind the remote is fast-forwarded, one ahead is kept and
+//!   pushed (so a Merge can't land the PR without it);
+//! - a PR with no pending review request leaves its reviewer unrecorded, so
+//!   the project's configured reviewer still applies;
 //! - a diverged or checked-out head, a fork, another base and an already-owned
 //!   PR are refused before any card or worktree exists;
 //! - the listing moves a PR's head out of the branch group and hides PRs a
@@ -368,6 +371,29 @@ async fn a_pr_with_no_reviewer_goes_straight_to_the_merge_gate() {
 
     let card = adopt(&store, project_id, &handle, &mut rx).await;
     assert_eq!(card.state, CardState::ReadyToMerge);
+    assert!(
+        !card.pr.unwrap().reviewer_recorded,
+        "no pending request means unknown, not explicitly none"
+    );
+}
+
+#[tokio::test]
+async fn a_pr_with_no_pending_request_waits_on_the_project_reviewer() {
+    // GitHub drops a reviewer from `reviewRequests` once they've reviewed, so
+    // the project's configured reviewer must still gate the merge.
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, _origin) = repo_with_remote_pr(tmp.path());
+    let forge = PrForge {
+        reviewer: None,
+        ..PrForge::default()
+    };
+    let (store, project_id, handle, mut rx) = executor_for(&repo, forge);
+    let mut project = store.get_project(project_id).unwrap();
+    project.config.reviewer = Some("octocat".into());
+    store.upsert_project(&project).unwrap();
+
+    let card = adopt(&store, project_id, &handle, &mut rx).await;
+    assert_eq!(card.state, CardState::PrReview(PrReviewSub::Idle));
 }
 
 #[tokio::test]
@@ -383,9 +409,9 @@ async fn a_local_head_behind_the_remote_is_fast_forwarded() {
 }
 
 #[tokio::test]
-async fn a_local_head_ahead_of_the_remote_is_kept() {
+async fn a_local_head_ahead_of_the_remote_is_kept_and_pushed() {
     let tmp = tempfile::tempdir().unwrap();
-    let (repo, _origin) = repo_with_remote_pr(tmp.path());
+    let (repo, origin) = repo_with_remote_pr(tmp.path());
     git(
         &repo,
         &["checkout", "-q", "-b", HEAD, &format!("origin/{HEAD}")],
@@ -397,6 +423,11 @@ async fn a_local_head_ahead_of_the_remote_is_kept() {
 
     let card = adopt(&store, project_id, &handle, &mut rx).await;
     assert_eq!(sha(&repo, HEAD), ahead, "unpushed commits survive");
+    assert_eq!(
+        git_stdout(&origin, &["rev-parse", HEAD]),
+        ahead,
+        "unpushed commits are published, so a Merge can't drop them"
+    );
     assert!(card.worktree_path.unwrap().join("more.txt").exists());
 }
 
