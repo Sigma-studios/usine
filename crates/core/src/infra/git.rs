@@ -944,6 +944,47 @@ pub fn checkout_of_branch(repo: &Path, branch: &str) -> Option<PathBuf> {
     None
 }
 
+/// How a local branch's tip relates to another ref's (typically its
+/// `origin/` twin), from the local branch's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    Same,
+    /// `local` is an ancestor of `remote`: a fast-forward catches it up.
+    Behind,
+    /// `remote` is an ancestor of `local`: it holds unpushed commits.
+    Ahead,
+    /// Each side has commits the other lacks.
+    Diverged,
+}
+
+/// How `local`'s tip relates to `remote`'s, or `None` when either doesn't
+/// resolve. Both are rev-parsed as given — no `origin/` fallback — so a
+/// missing local branch reads as `None`, never as its remote twin.
+pub fn branch_relation(repo: &Path, local: &str, remote: &str) -> Option<Relation> {
+    let r = git2::Repository::open(repo).ok()?;
+    let local = r.revparse_single(local).ok()?.peel_to_commit().ok()?.id();
+    let remote = r.revparse_single(remote).ok()?.peel_to_commit().ok()?.id();
+    Some(if local == remote {
+        Relation::Same
+    } else if r.graph_descendant_of(remote, local).ok()? {
+        Relation::Behind
+    } else if r.graph_descendant_of(local, remote).ok()? {
+        Relation::Ahead
+    } else {
+        Relation::Diverged
+    })
+}
+
+/// Point local `branch` at `target` (`git branch -f`), creating it if needed.
+/// Only for fast-forwarding a branch that is checked out nowhere — git2 would
+/// happily move a checked-out branch's ref out from under its working tree.
+pub fn force_branch(repo: &Path, branch: &str, target: &str) -> Result<()> {
+    let r = git2::Repository::open(repo)?;
+    let commit = r.revparse_single(target)?.peel_to_commit()?;
+    r.branch(branch, &commit, true)?;
+    Ok(())
+}
+
 /// Whether `name` resolves to a commit in the repo (tolerating bare branch
 /// names that only exist as `origin/<name>`).
 pub fn commitish_exists(repo: &Path, name: &str) -> bool {
@@ -1018,6 +1059,57 @@ fn exclude_additions(existing: &str, patterns: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_relation_reads_all_four_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.dev"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["branch", "same"]);
+        git(&["branch", "behind"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "tip"]);
+        git(&["branch", "ahead"]);
+        git(&["branch", "-f", "remote", "HEAD~1"]);
+        git(&["checkout", "-q", "-b", "diverged", "HEAD~1"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "side"]);
+        git(&["checkout", "-q", "-"]);
+        // `remote` sits at base; `HEAD`'s branch holds `tip` on top of it.
+        assert_eq!(
+            branch_relation(repo, "same", "remote"),
+            Some(Relation::Same)
+        );
+        assert_eq!(
+            branch_relation(repo, "behind", "ahead"),
+            Some(Relation::Behind)
+        );
+        assert_eq!(
+            branch_relation(repo, "ahead", "remote"),
+            Some(Relation::Ahead)
+        );
+        assert_eq!(
+            branch_relation(repo, "diverged", "ahead"),
+            Some(Relation::Diverged)
+        );
+        assert_eq!(branch_relation(repo, "missing", "remote"), None);
+
+        force_branch(repo, "behind", "ahead").unwrap();
+        assert_eq!(
+            branch_relation(repo, "behind", "ahead"),
+            Some(Relation::Same)
+        );
+    }
 
     #[test]
     fn push_refspec_sets_no_upstream() {

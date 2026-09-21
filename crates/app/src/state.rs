@@ -14,8 +14,8 @@ use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
     spawn_executor, AdoptProbe, AppSettings, Card, CardAnswers, CardState, Change, DesignSub,
     DiffState, DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind,
-    ExecutorHandle, FixItem, FixOutcome, FixReport, Forge, GhForge, GitOps, Handoff, Outcome,
-    PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig, Provider, ProviderFactory,
+    ExecutorHandle, FixItem, FixOutcome, FixReport, Forge, GhForge, GitOps, Handoff, OpenPr,
+    Outcome, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig, Provider, ProviderFactory,
     QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub, Severity, SimFactory,
     SimForge, SimGit, Store, TestItem, UsageSnapshot,
 };
@@ -78,6 +78,9 @@ pub struct AppState {
     /// Per-project adoptable branches (local + remote, minus base/usine/card
     /// refs), fetched when the adopt dialog opens. In-memory only.
     pub adopt_sources: Signal<HashMap<Uuid, Vec<String>>>,
+    /// Per-project adoptable open PRs (same-repo, targeting the base, not a
+    /// card's), fetched with `adopt_sources`. In-memory only.
+    pub adopt_prs: Signal<HashMap<Uuid, Vec<OpenPr>>>,
     /// The latest adopt-probe result per project. The dialog matches the
     /// probe's `source_ref` against its current pick, so a stale response for a
     /// previously picked branch is ignored. In-memory only.
@@ -254,6 +257,7 @@ impl AppState {
             reviewers: Signal::new(HashMap::new()),
             pr_authors: Signal::new(HashMap::new()),
             adopt_sources: Signal::new(HashMap::new()),
+            adopt_prs: Signal::new(HashMap::new()),
             adopt_probes: Signal::new(HashMap::new()),
             review_tasks: Signal::new(review_tasks),
             skip_plans: Signal::new(skip_plans),
@@ -458,9 +462,15 @@ impl AppState {
                 let mut authors = self.pr_authors;
                 authors.write().insert(project_id, logins);
             }
-            ExecutorEventKind::AdoptSources { project_id, refs } => {
+            ExecutorEventKind::AdoptSources {
+                project_id,
+                refs,
+                prs,
+            } => {
                 let mut sources = self.adopt_sources;
                 sources.write().insert(project_id, refs);
+                let mut adopt_prs = self.adopt_prs;
+                adopt_prs.write().insert(project_id, prs);
             }
             ExecutorEventKind::AdoptProbe { project_id, probe } => {
                 let mut probes = self.adopt_probes;
@@ -608,8 +618,8 @@ impl AppState {
         self.send(ExecutorCommand::ListPrAuthors { project_id });
     }
 
-    /// Ask the executor for a project's adoptable branches (the adopt dialog's
-    /// picker). The result arrives as an `AdoptSources` event.
+    /// Ask the executor for a project's adoptable branches and open PRs (the
+    /// adopt dialog's picker). The result arrives as an `AdoptSources` event.
     pub fn fetch_adopt_sources(&self, project_id: Uuid) {
         self.send(ExecutorCommand::ListAdoptSources { project_id });
     }
@@ -640,6 +650,17 @@ impl AppState {
             description,
             retire_original,
             dirty_action,
+        });
+    }
+
+    /// Adopt an open PR into a new card that takes it over at the PR-review
+    /// stage (no self-review; fixes push to the PR's own branch).
+    pub fn adopt_pr(&self, project_id: Uuid, pr_number: u64, title: String, description: String) {
+        self.send(ExecutorCommand::AdoptPr {
+            project_id,
+            pr_number,
+            title,
+            description,
         });
     }
 

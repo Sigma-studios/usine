@@ -1,39 +1,56 @@
-//! Branch adoption: turning an existing hand-made branch into a first-class
-//! card that enters the pipeline at the self-review pass.
+//! Adoption: turning existing work into a first-class card.
 //!
-//! The card gets its own `usine/<slug>` branch cut at the adopted tip, so the
-//! original branch stays exactly what it was and every downstream mechanism
-//! (self-review, fixes, validation, PR, teardown, back-to-start, delete) works
-//! unchanged — no "adopted" flag, no special cases.
+//! - A hand-made **branch** enters the pipeline at the self-review pass. The
+//!   card gets its own `usine/<slug>` branch cut at the adopted tip, so the
+//!   original branch stays exactly what it was and every downstream mechanism
+//!   (self-review, fixes, validation, PR, teardown, back-to-start, delete)
+//!   works unchanged — no "adopted" flag, no special cases.
+//! - An open **PR** (say, one opened on another machine) enters at the
+//!   PR-review stage. Here the card attaches to the PR's own head branch
+//!   instead of cutting one: a card pushes `card.branch`, and the PR poll only
+//!   needs `card.pr`, so a card whose branch *is* the PR head takes that PR
+//!   over — every later push updates it, and no second PR is ever opened.
 //!
 //! Deliberately out of scope (v1):
 //! - Stacked branches: the diff and the eventual PR always target the
-//!   project's base branch, even if the adopted branch forked from another.
-//! - Adopting a branch that already has an open PR into `PrReview`: the probe
-//!   warns about the PR, and proceeding eventually opens a second one.
+//!   project's base branch, even if the adopted branch forked from another —
+//!   and a PR targeting another base is refused.
+//! - PRs from forks: the card couldn't push its fixes as its own branch.
 
 use std::collections::HashSet;
 
 use crate::agent::events::{AdoptProbe, DirtyAction};
+use crate::domain::model::PrInfo;
+use crate::infra::forge::OpenPr;
 use crate::infra::git::{
-    checkout_of_branch, commitish_exists, is_dirty, log_subjects, remote_tracking_base,
+    branch_relation, checkout_of_branch, commitish_exists, force_branch, is_dirty, log_subjects,
+    remote_tracking_base, Relation,
 };
 
 use super::*;
 
 impl Executor {
-    /// List the project's branches a card could adopt (the dialog's picker).
+    /// List the project's branches and open PRs a card could adopt (the
+    /// dialog's picker).
     pub(super) async fn list_adopt_sources(&self, project_id: Uuid) -> Result<()> {
         let project = self.store.get_project(project_id)?;
+        let base = project.config.effective_base_branch();
         let all = self.git.list_all_branches(&project.path).await?;
-        let refs = adopt_source_refs(
-            &all,
-            project.config.effective_base_branch(),
-            &self.card_branches(project_id),
-        );
+        let owned = self.card_branches(project_id);
+        let refs = adopt_source_refs(&all, base, &owned);
+        // Best-effort: offline or unauthed, the branches still load.
+        let prs = match self.forge.list_open_prs(&project.path).await {
+            Ok(prs) => prs,
+            Err(e) => {
+                tracing::warn!("listing open PRs to adopt failed: {e}");
+                Vec::new()
+            }
+        };
+        let prs = adoptable_prs(prs, base, &owned, &self.card_pr_numbers(project_id));
+        let refs = drop_pr_heads(refs, &prs);
         let _ = self
             .evt_tx
-            .unbounded_send(ExecutorEvent::adopt_sources(project_id, refs));
+            .unbounded_send(ExecutorEvent::adopt_sources(project_id, refs, prs));
         Ok(())
     }
 
@@ -260,6 +277,158 @@ impl Executor {
         }
     }
 
+    /// Adopt open PR `pr_number` into a new card that takes the PR over: the
+    /// card attaches to the PR's head branch and lands at the PR-review stage,
+    /// with its comments, checks and mergeability pulled right away. Validates
+    /// everything before creating anything, like [`Self::adopt_branch`].
+    pub(super) async fn adopt_pr(
+        &self,
+        project_id: Uuid,
+        pr_number: u64,
+        title: String,
+        description: String,
+    ) -> Result<()> {
+        let project = self.store.get_project(project_id)?;
+        // Refresh origin so the head's remote-tracking ref exists and is
+        // current. Non-fatal, as in `adopt_branch`.
+        if let Err(e) = self.git.fetch(&project.path, "origin").await {
+            tracing::warn!("adopt PR #{pr_number}: fetching origin failed: {e}");
+        }
+        let target = self
+            .forge
+            .pr_push_target(&project.path, pr_number)
+            .await?
+            .ok_or_else(|| {
+                CoreError::other(format!("couldn't read PR #{pr_number} from the forge"))
+            })?;
+        if target.cross_repo {
+            return Err(CoreError::other(format!(
+                "cannot adopt PR #{pr_number}: PRs from forks can't be adopted — review them \
+                 from the PR-review board instead"
+            )));
+        }
+        let base = project.config.effective_base_branch();
+        if !target.base_ref.is_empty() && target.base_ref != base {
+            return Err(CoreError::other(format!(
+                "cannot adopt PR #{pr_number}: it targets `{}`, not the project's base `{base}`",
+                target.base_ref
+            )));
+        }
+        let pr = self
+            .forge
+            .pr_by_number(&project.path, pr_number)
+            .await?
+            .ok_or_else(|| CoreError::other(format!("PR #{pr_number} is no longer open")))?;
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err(CoreError::other("a title is required to adopt a PR"));
+        }
+        if description.trim().is_empty() {
+            return Err(CoreError::other(
+                "a task description is required to adopt a PR — it's what the \
+                 triage and fix agents read as the statement of intent",
+            ));
+        }
+        let head = target.head_ref;
+        if let Some(refusal) = self.adopt_pr_refusal(&project, &head, pr_number) {
+            return Err(CoreError::other(format!(
+                "cannot adopt PR #{pr_number}: {refusal}"
+            )));
+        }
+        // The card's worktree must own the head branch: git won't check one
+        // branch out twice, and pushes from someone else's checkout would be
+        // the cross-card contamination `finalize_run` guards against.
+        if let Some(path) = checkout_of_branch(&project.path, &head) {
+            return Err(CoreError::other(format!(
+                "cannot adopt PR #{pr_number}: `{head}` is checked out at {} — switch that \
+                 checkout to another branch first",
+                path.display()
+            )));
+        }
+        let remote = format!("refs/remotes/origin/{head}");
+        let local_ref = format!("refs/heads/{head}");
+        let mut card = Card::new(
+            project_id,
+            &title,
+            &description,
+            self.store.settings()?.new_card_config(),
+        );
+        let worktree = worktree_path(&project.path, card.id);
+        match branch_relation(&project.path, &local_ref, &remote) {
+            // No local branch yet: create it at the remote tip. `create_worktree`
+            // cuts with `--no-track`; the card's first push `-u` sets upstream.
+            None => {
+                self.git
+                    .create_worktree(&project.path, &head, &worktree, &format!("origin/{head}"))
+                    .await?
+            }
+            Some(Relation::Diverged) => {
+                return Err(CoreError::other(format!(
+                    "cannot adopt PR #{pr_number}: your local `{head}` and `origin/{head}` have \
+                     diverged — reconcile them (or delete the local branch) first"
+                )));
+            }
+            Some(relation) => {
+                // Behind: catch up to what the PR shows. Same: nothing to do.
+                if relation == Relation::Behind {
+                    force_branch(&project.path, &head, &remote)?;
+                }
+                self.git
+                    .worktree_add_existing(&project.path, &head, &worktree)
+                    .await?;
+                // Ahead: publish the unpushed commits now. Left local, an
+                // in-app Merge would merge the PR without them and then
+                // force-delete the branch that held them.
+                if relation == Relation::Ahead {
+                    if let Err(e) = self.git.push(&worktree, &head).await {
+                        let _ = self.git.remove_worktree(&project.path, &worktree).await;
+                        return Err(CoreError::other(format!(
+                            "cannot adopt PR #{pr_number}: pushing your local commits on \
+                             `{head}` failed: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // The work is already a PR, so the card enters where `create_pr`
+        // leaves one — skipping self-review. A direct set, not a Transition,
+        // for the same reason as in `adopt_branch`.
+        card.state = CardState::PrReview(PrReviewSub::Idle);
+        card.branch = Some(head);
+        card.worktree_path = Some(worktree);
+        // The forge only lists *pending* review requests — a reviewer who
+        // already submitted drops off — so a missing one is "unknown", not
+        // "explicitly none": leave it unrecorded so the project's configured
+        // reviewer still applies.
+        card.pr = Some(PrInfo {
+            reviewer_recorded: pr.reviewer.is_some(),
+            ..pr
+        });
+        self.store.upsert_card(&card)?;
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::updated(card.clone()));
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            card.id,
+            Severity::Success,
+            format!("Adopted PR #{pr_number} — now tracking its review"),
+        ));
+
+        // Pull the PR's comments, reviews, checks and mergeability now rather
+        // than on the next poll. This also runs the auto-advances — including
+        // "no reviewer → ready to merge", which `create_pr` applies up front
+        // but which here must wait for the comment counts: an adopted PR may
+        // already carry feedback. Under the card's claim, since it can
+        // transition; best-effort, since the poll catches up.
+        if let Some(_guard) = claim(&self.in_flight, &self.evt_tx, card.id) {
+            if let Err(e) = self.list_reviews(card.id).await {
+                tracing::warn!("adopt PR #{pr_number}: first review refresh failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
     /// Copy `checkout`'s uncommitted state — the tracked diff plus untracked
     /// files — into the card's worktree and commit it there. Strictly a copy:
     /// the user's checkout is read, never written.
@@ -330,6 +499,40 @@ impl Executor {
         None
     }
 
+    /// Why PR head `head` can't be adopted, or `None` when it can: the
+    /// branch-adoption checks that still apply once the head is attached to
+    /// rather than cut from — a `usine/` head is fine here (a card pushed from
+    /// another machine is this feature's main case).
+    fn adopt_pr_refusal(&self, project: &Project, head: &str, pr_number: u64) -> Option<String> {
+        if head == project.config.effective_base_branch() {
+            return Some(format!("its head `{head}` is the project's base branch"));
+        }
+        if let Ok(cards) = self.store.list_cards_for_project(project.id) {
+            if let Some(card) = cards.iter().find(|c| {
+                c.branch.as_deref() == Some(head)
+                    || c.pr.as_ref().is_some_and(|p| p.number == pr_number)
+            }) {
+                return Some(format!("it already belongs to the card “{}”", card.title));
+            }
+        }
+        if !commitish_exists(&project.path, &format!("refs/remotes/origin/{head}")) {
+            return Some(format!(
+                "`origin/{head}` does not resolve — is the PR's branch on `origin`?"
+            ));
+        }
+        None
+    }
+
+    /// The PR numbers already owned by the project's cards.
+    fn card_pr_numbers(&self, project_id: Uuid) -> HashSet<u64> {
+        self.store
+            .list_cards_for_project(project_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| c.pr.map(|p| p.number))
+            .collect()
+    }
+
     /// The branches already owned by the project's cards.
     fn card_branches(&self, project_id: Uuid) -> HashSet<String> {
         self.store
@@ -382,6 +585,35 @@ fn adopt_source_refs(all: &[String], base: &str, card_owned: &HashSet<String>) -
     out
 }
 
+/// Filter the forge's open PRs down to adoptable ones: same-repo, targeting
+/// the project base, and not already a card's (by branch or PR number). Keeps
+/// the forge's order (the viewer's own PRs first).
+fn adoptable_prs(
+    prs: Vec<OpenPr>,
+    base: &str,
+    card_branches: &HashSet<String>,
+    card_prs: &HashSet<u64>,
+) -> Vec<OpenPr> {
+    prs.into_iter()
+        .filter(|p| {
+            !p.cross_repo
+                && p.base_ref == base
+                && !card_branches.contains(&p.head_ref)
+                && !card_prs.contains(&p.number)
+        })
+        .collect()
+}
+
+/// Drop every branch (local or `origin/…`) that is a listed PR's head, so each
+/// piece of work shows up once — in the dialog's PR group, where picking it
+/// adopts the PR itself rather than cutting a second branch off it.
+fn drop_pr_heads(refs: Vec<String>, prs: &[OpenPr]) -> Vec<String> {
+    let heads: HashSet<&str> = prs.iter().map(|p| p.head_ref.as_str()).collect();
+    refs.into_iter()
+        .filter(|r| !heads.contains(local_name(r)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +647,58 @@ mod tests {
         let all = strs(&["mine", "origin/mine"]);
         let owned: HashSet<String> = ["mine".to_string()].into();
         assert!(adopt_source_refs(&all, "dev", &owned).is_empty());
+    }
+
+    fn open_pr(number: u64, head: &str) -> OpenPr {
+        OpenPr {
+            number,
+            title: format!("PR {number}"),
+            author: "me".into(),
+            head_ref: head.into(),
+            base_ref: "dev".into(),
+            url: String::new(),
+            body: String::new(),
+            draft: false,
+            cross_repo: false,
+            mine: true,
+        }
+    }
+
+    #[test]
+    fn adoptable_prs_drop_forks_other_bases_and_card_owned() {
+        let fork = OpenPr {
+            cross_repo: true,
+            ..open_pr(2, "patch-1")
+        };
+        let other_base = OpenPr {
+            base_ref: "release".into(),
+            ..open_pr(3, "hotfix")
+        };
+        let prs = vec![
+            open_pr(1, "usine/from-laptop-1234"),
+            fork,
+            other_base,
+            open_pr(4, "taken-branch"),
+            open_pr(5, "taken-number"),
+            open_pr(6, "feat/b"),
+        ];
+        let branches: HashSet<String> = ["taken-branch".to_string()].into();
+        let numbers: HashSet<u64> = [5].into();
+        let kept: Vec<u64> = adoptable_prs(prs, "dev", &branches, &numbers)
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(kept, vec![1, 6], "a usine/ head is adoptable as a PR");
+    }
+
+    #[test]
+    fn pr_heads_leave_the_branch_list() {
+        let refs = strs(&["feat/b", "origin/feat/c", "other", "origin/feat/b-2"]);
+        let prs = [open_pr(1, "feat/b"), open_pr(2, "feat/c")];
+        assert_eq!(
+            drop_pr_heads(refs, &prs),
+            strs(&["other", "origin/feat/b-2"])
+        );
     }
 
     #[test]
