@@ -272,10 +272,12 @@ fn InfoIcon(tip: String) -> Element {
 enum ProjectTab {
     Reviews,
     Commands,
+    Notifications,
 }
 
-/// Per-project settings: a tabbed dialog over the PR-review workflow and the
-/// worktree commands (setup/validate/run/teardown) configuration.
+/// Per-project settings: a tabbed dialog over the PR-review workflow, the
+/// worktree commands (setup/validate/run/teardown) configuration, and whether
+/// the project's attention signals are muted.
 #[component]
 pub fn ProjectSettingsModal() -> Element {
     let Some(pid) = *PROJECT_SETTINGS.read() else {
@@ -319,12 +321,20 @@ pub fn ProjectSettingsModal() -> Element {
                         onclick: move |_| tab.set(ProjectTab::Commands),
                         "Commands"
                     }
+                    button {
+                        class: if tab() == ProjectTab::Notifications { "settings-tab active" } else { "settings-tab" },
+                        onclick: move |_| tab.set(ProjectTab::Notifications),
+                        "Notifications"
+                    }
                 }
                 if tab() == ProjectTab::Reviews {
                     ReviewsTab { pid }
                 }
                 if tab() == ProjectTab::Commands {
                     CommandsTab { pid }
+                }
+                if tab() == ProjectTab::Notifications {
+                    NotificationsTab { pid }
                 }
             }
         }
@@ -941,6 +951,44 @@ fn CommandsTab(pid: Uuid) -> Element {
                         }
                     },
                 }
+            }
+        }
+    }
+}
+
+/// The "Notifications" tab: mute the project so its cards and PR reviews stop
+/// lighting up the dock badge and the sidebar row.
+#[component]
+fn NotificationsTab(pid: Uuid) -> Element {
+    let state = use_context::<AppState>();
+    let Some(project) = state.projects.read().iter().find(|p| p.id == pid).cloned() else {
+        return rsx! {};
+    };
+
+    rsx! {
+        div { class: "section",
+            div { class: "field-header",
+                div { class: "field-title",
+                    h3 { "Notifications" }
+                }
+            }
+            div { class: "field",
+                label { class: "adopt-choice",
+                    input {
+                        r#type: "checkbox",
+                        checked: project.config.notifications_muted,
+                        onchange: {
+                            let project = project.clone();
+                            move |_| {
+                                let mut p = project.clone();
+                                p.config.notifications_muted = !p.config.notifications_muted;
+                                state.save_project(p);
+                            }
+                        },
+                    }
+                    "Mute notifications for this project"
+                }
+                div { class: "hint", "Cards and PR reviews here stop counting toward the dock badge and sidebar badges. Unmute here to restore them." }
             }
         }
     }

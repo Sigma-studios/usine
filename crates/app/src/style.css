@@ -172,6 +172,16 @@ body.resizing .info-tip { visibility: hidden; opacity: 0; }
 .proj-dot.urgent { background: var(--red); }
 .proj-dot.idle { background: var(--border); }
 .proj-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Muted project: grayed name plus a bell-off indicator hugging it. The name
+   stops growing and the icon takes the slack instead, so the icon stays next
+   to the name while the action buttons stay right-aligned. */
+.nav-item.muted .proj-name { color: var(--muted); flex: 0 1 auto; }
+.nav-item.active.muted .proj-name { color: rgba(255,255,255,0.6); }
+.proj-mute {
+  display: inline-flex; align-items: center; flex-shrink: 0;
+  color: var(--muted); margin-left: -3px; margin-right: auto;
+}
+.nav-item.active .proj-mute { color: rgba(255,255,255,0.6); }
 /* Cards-waiting count: same geometry as `.proj-badge` but sitting in normal
    flow, right-aligned against the name by the name's `flex: 1`. */
 .proj-count {

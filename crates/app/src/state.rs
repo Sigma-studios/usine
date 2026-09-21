@@ -774,12 +774,36 @@ impl AppState {
     /// other platforms.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn review_attention_count(&self) -> usize {
-        self.review_tasks
+        let muted = self.muted_project_ids();
+        count_unmuted_attention(
+            self.review_tasks
+                .read()
+                .iter()
+                .flat_map(|(pid, tasks)| tasks.iter().map(|t| (*pid, t.status.needs_attention()))),
+            &muted,
+        )
+    }
+
+    /// Total cards needing attention across unmuted projects (dock badge).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn card_attention_count(&self) -> usize {
+        let muted = self.muted_project_ids();
+        count_unmuted_attention(
+            self.cards
+                .read()
+                .iter()
+                .map(|c| (c.project_id, c.needs_attention())),
+            &muted,
+        )
+    }
+
+    fn muted_project_ids(&self) -> HashSet<Uuid> {
+        self.projects
             .read()
-            .values()
-            .flatten()
-            .filter(|t| t.status.needs_attention())
-            .count()
+            .iter()
+            .filter(|p| p.config.notifications_muted)
+            .map(|p| p.id)
+            .collect()
     }
 
     pub fn scan_reviews(&self, project_id: Uuid) {
@@ -1042,6 +1066,17 @@ fn open_store() -> (Store, bool) {
             (Store::open_in_memory().expect("in-memory store"), false)
         }
     }
+}
+
+/// Count the `(project_id, needs_attention)` items that need attention and
+/// don't belong to a muted project — the dock badge's arithmetic.
+fn count_unmuted_attention(
+    items: impl Iterator<Item = (Uuid, bool)>,
+    muted: &HashSet<Uuid>,
+) -> usize {
+    items
+        .filter(|(pid, needs)| *needs && !muted.contains(pid))
+        .count()
 }
 
 /// Seed a demo project with cards spread across columns so a first-run board
@@ -1383,7 +1418,21 @@ mod active_work_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_loaded_transcript;
+    use super::{count_unmuted_attention, merge_loaded_transcript};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn attention_count_skips_muted_projects() {
+        let (loud, quiet) = (Uuid::new_v4(), Uuid::new_v4());
+        let items = [(loud, true), (loud, false), (quiet, true), (quiet, true)];
+        assert_eq!(
+            count_unmuted_attention(items.into_iter(), &HashSet::new()),
+            3
+        );
+        let muted = HashSet::from([quiet]);
+        assert_eq!(count_unmuted_attention(items.into_iter(), &muted), 1);
+    }
 
     fn entries(v: &[(i64, &str)]) -> Vec<(i64, String)> {
         v.iter().map(|(ts, l)| (*ts, (*l).to_string())).collect()
