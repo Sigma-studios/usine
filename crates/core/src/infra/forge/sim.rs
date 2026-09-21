@@ -6,7 +6,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use super::{normalize_reviewer, Forge, PrPushTarget, PrSummary, ReviewScope};
+use super::{normalize_reviewer, Forge, OpenPr, PrPushTarget, PrSummary, ReviewScope};
 use crate::domain::model::{
     CheckStatus, DraftComment, Mergeable, PrInfo, PrState, ReviewComment, ReviewEvent,
     ReviewSummary, ReviewThread,
@@ -16,6 +16,14 @@ use crate::error::Result;
 /// Simulated forge for Phase A: canned PR + review comments so the PR-review
 /// column is fully navigable without GitHub.
 pub struct SimForge;
+
+impl SimForge {
+    /// The open PR the sim offers for adoption. Its head only resolves if the
+    /// project's repo really has `origin/feature/sim-pr` — adoption checks git
+    /// for real, even in the sim.
+    pub const OPEN_PR: u64 = 57;
+    pub const OPEN_PR_HEAD: &'static str = "feature/sim-pr";
+}
 
 #[async_trait]
 impl Forge for SimForge {
@@ -127,12 +135,46 @@ impl Forge for SimForge {
     }
 
     /// A same-repo, pushable head, so "publish & fix" runs end to end in the sim.
-    async fn pr_push_target(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
+    async fn pr_push_target(&self, repo: &Path, pr_number: u64) -> Result<Option<PrPushTarget>> {
+        let head_ref = if pr_number == Self::OPEN_PR {
+            Self::OPEN_PR_HEAD.to_string()
+        } else {
+            format!("sim/pr-{pr_number}")
+        };
         Ok(Some(PrPushTarget {
-            head_ref: format!("sim/pr-{pr_number}"),
+            head_ref,
+            base_ref: crate::infra::git::detect_base_branch(repo),
             cross_repo: false,
             head_repo: String::new(),
             maintainer_can_modify: true,
+        }))
+    }
+
+    async fn list_open_prs(&self, repo: &Path) -> Result<Vec<OpenPr>> {
+        Ok(vec![OpenPr {
+            number: Self::OPEN_PR,
+            title: "Speed up the sim dashboard".into(),
+            author: "you".into(),
+            head_ref: Self::OPEN_PR_HEAD.into(),
+            // Whatever the repo's base is, so the listing's "targets the
+            // project base" filter keeps it.
+            base_ref: crate::infra::git::detect_base_branch(repo),
+            url: format!("https://github.com/example/repo/pull/{}", Self::OPEN_PR),
+            body: "Opened from another machine: memoizes the dashboard queries.".into(),
+            draft: false,
+            cross_repo: false,
+            mine: true,
+        }])
+    }
+
+    async fn pr_by_number(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrInfo>> {
+        Ok((pr_number == Self::OPEN_PR).then(|| PrInfo {
+            number: pr_number,
+            url: format!("https://github.com/example/repo/pull/{pr_number}"),
+            title: "Speed up the sim dashboard".into(),
+            state: PrState::Open,
+            reviewer: Some("octocat".into()),
+            reviewer_recorded: false,
         }))
     }
 

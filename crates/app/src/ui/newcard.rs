@@ -67,7 +67,7 @@ fn ProjectPicker(intent: NewCardIntent) -> Element {
         .map(|p| p.path.display().to_string());
     let (title, confirm_label) = match intent {
         NewCardIntent::Blank => ("New card", "Create card"),
-        NewCardIntent::Adopt => ("Adopt a branch", "Continue"),
+        NewCardIntent::Adopt => ("Adopt a branch or PR", "Continue"),
     };
     let target = Uuid::parse_str(&chosen).ok();
 

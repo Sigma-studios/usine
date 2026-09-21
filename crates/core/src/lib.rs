@@ -83,8 +83,8 @@ pub use domain::state_machine::{
 pub use error::{CoreError, Result};
 pub use infra::forge::{
     detect_forge, normalize_azure_identity, normalize_login, parse_remote, AzureForges, AzureRepo,
-    FailedCheck, Forge, ForgeFactory, ForgeRegistry, GhForge, LivePrState, PrPushTarget, PrSummary,
-    RemoteForge, ReviewScope, SimForge, AZURE_DEVOPS_PAT_ENV,
+    FailedCheck, Forge, ForgeFactory, ForgeRegistry, GhForge, LivePrState, OpenPr, PrPushTarget,
+    PrSummary, RemoteForge, ReviewScope, SimForge, AZURE_DEVOPS_PAT_ENV,
 };
 pub use infra::git::{
     remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,

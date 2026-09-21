@@ -16,7 +16,7 @@ use crate::domain::model::{
     ReviewThread,
 };
 use crate::infra::forge::remote::AzureRepo;
-use crate::infra::forge::{FailedCheck, LivePrState, PrPushTarget, PrSummary};
+use crate::infra::forge::{FailedCheck, LivePrState, OpenPr, PrPushTarget, PrSummary};
 
 // --- ids ----------------------------------------------------------------------
 
@@ -289,6 +289,7 @@ pub fn push_target(pr: &Value) -> Option<PrPushTarget> {
     let fork = pr.pointer("/forkSource/repository");
     Some(PrPushTarget {
         head_ref: head,
+        base_ref: short_ref(&text(pr, "targetRefName")),
         cross_repo: fork.is_some(),
         head_repo: fork
             .and_then(|r| r.get("name"))
@@ -315,6 +316,27 @@ pub fn pr_summary(repo: &AzureRepo, pr: &Value, checks: CheckStatus) -> PrSummar
         body: text(pr, "description"),
         checks,
         mergeable: mergeable(pr),
+    }
+}
+
+/// An active PR as the adopt dialog lists it. `mine` compares identity ids,
+/// so an unknown `me_id` (empty) flags nothing.
+pub fn open_pr(repo: &AzureRepo, pr: &Value, me_id: &str) -> OpenPr {
+    let creator = pr.get("createdBy");
+    OpenPr {
+        number: pr_id(pr),
+        title: text(pr, "title"),
+        author: creator
+            .map(identity_handle)
+            .unwrap_or_else(|| "unknown".into()),
+        head_ref: short_ref(&text(pr, "sourceRefName")),
+        base_ref: short_ref(&text(pr, "targetRefName")),
+        url: pr_web_url(repo, pr),
+        body: text(pr, "description"),
+        draft: pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        cross_repo: pr.pointer("/forkSource/repository").is_some(),
+        mine: !me_id.is_empty()
+            && creator.is_some_and(|c| identity_id(c).eq_ignore_ascii_case(me_id)),
     }
 }
 
@@ -1232,14 +1254,41 @@ mod tests {
 
     #[test]
     fn push_targets_refuse_forks() {
-        let same = json!({ "sourceRefName": "refs/heads/feat/x" });
+        let same = json!({ "sourceRefName": "refs/heads/feat/x",
+                           "targetRefName": "refs/heads/dev" });
         let t = push_target(&same).unwrap();
         assert_eq!(t.head_ref, "feat/x");
+        assert_eq!(t.base_ref, "dev");
         assert!(t.pushable());
         let fork = json!({ "sourceRefName": "refs/heads/feat/x", "forkSource": { "repository": { "name": "fork" } } });
         let t = push_target(&fork).unwrap();
         assert!(t.cross_repo && !t.pushable());
         assert!(push_target(&json!({})).is_none());
+    }
+
+    #[test]
+    fn open_prs_read_forks_drafts_and_mine() {
+        let repo = repo();
+        let pr = json!({ "pullRequestId": 7, "title": "Mine", "isDraft": true,
+            "sourceRefName": "refs/heads/feat/a", "targetRefName": "refs/heads/main",
+            "description": "why", "createdBy": identity(ME, "Me@x.com") });
+        let p = open_pr(&repo, &pr, ME);
+        assert_eq!(
+            (p.number, p.head_ref.as_str(), p.base_ref.as_str()),
+            (7, "feat/a", "main")
+        );
+        assert!(p.draft && p.mine && !p.cross_repo);
+        assert_eq!(p.author, "me@x.com");
+        assert_eq!(p.body, "why");
+        assert!(
+            !open_pr(&repo, &pr, "").mine,
+            "an unknown viewer flags nothing"
+        );
+        let fork = json!({ "pullRequestId": 8, "sourceRefName": "refs/heads/patch",
+            "forkSource": { "repository": { "name": "fork" } },
+            "createdBy": identity("o", "o@x.com") });
+        let p = open_pr(&repo, &fork, ME);
+        assert!(p.cross_repo && !p.mine && !p.draft);
     }
 
     #[test]

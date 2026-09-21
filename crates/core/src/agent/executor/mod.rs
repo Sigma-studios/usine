@@ -518,6 +518,15 @@ impl Executor {
                 )
                 .await
             }
+            ExecutorCommand::AdoptPr {
+                project_id,
+                pr_number,
+                title,
+                description,
+            } => {
+                self.adopt_pr(project_id, pr_number, title, description)
+                    .await
+            }
             ExecutorCommand::RefreshUsage => {
                 self.refresh_usage().await;
                 Ok(())

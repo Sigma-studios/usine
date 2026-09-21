@@ -88,6 +88,28 @@ pub struct FailedCheck {
     pub url: String,
 }
 
+/// An open PR on this repo that a card could adopt — the adopt dialog's
+/// "Pull requests" group. Carries everything the dialog prefills from, so
+/// picking one needs no probe round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPr {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub url: String,
+    /// The PR description, as written by the author.
+    pub body: String,
+    pub draft: bool,
+    /// Whether the head lives on a fork (not adoptable: we can't push to it
+    /// as the card's own branch).
+    pub cross_repo: bool,
+    /// Whether the signed-in user authored it. `false` when the login can't be
+    /// read — the dialog then merely shows an extra warning.
+    pub mine: bool,
+}
+
 /// The reviewer login to record on a created PR: trimmed, with the empty/absent
 /// case collapsed to `None` (matching the `--reviewer` arg being omitted).
 pub fn normalize_reviewer(reviewer: Option<&str>) -> Option<String> {
@@ -103,6 +125,8 @@ pub fn normalize_reviewer(reviewer: Option<&str>) -> Option<String> {
 pub struct PrPushTarget {
     /// The PR's head branch name, as the target repo holds it.
     pub head_ref: String,
+    /// The branch the PR targets (empty when the forge didn't say).
+    pub base_ref: String,
     /// Whether the head is on a fork rather than this repo.
     pub cross_repo: bool,
     /// `owner/repo` of the head repository (GitHub forks only; empty otherwise).
@@ -295,6 +319,18 @@ pub trait Forge: Send + Sync {
     /// come back `None`, so forges that don't model it — the sim, test doubles —
     /// need no override.
     async fn pr_for_head(&self, _repo: &Path, _head: &str) -> Result<Option<PrInfo>> {
+        Ok(None)
+    }
+
+    /// Every open PR on the repo — the adopt dialog's "Pull requests" group.
+    /// Defaulted to none so test doubles need no override.
+    async fn list_open_prs(&self, _repo: &Path) -> Result<Vec<OpenPr>> {
+        Ok(Vec::new())
+    }
+
+    /// PR `pr_number` as a [`PrInfo`], `None` unless it is open. What PR
+    /// adoption records on the card; the default ("can't tell") refuses it.
+    async fn pr_by_number(&self, _repo: &Path, _pr_number: u64) -> Result<Option<PrInfo>> {
         Ok(None)
     }
 }
@@ -512,6 +548,12 @@ impl Forge for UnavailableForge {
         self.err()
     }
     async fn comment_on_pr(&self, _: &Path, _: u64, _: &str) -> Result<()> {
+        self.err()
+    }
+    async fn list_open_prs(&self, _: &Path) -> Result<Vec<OpenPr>> {
+        self.err()
+    }
+    async fn pr_by_number(&self, _: &Path, _: u64) -> Result<Option<PrInfo>> {
         self.err()
     }
 }

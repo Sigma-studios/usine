@@ -41,7 +41,9 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use super::remote::{encode_segment, parse_remote, AzureRepo, RemoteForge};
-use super::{FailedCheck, Forge, ForgeFactory, LivePrState, PrPushTarget, PrSummary, ReviewScope};
+use super::{
+    FailedCheck, Forge, ForgeFactory, LivePrState, OpenPr, PrPushTarget, PrSummary, ReviewScope,
+};
 use crate::domain::model::{
     CheckStatus, DraftComment, Mergeable, PrInfo, PrState, ReviewComment, ReviewEvent,
     ReviewSummary, ReviewThread,
@@ -846,6 +848,30 @@ impl Forge for AzureForge {
         Ok(wire::pr_list(&v)
             .iter()
             .find_map(|pr| wire::pr_info(&self.repo, pr)))
+    }
+
+    async fn list_open_prs(&self, _repo: &Path) -> Result<Vec<OpenPr>> {
+        // "Who am I" only orders the list and flags "not yours", so a failed
+        // lookup degrades to an unflagged listing rather than an error.
+        let (prs, me) = tokio::join!(self.active_prs(), self.me());
+        let me = me.map(|(id, _)| id).unwrap_or_default();
+        let mut prs: Vec<OpenPr> = prs?
+            .iter()
+            .map(|pr| wire::open_pr(&self.repo, pr, &me))
+            .filter(|p| p.number != 0 && !p.head_ref.is_empty())
+            .collect();
+        // The user's own PRs first; stable, so Azure's newest-first order
+        // holds within.
+        prs.sort_by_key(|p| !p.mine);
+        Ok(prs)
+    }
+
+    async fn pr_by_number(&self, _repo: &Path, pr_number: u64) -> Result<Option<PrInfo>> {
+        // A failure is an error, not "no PR": the caller must tell "closed"
+        // from "couldn't ask".
+        let pr = self.fresh_pr(pr_number).await?;
+        Ok(wire::pr_info(&self.repo, &pr)
+            .filter(|info| matches!(info.state, PrState::Open | PrState::Draft)))
     }
 }
 
