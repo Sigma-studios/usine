@@ -7,7 +7,18 @@ use usine_core::{supported_efforts, Effort, ModelSpec, Provider, SEVERITY_LEVELS
 /// Selectable model ids per provider.
 pub(crate) fn models_for(provider: Provider) -> &'static [&'static str] {
     match provider {
-        Provider::Claude => &["opus", "sonnet", "haiku", "fable", "claude-fable-5-1"],
+        // The bare aliases track whatever Claude Code points them at today
+        // (`opus` resolves to Opus 5.5, `fable` to Fable 5.1); the pinned ids
+        // beside them stay on that exact version when the alias moves on.
+        Provider::Claude => &[
+            "opus",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-fable-5-1",
+        ],
         // Models available through Codex with ChatGPT authentication, newest
         // first. Older entries remain selectable for plan-dependent access.
         Provider::Codex => &[
@@ -26,6 +37,8 @@ pub(crate) fn models_for(provider: Provider) -> &'static [&'static str] {
 /// aliases, the Codex ids) print as-is.
 pub(crate) fn model_label(model: &str) -> &str {
     match model {
+        "claude-opus-5-5" => "opus 5.5",
+        "claude-opus-5" => "opus 5",
         "claude-fable-5-1" => "fable 5.1",
         other => other,
     }
@@ -201,17 +214,26 @@ mod tests {
     }
 
     #[test]
-    fn claude_picker_pins_fable_5_1_while_keeping_the_alias() {
+    fn claude_picker_pins_versions_while_keeping_the_aliases() {
         let models = models_for(Provider::Claude);
         assert!(models.contains(&"claude-fable-5-1"));
-        // Dropping the bare alias would strand cards already configured on it:
-        // the select would render blank and silently switch model on next edit.
+        // Opus 5.5 is what the `opus` alias resolves to today; pinning it lets a
+        // card stay on this version once the alias moves to the next Opus, and
+        // `claude-opus-5` keeps the previous one reachable.
+        assert!(models.contains(&"claude-opus-5-5"));
+        assert!(models.contains(&"claude-opus-5"));
+        // Dropping the bare aliases would strand cards already configured on
+        // them: the select would render blank and silently switch model on next
+        // edit.
         assert!(models.contains(&"fable"));
+        assert!(models.contains(&"opus"));
     }
 
     #[test]
     fn only_the_pinned_ids_get_a_friendlier_label() {
         assert_eq!(model_label("claude-fable-5-1"), "fable 5.1");
+        assert_eq!(model_label("claude-opus-5-5"), "opus 5.5");
+        assert_eq!(model_label("claude-opus-5"), "opus 5");
         assert_eq!(model_label("opus"), "opus");
         assert_eq!(model_label("gpt-5.6-sol"), "gpt-5.6-sol");
     }
