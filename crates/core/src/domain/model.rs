@@ -229,11 +229,11 @@ impl Effort {
 /// [`Effort::clamp_to`]), so a run never asks a model for a level it would reject
 /// or silently drop.
 ///
-/// * **Claude** — the `opus` (4.8), `sonnet` (5), and `fable` aliases take the
-///   full range, as does the pinned `claude-fable-5-1` id (Fable 5.1 tops out at
-///   `max`; it has no `ultra`). The `fable` alias resolves to Fable 5.1 today.
-///   Haiku 4.5 has no effort tiers, so it gets a single neutral entry. Matched by
-///   family rather than exact alias, so pinned ids resolve too.
+/// * **Claude** — the `opus` (5.5), `sonnet` (5), and `fable` (5.1) aliases take
+///   the full range, as do the pinned `claude-opus-5-5` and `claude-fable-5-1`
+///   ids: both top out at `max` and have no `ultra`. Haiku 4.5 has no effort
+///   tiers, so it gets a single neutral entry. Matched by family rather than
+///   exact alias, so pinned ids resolve too.
 /// * **Codex** — GPT-5.6 Sol and Terra reach `ultra`, while Luna reaches `max`.
 ///   GPT-5.3 through GPT-5.5 reach `xhigh`, as did the retiring
 ///   `gpt-5.1-codex-max`; legacy or unknown ids stay at `high`.
@@ -241,7 +241,9 @@ impl Effort {
 /// Verified against the Claude Code model-config docs and OpenAI's Codex model
 /// docs (Jul 2026 — the pre-5.3 Codex lineup shuts down 2026-07-23), and the
 /// Claude Code 2.1.259 baked catalog for Fable 5.1 (Sep 2026: `effort_cost_index`
-/// lists `low`…`max`). Claude Code
+/// lists `low`…`max`). Opus 5.5 checked the same way against the 2.1.282 catalog
+/// (Sep 2026): `capabilities` carries `effort`/`xhigh_effort`/`max_effort` and no
+/// `ultra`, and the `opus` alias now targets `claude-opus-5-5`. Claude Code
 /// clamps unsupported levels itself; Codex does not, which is why clamping
 /// happens before the CLI call.
 pub fn supported_efforts(provider: Provider, model: &str) -> &'static [Effort] {
@@ -1896,6 +1898,18 @@ mod tests {
         assert!(!efforts.contains(&Effort::Ultra));
         // A spec carried over from a Codex model must land on max, not blank.
         assert_eq!(Effort::Ultra.clamp_to(efforts), Effort::Max);
+    }
+
+    #[test]
+    fn opus_5_5_takes_the_full_range_by_alias_or_pinned_id() {
+        for model in ["opus", "claude-opus-5-5"] {
+            let efforts = supported_efforts(Provider::Claude, model);
+            assert_eq!(efforts.last(), Some(&Effort::Max), "{model}");
+            assert!(!efforts.contains(&Effort::Ultra), "{model}");
+            // Switching a card over from a Codex model that reaches `ultra` must
+            // land on max, not blank out the effort dropdown.
+            assert_eq!(Effort::Ultra.clamp_to(efforts), Effort::Max, "{model}");
+        }
     }
 
     #[test]
