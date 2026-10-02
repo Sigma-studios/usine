@@ -434,6 +434,7 @@ impl Executor {
         // could never start, and the prompt above omits the testing
         // instruction on that same condition.
         if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
+            self.clear_stale_preview_status(card.id);
             if project.config.auto_preview {
                 let _ = self
                     .cmd_tx

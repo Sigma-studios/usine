@@ -47,6 +47,7 @@ mod adopt;
 mod diff;
 mod gate;
 mod lifecycle;
+mod output;
 mod pr;
 mod pr_review;
 mod preview;

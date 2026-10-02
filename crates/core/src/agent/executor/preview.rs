@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
+use super::output::{drain, spawn_capture_reader, OutputTail, SharedTail};
 use super::*;
 use crate::domain::config::{resolve_open_command, PreviewPort, ProjectConfig};
 use crate::domain::model::{PreviewStatus, PreviewUrl};
@@ -33,6 +33,12 @@ const TEARDOWN_CANDIDATES: &[&str] = &["teardown-worktree.sh", "scripts/teardown
 
 /// How long a `SIGTERM`ed preview tree gets to exit cleanly before `SIGKILL`.
 const KILL_GRACE: Duration = Duration::from_millis(800);
+
+/// How much of a preview process's output a failure quotes (toast, card
+/// tooltip, persisted transcript line). Enough to hold the error and a little
+/// context; the full stream is in the live transcript.
+const FAILURE_TAIL_LINES: usize = 20;
+const FAILURE_TAIL_BYTES: usize = 4 * 1024;
 
 /// How often the request watcher polls a write run's worktree for the agent's
 /// preview-request sentinel.
@@ -94,8 +100,12 @@ impl Executor {
     /// channel — the single cleanup path for every entry point's error exit,
     /// so no failure can strand a reserved slot (which would refuse all
     /// later starts as "already running").
+    ///
+    /// The failure is also persisted to the transcript: the setup output that
+    /// explains it streams live only, so this is what survives a restart.
     fn abandon_claim(&self, id: Uuid, generation: Uuid, error: &CoreError) {
         self.release_claim(id, generation);
+        self.progress(id, &format!("✕ Preview failed: {error}"));
         self.emit_preview(id, PreviewStatus::Failed(error.to_string()), Vec::new());
     }
 
@@ -294,7 +304,9 @@ impl Executor {
             TEARDOWN_CANDIDATES,
         ) {
             self.progress(id, "Tearing down the preview…");
-            let _ = self.run_blocking_script(id, worktree, &cmd).await;
+            if let Err(e) = self.run_blocking_script(id, worktree, &cmd).await {
+                self.progress(id, &format!("⚠ {e}"));
+            }
         }
     }
 
@@ -474,13 +486,10 @@ impl Executor {
             return Ok(());
         }
 
-        // Stream both streams live to the UI (unpersisted — dev output is huge).
-        if let Some(out) = child.stdout.take() {
-            self.spawn_log_reader(card_id, out);
-        }
-        if let Some(err) = child.stderr.take() {
-            self.spawn_log_reader(card_id, err);
-        }
+        // Stream both streams live to the UI (unpersisted — dev output is huge),
+        // keeping the tail an unexpected exit quotes.
+        let tail = OutputTail::shared(FAILURE_TAIL_LINES, FAILURE_TAIL_BYTES);
+        let readers = self.capture_output(card_id, &mut child, &tail);
 
         let urls = compute_preview_urls(worktree, &config.preview_ports);
         // Surface the URLs to an agent working in this worktree too (see
@@ -496,31 +505,6 @@ impl Executor {
             crate::agent::testing::preview_info_json(&urls),
         );
 
-        // Reaper: on exit, report Stopped/Failed iff this generation still owns the
-        // slot. An intentional stop/relaunch removes the entry first, so the reaper
-        // stays quiet and doesn't clobber the new run's status. Either way the
-        // worktree's preview-info file no longer describes a live app, so drop it
-        // (a relaunch rewrites it).
-        let previews = self.previews.clone();
-        let evt_tx = self.evt_tx.clone();
-        let wt = worktree.to_path_buf();
-        tokio::spawn(async move {
-            let status = child.wait().await;
-            clear_preview_info(&wt);
-            let mut map = lock(&previews);
-            if map.get(&card_id).map(|h| h.generation) != Some(generation) {
-                return;
-            }
-            map.remove(&card_id);
-            drop(map);
-            let update = match status {
-                Ok(s) if s.success() => PreviewStatus::Stopped,
-                Ok(s) => PreviewStatus::Failed(format!("the app exited ({s})")),
-                Err(e) => PreviewStatus::Failed(format!("the app process errored: {e}")),
-            };
-            let _ =
-                evt_tx.unbounded_send(ExecutorEvent::preview_updated(card_id, update, Vec::new()));
-        });
         let addrs = urls
             .iter()
             .map(|u| format!("{}: {}", u.label, u.url))
@@ -535,6 +519,46 @@ impl Executor {
             },
         );
         self.emit_preview(card_id, PreviewStatus::Running, urls);
+
+        // Reaper: on exit, report Stopped/Failed iff this generation still owns the
+        // slot. An intentional stop/relaunch removes the entry first, so the reaper
+        // stays quiet and doesn't clobber the new run's status. Either way the
+        // worktree's preview-info file no longer describes a live app, so drop it
+        // (a relaunch rewrites it). Spawned only after `Running` went out, so an
+        // app that dies instantly can't have its `Failed` overtaken by it.
+        let previews = self.previews.clone();
+        let evt_tx = self.evt_tx.clone();
+        let store = self.store.clone();
+        let wt = worktree.to_path_buf();
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            clear_preview_info(&wt);
+            {
+                let mut map = lock(&previews);
+                if map.get(&card_id).map(|h| h.generation) != Some(generation) {
+                    return;
+                }
+                map.remove(&card_id);
+            }
+            let update = match status {
+                Ok(s) if s.success() => PreviewStatus::Stopped,
+                Ok(s) => {
+                    drain(readers).await;
+                    PreviewStatus::Failed(script_failure("The app", &run, s, &lock(&tail).render()))
+                }
+                Err(e) => PreviewStatus::Failed(format!("the app process errored: {e}")),
+            };
+            if let PreviewStatus::Failed(reason) = &update {
+                transcript(
+                    &store,
+                    &evt_tx,
+                    card_id,
+                    format!("✕ Preview failed: {reason}"),
+                );
+            }
+            let _ =
+                evt_tx.unbounded_send(ExecutorEvent::preview_updated(card_id, update, Vec::new()));
+        });
         Ok(())
     }
 
@@ -673,12 +697,8 @@ impl Executor {
             return Ok(SetupOutcome::Stopped);
         }
 
-        if let Some(out) = child.stdout.take() {
-            self.spawn_log_reader(card_id, out);
-        }
-        if let Some(err) = child.stderr.take() {
-            self.spawn_log_reader(card_id, err);
-        }
+        let tail = OutputTail::shared(FAILURE_TAIL_LINES, FAILURE_TAIL_BYTES);
+        let readers = self.capture_output(card_id, &mut child, &tail);
         let status = child.wait().await;
         // A stop that landed while we were running took our slot (or cleared it)
         // and already reaped the process — report that rather than a spurious exit.
@@ -687,7 +707,16 @@ impl Executor {
         }
         match status {
             Ok(s) if s.success() => Ok(SetupOutcome::Completed),
-            Ok(s) => Err(CoreError::other(format!("setup script exited with {s}"))),
+            Ok(s) => {
+                drain(readers).await;
+                let tail = lock(&tail).render();
+                Err(CoreError::other(script_failure(
+                    "Preview setup",
+                    cmd,
+                    s,
+                    &tail,
+                )))
+            }
             Err(e) => Err(CoreError::other(format!("setup script failed to run: {e}"))),
         }
     }
@@ -704,32 +733,64 @@ impl Executor {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| CoreError::other(format!("failed to run `{cmd}`: {e}")))?;
-        if let Some(out) = child.stdout.take() {
-            self.spawn_log_reader(card_id, out);
-        }
-        if let Some(err) = child.stderr.take() {
-            self.spawn_log_reader(card_id, err);
-        }
+        let tail = OutputTail::shared(FAILURE_TAIL_LINES, FAILURE_TAIL_BYTES);
+        let readers = self.capture_output(card_id, &mut child, &tail);
         let status = child
             .wait()
             .await
-            .map_err(|e| CoreError::other(format!("script failed to run: {e}")))?;
+            .map_err(|e| CoreError::other(format!("`{cmd}` failed to run: {e}")))?;
         if !status.success() {
-            return Err(CoreError::other(format!("script exited with {status}")));
+            drain(readers).await;
+            let tail = lock(&tail).render();
+            return Err(CoreError::other(script_failure(
+                "Preview teardown",
+                cmd,
+                status,
+                &tail,
+            )));
         }
         Ok(())
     }
 
-    /// Forward a child stream's lines to the UI transcript live (not persisted).
-    fn spawn_log_reader<S: AsyncRead + Unpin + Send + 'static>(&self, card_id: Uuid, stream: S) {
-        let evt_tx = self.evt_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stream).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ =
-                    evt_tx.unbounded_send(ExecutorEvent::transcript(card_id, now_millis(), line));
-            }
-        });
+    /// Stream a child's stdout and stderr live to the UI transcript (not
+    /// persisted) while collecting their interleaved tail into `tail`. Returns
+    /// the readers so a failure path can [`drain`] them before quoting it.
+    fn capture_output(
+        &self,
+        id: Uuid,
+        child: &mut Child,
+        tail: &SharedTail,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut readers = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            readers.push(spawn_capture_reader(
+                self.evt_tx.clone(),
+                id,
+                out,
+                Arc::clone(tail),
+            ));
+        }
+        if let Some(err) = child.stderr.take() {
+            readers.push(spawn_capture_reader(
+                self.evt_tx.clone(),
+                id,
+                err,
+                Arc::clone(tail),
+            ));
+        }
+        readers
+    }
+
+    /// A new write run starts with a clean preview slate: a `Failed` left by an
+    /// earlier attempt would otherwise keep showing (red retry, stale reason)
+    /// on the card once this run parks, even if no preview ran this time.
+    /// No-op while a preview is claimed — it owns the status. The lock is held
+    /// across the send so a racing claim's `SettingUp` can't be overtaken.
+    pub(super) fn clear_stale_preview_status(&self, card_id: Uuid) {
+        let map = lock(&self.previews);
+        if !map.contains_key(&card_id) {
+            self.emit_preview(card_id, PreviewStatus::Stopped, Vec::new());
+        }
     }
 
     fn emit_preview(&self, card_id: Uuid, status: PreviewStatus, urls: Vec<PreviewUrl>) {
@@ -788,6 +849,22 @@ pub(super) fn run_command(config: &ProjectConfig) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// The error for a preview process (`what`: "Preview setup", "The app", …)
+/// that exited non-zero: which command, its exit status, and the tail of what
+/// it printed. A script that printed nothing gets a hint instead — only the
+/// script itself can say where it stopped.
+fn script_failure(what: &str, cmd: &str, status: impl std::fmt::Display, tail: &str) -> String {
+    if tail.is_empty() {
+        format!(
+            "{what} `{cmd}` failed ({status}) and printed nothing — add `set -x` or \
+             `trap 'echo \"failed at line $LINENO: $BASH_COMMAND\" >&2' ERR` to the script \
+             to see where it stops."
+        )
+    } else {
+        format!("{what} `{cmd}` failed ({status}):\n{tail}")
+    }
 }
 
 /// Best-effort removal of a worktree's preview-info file once the app it
@@ -990,6 +1067,31 @@ pub(super) fn reap_all_blocking(_leaders: &[u32]) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_failure_quotes_the_output_tail() {
+        let msg = script_failure(
+            "Preview setup",
+            "bash scripts/setup-worktree.sh",
+            "exit status: 1",
+            "step one\ndb: connection refused",
+        );
+        assert_eq!(
+            msg,
+            "Preview setup `bash scripts/setup-worktree.sh` failed (exit status: 1):\n\
+             step one\ndb: connection refused"
+        );
+    }
+
+    #[test]
+    fn script_failure_without_output_suggests_tracing() {
+        let msg = script_failure("Preview setup", "exit 1", "exit status: 1", "");
+        assert!(
+            msg.starts_with("Preview setup `exit 1` failed (exit status: 1) and printed nothing")
+        );
+        assert!(msg.contains("set -x"), "{msg}");
+        assert!(msg.contains("ERR"), "{msg}");
+    }
 
     #[test]
     fn urls_add_offset_to_each_port() {

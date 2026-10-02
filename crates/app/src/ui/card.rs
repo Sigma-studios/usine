@@ -13,8 +13,11 @@ use crate::state::AppState;
 enum PreviewTools {
     /// Not eligible: no committed worktree yet, or no run command configured.
     Hidden,
-    /// Stopped, never started, or failed — offer to launch it.
+    /// Stopped or never started — offer to launch it.
     Idle,
+    /// The last start failed (or the app crashed) — offer a retry, flagged red
+    /// with the reason in its tooltip.
+    Failed { reason: String },
     /// Running the setup script; nothing to click yet.
     Starting,
     /// Up — offer to open it (if it reported a URL) and to stop it.
@@ -203,7 +206,8 @@ pub fn CardView(card: Card) -> Element {
             Some((PreviewStatus::Running, urls)) => PreviewTools::Running {
                 url: urls.first().map(|u| u.url.clone()),
             },
-            // Stopped, failed, or never started: all offer the same next step.
+            Some((PreviewStatus::Failed(reason), _)) => PreviewTools::Failed { reason },
+            // Stopped or never started.
             _ => PreviewTools::Idle,
         }
     } else {
@@ -626,6 +630,18 @@ fn PreviewControls(card_id: Uuid, tools: PreviewTools) -> Element {
                 class: "card-icon-btn",
                 title: "Run app",
                 "aria-label": "Run app",
+                onclick: move |e| {
+                    e.stop_propagation();
+                    state.send(ExecutorCommand::StartPreview { card_id });
+                },
+                IconPlay {}
+            }
+        },
+        PreviewTools::Failed { reason } => rsx! {
+            button {
+                class: "card-icon-btn is-failed",
+                title: "App failed to start — click to retry\n\n{reason}",
+                "aria-label": "App failed to start — retry",
                 onclick: move |e| {
                     e.stop_propagation();
                     state.send(ExecutorCommand::StartPreview { card_id });
