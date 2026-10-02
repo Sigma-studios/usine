@@ -781,6 +781,18 @@ impl Executor {
         readers
     }
 
+    /// A new write run starts with a clean preview slate: a `Failed` left by an
+    /// earlier attempt would otherwise keep showing (red retry, stale reason)
+    /// on the card once this run parks, even if no preview ran this time.
+    /// No-op while a preview is claimed — it owns the status. The lock is held
+    /// across the send so a racing claim's `SettingUp` can't be overtaken.
+    pub(super) fn clear_stale_preview_status(&self, card_id: Uuid) {
+        let map = lock(&self.previews);
+        if !map.contains_key(&card_id) {
+            self.emit_preview(card_id, PreviewStatus::Stopped, Vec::new());
+        }
+    }
+
     fn emit_preview(&self, card_id: Uuid, status: PreviewStatus, urls: Vec<PreviewUrl>) {
         let _ = self
             .evt_tx

@@ -35,7 +35,18 @@ impl OutputTail {
         Arc::new(Mutex::new(Self::new(max_lines, max_bytes)))
     }
 
-    pub(super) fn push(&mut self, line: String) {
+    pub(super) fn push(&mut self, mut line: String) {
+        // A single line over the byte cap (a one-line JSON log with a stack, a
+        // minified-bundle error) would otherwise evict itself along with
+        // everything else — keep its end instead, it's usually the error.
+        if line.len() + 1 > self.max_bytes {
+            let mut start = line.len() + 1 - self.max_bytes;
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            line.drain(..start);
+            self.truncated = true;
+        }
         self.bytes += line.len() + 1;
         self.lines.push_back(line);
         while self.lines.len() > self.max_lines || self.bytes > self.max_bytes {
@@ -115,6 +126,16 @@ mod tests {
         assert_eq!(tail.render(), "aaaa\nbbbb");
         tail.push("cc".into()); // 13 → drop "aaaa"
         assert_eq!(tail.render(), "…(output truncated)\nbbbb\ncc");
+    }
+
+    #[test]
+    fn oversized_line_keeps_its_end() {
+        let mut tail = OutputTail::new(100, 8);
+        tail.push("old".into());
+        tail.push("xxxxxxxxxxé-error".into());
+        assert_eq!(tail.render(), "…(output truncated)\n-error");
+        tail.push("ok".into());
+        assert_eq!(tail.render(), "…(output truncated)\nok");
     }
 
     #[test]

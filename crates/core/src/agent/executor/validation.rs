@@ -23,7 +23,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use super::actor::reap_idle_preview_direct;
-use super::output::{spawn_capture_reader, OutputTail, SharedTail};
+use super::output::{drain, spawn_capture_reader, OutputTail, SharedTail};
 use super::preview::kill_group;
 use super::*;
 use crate::domain::config::ProjectConfig;
@@ -357,10 +357,10 @@ async fn run_step(
             }
         }
     };
-    // Let the readers drain what the child wrote before we snapshot the tail.
-    for r in readers {
-        let _ = r.await;
-    }
+    // Let the readers drain what the child wrote before we snapshot the tail
+    // (bounded: the setup script may leave a background process holding the
+    // pipes open).
+    drain(readers).await;
     match status {
         Ok(s) if s.success() => StepOutcome::Passed,
         Ok(s) => {

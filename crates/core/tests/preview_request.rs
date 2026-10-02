@@ -72,7 +72,8 @@ fn executor(store: &Store) -> (usine_core::ExecutorHandle, UnboundedReceiver<Exe
 }
 
 /// With `auto_preview` off and no sentinel, a full write run comes and goes
-/// without a single preview event: nothing launches eagerly.
+/// without launching a preview: the only preview event allowed is the
+/// run-start `Stopped` that clears a previous attempt's stale failure.
 #[tokio::test]
 async fn toggle_off_launches_no_preview() {
     let wt = tempfile::tempdir().unwrap();
@@ -92,7 +93,9 @@ async fn toggle_off_launches_no_preview() {
     // any preview activity in between is a failure.
     let mut saw_running = false;
     wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::PreviewUpdated { status, .. } if e.card_id == card_id => {
+        ExecutorEventKind::PreviewUpdated { status, .. }
+            if e.card_id == card_id && *status != PreviewStatus::Stopped =>
+        {
             panic!("no preview should ever start with auto_preview off, got {status:?}");
         }
         ExecutorEventKind::CardUpdated(c) if c.id == card_id => {
