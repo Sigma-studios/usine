@@ -20,10 +20,10 @@
 
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
 use super::actor::reap_idle_preview_direct;
+use super::output::{spawn_capture_reader, OutputTail, SharedTail};
 use super::preview::kill_group;
 use super::*;
 use crate::domain::config::ProjectConfig;
@@ -255,62 +255,6 @@ fn fix_validation_direct(
     });
 }
 
-/// A bounded tail of the check's output: the last [`MAX_TAIL_LINES`] lines
-/// capped at [`MAX_TAIL_BYTES`], with a truncation marker once anything fell
-/// off. What the fix prompt and the parked panel show.
-#[derive(Default)]
-struct OutputTail {
-    lines: std::collections::VecDeque<String>,
-    bytes: usize,
-    truncated: bool,
-}
-
-impl OutputTail {
-    fn push(&mut self, line: String) {
-        self.bytes += line.len() + 1;
-        self.lines.push_back(line);
-        while self.lines.len() > MAX_TAIL_LINES || self.bytes > MAX_TAIL_BYTES {
-            if let Some(dropped) = self.lines.pop_front() {
-                self.bytes -= dropped.len() + 1;
-                self.truncated = true;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn render(&self) -> String {
-        let mut out = String::new();
-        if self.truncated {
-            out.push_str("…(output truncated)\n");
-        }
-        for line in &self.lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.trim_end().to_string()
-    }
-}
-
-type SharedTail = Arc<Mutex<OutputTail>>;
-
-/// Forward a child stream's lines to the UI transcript live (not persisted —
-/// the preview precedent) while also collecting the bounded tail.
-fn spawn_capture_reader<S: AsyncRead + Unpin + Send + 'static>(
-    evt_tx: UnboundedSender<ExecutorEvent>,
-    card_id: Uuid,
-    stream: S,
-    tail: SharedTail,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stream).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            lock(&tail).push(line.clone());
-            let _ = evt_tx.unbounded_send(ExecutorEvent::transcript(card_id, now_millis(), line));
-        }
-    })
-}
-
 /// How one supervised step of the gate ended. Setup and the check run exactly
 /// the same way, so they share this; what differs is how a failure is routed —
 /// see `validation_actor`.
@@ -367,7 +311,7 @@ async fn run_step(
         lock(validations).insert(card_id, pid);
     }
 
-    let tail: SharedTail = Arc::new(Mutex::new(OutputTail::default()));
+    let tail: SharedTail = OutputTail::shared(MAX_TAIL_LINES, MAX_TAIL_BYTES);
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         readers.push(spawn_capture_reader(

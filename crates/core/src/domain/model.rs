@@ -724,7 +724,9 @@ pub enum PreviewStatus {
     Running,
     /// Not running (never started, or stopped by the user / because it exited).
     Stopped,
-    /// Setup or launch failed; carries the reason for a toast.
+    /// Setup or launch failed, or the app exited non-zero. Carries the reason
+    /// (command, exit status, output tail) for the toast and the card's retry
+    /// button tooltip.
     Failed(String),
 }
 
