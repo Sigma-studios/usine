@@ -15,7 +15,7 @@ default = ["mcp"]
 mcp = ["tokio/net"]
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 directories.workspace = true
 futures.workspace = true
 git2 = "0.21.0"
@@ -48,7 +48,7 @@ uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 # Tests implement `AgentProvider` (an async-trait trait) to simulate failures.
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 tempfile = "3.27.0"
 # The Azure DevOps forge's tests serve a fake Azure over a local socket, with
 # or without the `mcp` feature's `tokio/net`.

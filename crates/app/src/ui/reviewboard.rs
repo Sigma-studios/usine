@@ -99,6 +99,10 @@ enum PreviewTools {
     /// The project has no run command configured, or the PR is already published.
     Hidden,
     Idle,
+    /// The last start failed; the reason goes in the retry button's tooltip.
+    Failed {
+        reason: String,
+    },
     Starting,
     Running {
         url: Option<String>,
@@ -159,6 +163,7 @@ fn ReviewTaskCard(task: ReviewTask) -> Element {
             Some((PreviewStatus::Running, urls)) => PreviewTools::Running {
                 url: urls.first().map(|u| u.url.clone()),
             },
+            Some((PreviewStatus::Failed(reason), _)) => PreviewTools::Failed { reason },
             _ => PreviewTools::Idle,
         }
     } else {
@@ -392,6 +397,18 @@ fn ReviewPreviewControls(review_id: Uuid, tools: PreviewTools) -> Element {
                 class: "card-icon-btn",
                 title: "Run this PR",
                 "aria-label": "Run this PR",
+                onclick: move |e| {
+                    e.stop_propagation();
+                    state.start_review_preview(review_id);
+                },
+                IconPlay {}
+            }
+        },
+        PreviewTools::Failed { reason } => rsx! {
+            button {
+                class: "card-icon-btn is-failed",
+                title: "App failed to start — click to retry\n\n{reason}",
+                "aria-label": "App failed to start — retry",
                 onclick: move |e| {
                     e.stop_propagation();
                     state.start_review_preview(review_id);

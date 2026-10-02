@@ -377,6 +377,9 @@ select option { background: var(--panel-2); color: var(--text); }
 .card-icon-btn:hover { color: var(--text); opacity: 1; background: var(--surface-hover); }
 /* The starting spinner is a status, not a target. */
 .card-icon-btn.is-busy { cursor: default; opacity: 1; }
+/* The last preview start failed: the retry stays a Play button, in red. */
+.card-icon-btn.is-failed { color: var(--red); opacity: 1; }
+.card-icon-btn.is-failed:hover { color: var(--red); background: var(--red-wash); }
 .card-icon-btn.is-busy:hover { background: transparent; }
 .btn {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -897,7 +900,7 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 }
 .toast .toast-msg {
   flex: 1; font-size: 13px;
-  min-width: 0; overflow-wrap: anywhere;
+  min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap;
   max-height: 40vh; overflow-y: auto;
 }
 .toast .toast-close { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 16px; }
