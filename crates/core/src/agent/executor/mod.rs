@@ -489,9 +489,11 @@ impl Executor {
             ExecutorCommand::FollowUpInvestigation { card_id, feedback } => {
                 self.follow_up_investigation(card_id, feedback).await
             }
-            ExecutorCommand::ConvertToImplementation { card_id } => {
-                self.convert_to_implementation(card_id).await
-            }
+            ExecutorCommand::ConvertToImplementation {
+                card_id,
+                answers,
+                note,
+            } => self.convert_to_implementation(card_id, answers, note).await,
             ExecutorCommand::ListReviewers { project_id } => self.list_reviewers(project_id).await,
             ExecutorCommand::ListPrAuthors { project_id } => self.list_pr_authors(project_id).await,
             ExecutorCommand::ListAdoptSources { project_id } => {
@@ -964,6 +966,38 @@ fn fold_qa(description: &str, qa_log: &[String]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The Q&A-log entry for answers given to an investigation's questions at
+/// conversion time — `None` when every answer is blank, so an untouched
+/// question list adds nothing. Paired by index like the panel's follow-up
+/// send-back, but phrased for an implementation rather than a re-plan. Answers
+/// past the end of `questions` (a draft outliving its question list) are kept
+/// as unpaired lines rather than dropped.
+fn conversion_answers(
+    questions: &[crate::agent::plan::PlanQuestion],
+    answers: &[String],
+) -> Option<String> {
+    let answer = |i: usize| answers.get(i).map_or("", |a| a.trim());
+    let extra: Vec<&str> = (questions.len()..answers.len())
+        .map(answer)
+        .filter(|a| !a.is_empty())
+        .collect();
+    if extra.is_empty() && (0..questions.len()).all(|i| answer(i).is_empty()) {
+        return None;
+    }
+    let mut s = String::from("Answers to the investigation's questions:\n");
+    for (i, q) in questions.iter().enumerate() {
+        let a = match answer(i) {
+            "" => "(no answer — use your judgement)",
+            a => a,
+        };
+        s.push_str(&format!("{}. {} → {}\n", i + 1, q.question, a));
+    }
+    for a in extra {
+        s.push_str(&format!("- {a}\n"));
+    }
+    Some(s)
 }
 
 /// Fold an investigation's conclusion into the task description when the card
@@ -2580,6 +2614,38 @@ mod tests {
         assert!(d.starts_with("Audit the cache."));
         assert!(d.contains("## Findings (from investigation)"));
         assert!(d.contains("src/cache.rs:42"));
+    }
+
+    #[test]
+    fn conversion_answers_pairs_questions_and_skips_all_blank() {
+        use crate::agent::plan::PlanQuestion;
+        let qs = [
+            PlanQuestion {
+                question: "Bound by size or TTL?".into(),
+                options: vec![],
+            },
+            PlanQuestion {
+                question: "Expose a metric?".into(),
+                options: vec![],
+            },
+        ];
+        assert_eq!(conversion_answers(&qs, &[]), None);
+        assert_eq!(conversion_answers(&qs, &[" ".into(), String::new()]), None);
+        let s = conversion_answers(&qs, &["  LRU, 10k entries ".into(), String::new()]).unwrap();
+        assert!(s.contains("1. Bound by size or TTL? → LRU, 10k entries\n"));
+        assert!(s.contains("2. Expose a metric? → (no answer — use your judgement)"));
+        assert!(s.find("1. ").unwrap() < s.find("2. ").unwrap());
+
+        // Answers past the question list are kept, never a bare heading.
+        assert_eq!(conversion_answers(&[], &[" ".into()]), None);
+        let s = conversion_answers(&[], &["keep it simple".into()]).unwrap();
+        assert_eq!(
+            s,
+            "Answers to the investigation's questions:\n- keep it simple\n"
+        );
+        let s = conversion_answers(&qs, &["LRU".into(), String::new(), "also log".into()]).unwrap();
+        assert!(s.contains("1. Bound by size or TTL? → LRU\n"));
+        assert!(s.ends_with("- also log\n"));
     }
 
     /// A plan run whose final result is too short to be a plan and carries no
