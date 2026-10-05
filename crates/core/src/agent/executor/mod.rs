@@ -2451,7 +2451,10 @@ mod tests {
         // Answers past the question list are kept, never a bare heading.
         assert_eq!(conversion_answers(&[], &[" ".into()]), None);
         let s = conversion_answers(&[], &["keep it simple".into()]).unwrap();
-        assert_eq!(s, "Answers to the investigation's questions:\n- keep it simple\n");
+        assert_eq!(
+            s,
+            "Answers to the investigation's questions:\n- keep it simple\n"
+        );
         let s = conversion_answers(&qs, &["LRU".into(), String::new(), "also log".into()]).unwrap();
         assert!(s.contains("1. Bound by size or TTL? → LRU\n"));
         assert!(s.ends_with("- also log\n"));
