@@ -796,6 +796,27 @@ impl AppState {
         (waiting, urgent)
     }
 
+    /// Whether any of a project's cards or PR reviews has work in flight — the
+    /// same definition as the quit guard's `active_work`. Previews are left out
+    /// on purpose: they are long-lived servers and would keep the sidebar dot
+    /// spinning forever. Reads, so the sidebar re-renders as runs come and go.
+    pub fn project_is_working(&self, project_id: Uuid) -> bool {
+        let busy = self.busy.read();
+        let queued: HashSet<Uuid> = self.run_queue.read().iter().map(|t| t.id()).collect();
+        let card_working = self
+            .cards
+            .read()
+            .iter()
+            .filter(|c| c.project_id == project_id)
+            .any(|c| is_active(c.id, c.state.is_running(), &busy, &queued));
+        card_working
+            || self.review_tasks.read().get(&project_id).is_some_and(|tasks| {
+                tasks
+                    .iter()
+                    .any(|t| is_active(t.id, t.status.is_running(), &busy, &queued))
+            })
+    }
+
     /// Total review tasks needing attention across unmuted projects (dock badge).
     /// Only called from the macOS-only dock badge effect, so it's dead code on
     /// other platforms.
@@ -1426,9 +1447,15 @@ fn active_titles(
 ) -> Vec<String> {
     items
         .into_iter()
-        .filter(|(id, running, _)| *running || busy.contains(id) || queued.contains(id))
+        .filter(|(id, running, _)| is_active(*id, *running, busy, queued))
         .map(|(_, _, title)| title)
         .collect()
+}
+
+/// Whether an item counts as work in flight: its own run, a command mid
+/// git/forge step (`busy`), or a launch waiting for a slot.
+fn is_active(id: Uuid, running: bool, busy: &HashSet<Uuid>, queued: &HashSet<Uuid>) -> bool {
+    running || busy.contains(&id) || queued.contains(&id)
 }
 
 #[cfg(test)]

@@ -63,28 +63,29 @@ pub fn Sidebar() -> Element {
                         };
                         let path = project.path.display().to_string();
                         // A muted project raises no attention signals: zeroing
-                        // the counts leaves an idle dot, no count and no eye badge.
+                        // the counts leaves no red/blue dot, no count and no eye
+                        // badge. Work in flight isn't a notification, so a muted
+                        // project still spins.
                         let (review_count, (attention_count, urgent_count)) = if muted {
                             (0, (0, 0))
                         } else {
                             (state.project_review_count(pid), state.project_attention_counts(pid))
                         };
-                        // Three-state health dot: red = failed / agent question,
-                        // accent = waiting on you, dim = idle.
-                        let dot_class = if urgent_count > 0 {
-                            "proj-dot urgent"
-                        } else if attention_count > 0 {
-                            "proj-dot"
-                        } else {
-                            "proj-dot idle"
-                        };
+                        let working = state.project_is_working(pid);
+                        let dot_class = dot_class(attention_count, urgent_count, working);
                         rsx! {
                             div {
                                 key: "{pid}",
                                 class: "{class}",
                                 title: "{path}",
                                 onclick: move |_| state.select_view(SelectedView::Project(pid)),
-                                span { class: "{dot_class}" }
+                                // No empty title on the other states: it would mask
+                                // the row's path tooltip.
+                                if dot_class == DOT_WORKING {
+                                    span { class: "{dot_class}", title: "Agents working" }
+                                } else {
+                                    span { class: "{dot_class}" }
+                                }
                                 span { class: "proj-name", "{name}" }
                                 // Indicator only: a click falls through to the row.
                                 if muted {
@@ -215,5 +216,47 @@ pub fn Sidebar() -> Element {
             }
             PanelResizer { panel: Panel::Sidebar }
         }
+    }
+}
+
+const DOT_WORKING: &str = "proj-dot working";
+
+/// Four-state health dot, most pressing first: red = failed / agent question,
+/// accent = waiting on you, spinner = agents working (never while anything
+/// awaits you), dim = idle.
+fn dot_class(attention: usize, urgent: usize, working: bool) -> &'static str {
+    if urgent > 0 {
+        "proj-dot urgent"
+    } else if attention > 0 {
+        "proj-dot"
+    } else if working {
+        DOT_WORKING
+    } else {
+        "proj-dot idle"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urgent_beats_everything() {
+        assert_eq!(dot_class(2, 1, true), "proj-dot urgent");
+    }
+
+    #[test]
+    fn waiting_beats_working() {
+        assert_eq!(dot_class(1, 0, true), "proj-dot");
+    }
+
+    #[test]
+    fn working_beats_idle() {
+        assert_eq!(dot_class(0, 0, true), DOT_WORKING);
+    }
+
+    #[test]
+    fn nothing_is_idle() {
+        assert_eq!(dot_class(0, 0, false), "proj-dot idle");
     }
 }
