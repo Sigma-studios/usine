@@ -271,7 +271,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
         // 2) Ready to open the pull request.
         if is_ready_for_pr {
-            div { class: "section",
+            div { class: "section", "data-submit-scope": "1",
                 h3 { "Create pull request" }
                 // The self-review / validation fix checklist. It is written on
                 // the way here, and this is where the user decides to ship — the
@@ -351,6 +351,8 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 div { class: "row",
                     button {
                         class: "btn primary",
+                        "data-submit": "1",
+                        title: format!("Create PR ({})", crate::ui::shortcuts::submit_hint()),
                         disabled: !branch_ready,
                         onclick: {
                             let branch = clean_branch.clone();

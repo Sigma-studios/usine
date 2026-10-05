@@ -513,6 +513,8 @@ select option { background: var(--panel-2); color: var(--text); }
    the board buttons, without collapsing the gaps `.detail-body` gives them. */
 .section-group { display: flex; flex-direction: column; gap: 16px; }
 .section { display: flex; flex-direction: column; gap: 6px; }
+/* ⌘↩ scope spanning sibling sections (detail/mod.rs): no box of its own. */
+.submit-scope { display: contents; }
 .section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 .checkbox-row {
   display: flex; align-items: center; gap: 8px;

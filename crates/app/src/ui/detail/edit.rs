@@ -445,6 +445,10 @@ pub(super) fn ConfigForm(card: Card) -> Element {
             }
             button {
                 class: "btn primary",
+                // ⌘↩ from the description (a separate section) reaches this
+                // through the `submit-scope` wrapper in `detail/mod.rs`.
+                "data-submit": "1",
+                title: format!("{start_label} ({})", crate::ui::shortcuts::submit_hint()),
                 onclick: move |_| state.send(ExecutorCommand::Start { card_id: id }),
                 "{start_label}"
             }

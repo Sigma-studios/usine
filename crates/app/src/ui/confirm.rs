@@ -105,6 +105,9 @@ pub fn ConfirmHost() -> Element {
         div { class: "modal-overlay confirm-overlay", onclick: move |_| dismiss(),
             div {
                 class: "modal",
+                // ⌘↩ confirms (see `shortcuts.rs`) — but never a dangerous
+                // action: Delete card / Delete project still take a click.
+                "data-submit-scope": (!req.danger).then_some("1"),
                 "role": "dialog",
                 "aria-modal": "true",
                 tabindex: "-1",
@@ -164,6 +167,8 @@ pub fn ConfirmHost() -> Element {
                     button { class: "btn", onclick: move |_| dismiss(), "Cancel" }
                     button {
                         class: "{confirm_class}",
+                        "data-submit": "1",
+                        title: if req.danger { None } else { Some(format!("{} ({})", req.confirm_label, super::shortcuts::submit_hint())) },
                         onclick: move |_| {
                             match action.clone() {
                                 ConfirmAction::Send(cmd) => state.send(cmd),
