@@ -77,7 +77,14 @@ impl Executor {
     /// cost is kept (the investigation was real spend on this card's life), and
     /// the conclusion is folded into the description under a marked findings
     /// section (plain text afterward, so the user can trim it in the editor).
-    pub(super) async fn convert_to_implementation(&self, card_id: Uuid) -> Result<()> {
+    /// Answers typed against the conclusion's questions and an unsent note ride
+    /// along in the folded Q&A context, after the earlier follow-up rounds.
+    pub(super) async fn convert_to_implementation(
+        &self,
+        card_id: Uuid,
+        answers: Vec<String>,
+        note: String,
+    ) -> Result<()> {
         let mut converted = false;
         let updated = self.store.mutate_card(card_id, |c| {
             // Tolerate a double-click race: only a concluded card converts.
@@ -88,10 +95,16 @@ impl Executor {
                 &c.description,
                 &crate::agent::investigate::conclusion_prose(&conclusion),
             );
-            if !c.qa_log.is_empty() {
-                c.description = fold_qa(&c.description, &c.qa_log);
-                c.qa_log.clear();
+            let mut qa = c.qa_log.clone();
+            let (_, questions) = crate::agent::plan::parse_questions(&conclusion);
+            qa.extend(conversion_answers(&questions, &answers));
+            if !note.trim().is_empty() {
+                qa.push(format!("Note: {}", note.trim()));
             }
+            if !qa.is_empty() {
+                c.description = fold_qa(&c.description, &qa);
+            }
+            c.qa_log.clear();
             c.config.kind = CardKind::Task;
             c.state = transition(&c.state, Transition::ResetToStart)?;
             // The next run is a fresh conversation with the findings in-prompt.

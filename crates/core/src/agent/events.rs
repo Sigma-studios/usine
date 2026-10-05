@@ -179,7 +179,14 @@ pub enum ExecutorCommand {
     /// the kind to Task, and reset to the starting block so the user shapes the
     /// implementation prompt from there. Cost is kept (the investigation was
     /// real spend on this card); the session is cleared so the next run is fresh.
-    ConvertToImplementation { card_id: Uuid },
+    /// `answers` are the user's replies to the conclusion's questions (by index,
+    /// blanks allowed) and `note` any unsent "dig deeper" text — both folded into
+    /// the description so nothing typed on the panel is lost by converting.
+    ConvertToImplementation {
+        card_id: Uuid,
+        answers: Vec<String>,
+        note: String,
+    },
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
     ListReviewers { project_id: Uuid },
@@ -458,7 +465,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ReviseImplementation { card_id, .. }
             | ExecutorCommand::AskQuestion { card_id, .. }
             | ExecutorCommand::FollowUpInvestigation { card_id, .. }
-            | ExecutorCommand::ConvertToImplementation { card_id }
+            | ExecutorCommand::ConvertToImplementation { card_id, .. }
             | ExecutorCommand::Merge { card_id, .. }
             | ExecutorCommand::ResolveConflicts { card_id }
             | ExecutorCommand::FixChecks { card_id }

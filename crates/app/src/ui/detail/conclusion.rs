@@ -53,7 +53,7 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
             div { class: "section",
                 h3 { "Questions" }
                 div { class: "hint",
-                    "Answering these sends a follow-up round with your answers as context."
+                    "Answer these, then investigate further or turn this into an implementation; your answers go along either way."
                 }
                 super::plan::QuestionList { questions: questions.clone(), answers }
             }
@@ -106,8 +106,16 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
             h3 { "Turn into implementation" }
             button {
                 class: "btn primary",
-                title: "Continues this card as an implementation: the findings are folded into the task description and the card returns to the starting block, where you shape the prompt before starting",
-                onclick: move |_| state.send(ExecutorCommand::ConvertToImplementation { card_id }),
+                title: "Continues this card as an implementation: the findings, your answers to its questions and any unsent dig-deeper note are folded into the task description, and the card returns to the starting block, where you shape the prompt before starting",
+                onclick: move |_| {
+                    // Whatever is typed on the panel goes along — the core pairs
+                    // the answers with the conclusion's questions.
+                    let cur: Vec<String> = answers.read().clone();
+                    let note = follow_up.read().trim().to_string();
+                    state.send(ExecutorCommand::ConvertToImplementation { card_id, answers: cur, note });
+                    drafts::clear(card_id, "investigate.followup", follow_up, String::new());
+                    drafts::clear(card_id, "investigate.answers", answers, vec![String::new(); n]);
+                },
                 "Turn into implementation"
             }
         }
