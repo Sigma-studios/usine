@@ -204,15 +204,32 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
 
     // Convert → same card, back in the starting block as a Task, findings in
     // the description, follow-up folded as context, cost kept, session cleared.
-    exec.send(ExecutorCommand::ConvertToImplementation { card_id });
+    // The answers typed against the conclusion's question and the unsent
+    // "dig deeper" note ride along too — converting must not drop them.
+    exec.send(ExecutorCommand::ConvertToImplementation {
+        card_id,
+        answers: vec!["LRU capped at 10k entries".into()],
+        note: "Keep the public API unchanged.".into(),
+    });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::StartingBlock)).await;
     assert_eq!(card.config.kind, CardKind::Task);
     assert!(card
         .description
         .contains("## Findings (from investigation)"));
-    assert!(card
-        .description
-        .contains("How big does it get under real traffic?"));
+    let d = &card.description;
+    let followup = d
+        .find("How big does it get under real traffic?")
+        .expect("follow-up folded");
+    let answer = d
+        .find("1. How should the cache be bounded? → LRU capped at 10k entries")
+        .expect("answer folded, paired with its question");
+    let note = d
+        .find("Note: Keep the public API unchanged.")
+        .expect("note folded");
+    assert!(
+        followup < answer && answer < note,
+        "earlier rounds first, then the conversion's answers and note"
+    );
     assert!(card.qa_log.is_empty(), "the folded Q&A log is cleared");
     assert!(
         !card.cost.is_zero(),
@@ -229,7 +246,11 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     wait_released(&mut rx).await;
 
     // Converting a card that isn't concluded is a silent no-op (double-click).
-    exec.send(ExecutorCommand::ConvertToImplementation { card_id });
+    exec.send(ExecutorCommand::ConvertToImplementation {
+        card_id,
+        answers: vec![],
+        note: String::new(),
+    });
     wait_released(&mut rx).await;
     // Prove it did nothing by driving the next lifecycle step successfully:
     // the card is a Task now, so Start enters the design phase.
