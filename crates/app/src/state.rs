@@ -1050,6 +1050,17 @@ impl AppState {
             .unwrap_or_else(|| "—".into())
     }
 
+    /// The branch a project's cards fork from and merge into — what "Update
+    /// from <base>" names. `main` for an unknown project.
+    pub fn base_branch_of(&self, project_id: Uuid) -> String {
+        self.projects
+            .read()
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.config.effective_base_branch().to_string())
+            .unwrap_or_else(|| "main".into())
+    }
+
     /// The code host a project's PRs live on — what every "on GitHub" /
     /// "on Azure DevOps" in the UI names. GitHub for an unknown project.
     pub fn forge_of(&self, project_id: Uuid) -> ForgeKind {

@@ -377,6 +377,19 @@ pub enum MergeOutcome {
     Conflicted(Vec<String>),
 }
 
+/// What landed on an upstream ref that the checked-out branch doesn't have
+/// yet — the context an update-from-base agent works from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamChanges {
+    /// Subjects of the upstream commits not in HEAD, newest first.
+    pub subjects: Vec<String>,
+    /// Paths those commits changed (fork point → upstream tip), sorted.
+    pub files: Vec<String>,
+    /// The subset of `files` the branch's own commits (fork point → HEAD)
+    /// also touch.
+    pub overlap: Vec<String>,
+}
+
 // --- mutation trait (real + simulated) -------------------------------------
 
 #[async_trait]
@@ -509,6 +522,21 @@ pub trait GitOps: Send + Sync {
     /// missing: callers use this to decide whether to *invalidate* a known-good
     /// state, and guessing "yes" there costs more than guessing "no".
     async fn branch_ahead_of_remote(&self, _dir: &Path, _branch: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// What `upstream` holds that `dir`'s HEAD doesn't (see
+    /// [`UpstreamChanges`]). Backends that don't model history report nothing
+    /// — which callers read as "already up to date".
+    async fn upstream_changes(&self, _dir: &Path, _upstream: &str) -> Result<UpstreamChanges> {
+        Ok(UpstreamChanges::default())
+    }
+    /// Hard-reset `dir` to `to` (and clean untracked files) — only if that
+    /// drops nothing anyone else can see: `to` must be HEAD or an ancestor of
+    /// it, and the remote-tracking `origin/<branch>` must be absent or an
+    /// ancestor of `to`. Returns whether it rewound. Never touches the remote.
+    /// Backends that don't model history never rewind, so callers fall back to
+    /// [`Self::discard_changes`].
+    async fn rewind_unpublished(&self, _dir: &Path, _branch: &str, _to: &str) -> Result<bool> {
         Ok(false)
     }
 }
@@ -796,6 +824,20 @@ impl GitOps for RealGit {
             .trim()
             .to_string())
     }
+
+    async fn upstream_changes(&self, dir: &Path, upstream: &str) -> Result<UpstreamChanges> {
+        upstream_changes(dir, upstream)
+    }
+
+    async fn rewind_unpublished(&self, dir: &Path, branch: &str, to: &str) -> Result<bool> {
+        if !can_rewind_unpublished(dir, branch, to)? {
+            return Ok(false);
+        }
+        // `reset --hard` also ends a merge in progress (drops MERGE_HEAD).
+        run_git(dir, &["reset".into(), "--hard".into(), to.into()]).await?;
+        run_git(dir, &["clean".into(), "-fd".into()]).await?;
+        Ok(true)
+    }
 }
 
 /// No-op git for Phase A so the board flows without a real repo.
@@ -974,9 +1016,15 @@ pub fn log_subjects(repo: &Path, base: &str, head: &str) -> Result<Vec<String>> 
     let base_oid = resolve_oid(&r, base)?;
     let head_oid = resolve_oid(&r, head)?;
     let fork = r.merge_base(base_oid, head_oid)?;
+    walk_subjects(&r, head_oid, fork)
+}
+
+/// The subjects of the commits reachable from `push` but not from `hide`,
+/// newest first.
+fn walk_subjects(r: &git2::Repository, push: git2::Oid, hide: git2::Oid) -> Result<Vec<String>> {
     let mut walk = r.revwalk()?;
-    walk.push(head_oid)?;
-    walk.hide(fork)?;
+    walk.push(push)?;
+    walk.hide(hide)?;
     let mut subjects = Vec::new();
     for oid in walk {
         let commit = r.find_commit(oid?)?;
@@ -990,6 +1038,65 @@ pub fn log_subjects(repo: &Path, base: &str, head: &str) -> Result<Vec<String>> 
         );
     }
     Ok(subjects)
+}
+
+/// What `upstream` holds that `repo`'s HEAD doesn't — see [`UpstreamChanges`].
+/// The subjects hide HEAD itself rather than the fork point, so an earlier
+/// merge of the same base doesn't re-list what already came in; the files are
+/// diffed from the fork point, which after such a merge is that merge's base
+/// tip.
+pub fn upstream_changes(repo: &Path, upstream: &str) -> Result<UpstreamChanges> {
+    let r = git2::Repository::open(repo)?;
+    let up = resolve_oid(&r, upstream)?;
+    let head = r.head()?.peel_to_commit()?.id();
+    let subjects = walk_subjects(&r, up, head)?;
+    if subjects.is_empty() {
+        return Ok(UpstreamChanges::default());
+    }
+    let fork = r.merge_base(up, head)?;
+    let tree = |oid: git2::Oid| r.find_commit(oid).and_then(|c| c.tree());
+    let fork_tree = tree(fork)?;
+    let paths = |to: git2::Oid| -> Result<std::collections::BTreeSet<String>> {
+        let diff = r.diff_tree_to_tree(Some(&fork_tree), Some(&tree(to)?), None)?;
+        let mut out = std::collections::BTreeSet::new();
+        for delta in diff.deltas() {
+            for f in [delta.old_file(), delta.new_file()] {
+                if let Some(p) = f.path() {
+                    out.insert(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+        Ok(out)
+    };
+    let files = paths(up)?;
+    let ours = paths(head)?;
+    Ok(UpstreamChanges {
+        subjects,
+        overlap: files.intersection(&ours).cloned().collect(),
+        files: files.into_iter().collect(),
+    })
+}
+
+/// Whether hard-resetting `repo`'s HEAD to `to` would drop only unpublished
+/// history — see [`GitOps::rewind_unpublished`].
+fn can_rewind_unpublished(repo: &Path, branch: &str, to: &str) -> Result<bool> {
+    let r = git2::Repository::open(repo)?;
+    let head = r.head()?.peel_to_commit()?.id();
+    let to = r.revparse_single(to)?.peel_to_commit()?.id();
+    let within = |tip: git2::Oid, anc: git2::Oid| -> Result<bool> {
+        Ok(tip == anc || r.graph_descendant_of(tip, anc)?)
+    };
+    if !within(head, to)? {
+        return Ok(false);
+    }
+    let published = match r.revparse_single(&format!("refs/remotes/origin/{branch}")) {
+        Ok(obj) => Some(obj.peel_to_commit()?.id()),
+        Err(_) => None,
+    };
+    match published {
+        Some(tip) => within(to, tip),
+        None => Ok(true),
+    }
 }
 
 /// The working tree that has local `branch` checked out — the main checkout or
@@ -1186,6 +1293,106 @@ mod tests {
             branch_relation(repo, "behind", "ahead"),
             Some(Relation::Same)
         );
+    }
+
+    /// A scratch repo with `main` and a `feature` branch forked from it, plus a
+    /// `git` runner returning stdout.
+    fn fork_fixture() -> (tempfile::TempDir, impl Fn(&[&str]) -> String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let git = move |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.dev"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        let write = |dir: &Path, f: &str, body: &str| std::fs::write(dir.join(f), body).unwrap();
+        write(tmp.path(), "shared.rs", "a\n");
+        write(tmp.path(), "other.rs", "o\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        write(tmp.path(), "shared.rs", "a\nmine\n");
+        git(&["commit", "-q", "-am", "card work"]);
+        git(&["checkout", "-q", "main"]);
+        write(tmp.path(), "other.rs", "o\nup\n");
+        git(&["commit", "-q", "-am", "other"]);
+        write(tmp.path(), "shared.rs", "up\na\n");
+        git(&["commit", "-q", "-am", "rename helper"]);
+        git(&["checkout", "-q", "feature"]);
+        (tmp, git)
+    }
+
+    #[test]
+    fn upstream_changes_lists_subjects_files_and_overlap() {
+        let (tmp, git) = fork_fixture();
+        let up = upstream_changes(tmp.path(), "main").unwrap();
+        assert_eq!(up.subjects, vec!["rename helper", "other"]);
+        assert_eq!(up.files, vec!["other.rs", "shared.rs"]);
+        assert_eq!(up.overlap, vec!["shared.rs"]);
+
+        // Right after merging, nothing is left upstream.
+        git(&["merge", "-q", "--no-edit", "main"]);
+        assert_eq!(
+            upstream_changes(tmp.path(), "main").unwrap(),
+            UpstreamChanges::default()
+        );
+
+        // A later upstream commit lists only itself, not what the earlier
+        // merge already brought in.
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(tmp.path().join("new.rs"), "n\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add new"]);
+        git(&["checkout", "-q", "feature"]);
+        let up = upstream_changes(tmp.path(), "main").unwrap();
+        assert_eq!(up.subjects, vec!["add new"]);
+        assert_eq!(up.files, vec!["new.rs"]);
+        assert!(up.overlap.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewind_unpublished_rewinds_only_unshared_history() {
+        let (tmp, git) = fork_fixture();
+        let dir = tmp.path();
+        let pre = git(&["rev-parse", "HEAD"]);
+        git(&["merge", "-q", "--no-edit", "main"]);
+        let merged = git(&["rev-parse", "HEAD"]);
+
+        // Published past `to`: the tracking ref holds the merge — refuse.
+        git(&["update-ref", "refs/remotes/origin/feature", &merged]);
+        assert!(!RealGit
+            .rewind_unpublished(dir, "feature", &pre)
+            .await
+            .unwrap());
+        assert_eq!(git(&["rev-parse", "HEAD"]), merged);
+
+        // `to` isn't an ancestor of HEAD — refuse.
+        let side = git(&["rev-parse", "main"]);
+        git(&["update-ref", "-d", "refs/remotes/origin/feature"]);
+        git(&["checkout", "-q", "-b", "elsewhere", &pre]);
+        assert!(!RealGit
+            .rewind_unpublished(dir, "elsewhere", &side)
+            .await
+            .unwrap());
+        git(&["checkout", "-q", "feature"]);
+
+        // Published only up to `to` (or not at all): rewind.
+        git(&["update-ref", "refs/remotes/origin/feature", &pre]);
+        std::fs::write(dir.join("stray.txt"), "x").unwrap();
+        assert!(RealGit
+            .rewind_unpublished(dir, "feature", &pre)
+            .await
+            .unwrap());
+        assert_eq!(git(&["rev-parse", "HEAD"]), pre);
+        assert!(!dir.join("stray.txt").exists());
     }
 
     #[test]

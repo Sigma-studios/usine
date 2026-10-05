@@ -341,7 +341,8 @@ fn resolving(
 }
 
 /// The resolution run happens in the card's own worktree, through the same
-/// applying-fixes loop a post-PR change uses — so it lands back on `ReadyToMerge`.
+/// `Updating` loop an update from the base uses — so it lands back on
+/// `ReadyToMerge`.
 #[tokio::test]
 async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -354,7 +355,10 @@ async fn resolving_conflicts_hands_the_conflicted_worktree_to_an_agent() {
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
             c.state,
-            CardState::PrReview(usine_core::PrReviewSub::ApplyingFixes)
+            CardState::Updating {
+                sub: usine_core::RunSub::Running,
+                ..
+            }
         )
         .then_some(()),
         _ => None,
@@ -695,7 +699,10 @@ async fn a_conflict_run_that_asks_parks_the_card_and_publishes_nothing() {
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
             c.state,
-            CardState::PrReview(usine_core::PrReviewSub::AwaitingAnswer(_))
+            CardState::Updating {
+                sub: usine_core::RunSub::Intervention(_),
+                ..
+            }
         )
         .then_some(()),
         _ => None,
@@ -736,7 +743,10 @@ async fn answering_resumes_the_resolution_with_the_brief_and_the_answer() {
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
             c.state,
-            CardState::PrReview(usine_core::PrReviewSub::AwaitingAnswer(_))
+            CardState::Updating {
+                sub: usine_core::RunSub::Intervention(_),
+                ..
+            }
         )
         .then_some(()),
         _ => None,
@@ -750,14 +760,17 @@ async fn answering_resumes_the_resolution_with_the_brief_and_the_answer() {
     wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c) if c.id == card.id => matches!(
             c.state,
-            CardState::PrReview(usine_core::PrReviewSub::ApplyingFixes)
+            CardState::Updating {
+                sub: usine_core::RunSub::Running,
+                ..
+            }
         )
         .then_some(()),
         _ => None,
     })
     .await;
 
-    // The state flips to `ApplyingFixes` a beat before the relaunched run
+    // The state flips back to running a beat before the relaunched run
     // reaches the provider, so wait on the prompt itself.
     let second = {
         let mut second = None;

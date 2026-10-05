@@ -27,6 +27,7 @@ mod pr_create;
 mod pr_review;
 mod review;
 mod transcript;
+mod update;
 
 use chat::{AgentChatSection, ChatLog};
 use conclusion::ConclusionPanel;
@@ -38,6 +39,7 @@ use pr_create::PrCreateForm;
 use pr_review::PrReviewPanel;
 use review::ReviewDetail;
 use transcript::TranscriptView;
+use update::UpdateFromBase;
 
 /// The detail panel for whichever board is up. Mirrors `BoardArea`: the two
 /// boards keep independent selections, so switching between them doesn't leak
@@ -115,11 +117,32 @@ fn CardDetail() -> Element {
                     format!("Run failed: {m}")
                 }
             });
-            let body_class = if busy || question.is_some() || fail_display.is_some() {
-                "detail-body is-busy"
-            } else {
-                "detail-body"
+            // An update from the base wraps the gate it was started from, the
+            // same way: the gate stays on screen, frozen, under a banner that
+            // owns the live run's controls — its Stop, or its question.
+            let updating = match &card.state {
+                CardState::Updating { sub, .. } => Some(sub.clone()),
+                _ => None,
             };
+            let update_base = state.base_branch_of(card.project_id);
+            // A faulted update can also be abandoned, which rolls the merge back.
+            let abandonable = matches!(
+                &card.state,
+                CardState::Failed { previous, .. } if matches!(**previous, CardState::Updating { .. })
+            );
+            let update_dest = crate::ui::stop_destination(&card).unwrap_or("where it was");
+            let update_recap = state.review_recaps.read().get(&id).cloned();
+            let pr_untouched = if card.pr.is_some() {
+                ", and the PR is exactly as it was"
+            } else {
+                ""
+            };
+            let body_class =
+                if busy || question.is_some() || fail_display.is_some() || updating.is_some() {
+                    "detail-body is-busy"
+                } else {
+                    "detail-body"
+                };
             // Committed work to diff: the same window the card menu's entry
             // uses — through a fault or an in-flight question, since the
             // worktree is still there.
@@ -204,6 +227,83 @@ fn CardDetail() -> Element {
                                 class: "btn",
                                 onclick: move |_| state.send(ExecutorCommand::Retry { card_id: id }),
                                 "{recover_label}"
+                            }
+                            if abandonable {
+                                button {
+                                    class: "btn subtle",
+                                    onclick: {
+                                        let base = update_base.clone();
+                                        move |_| request_confirm(ConfirmRequest {
+                                            title: "Abandon the update?".into(),
+                                            message: format!(
+                                                "Roll the merge of {base} back and return to {update_dest}?"
+                                            ),
+                                            confirm_label: "Abandon update".into(),
+                                            danger: true,
+                                            action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
+                                        })
+                                    },
+                                    "Abandon update"
+                                }
+                            }
+                        }
+                    }
+                    if let Some(usine_core::RunSub::Running) = &updating {
+                        div { class: "detail-banner",
+                            div { class: "row",
+                                span { class: "spinner" }
+                                span {
+                                    title: "Updating from {update_base} — the agent is checking this card's work against what landed",
+                                    "Updating from {update_base} — the agent is checking this card's work against what landed"
+                                }
+                            }
+                            button {
+                                class: "btn subtle",
+                                onclick: move |_| request_confirm(ConfirmRequest {
+                                    title: "Stop the update?".into(),
+                                    message: format!(
+                                        "Stop the agent's run? The card returns to {update_dest}, and the merge is rolled back."
+                                    ),
+                                    confirm_label: "Stop".into(),
+                                    danger: true,
+                                    action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
+                                }),
+                                "Stop"
+                            }
+                        }
+                    }
+                    // The update (or a conflict resolution run as one) stopped
+                    // on a question rather than guessing. Outside `.detail-body`
+                    // so the answer stays live while the gate below is frozen.
+                    if let Some(usine_core::RunSub::Intervention(iv)) = updating {
+                        div { class: "detail-update-gate",
+                            h3 { "Update from {update_base} needs a decision" }
+                            div { class: "hint", "Nothing has been committed{pr_untouched}." }
+                            if let Some(recap) = update_recap {
+                                div { class: "hint", "What it got through" }
+                                ArtifactText { text: recap }
+                            }
+                            InterventionPanel {
+                                card_id: id,
+                                question: iv.question.clone(),
+                                options: iv.options.clone(),
+                            }
+                            button {
+                                class: "btn subtle",
+                                onclick: {
+                                    let base = update_base.clone();
+                                    move |_| request_confirm(ConfirmRequest {
+                                        title: "Stop the update?".into(),
+                                        message: format!(
+                                            "Roll the merge of {base} back and return the card to {update_dest}? You can then handle it yourself, or update again."
+                                        ),
+                                        confirm_label: "Stop".into(),
+                                        danger: true,
+                                        action: ConfirmAction::Send(ExecutorCommand::Cancel { card_id: id }),
+                                    })
+                                },
+                                title: "Rolls the merge back and returns the card to where the update started. Answering instead resumes the update where it left off.",
+                                "Stop and handle it myself"
                             }
                         }
                     }
@@ -399,10 +499,13 @@ fn CardPanel(card: Card) -> Element {
         // conflict request id, not the state: a fix run's live `AskUserQuestion`
         // (a review-comment or CI fix) parks in the same sub-state, and none of
         // this copy is true of it — that one just gets the panel below.
+        // An update's question renders in `CardDetail`'s banner instead,
+        // outside the frozen body.
         if card
             .state
             .intervention()
             .is_some_and(|i| i.request_id == CONFLICT_INTERVENTION_ID)
+            && !matches!(card.state, CardState::Updating { .. })
         {
             div { class: "section",
                 h3 { "Conflict resolution needs a decision" }
@@ -428,7 +531,11 @@ fn CardPanel(card: Card) -> Element {
             }
         }
 
-        if let Some(iv) = card.state.intervention() {
+        if let Some(iv) = card
+            .state
+            .intervention()
+            .filter(|_| !matches!(card.state, CardState::Updating { .. }))
+        {
             InterventionPanel {
                 card_id: id,
                 question: iv.question.clone(),
@@ -666,6 +773,7 @@ fn CardPanel(card: Card) -> Element {
                     }
                 }
             }
+            UpdateFromBase { card_id: id, base: state.base_branch_of(card.project_id) }
             AgentChatSection {
                 card_id: id,
                 on_request: move |fb: String| {
@@ -1189,7 +1297,9 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::MergedWithoutReview { merged: true } => "ext-merged",
         CardState::MergedWithoutReview { merged: false } => "ext-closed",
         CardState::Done => "done",
-        // `effective()` never returns either of these.
-        CardState::Failed { .. } | CardState::Answering { .. } => "wrapped",
+        // `effective()` never returns any of these.
+        CardState::Failed { .. } | CardState::Answering { .. } | CardState::Updating { .. } => {
+            "wrapped"
+        }
     }
 }

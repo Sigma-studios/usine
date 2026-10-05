@@ -322,6 +322,7 @@ impl Executor {
             card.state,
             CardState::Implementing(_)
                 | CardState::PrReview(PrReviewSub::ApplyingChange | PrReviewSub::ApplyingFixes)
+                | CardState::Updating { .. }
         ) && self
             .store
             .get_pending_change(card.id)
@@ -764,6 +765,12 @@ impl Executor {
             // re-established here: re-cutting it would destroy that merge, and
             // `launch`'s tripwire already errors clearly if it went missing.
             CardState::PrReview(PrReviewSub::ApplyingFixes) => RunMode::ApplyFixes,
+            // An update (or a conflict resolution run as one) that asked: same
+            // story, the merge and its brief are still in place.
+            CardState::Updating {
+                sub: RunSub::Running,
+                ..
+            } => RunMode::ApplyFixes,
             _ => return Ok(()),
         };
         let resume = card.last_session.clone();
@@ -853,6 +860,22 @@ impl Executor {
                 )
         ) {
             self.discard_cancelled_run_edits(card_id, run_id).await;
+        }
+        // Stopping an update — live, parked on a question, or faulted — rolls
+        // the merge back. Matched on the raw state: `effective()` would see
+        // through the wrapper to the parked gate underneath.
+        let is_update = match &prior {
+            CardState::Updating { .. } => true,
+            CardState::Failed { previous, .. } => matches!(**previous, CardState::Updating { .. }),
+            _ => false,
+        };
+        if is_update {
+            let _ = self.store.set_pending_change(card_id, "");
+            let _ = self.store.set_fix_extra(card_id, None);
+            let _ = self.store.take_pending_fix_qa(card_id);
+            self.roll_back_update(card_id, run_id).await;
+            let _ = self.store.set_update_origin(card_id, None);
+            self.reap_idle_preview(card_id).await;
         }
         if matches!(prior, CardState::Implementing(_)) {
             // An implementing run auto-starts the card's preview and nothing
@@ -951,20 +974,8 @@ impl Executor {
     /// stashed "Fix applied" log lines: the cancelled run fixed nothing.
     async fn discard_cancelled_run_edits(&self, card_id: Uuid, cancelled: Option<Uuid>) {
         let _ = self.store.take_pending_fix_qa(card_id);
-        if cancelled.is_some() {
-            for _ in 0..100 {
-                if lock(&self.runs)
-                    .get(&card_id)
-                    .map(|(rid, _)| Some(*rid) != cancelled)
-                    .unwrap_or(true)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if lock(&self.runs).contains_key(&card_id) {
-                return;
-            }
+        if !self.await_run_exit(card_id, cancelled).await {
+            return;
         }
         let Ok(card) = self.store.get_card(card_id) else {
             return;
@@ -982,6 +993,80 @@ impl Executor {
                 card_id,
                 Severity::Warning,
                 format!("couldn't discard the cancelled run's edits: {e}"),
+            ));
+        }
+    }
+
+    /// Wait for the cancelled run `cancelled` to release the card's runs-map
+    /// slot (its actor ends once the child dies). `false` when the slot is
+    /// still held after the grace period, or a newer run holds it — the
+    /// worktree may be a live run's, so the caller must not touch it.
+    async fn await_run_exit(&self, card_id: Uuid, cancelled: Option<Uuid>) -> bool {
+        if cancelled.is_none() {
+            return true;
+        }
+        for _ in 0..100 {
+            if lock(&self.runs)
+                .get(&card_id)
+                .map(|(rid, _)| Some(*rid) != cancelled)
+                .unwrap_or(true)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        !lock(&self.runs).contains_key(&card_id)
+    }
+
+    /// Undo a stopped (or abandoned) update from the base: rewind the branch
+    /// to its pre-merge commit, so no orphan merge commit is left behind —
+    /// but only when nothing past it has been published (see
+    /// [`GitOps::rewind_unpublished`]); nothing is ever force-pushed. Otherwise
+    /// fall back to discarding the run's uncommitted edits, which also aborts
+    /// a merge still in progress, and say why a committed merge was kept.
+    async fn roll_back_update(&self, card_id: Uuid, cancelled: Option<Uuid>) {
+        if !self.await_run_exit(card_id, cancelled).await {
+            return;
+        }
+        let Ok(card) = self.store.get_card(card_id) else {
+            return;
+        };
+        let Ok(project) = self.store.get_project(card.project_id) else {
+            return;
+        };
+        // Only ever reset the card's ISOLATED worktree (see `finalize_run`).
+        let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) else {
+            return;
+        };
+        let origin = self.store.get_update_origin(card_id).unwrap_or(None);
+        if let (Some(origin), Some(branch)) = (&origin, &card.branch) {
+            if let Ok(true) = self.git.rewind_unpublished(&dir, branch, origin).await {
+                return;
+            }
+        }
+        if let Err(e) = self.git.discard_changes(&dir).await {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                format!("couldn't discard the cancelled update's edits: {e}"),
+            ));
+            return;
+        }
+        let head = self.git.head_sha(&dir).await.unwrap_or_default();
+        let kept_merge = match &origin {
+            // Backends that don't model history report no head: no claim.
+            Some(origin) => !head.is_empty() && !same_commit(&head, origin),
+            None => false,
+        };
+        if kept_merge {
+            let base = project.config.effective_base_branch();
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                format!(
+                    "Kept the merge of {base}: it's already on the remote, so rolling it back \
+                     would rewrite shared history."
+                ),
             ));
         }
     }
@@ -1258,6 +1343,12 @@ impl Executor {
             CardState::PrReview(PrReviewSub::FetchingComments) => RunMode::Triage,
             CardState::PrReview(PrReviewSub::ApplyingFixes) => RunMode::ApplyFixes,
             CardState::PrReview(PrReviewSub::ApplyingChange) => RunMode::ApplyFixes,
+            // The stashed update brief restates the task below; an existing
+            // worktree (with its merge in progress) is left as it is.
+            CardState::Updating {
+                sub: RunSub::Running,
+                ..
+            } => RunMode::ApplyFixes,
             _ => return Ok(()),
         };
         // Write runs must have an isolated worktree (the launch tripwire refuses to
@@ -1330,4 +1421,9 @@ impl Executor {
         };
         self.launch(card, mode, extra, resume).await
     }
+}
+
+/// Whether two (possibly abbreviated) shas name the same commit.
+fn same_commit(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
 }

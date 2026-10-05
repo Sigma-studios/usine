@@ -286,10 +286,17 @@ pub enum ExecutorCommand {
         delete_branch: bool,
         force: bool,
     },
-    /// From `ReadyToMerge`, after a merge failed on conflicts: merge the base
-    /// branch into the card's branch inside its worktree and hand the conflicts
-    /// to an agent. Loops back through applying fixes to `ReadyToMerge`.
+    /// From `ReadyToMerge` (or `PrReview(Idle)`), after a merge failed on
+    /// conflicts: merge the base branch into the card's branch inside its
+    /// worktree and hand the conflicts to an agent. Loops back through
+    /// `Updating` to the gate it was started from.
     ResolveConflicts { card_id: Uuid },
+    /// From a parked gate around the PR (`ReadyForPr`, `ValidationFailed`,
+    /// `PrReview(Idle)`, `ReadyToMerge`): merge `origin/<base>` into the card's
+    /// branch and run an agent that adapts the card's work to what landed,
+    /// guided by the user's optional `note`. Loops back through `Updating` to
+    /// the gate it was started from.
+    UpdateFromBase { card_id: Uuid, note: Option<String> },
     /// From `ReadyToMerge`, after the merge gate found the PR's CI checks red:
     /// hand the failing checks (with their run logs) to an agent in the card's
     /// worktree. Loops back through applying fixes to `ReadyToMerge`; the push
@@ -461,6 +468,7 @@ impl ExecutorCommand {
             | ExecutorCommand::ConvertToImplementation { card_id }
             | ExecutorCommand::Merge { card_id, .. }
             | ExecutorCommand::ResolveConflicts { card_id }
+            | ExecutorCommand::UpdateFromBase { card_id, .. }
             | ExecutorCommand::FixChecks { card_id }
             | ExecutorCommand::SkipReview { card_id }
             | ExecutorCommand::SelfReview { card_id }
@@ -575,6 +583,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::ConvertToImplementation { .. }
                 | ExecutorCommand::Merge { .. }
                 | ExecutorCommand::ResolveConflicts { .. }
+                | ExecutorCommand::UpdateFromBase { .. }
                 | ExecutorCommand::FixChecks { .. }
                 | ExecutorCommand::SkipReview { .. }
                 | ExecutorCommand::SelfReview { .. }

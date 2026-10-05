@@ -1372,14 +1372,87 @@ impl Executor {
         false
     }
 
+    /// Bring the base branch into the card's branch and have an agent adapt
+    /// the card's work to it — for upstream changes that break the card without
+    /// a git conflict (a renamed helper, a changed API or schema).
+    ///
+    /// Merges `origin/<base>` in the card's ISOLATED worktree, then ALWAYS
+    /// runs an agent, whether the merge came out clean or conflicted: its brief
+    /// lists what landed upstream (flagging files this branch also touches)
+    /// and the user's optional `note`. "Nothing needs adapting" is an allowed
+    /// outcome. The card waits in `Updating` and returns to the gate it was
+    /// started from, where the existing re-verification takes over: the
+    /// validation gate before a PR, the push's CI run after one.
+    ///
+    /// The pre-merge commit is recorded so Cancel can rewind the branch to it
+    /// (see `cancel`). Nothing landed upstream → a toast, and nothing changes.
+    pub(super) async fn update_from_base(&self, card_id: Uuid, note: Option<String>) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let base = project.config.effective_base_branch().to_string();
+        // Reject a stale panel BEFORE touching git: the merge below can't be
+        // taken back by a transition that then fails.
+        transition(&card.state, Transition::UpdateFromBase)?;
+
+        // Everything up to the transition is recoverable: a failure here leaves
+        // the card where it stands (a merge that failed outright, such as on a
+        // dirty tree, leaves no merge in progress behind).
+        self.ensure_branch_worktree(card_id).await?;
+        let dir = self
+            .store
+            .get_card(card_id)?
+            .worktree_path
+            .ok_or_else(|| CoreError::other("card has no worktree to update"))?;
+        self.progress(card_id, "Fetching origin…");
+        self.git.fetch(&dir, "origin").await?;
+        let upstream = format!("origin/{base}");
+        let up = self.git.upstream_changes(&dir, &upstream).await?;
+        if up.subjects.is_empty() {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Info,
+                format!("Already up to date with {base} — nothing to merge."),
+            ));
+            return Ok(());
+        }
+        // Where Cancel rewinds to.
+        let pre = self.git.head_sha(&dir).await?;
+        self.progress(card_id, &format!("Merging {base}…"));
+        let conflicted = match self.git.merge_ref(&dir, &upstream).await? {
+            MergeOutcome::Clean => Vec::new(),
+            MergeOutcome::Conflicted(files) => files,
+        };
+        self.store.set_update_origin(
+            card_id,
+            Some(&pre).filter(|p| !p.is_empty()).map(String::as_str),
+        )?;
+        let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        if let Some(n) = &note {
+            // Kept for a later "back to start", like a requested change.
+            self.record_qa(card_id, format!("Requested on update from {base}: {n}"));
+        }
+        let extra = update_prompt(&base, &up, &conflicted, note.as_deref());
+        // Stash the task before entering the running state, so a retry of a
+        // faulted run (or the answer to a question) can restate it.
+        self.store.set_fix_extra(card_id, Some(&extra))?;
+        let card = self.apply(card_id, Transition::UpdateFromBase)?;
+        if let Some(n) = &note {
+            // The recap lands in the Agent Chat log under the note.
+            self.store.set_pending_change(card_id, n)?;
+        }
+        self.launch(card, RunMode::ApplyFixes, Some(extra), None)
+            .await
+    }
+
     /// Resolve the PR's conflicts with its base branch, with an agent.
     ///
     /// The base is merged into the card's branch inside the card's ISOLATED
     /// worktree — never the user's working copy — which leaves that worktree
     /// mid-merge with the conflict markers in place. The agent then resolves them
     /// exactly as a human would, and `finalize_run` commits (completing the merge)
-    /// and pushes. The card loops back to `ReadyToMerge` for the user to merge
-    /// again.
+    /// and pushes. The run goes through `Updating` like an update from the base
+    /// (marker check, question parking, rewind on cancel), so the card returns
+    /// to the gate it was started from for the user to merge again.
     pub(super) async fn resolve_conflicts(&self, card_id: Uuid) -> Result<()> {
         let card = self.store.get_card(card_id)?;
         let project = self.store.get_project(card.project_id)?;
@@ -1426,6 +1499,8 @@ impl Executor {
 
         self.progress(card_id, &format!("Fetching origin and merging {base}…"));
         self.git.fetch(&dir, "origin").await?;
+        // Where Cancel rewinds to, should the merge stop on conflicts.
+        let pre = self.git.head_sha(&dir).await?;
         let files = match self.git.merge_ref(&dir, &format!("origin/{base}")).await? {
             // The conflict resolved itself (the base moved again, or someone
             // updated the branch). Publish the merge and let the user retry.
@@ -1472,11 +1547,15 @@ impl Executor {
             ),
         );
         let extra = conflict_prompt(&base, &files);
+        self.store.set_update_origin(
+            card_id,
+            Some(&pre).filter(|p| !p.is_empty()).map(String::as_str),
+        )?;
         // Stash the task before entering the running state, so a retry of a
         // faulted run can restate it (see `relaunch`). Without this, a retried
         // conflict run has no idea a merge is in progress.
         self.store.set_fix_extra(card_id, Some(&extra))?;
-        let card = self.apply(card_id, Transition::RequestPostPrChange)?;
+        let card = self.apply(card_id, Transition::UpdateFromBase)?;
         self.launch(card, RunMode::ApplyFixes, Some(extra), None)
             .await
     }

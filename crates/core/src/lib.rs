@@ -88,5 +88,6 @@ pub use infra::forge::{
 };
 pub use infra::git::{
     remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
+    UpstreamChanges,
 };
 pub use infra::persistence::{rebuild_database, Store};

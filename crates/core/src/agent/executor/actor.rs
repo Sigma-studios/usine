@@ -269,23 +269,41 @@ async fn finalize_run(
     // state lost the race (a Cancel landed just ahead of this Done), so we skip
     // committing/transitioning a run the user abandoned. Both PR-review fixes and
     // pre-PR self-review fixes are `ApplyFixes` runs but resolve differently.
-    // `is_pr_fix_run` rides along because both PR sub-states resolve to
-    // `AgentFixesDone`, and only the fix one can be a conflict resolution — the
-    // pre-commit gate below needs to tell them apart.
-    let (transition, is_pr_fix_run) = match store.get_card(card_id)?.state {
-        CardState::Implementing(RunSub::Running) => (Transition::AgentImplementDone, false),
-        CardState::AwaitingReview(ReviewSub::ApplyingFixes) => (Transition::SelfFixesDone, false),
+    let prior = store.get_card(card_id)?.state;
+    let transition = match &prior {
+        CardState::Implementing(RunSub::Running) => Transition::AgentImplementDone,
+        CardState::AwaitingReview(ReviewSub::ApplyingFixes) => Transition::SelfFixesDone,
         // A validation-fix run: committing routes back into the check
         // (`Validating{n+1}`), closing the gate's fix loop.
         CardState::AwaitingReview(ReviewSub::FixingValidation { .. }) => {
-            (Transition::ValidationFixDone, false)
+            Transition::ValidationFixDone
         }
-        CardState::PrReview(PrReviewSub::ApplyingFixes) => (Transition::AgentFixesDone, true),
+        CardState::PrReview(PrReviewSub::ApplyingFixes) => Transition::AgentFixesDone,
         // A reprompt on an open PR: same commit + push, but the state machine
         // routes `AgentFixesDone` back to `PrReview(Idle)` (not `ReadyToMerge`).
-        CardState::PrReview(PrReviewSub::ApplyingChange) => (Transition::AgentFixesDone, false),
+        CardState::PrReview(PrReviewSub::ApplyingChange) => Transition::AgentFixesDone,
+        // An update from the base (or a conflict resolution, which runs as
+        // one): back to the gate it was started from.
+        CardState::Updating {
+            sub: RunSub::Running,
+            ..
+        } => Transition::UpdateDone,
         _ => return Ok(()),
     };
+    let is_update = matches!(transition, Transition::UpdateDone);
+    // The stashed brief tells a conflict resolution or an update apart from
+    // every other fix run (see `is_conflict_brief`). Filtered by transition
+    // so a stale stash can't gate an implement or validation run.
+    let brief = if matches!(
+        transition,
+        Transition::AgentFixesDone | Transition::UpdateDone
+    ) {
+        store.get_fix_extra(card_id)?.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let conflict_brief = is_conflict_brief(&brief);
+    let update_brief = is_update_brief(&brief);
 
     let card = store.mutate_card(card_id, |c| {
         c.cost += crate::Cost::from_usd(cost);
@@ -293,9 +311,9 @@ async fn finalize_run(
         Ok(())
     })?;
 
-    // A conflict-resolution run gets a gate before the commit, because here
-    // committing *completes the merge* and pushes it to the open PR — there is
-    // no later step that could take it back.
+    // A conflict-resolution or update run gets a gate before the commit,
+    // because here committing *completes the merge* and pushes it to the open
+    // PR — there is no later step that could take it back.
     //
     //  - It asked a question (`usine-questions`, the channel `conflict_prompt`
     //    hands it): park with nothing published, so the answering run inherits
@@ -310,7 +328,7 @@ async fn finalize_run(
     // (a common habit, and nothing in the brief forbids it) leaves no
     // `MERGE_HEAD`, and the checks matter just as much there — the local merge
     // commit is pushed to the PR either way.
-    if is_pr_fix_run && is_conflict_brief(&store.get_fix_extra(card_id)?.unwrap_or_default()) {
+    if conflict_brief || update_brief {
         let project = store.get_project(card.project_id)?;
         if let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) {
             let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
@@ -331,7 +349,14 @@ async fn finalize_run(
                     store,
                     evt_tx,
                     card_id,
-                    Transition::AgentNeedsInput(super::conflict_intervention(&questions)),
+                    Transition::AgentNeedsInput(super::conflict_intervention(
+                        &questions,
+                        if update_brief {
+                            super::UPDATE_QUESTION_LEAD
+                        } else {
+                            super::CONFLICT_QUESTION_LEAD
+                        },
+                    )),
                 )?;
                 reap_idle_preview_direct(executor, card_id);
                 return Ok(());
@@ -340,12 +365,15 @@ async fn finalize_run(
             // without this the run would fall through and be reported as if it
             // had never tried to ask.
             let fault = if crate::agent::plan::plan_block_malformed(&result_text) {
-                Some(
-                    "The run tried to ask about a conflict, but its `usine-questions` block \
-                     wasn't valid JSON, so the question was lost — nothing was committed or \
-                     pushed. Retry to run it again."
-                        .to_string(),
-                )
+                let about = if update_brief {
+                    "tried to ask a question"
+                } else {
+                    "tried to ask about a conflict"
+                };
+                Some(format!(
+                    "The run {about}, but its `usine-questions` block wasn't valid JSON, so the \
+                     question was lost — nothing was committed or pushed. Retry to run it again."
+                ))
             } else {
                 let unresolved = git.unresolved_conflicts(&dir).await.unwrap_or_default();
                 (!unresolved.is_empty()).then(|| {
@@ -491,6 +519,15 @@ async fn finalize_run(
     //    hand. A no-op fix run therefore advances with a warning — its recap says
     //    what the agent concluded — dropping the stashed "Fix applied" lines so
     //    it leaves no false claim on the log.
+    // For display, drop the machine-facing blocks the agent appended — including
+    // a questions block that got this far (a fix run that asked but whose merge
+    // had already been completed, say), which must never render raw as a recap.
+    let summary = crate::agent::fixes::strip_fixes_block(
+        &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
+            &crate::agent::plan::parse_questions(&result_text).0,
+        )),
+    );
+
     if !committed {
         if matches!(transition, Transition::AgentImplementDone) {
             let prior_work = card.branch.is_some()
@@ -564,9 +601,12 @@ async fn finalize_run(
                         // committed path's reset rather than leaving this one
                         // catch-up path claiming a green the build has just
                         // invalidated.
+                        // The mergeability is just as stale: an update's
+                        // merge commit is what went out.
                         let expects_ci = project.expects_ci();
                         if let Ok(updated) = store.mutate_card(card_id, |c| {
                             super::pr::mark_ci_in_flight(c, expects_ci);
+                            super::pr::mark_mergeable_stale(c);
                             Ok(())
                         }) {
                             let _ = evt_tx.unbounded_send(ExecutorEvent::updated(updated));
@@ -574,13 +614,29 @@ async fn finalize_run(
                     }
                 }
             }
-            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
-                card_id,
-                Severity::Warning,
-                "The fix run finished without changing any files — the agent judged nothing \
-                 needed changing. Advancing so the next step can verify that."
-                    .to_string(),
-            ));
+            if is_update {
+                // "Nothing to adapt" is an allowed outcome of an update: the
+                // merge itself is the work, and the agent says why it stopped
+                // there.
+                let base = project.config.effective_base_branch();
+                let message = match first_sentence(&summary, 200) {
+                    reason if reason.is_empty() => format!("Merged {base}; nothing to adapt."),
+                    reason => format!("Merged {base}; nothing to adapt — {reason}"),
+                };
+                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Success,
+                    message,
+                ));
+            } else {
+                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Warning,
+                    "The fix run finished without changing any files — the agent judged nothing \
+                     needed changing. Advancing so the next step can verify that."
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -589,8 +645,11 @@ async fn finalize_run(
     // recorded) at launch by `apply_fixes` / `apply_self_fixes`, so a run that
     // never lands leaves no false claim behind; a faulted run keeps its stash
     // for a retry. Keyed off the transition so an implement run can't sweep up
-    // a stale stash.
-    if !matches!(transition, Transition::AgentImplementDone) {
+    // a stale stash. An update stashes none, and must not consume one.
+    if !matches!(
+        transition,
+        Transition::AgentImplementDone | Transition::UpdateDone
+    ) {
         let fix_qa = store.take_pending_fix_qa(card_id).unwrap_or_default();
         if !fix_qa.is_empty() {
             let _ = store.mutate_card(card_id, |c| {
@@ -600,15 +659,6 @@ async fn finalize_run(
         }
     }
 
-    // For display, drop the machine-facing blocks the agent appended — including
-    // a questions block that got this far (a fix run that asked but whose merge
-    // had already been completed, say), which must never render raw as a recap.
-    let summary = crate::agent::fixes::strip_fixes_block(
-        &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
-            &crate::agent::plan::parse_questions(&result_text).0,
-        )),
-    );
-
     // A "Request changes" run (implement, or a change on an open PR) reports
     // under its request in the Agent Chat log, and leaves the original
     // hand-off / fixes recap alone. The stashed request is what marks it — a
@@ -616,12 +666,19 @@ async fn finalize_run(
     // comment-fix run, which never stashes one. Recorded before the
     // transition, like the hand-off below, and even when the recap is empty so
     // the request itself stays visible.
+    // An update without a note gets an entry of its own, titled after the
+    // base it merged (a conflict resolution keeps the fixes recap below).
     let is_change_run = matches!(
         transition,
-        Transition::AgentImplementDone | Transition::AgentFixesDone
+        Transition::AgentImplementDone | Transition::AgentFixesDone | Transition::UpdateDone
     ) && store.get_pending_change(card_id).unwrap_or(None).is_some();
-    if is_change_run {
-        let _ = store.record_change(card_id, &summary);
+    let logs_update = is_update && !is_change_run && update_brief;
+    if is_change_run || logs_update {
+        let _ = if is_change_run {
+            store.record_change(card_id, &summary)
+        } else {
+            store.record_update(card_id, project.config.effective_base_branch(), &summary)
+        };
         if let Ok(answers) = store.get_answers(card_id) {
             let _ = evt_tx.unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
         }
@@ -641,7 +698,11 @@ async fn finalize_run(
     // with. Stored on the same "only once the commit is real" rule as the
     // restart-log lines above, and for every fix path (PR comments, self-review,
     // validation) — the checklist is what makes an under-reported run visible.
-    if !matches!(transition, Transition::AgentImplementDone) {
+    // An update has no findings, and must not wipe the merge gate's checklist.
+    if !matches!(
+        transition,
+        Transition::AgentImplementDone | Transition::UpdateDone
+    ) {
         let items = store.take_pending_fix_items(card_id).unwrap_or_default();
         // An empty report clears the field: a later fix run that stashed nothing
         // (or reported nothing) must not leave the previous run's checklist
@@ -653,8 +714,11 @@ async fn finalize_run(
 
     // A PR fix run: keep the agent's summary as the fixes recap so the user can
     // react (e.g. if a fix was uncertain) before merging.
+    // A conflict resolution without a note keeps that recap too, as it did
+    // before it ran as an update.
     let is_pr_fix = matches!(transition, Transition::AgentFixesDone);
-    if is_pr_fix && !is_change_run && !summary.is_empty() {
+    let keeps_recap = is_pr_fix || (is_update && conflict_brief);
+    if keeps_recap && !is_change_run && !summary.is_empty() {
         let _ = store.set_review_recap(card_id, &summary);
         let _ = evt_tx.unbounded_send(ExecutorEvent::recap_updated(card_id, summary.clone()));
     }
@@ -664,16 +728,30 @@ async fn finalize_run(
     // command: `ValidationFixDone` lands on `Validating` (a running state), and
     // a dispatched command can be dropped by a concurrently claimed in-flight
     // slot — which would strand the card running with no check behind it.
-    let needs_validation = matches!(
-        transition,
-        Transition::SelfFixesDone | Transition::ValidationFixDone
-    );
+    // An update started from the pre-PR gate re-enters it the same way.
+    let needs_validation = match transition {
+        Transition::SelfFixesDone | Transition::ValidationFixDone => true,
+        Transition::UpdateDone => matches!(
+            &prior,
+            CardState::Updating { previous, .. } if matches!(
+                **previous,
+                CardState::AwaitingReview(
+                    ReviewSub::ReadyForPr | ReviewSub::ValidationFailed { .. }
+                )
+            )
+        ),
+        _ => false,
+    };
     let is_implement_done = matches!(transition, Transition::AgentImplementDone);
     // The fix run committed its task — drop the stashed copy so a later,
     // unrelated retry can't resurrect it (best-effort; a stale stash is
     // overwritten at the next fix launch anyway).
     if !is_implement_done {
         let _ = store.set_fix_extra(card_id, None);
+    }
+    // The update landed: there is no pre-merge state left to rewind to.
+    if is_update {
+        let _ = store.set_update_origin(card_id, None);
     }
     // The fix run replied to every declined comment and resolved every fixed one
     // (see `apply_fixes`), so no thread the picker saw is still unanswered. Land
@@ -781,6 +859,28 @@ async fn finalize_self_review(
 pub(super) fn reap_idle_preview_direct(executor: &Weak<Executor>, card_id: Uuid) {
     if let Some(exec) = executor.upgrade() {
         tokio::spawn(async move { exec.reap_idle_preview(card_id).await });
+    }
+}
+
+/// The first sentence of `text` (up to the first `. `, `! `, `? ` or line
+/// break), capped at `max` characters with an ellipsis.
+fn first_sentence(text: &str, max: usize) -> String {
+    let text = text.trim();
+    let end = text
+        .char_indices()
+        .find(|&(i, c)| {
+            c == '\n'
+                || (matches!(c, '.' | '!' | '?')
+                    && text[i + c.len_utf8()..].starts_with(char::is_whitespace))
+        })
+        .map(|(i, c)| if c == '\n' { i } else { i + c.len_utf8() })
+        .unwrap_or(text.len());
+    let sentence = text[..end].trim();
+    if sentence.chars().count() <= max {
+        sentence.to_string()
+    } else {
+        let cut: String = sentence.chars().take(max).collect();
+        format!("{}…", cut.trim_end())
     }
 }
 
