@@ -578,6 +578,9 @@ impl Executor {
                 force,
             } => self.merge(card_id, delete_branch, force).await,
             ExecutorCommand::ResolveConflicts { card_id } => self.resolve_conflicts(card_id).await,
+            ExecutorCommand::UpdateFromBase { card_id, note } => {
+                self.update_from_base(card_id, note).await
+            }
             ExecutorCommand::FixChecks { card_id } => self.fix_checks(card_id).await,
             ExecutorCommand::SkipReview { card_id } => self.skip_review(card_id).await,
             ExecutorCommand::SelfReview { card_id } => self.self_review(card_id).await,
@@ -1491,6 +1494,13 @@ pub(crate) fn is_conflict_brief(extra: &str) -> bool {
 /// from a fix run's live `AskUserQuestion`, which parks in the same state.
 pub const CONFLICT_INTERVENTION_ID: &str = "conflict";
 
+/// The lead line of a folded multi-question conflict intervention.
+pub(super) const CONFLICT_QUESTION_LEAD: &str =
+    "The agent can't resolve these conflicts without your decision:";
+
+/// The lead line of a folded multi-question update intervention.
+pub(super) const UPDATE_QUESTION_LEAD: &str = "The update can't continue without your decision:";
+
 /// The one way out of resolving a conflict: ask. Deliberately framed as the
 /// exception — most conflicts are decidable from the code, and a run that asks
 /// costs the user a round trip. Asking means ending the turn with a
@@ -1510,13 +1520,126 @@ which conflicts you resolved and which are blocked on the answer. Nothing is com
 pushed while a question is outstanding, and you'll be run again with the answer to finish the \
 merge. Do not use this to hand back a conflict you could have worked out by reading the code.";
 
-/// Fold a conflict run's questions into the single [`Intervention`] the
-/// intervention UI renders. One question keeps its option buttons; several are
-/// numbered into one prompt with a free-text answer, since the panel asks one
-/// thing at a time. `request_id` is a constant: there is no live run to route
-/// the answer back to (the run ended to ask), mirroring the stream parser's
-/// own `"ask"` / `"control"` fallbacks.
-fn conflict_intervention(questions: &[crate::agent::plan::PlanQuestion]) -> Intervention {
+/// Build the update-from-base brief: `origin/<base>` was just merged into the
+/// card's branch (cleanly, or stopping on `conflicted`), and the agent checks
+/// the card's own work against what landed — `up` lists it, with the files
+/// this branch also touches flagged first — plus the user's optional `note`.
+/// "Nothing needs adapting" is an allowed outcome, explained in the final
+/// message (`finalize_run` quotes it back to the user).
+fn update_prompt(
+    base: &str,
+    up: &crate::UpstreamChanges,
+    conflicted: &[String],
+    note: Option<&str>,
+) -> String {
+    const MAX_SUBJECTS: usize = 50;
+    const MAX_FILES: usize = 100;
+    let mut s = format!(
+        "{UPDATE_BRIEF_OPENER}\n\n\
+         `origin/{base}` was just merged into this branch, and your work must stay correct on top \
+         of it.\n\n\
+         What landed on `{base}`:\n"
+    );
+    for subject in up.subjects.iter().take(MAX_SUBJECTS) {
+        s.push_str(&format!("- {subject}\n"));
+    }
+    if up.subjects.len() > MAX_SUBJECTS {
+        s.push_str(&format!("- +{} more\n", up.subjects.len() - MAX_SUBJECTS));
+    }
+    if !up.files.is_empty() {
+        s.push_str("\nFiles it changed:\n");
+        let files: Vec<String> = up
+            .overlap
+            .iter()
+            .map(|f| format!("{f} (also changed by this branch)"))
+            .chain(up.files.iter().filter(|f| !up.overlap.contains(f)).cloned())
+            .collect();
+        for f in files.iter().take(MAX_FILES) {
+            s.push_str(&format!("- {f}\n"));
+        }
+        if files.len() > MAX_FILES {
+            s.push_str(&format!("- +{} more\n", files.len() - MAX_FILES));
+        }
+    }
+    if conflicted.is_empty() {
+        s.push_str(&format!(
+            "\n{UPDATE_CLEAN_MERGE_LINE} Don't revert, reset or rebase it. Do not push.\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "\nThe merge stopped on conflicts and is still in progress in this worktree. Resolve \
+             every conflict, preserving the intent of BOTH sides — this branch's change and the \
+             change that landed on `{base}`. Do NOT run `git merge --abort`, `git reset`, or \
+             `git checkout` on the branch: that would discard the in-progress merge. Do not push. \
+             Leave no conflict markers behind.\n\nConflicted files:\n"
+        ));
+        for f in conflicted {
+            s.push_str(&format!("- {f}\n"));
+        }
+    }
+    if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
+        s.push_str("\nWhat to look out for:\n");
+        s.push_str(note);
+        s.push('\n');
+    }
+    s.push_str(
+        "\nCheck this branch's own changes against what landed: renamed or removed symbols, \
+         changed signatures, migrations, config. Adapt this branch's work where needed and make \
+         sure the project builds. Your changes are committed for you when the run ends.\n\n\
+         If nothing needs adapting, change nothing and say why in the first sentence of your \
+         final message.\n\n",
+    );
+    s.push_str(UPDATE_ESCAPE_HATCH);
+    s
+}
+
+/// The opening of [`update_prompt`], marking a stashed fix brief as an
+/// update-from-base one (see [`CONFLICT_BRIEF_OPENER`] for why the marker must
+/// outlive the run). A fixed heading rather than the first sentence, which
+/// starts with the base name.
+const UPDATE_BRIEF_OPENER: &str = "## Update from the base branch";
+
+/// Whether a stashed fix-run brief is an update from the base branch (see
+/// [`UPDATE_BRIEF_OPENER`]).
+pub(crate) fn is_update_brief(extra: &str) -> bool {
+    extra.starts_with(UPDATE_BRIEF_OPENER)
+}
+
+/// Tells an update whose merge came out clean (usine committed it) from one
+/// that stopped on conflicts (the agent's run completes it).
+const UPDATE_CLEAN_MERGE_LINE: &str = "The merge is already committed.";
+
+/// Whether a stashed brief is an update whose merge usine committed itself
+/// before the run — so a HEAD still on that merge means the run added nothing.
+pub(crate) fn is_clean_update_brief(extra: &str) -> bool {
+    is_update_brief(extra) && extra.contains(UPDATE_CLEAN_MERGE_LINE)
+}
+
+/// [`CONFLICT_ESCAPE_HATCH`] for an update run: the same `usine-questions`
+/// channel and the same promise that nothing ships while a question is open,
+/// worded for any decision the update raises, not only a conflict.
+const UPDATE_ESCAPE_HATCH: &str = "\
+If — and only if — you hit a decision you can't make from the code (a conflict whose two sides \
+encode incompatible intent, or how to adapt to an upstream change when that is a product \
+decision that isn't yours to make), do not guess: leave any such conflict's markers exactly as \
+they are, do whatever else you can, and end your turn with a fenced code block tagged \
+`usine-questions` containing a JSON array of questions, each shaped like {\"question\": \"...\", \
+\"options\": [\"Option A\", \"Option B\"]} (2-4 short options each; the user can also type their \
+own answer). Say in your final message what you got through and what is blocked on the answer. \
+Nothing is committed or pushed while a question is outstanding, and you'll be run again with \
+the answer to finish. Do not use this to hand back something you could have worked out by \
+reading the code.";
+
+/// Fold a conflict or update run's questions into the single [`Intervention`]
+/// the intervention UI renders. One question keeps its option buttons;
+/// several are numbered into one prompt (under `lead`) with a free-text
+/// answer, since the panel asks one thing at a time. `request_id` is a
+/// constant: there is no live run to route the answer back to (the run ended
+/// to ask), mirroring the stream parser's own `"ask"` / `"control"` fallbacks.
+fn conflict_intervention(
+    questions: &[crate::agent::plan::PlanQuestion],
+    lead: &str,
+) -> Intervention {
     let id = CONFLICT_INTERVENTION_ID.to_string();
     match questions {
         [only] => Intervention {
@@ -1525,8 +1648,7 @@ fn conflict_intervention(questions: &[crate::agent::plan::PlanQuestion]) -> Inte
             options: only.options.clone(),
         },
         many => {
-            let mut q =
-                String::from("The agent can't resolve these conflicts without your decision:\n");
+            let mut q = format!("{lead}\n");
             for (i, item) in many.iter().enumerate() {
                 q.push_str(&format!("\n{}. {}", i + 1, item.question));
                 if !item.options.is_empty() {
@@ -2178,27 +2300,93 @@ mod tests {
         ));
     }
 
+    fn upstream(subjects: usize) -> crate::UpstreamChanges {
+        crate::UpstreamChanges {
+            subjects: (0..subjects)
+                .map(|i| format!("upstream commit {i}"))
+                .collect(),
+            files: vec!["a.rs".into(), "shared.rs".into(), "z.rs".into()],
+            overlap: vec!["shared.rs".into()],
+        }
+    }
+
+    #[test]
+    fn update_prompt_caps_subjects() {
+        let p = update_prompt("main", &upstream(53), &[], None);
+        assert!(p.contains("upstream commit 49"));
+        assert!(!p.contains("upstream commit 50"));
+        assert!(p.contains("+3 more"));
+        let p = update_prompt("main", &upstream(2), &[], None);
+        assert!(!p.contains("more\n"));
+    }
+
+    #[test]
+    fn update_prompt_lists_overlap_first_and_tagged() {
+        let p = update_prompt("main", &upstream(1), &[], None);
+        let shared = p.find("- shared.rs (also changed by this branch)").unwrap();
+        let a = p.find("- a.rs\n").unwrap();
+        assert!(shared < a);
+        assert!(p.contains("- z.rs\n"));
+        assert!(!p.contains("- shared.rs\n"), "overlap is listed once");
+        assert!(p.contains("`origin/main` was just merged into this branch"));
+    }
+
+    #[test]
+    fn update_prompt_carries_the_note_and_conflicts_only_when_present() {
+        let clean = update_prompt("main", &upstream(1), &[], Some("  watch the migration  "));
+        assert!(clean.contains("What to look out for:\nwatch the migration\n"));
+        assert!(clean.contains("already committed"));
+        assert!(!clean.contains("Conflicted files"));
+        assert!(!clean.contains("git merge --abort"));
+        assert!(clean.contains("If nothing needs adapting, change nothing"));
+        assert!(clean.contains("usine-questions"));
+
+        let conflicted = update_prompt("main", &upstream(1), &["src/lib.rs".into()], None);
+        assert!(conflicted.contains("Conflicted files:\n- src/lib.rs\n"));
+        assert!(conflicted.contains("git merge --abort") && conflicted.contains("Do not push"));
+        assert!(!conflicted.contains("What to look out for"));
+        assert!(!conflicted.contains("already committed"));
+        assert!(is_clean_update_brief(&clean));
+        assert!(!is_clean_update_brief(&conflicted));
+    }
+
+    #[test]
+    fn update_brief_is_told_apart_from_the_conflict_brief() {
+        let update = update_prompt("main", &upstream(1), &[], None);
+        assert!(is_update_brief(&update));
+        assert!(!is_conflict_brief(&update));
+        let conflict = conflict_prompt("main", &["src/lib.rs".into()]);
+        assert!(!is_update_brief(&conflict));
+    }
+
     #[test]
     fn conflict_intervention_folds_several_questions_into_one_prompt() {
         use crate::agent::plan::PlanQuestion;
-        let one = conflict_intervention(&[PlanQuestion {
-            question: "Keep the retry loop?".into(),
-            options: vec!["Keep".into(), "Drop".into()],
-        }]);
+        let one = conflict_intervention(
+            &[PlanQuestion {
+                question: "Keep the retry loop?".into(),
+                options: vec!["Keep".into(), "Drop".into()],
+            }],
+            CONFLICT_QUESTION_LEAD,
+        );
         // A single question keeps its option buttons verbatim.
         assert_eq!(one.question, "Keep the retry loop?");
         assert_eq!(one.options, vec!["Keep", "Drop"]);
 
-        let many = conflict_intervention(&[
-            PlanQuestion {
-                question: "Keep the retry loop?".into(),
-                options: vec!["Keep".into(), "Drop".into()],
-            },
-            PlanQuestion {
-                question: "Which timeout wins?".into(),
-                options: vec![],
-            },
-        ]);
+        let many = conflict_intervention(
+            &[
+                PlanQuestion {
+                    question: "Keep the retry loop?".into(),
+                    options: vec!["Keep".into(), "Drop".into()],
+                },
+                PlanQuestion {
+                    question: "Which timeout wins?".into(),
+                    options: vec![],
+                },
+            ],
+            CONFLICT_QUESTION_LEAD,
+        );
+        assert!(many.question.starts_with(CONFLICT_QUESTION_LEAD));
         assert!(many.question.contains("1. Keep the retry loop?"));
         assert!(many.question.contains("(Keep / Drop)"));
         assert!(many.question.contains("2. Which timeout wins?"));

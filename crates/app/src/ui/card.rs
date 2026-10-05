@@ -62,17 +62,24 @@ pub fn CardView(card: Card) -> Element {
     // for the duration. They stay put and read disabled instead — `frozen`
     // adds `.is-busy`, whose `.btn` rule is exactly the "a command wouldn't
     // land right now" treatment. A fault keeps its Retry-only board treatment:
-    // a faulted card is acted on in the panel.
-    let frozen = matches!(card.state, CardState::Answering { .. });
+    // a faulted card is acted on in the panel. An update from the base wraps
+    // its gate the same way.
+    let frozen = matches!(
+        card.state,
+        CardState::Answering { .. } | CardState::Updating { .. }
+    );
     let st = match &card.state {
-        CardState::Answering { previous, .. } => previous.effective(),
+        CardState::Answering { previous, .. } | CardState::Updating { previous, .. } => {
+            previous.effective()
+        }
         s => s,
     };
     let recover_label = match st {
         CardState::Failed { message, .. } if message.starts_with("Interrupted") => "Resume",
         _ => "Retry",
     };
-    let needs_answer = st.intervention().is_some();
+    // An update's question lives on the wrapper, not the gate underneath.
+    let needs_answer = card.state.intervention().is_some() || st.intervention().is_some();
 
     let can_start = matches!(st, CardState::StartingBlock);
     let awaiting_approval = matches!(st, CardState::Designing(DesignSub::AwaitingApproval { .. }));

@@ -157,7 +157,7 @@ pub(super) fn AgentChatSection(
 /// The card's Agent Chat log — answered questions and requested changes, one
 /// list: newest expanded, earlier ones collapsed behind a one-line summary.
 /// A write run marks the log superseded, which collapses a stale answer
-/// without dropping it; the latest change recap stays open through it, since
+/// without dropping it; the latest change (or update) recap stays open through it, since
 /// a later fix run doesn't make "what your request changed" any less true.
 /// Renders nothing for an empty log. Read-only, so it can also sit on the
 /// running self-review / validation faces, which have no send box.
@@ -173,7 +173,7 @@ pub(super) fn ChatLog(card_id: Uuid) -> Element {
     let newest_open = log
         .exchanges
         .last()
-        .is_some_and(|ex| !log.superseded || ex.kind == ExchangeKind::Change);
+        .is_some_and(|ex| !log.superseded || ex.kind != ExchangeKind::Question);
     if log.exchanges.is_empty() {
         return rsx! {};
     }
@@ -191,9 +191,25 @@ pub(super) fn ChatLog(card_id: Uuid) -> Element {
                         if ex.kind == ExchangeKind::Change {
                             span { class: "badge kind qa-kind", "Change" }
                         }
+                        if ex.kind == ExchangeKind::Update {
+                            span { class: "badge kind qa-kind", "Update" }
+                        }
                         "{summary_line(&ex.question)}"
                     }
-                    if ex.kind == ExchangeKind::Change {
+                    if ex.kind == ExchangeKind::Update {
+                        // Titled after the base it merged; there is no request
+                        // to restate, only what the agent adapted (or why
+                        // nothing needed to).
+                        div { class: "hint", "What changed" }
+                        if ex.answer.trim().is_empty() {
+                            div { class: "hint", "No recap — see the transcript." }
+                        } else {
+                            ArtifactText {
+                                text: ex.answer.clone(),
+                                on_path: move |path: String| open_diff_dialog_at(card_id, path),
+                            }
+                        }
+                    } else if ex.kind == ExchangeKind::Change {
                         if !ex.question.is_empty() {
                             div { class: "hint", "You requested" }
                             div { class: "plan-box", "{ex.question}" }
@@ -285,6 +301,8 @@ pub(super) fn renders_chat(state: &CardState) -> bool {
         | CardState::Done => false,
 
         // Unreachable: `effective()` unwrapped both of these above.
-        CardState::Failed { .. } | CardState::Answering { .. } => false,
+        CardState::Failed { .. } | CardState::Answering { .. } | CardState::Updating { .. } => {
+            false
+        }
     }
 }

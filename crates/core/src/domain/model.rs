@@ -384,6 +384,8 @@ pub enum ExchangeKind {
     #[default]
     Question,
     Change,
+    /// The recap of an update-from-base run that carried no note.
+    Update,
 }
 
 /// One completed Agent Chat exchange: what the user asked (or requested) and
@@ -537,6 +539,13 @@ pub enum CardState {
         previous: Box<CardState>,
         question: String,
     },
+    /// The base branch was merged into the card's branch and an agent is
+    /// adapting the card's work to it. Wraps the parked state it was started
+    /// from, like `Answering`; `UpdateDone` / Cancel restore it.
+    Updating {
+        previous: Box<CardState>,
+        sub: RunSub,
+    },
 }
 
 impl CardState {
@@ -563,6 +572,7 @@ impl CardState {
             CardState::Done => Column::Done,
             CardState::Failed { previous, .. } => previous.column(),
             CardState::Answering { previous, .. } => previous.column(),
+            CardState::Updating { previous, .. } => previous.column(),
         }
     }
 
@@ -576,6 +586,7 @@ impl CardState {
         match self {
             CardState::Failed { previous, .. } => previous.effective(),
             CardState::Answering { previous, .. } => previous.effective(),
+            CardState::Updating { previous, .. } => previous.effective(),
             other => other,
         }
     }
@@ -591,6 +602,10 @@ impl CardState {
                 | CardState::PrReview(PrReviewSub::SelectingFixes { .. })
                 | CardState::PrReview(PrReviewSub::AwaitingAnswer(_))
                 | CardState::AwaitingReview(ReviewSub::SelectingFixes { .. })
+                | CardState::Updating {
+                    sub: RunSub::Intervention(_),
+                    ..
+                }
         )
     }
 
@@ -630,6 +645,10 @@ impl CardState {
                 | CardState::Implementing(RunSub::Intervention(_))
                 | CardState::PrReview(PrReviewSub::AwaitingAnswer(_))
                 | CardState::AwaitingReview(ReviewSub::ValidationFailed { .. })
+                | CardState::Updating {
+                    sub: RunSub::Intervention(_),
+                    ..
+                }
                 | CardState::Failed { .. }
         )
     }
@@ -655,6 +674,10 @@ impl CardState {
                 | CardState::PrReview(PrReviewSub::ApplyingFixes)
                 | CardState::PrReview(PrReviewSub::ApplyingChange)
                 | CardState::Answering { .. }
+                | CardState::Updating {
+                    sub: RunSub::Running,
+                    ..
+                }
         )
     }
 
@@ -665,6 +688,10 @@ impl CardState {
             CardState::Investigating(RunSub::Intervention(i)) => Some(i),
             CardState::Implementing(RunSub::Intervention(i)) => Some(i),
             CardState::PrReview(PrReviewSub::AwaitingAnswer(i)) => Some(i),
+            CardState::Updating {
+                sub: RunSub::Intervention(i),
+                ..
+            } => Some(i),
             _ => None,
         }
     }
@@ -708,6 +735,14 @@ impl CardState {
             CardState::Done => "done",
             CardState::Failed { .. } => "failed",
             CardState::Answering { .. } => "agent replying…",
+            CardState::Updating {
+                sub: RunSub::Running,
+                ..
+            } => "updating from base…",
+            CardState::Updating {
+                sub: RunSub::Intervention(_),
+                ..
+            } => "needs answer",
         }
     }
 }
@@ -2154,6 +2189,48 @@ mod tests {
             // Round-trips through the store's JSON codec shape.
             let json = serde_json::to_string(&s).unwrap();
             assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn updating_state_membership_columns_and_serde() {
+        // An update wraps the parked state it was started from, like
+        // `Answering`; column/effective delegate, the sub drives the rest.
+        let entries = [
+            (
+                CardState::AwaitingReview(ReviewSub::ReadyForPr),
+                Column::SelfReview,
+            ),
+            (CardState::PrReview(PrReviewSub::Idle), Column::PrReview),
+            (CardState::ReadyToMerge, Column::ReadyToMerge),
+        ];
+        for (previous, column) in entries {
+            let running = CardState::Updating {
+                previous: Box::new(previous.clone()),
+                sub: RunSub::Running,
+            };
+            assert!(running.is_running());
+            assert!(!running.needs_attention());
+            assert!(running.intervention().is_none());
+            assert_eq!(running.column(), column);
+            assert_eq!(*running.effective(), previous);
+            assert_eq!(running.status_label(), "updating from base…");
+
+            let parked = CardState::Updating {
+                previous: Box::new(previous.clone()),
+                sub: RunSub::Intervention(intervention()),
+            };
+            assert!(!parked.is_running());
+            assert!(parked.needs_intervention() && parked.needs_urgent_attention());
+            assert_eq!(parked.intervention(), Some(&intervention()));
+            assert_eq!(parked.column(), column);
+            assert_eq!(*parked.effective(), previous);
+            assert_eq!(parked.status_label(), "needs answer");
+
+            for s in [running, parked] {
+                let json = serde_json::to_string(&s).unwrap();
+                assert_eq!(serde_json::from_str::<CardState>(&json).unwrap(), s);
+            }
         }
     }
 

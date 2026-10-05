@@ -54,6 +54,7 @@ pub(crate) fn stop_destination(card: &usine_core::Card) -> Option<&'static str> 
         CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => "the failed validation",
         CardState::Concluded { .. } => "its conclusion",
         CardState::PrReview(PrReviewSub::Idle) => "the PR gate",
+        CardState::ReadyToMerge => "the merge gate",
         _ => return None,
     })
 }
