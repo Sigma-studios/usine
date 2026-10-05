@@ -237,7 +237,12 @@ struct CardFixExtraRecord {
 struct CardUpdateRecord {
     #[primary_key]
     card_id: String,
+    /// Empty when the backend reported no head (nothing to rewind to).
     pre_merge_head: String,
+    /// What a run parked on a question got through — shown on its question,
+    /// kept apart from the fixes recap the gate underneath displays.
+    #[serde(default)]
+    progress: String,
 }
 
 /// A pull request the user is reviewing (someone else's PR). Its own top-level
@@ -1011,9 +1016,11 @@ impl Store {
         let old: Option<CardUpdateRecord> = rw.get().primary(card_id.to_string())?;
         match (old, pre_merge_head) {
             (old, Some(head)) => {
+                // A new update starts with no progress of its own.
                 let rec = CardUpdateRecord {
                     card_id: card_id.to_string(),
                     pre_merge_head: head.to_string(),
+                    progress: String::new(),
                 };
                 match old {
                     Some(old) => rw.update(old, rec)?,
@@ -1030,7 +1037,49 @@ impl Store {
     pub fn get_update_origin(&self, card_id: Uuid) -> Result<Option<String>> {
         let r = self.db.r_transaction()?;
         let rec: Option<CardUpdateRecord> = r.get().primary(card_id.to_string())?;
-        Ok(rec.map(|r| r.pre_merge_head))
+        Ok(rec.map(|r| r.pre_merge_head).filter(|h| !h.is_empty()))
+    }
+
+    /// Record what an in-flight update's run got through before it stopped on
+    /// a question (empty clears it). Dropped with the rest of the update's
+    /// record when it lands or is cancelled.
+    pub fn set_update_progress(&self, card_id: Uuid, progress: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardUpdateRecord> = rw.get().primary(card_id.to_string())?;
+        match old {
+            Some(old) => {
+                let rec = CardUpdateRecord {
+                    progress: progress.to_string(),
+                    ..old.clone()
+                };
+                rw.update(old, rec)?;
+            }
+            None if progress.is_empty() => {}
+            None => rw.insert(CardUpdateRecord {
+                card_id: card_id.to_string(),
+                pre_merge_head: String::new(),
+                progress: progress.to_string(),
+            })?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// All in-flight updates' parked progress, keyed by card id (loaded once
+    /// at startup).
+    pub fn all_update_progress(&self) -> Result<HashMap<Uuid, String>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardUpdateRecord>()?.all()? {
+            let rec = rec?;
+            if rec.progress.is_empty() {
+                continue;
+            }
+            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
+                out.insert(id, rec.progress);
+            }
+        }
+        Ok(out)
     }
 
     // --- per-card options ----------------------------------------------
@@ -1618,6 +1667,36 @@ mod tests {
         assert_eq!(store.get_update_origin(id).unwrap(), None);
         // Clearing an absent record is a no-op.
         store.set_update_origin(id, None).unwrap();
+    }
+
+    #[test]
+    fn update_progress_lives_and_dies_with_the_update() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store.set_update_origin(id, Some("abc123")).unwrap();
+        store.set_update_progress(id, "merged; adapting").unwrap();
+        assert_eq!(
+            store
+                .all_update_progress()
+                .unwrap()
+                .get(&id)
+                .map(String::as_str),
+            Some("merged; adapting")
+        );
+        // Progress doesn't disturb the rewind target…
+        assert_eq!(
+            store.get_update_origin(id).unwrap().as_deref(),
+            Some("abc123")
+        );
+        // …a new update starts without it, and the update landing drops it.
+        store.set_update_origin(id, Some("def456")).unwrap();
+        assert!(store.all_update_progress().unwrap().is_empty());
+        store.set_update_progress(id, "again").unwrap();
+        store.set_update_origin(id, None).unwrap();
+        assert!(store.all_update_progress().unwrap().is_empty());
+        // Without an origin, progress alone reports no rewind target.
+        store.set_update_progress(id, "no head").unwrap();
+        assert_eq!(store.get_update_origin(id).unwrap(), None);
     }
 
     #[test]

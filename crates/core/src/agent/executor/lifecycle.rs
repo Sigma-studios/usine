@@ -799,6 +799,30 @@ impl Executor {
         // cancel is about to park.
         self.purge_queued(card_id);
         let prior = self.store.get_card(card_id)?.state;
+        // Stopping an update — live, parked on a question, or faulted — rolls
+        // the merge back. Matched on the raw state: `effective()` would see
+        // through the wrapper to the parked gate underneath.
+        let is_update = match &prior {
+            CardState::Updating { .. } => true,
+            CardState::Failed { previous, .. } => matches!(**previous, CardState::Updating { .. }),
+            _ => false,
+        };
+        // The rollback runs well after the card is back at its gate (it waits
+        // for the old process first), and Cancel itself is never claimed — so
+        // a fresh "Update from base" clicked meanwhile could merge, only for
+        // this rollback to reset its merge or forget its origin. Claim the
+        // card *before* it leaves `Updating` and hold it through the rollback:
+        // a command clicked in that window is dropped as a duplicate. Taken
+        // best-effort — an exclusive command already holding it can't be the
+        // new update (its state guard sees `Updating`), so go on without.
+        let _update_claim = is_update
+            .then(|| super::claim(&self.in_flight, &self.evt_tx, card_id))
+            .flatten();
+        let update_origin = if is_update {
+            self.store.get_update_origin(card_id).unwrap_or(None)
+        } else {
+            None
+        };
         let run_id = lock(&self.runs).get(&card_id).map(|(rid, control)| {
             let _ = control.unbounded_send(RunControl::Cancel);
             *rid
@@ -861,20 +885,21 @@ impl Executor {
         ) {
             self.discard_cancelled_run_edits(card_id, run_id).await;
         }
-        // Stopping an update — live, parked on a question, or faulted — rolls
-        // the merge back. Matched on the raw state: `effective()` would see
-        // through the wrapper to the parked gate underneath.
-        let is_update = match &prior {
-            CardState::Updating { .. } => true,
-            CardState::Failed { previous, .. } => matches!(**previous, CardState::Updating { .. }),
-            _ => false,
-        };
         if is_update {
             let _ = self.store.set_pending_change(card_id, "");
             let _ = self.store.set_fix_extra(card_id, None);
             let _ = self.store.take_pending_fix_qa(card_id);
-            self.roll_back_update(card_id, run_id).await;
-            let _ = self.store.set_update_origin(card_id, None);
+            self.roll_back_update(card_id, run_id, update_origin.as_deref())
+                .await;
+            // Only forget the origin this cancel rolled back from: one that
+            // changed meanwhile belongs to a newer update, whose own Cancel
+            // still needs it.
+            if self.store.get_update_origin(card_id).unwrap_or(None) == update_origin {
+                let _ = self.store.set_update_origin(card_id, None);
+                let _ = self
+                    .evt_tx
+                    .unbounded_send(ExecutorEvent::update_progress(card_id, ""));
+            }
             self.reap_idle_preview(card_id).await;
         }
         if matches!(prior, CardState::Implementing(_)) {
@@ -1024,8 +1049,19 @@ impl Executor {
     /// [`GitOps::rewind_unpublished`]); nothing is ever force-pushed. Otherwise
     /// fall back to discarding the run's uncommitted edits, which also aborts
     /// a merge still in progress, and say why a committed merge was kept.
-    async fn roll_back_update(&self, card_id: Uuid, cancelled: Option<Uuid>) {
+    async fn roll_back_update(&self, card_id: Uuid, cancelled: Option<Uuid>, origin: Option<&str>) {
         if !self.await_run_exit(card_id, cancelled).await {
+            return;
+        }
+        // A newer update took over the worktree meanwhile (see `cancel`'s
+        // claim): its merge is not ours to undo.
+        if self
+            .store
+            .get_update_origin(card_id)
+            .unwrap_or(None)
+            .as_deref()
+            != origin
+        {
             return;
         }
         let Ok(card) = self.store.get_card(card_id) else {
@@ -1038,8 +1074,7 @@ impl Executor {
         let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) else {
             return;
         };
-        let origin = self.store.get_update_origin(card_id).unwrap_or(None);
-        if let (Some(origin), Some(branch)) = (&origin, &card.branch) {
+        if let (Some(origin), Some(branch)) = (origin, &card.branch) {
             if let Ok(true) = self.git.rewind_unpublished(&dir, branch, origin).await {
                 return;
             }
@@ -1053,7 +1088,7 @@ impl Executor {
             return;
         }
         let head = self.git.head_sha(&dir).await.unwrap_or_default();
-        let kept_merge = match &origin {
+        let kept_merge = match origin {
             // Backends that don't model history report no head: no claim.
             Some(origin) => !head.is_empty() && !same_commit(&head, origin),
             None => false,

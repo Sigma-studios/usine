@@ -715,11 +715,17 @@ async fn a_conflict_run_that_asks_parks_the_card_and_publishes_nothing() {
     assert_eq!(iv.options, vec!["Keep", "Drop"]);
     assert!(!*git.committed.lock().unwrap(), "nothing may be committed");
     assert!(!*git.pushed.lock().unwrap(), "nothing may be pushed");
-    // The prose survives as the recap so the user can see what it did get
-    // through — but the machine-facing block must not leak into it.
-    let recap = store.get_review_recap(card.id).unwrap().unwrap_or_default();
+    // The prose survives as the update's progress so the user can see what
+    // it did get through — but the machine-facing block must not leak into
+    // it, and the gate's own fixes recap is left alone.
+    let recap = store
+        .all_update_progress()
+        .unwrap()
+        .remove(&card.id)
+        .unwrap_or_default();
     assert!(recap.contains("src/lib.rs needs your call"), "got: {recap}");
     assert!(!recap.contains("usine-questions"), "got: {recap}");
+    assert_eq!(store.get_review_recap(card.id).unwrap(), None);
     // The brief is still stashed: the answering run has to restate it.
     assert!(store.get_fix_extra(card.id).unwrap().is_some());
 }

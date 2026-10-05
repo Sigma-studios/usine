@@ -338,10 +338,12 @@ async fn finalize_run(
                         &crate::agent::commit::strip_commit_block(&clean),
                     ),
                 );
-                if !recap.is_empty() {
-                    let _ = store.set_review_recap(card_id, &recap);
-                    let _ = evt_tx.unbounded_send(ExecutorEvent::recap_updated(card_id, recap));
-                }
+                // Kept on the update, not as the fixes recap: that one belongs
+                // to the gate underneath, and a parked update must neither
+                // overwrite it nor be shown it as its own progress. Written
+                // even when empty, so an earlier park's text can't linger.
+                let _ = store.set_update_progress(card_id, &recap);
+                let _ = evt_tx.unbounded_send(ExecutorEvent::update_progress(card_id, recap));
                 // The stashed conflict brief and pending fix Q&A stay put:
                 // the answering run restates the brief, and the fixes it
                 // logs are only true once it commits.
@@ -617,11 +619,20 @@ async fn finalize_run(
             if is_update {
                 // "Nothing to adapt" is an allowed outcome of an update: the
                 // merge itself is the work, and the agent says why it stopped
-                // there.
+                // there. A clean tree alone doesn't show it — the agent may
+                // have committed its adaptations (or, after conflicts, the
+                // merge) itself — so it's only claimed while HEAD is still the
+                // merge usine committed on top of the recorded origin.
                 let base = project.config.effective_base_branch();
-                let message = match first_sentence(&summary, 200) {
-                    reason if reason.is_empty() => format!("Merged {base}; nothing to adapt."),
-                    reason => format!("Merged {base}; nothing to adapt — {reason}"),
+                let merge_untouched = super::is_clean_update_brief(&brief)
+                    && merge_still_head(git, &card, &project, store).await;
+                let message = if merge_untouched {
+                    match first_sentence(&summary, 200) {
+                        reason if reason.is_empty() => format!("Merged {base}; nothing to adapt."),
+                        reason => format!("Merged {base}; nothing to adapt — {reason}"),
+                    }
+                } else {
+                    format!("Updated from {base}.")
                 };
                 let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
                     card_id,
@@ -752,6 +763,7 @@ async fn finalize_run(
     // The update landed: there is no pre-merge state left to rewind to.
     if is_update {
         let _ = store.set_update_origin(card_id, None);
+        let _ = evt_tx.unbounded_send(ExecutorEvent::update_progress(card_id, ""));
     }
     // The fix run replied to every declined comment and resolved every fixed one
     // (see `apply_fixes`), so no thread the picker saw is still unanswered. Land
@@ -864,6 +876,28 @@ pub(super) fn reap_idle_preview_direct(executor: &Weak<Executor>, card_id: Uuid)
 
 /// The first sentence of `text` (up to the first `. `, `! `, `? ` or line
 /// break), capped at `max` characters with an ellipsis.
+/// Whether `card`'s HEAD is still the merge an update committed before its
+/// run: a two-parent commit whose first parent is the recorded pre-merge
+/// origin. Anything else — a commit on top, a merge the agent made — or a
+/// backend that can't tell, is `false`.
+async fn merge_still_head(
+    git: &Arc<dyn GitOps>,
+    card: &crate::Card,
+    project: &crate::Project,
+    store: &Store,
+) -> bool {
+    let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) else {
+        return false;
+    };
+    let Some(origin) = store.get_update_origin(card.id).unwrap_or(None) else {
+        return false;
+    };
+    match git.head_parents(&dir).await.unwrap_or_default().as_slice() {
+        [first, _theirs] => first.starts_with(&origin) || origin.starts_with(first.as_str()),
+        _ => false,
+    }
+}
+
 fn first_sentence(text: &str, max: usize) -> String {
     let text = text.trim();
     let end = text

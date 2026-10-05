@@ -512,6 +512,11 @@ pub trait GitOps: Send + Sync {
     async fn head_sha(&self, _dir: &Path) -> Result<String> {
         Ok(String::new())
     }
+    /// The full shas of the parents of `dir`'s HEAD, first parent first.
+    /// Backends that don't model history report none — "no information".
+    async fn head_parents(&self, _dir: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// A remote's configured URL (empty when unknown — see [`Self::head_sha`]).
     async fn remote_url(&self, _dir: &Path, _remote: &str) -> Result<String> {
         Ok(String::new())
@@ -532,8 +537,10 @@ pub trait GitOps: Send + Sync {
     }
     /// Hard-reset `dir` to `to` (and clean untracked files) — only if that
     /// drops nothing anyone else can see: `to` must be HEAD or an ancestor of
-    /// it, and the remote-tracking `origin/<branch>` must be absent or an
-    /// ancestor of `to`. Returns whether it rewound. Never touches the remote.
+    /// it, and no commit in `to..HEAD` may be reachable from the
+    /// remote-tracking `origin/<branch>` (absent counts as nothing published;
+    /// a tracking ref that moved on with someone else's push still blocks
+    /// nothing of ours). Returns whether it rewound. Never touches the remote.
     /// Backends that don't model history never rewind, so callers fall back to
     /// [`Self::discard_changes`].
     async fn rewind_unpublished(&self, _dir: &Path, _branch: &str, _to: &str) -> Result<bool> {
@@ -809,6 +816,12 @@ impl GitOps for RealGit {
 
     async fn head_sha(&self, dir: &Path) -> Result<String> {
         Ok(run_git(dir, &head_sha_args()).await?.trim().to_string())
+    }
+
+    async fn head_parents(&self, dir: &Path) -> Result<Vec<String>> {
+        let r = git2::Repository::open(dir)?;
+        let head = r.head()?.peel_to_commit()?;
+        Ok(head.parent_ids().map(|id| id.to_string()).collect())
     }
 
     async fn branch_ahead_of_remote(&self, dir: &Path, branch: &str) -> Result<bool> {
@@ -1093,9 +1106,16 @@ fn can_rewind_unpublished(repo: &Path, branch: &str, to: &str) -> Result<bool> {
         Ok(obj) => Some(obj.peel_to_commit()?.id()),
         Err(_) => None,
     };
-    match published {
-        Some(tip) => within(to, tip),
-        None => Ok(true),
+    // Nothing in `to..HEAD` is published iff everything HEAD shares with the
+    // tracking ref is already within `to` — whether or not the ref has since
+    // moved on with commits of its own (a push to the PR branch).
+    let Some(tip) = published else {
+        return Ok(true);
+    };
+    match r.merge_base(head, tip) {
+        Ok(shared) => within(to, shared),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(true),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1393,6 +1413,24 @@ mod tests {
             .unwrap());
         assert_eq!(git(&["rev-parse", "HEAD"]), pre);
         assert!(!dir.join("stray.txt").exists());
+
+        // Someone else pushed to the branch since (the tracking ref moved on
+        // past `pre`, on a line of its own): the merge still isn't published.
+        git(&["merge", "-q", "--no-edit", "main"]);
+        let merged = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "-b", "theirs", &pre]);
+        std::fs::write(dir.join("theirs.txt"), "t").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "their push"]);
+        let theirs = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "feature"]);
+        git(&["update-ref", "refs/remotes/origin/feature", &theirs]);
+        assert_eq!(git(&["rev-parse", "HEAD"]), merged);
+        assert!(RealGit
+            .rewind_unpublished(dir, "feature", &pre)
+            .await
+            .unwrap());
+        assert_eq!(git(&["rev-parse", "HEAD"]), pre);
     }
 
     #[test]

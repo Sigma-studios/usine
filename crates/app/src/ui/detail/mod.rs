@@ -131,11 +131,14 @@ fn CardDetail() -> Element {
                 CardState::Failed { previous, .. } if matches!(**previous, CardState::Updating { .. })
             );
             let update_dest = crate::ui::stop_destination(&card).unwrap_or("where it was");
-            let update_recap = state.review_recaps.read().get(&id).cloned();
-            let pr_untouched = if card.pr.is_some() {
-                ", and the PR is exactly as it was"
+            // Its own record: the fixes recap belongs to the gate underneath.
+            let update_recap = state.update_progress.read().get(&id).cloned();
+            // A clean merge is already committed locally (and the agent may
+            // have committed too) — what the update holds back is the push.
+            let update_held = if card.pr.is_some() {
+                "Nothing has been pushed — the PR is exactly as it was."
             } else {
-                ""
+                "Nothing has been pushed; stopping rolls the merge back."
             };
             let body_class =
                 if busy || question.is_some() || fail_display.is_some() || updating.is_some() {
@@ -278,7 +281,7 @@ fn CardDetail() -> Element {
                     if let Some(usine_core::RunSub::Intervention(iv)) = updating {
                         div { class: "detail-update-gate",
                             h3 { "Update from {update_base} needs a decision" }
-                            div { class: "hint", "Nothing has been committed{pr_untouched}." }
+                            div { class: "hint", "{update_held}" }
                             if let Some(recap) = update_recap {
                                 div { class: "hint", "What it got through" }
                                 ArtifactText { text: recap }

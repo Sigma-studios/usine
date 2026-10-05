@@ -712,6 +712,9 @@ pub enum ExecutorEventKind {
     ReviewTaskUpdated(Box<ReviewTask>),
     /// A card's fixes recap changed (`card_id` on the event).
     RecapUpdated { recap: String },
+    /// What a card's in-flight update got through before stopping on a
+    /// question (`card_id` on the event). Empty means none: the UI drops it.
+    UpdateProgress { progress: String },
     /// A card's fix-run report changed (`card_id` on the event): the findings
     /// the last fix run was asked to address, joined to the outcomes it
     /// reported. An empty report means there is none and the UI drops its entry.
@@ -882,6 +885,14 @@ impl ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::RecapUpdated {
                 recap: recap.into(),
+            },
+        }
+    }
+    pub fn update_progress(card_id: Uuid, progress: impl Into<String>) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::UpdateProgress {
+                progress: progress.into(),
             },
         }
     }

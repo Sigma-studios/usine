@@ -275,6 +275,9 @@ struct Scripted {
     prompts: Prompts,
     starts: Arc<AtomicUsize>,
     hold: bool,
+    /// Runs in the worktree before the run reports done — the agent's own
+    /// edits (and commits).
+    work: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Scripted {
@@ -284,6 +287,13 @@ impl Scripted {
             prompts: Arc::default(),
             starts: Arc::default(),
             hold: false,
+            work: None,
+        }
+    }
+    fn with_work(self, work: impl Fn() + Send + Sync + 'static) -> Self {
+        Scripted {
+            work: Some(Arc::new(work)),
+            ..self
         }
     }
     fn until_cancelled() -> Self {
@@ -327,6 +337,9 @@ impl AgentProvider for Scripted {
                 drop(evt_tx);
             });
         } else {
+            if let Some(work) = &self.work {
+                work();
+            }
             let result = {
                 let mut rs = self.results.lock().unwrap();
                 if rs.is_empty() {
@@ -631,6 +644,43 @@ async fn nothing_to_adapt_after_the_pr_still_pushes_the_merge() {
     assert_eq!(after.mergeable, Mergeable::Unknown);
     let last = store.get_answers(card.id).unwrap().exchanges.pop().unwrap();
     assert_eq!(last.kind, ExchangeKind::Update);
+}
+
+/// An agent that commits its adaptation itself leaves a clean tree, but HEAD
+/// is no longer the merge: the toast must not claim there was nothing to adapt.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_commit_is_not_reported_as_nothing_to_adapt() {
+    let fx = Fixture::new();
+    git(&fx.wt, &["push", "-qu", "origin", BRANCH]);
+    fx.land_upstream(false);
+    let wt = fx.wt.clone();
+    let agent = Scripted::new(&["Adapted the call site to the rename."]).with_work(move || {
+        std::fs::write(wt.join("adapted.rs"), "adapted\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "adapt to the rename"]);
+    });
+    let (_store, card, handle, mut rx) = spawn(
+        &fx.repo,
+        &fx.wt,
+        CardState::ReadyToMerge,
+        true,
+        |c| c.ci_checks = Some(true),
+        Arc::new(agent.clone()),
+        Arc::new(RealGit),
+    );
+    update(&handle, card.id, None);
+
+    let msg = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast {
+            severity: Severity::Success,
+            message,
+        } if e.card_id == card.id => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!msg.contains("nothing to adapt"), "got: {msg}");
+    wait_for_state(&mut rx, card.id, |s| *s == CardState::ReadyToMerge).await;
+    assert_eq!(fx.remote_branch(), fx.head(), "the adaptation is published");
 }
 
 // --- the pre-commit gate (scripted git) ----------------------------------------

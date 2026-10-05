@@ -1562,9 +1562,9 @@ fn update_prompt(
         }
     }
     if conflicted.is_empty() {
-        s.push_str(
-            "\nThe merge is already committed. Don't revert, reset or rebase it. Do not push.\n",
-        );
+        s.push_str(&format!(
+            "\n{UPDATE_CLEAN_MERGE_LINE} Don't revert, reset or rebase it. Do not push.\n"
+        ));
     } else {
         s.push_str(&format!(
             "\nThe merge stopped on conflicts and is still in progress in this worktree. Resolve \
@@ -1603,6 +1603,16 @@ const UPDATE_BRIEF_OPENER: &str = "## Update from the base branch";
 /// [`UPDATE_BRIEF_OPENER`]).
 pub(crate) fn is_update_brief(extra: &str) -> bool {
     extra.starts_with(UPDATE_BRIEF_OPENER)
+}
+
+/// Tells an update whose merge came out clean (usine committed it) from one
+/// that stopped on conflicts (the agent's run completes it).
+const UPDATE_CLEAN_MERGE_LINE: &str = "The merge is already committed.";
+
+/// Whether a stashed brief is an update whose merge usine committed itself
+/// before the run — so a HEAD still on that merge means the run added nothing.
+pub(crate) fn is_clean_update_brief(extra: &str) -> bool {
+    is_update_brief(extra) && extra.contains(UPDATE_CLEAN_MERGE_LINE)
 }
 
 /// [`CONFLICT_ESCAPE_HATCH`] for an update run: the same `usine-questions`
@@ -2336,6 +2346,8 @@ mod tests {
         assert!(conflicted.contains("git merge --abort") && conflicted.contains("Do not push"));
         assert!(!conflicted.contains("What to look out for"));
         assert!(!conflicted.contains("already committed"));
+        assert!(is_clean_update_brief(&clean));
+        assert!(!is_clean_update_brief(&conflicted));
     }
 
     #[test]
