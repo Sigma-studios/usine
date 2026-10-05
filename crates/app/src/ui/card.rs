@@ -432,16 +432,34 @@ pub fn CardView(card: Card) -> Element {
             // The reason the user left when marking the card blocked. Clamped to
             // three lines so a long note can't stretch the column; the title
             // attribute keeps the whole thing readable on hover.
-            if let Some(note) = blocked_note {
-                div { class: "blocked-note", title: "{note}", "{note}" }
+            // The unblock icon sits at the end of the note's row rather than in
+            // the actions row, so it costs a blocked card no extra height.
+            if card.blocked {
+                div { class: "blocked-row",
+                    if let Some(note) = blocked_note {
+                        div { class: "blocked-note", title: "{note}", "{note}" }
+                    }
+                    button {
+                        class: "card-icon-btn unblock",
+                        title: "Mark unblocked",
+                        "aria-label": "Mark unblocked",
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            state.send(ExecutorCommand::SetBlocked { card_id: id, blocked: false, note: None });
+                        },
+                        // Shield Enter on the button from the card's onkeydown.
+                        onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
+                        IconUnlock {}
+                    }
+                }
             }
             div { class: if frozen { "card-actions is-busy" } else { "card-actions" },
                 // Shield the action buttons' keydowns from the card handler too.
                 onkeydown: move |e| e.stop_propagation(),
                 // A blocked card is waiting on something outside Usine, so hide
                 // the actions that would advance it. The preview controls below
-                // stay, and the unblock icon beside them or the chevron menu
-                // lifts the marker.
+                // stay; the unblock icon by the note or the chevron menu lifts
+                // the marker.
                 if !card.blocked {
                     if can_start {
                         button {
@@ -614,23 +632,9 @@ pub fn CardView(card: Card) -> Element {
                     }
                 }
                 // Pushed to the bottom-right corner, away from the state's primary action.
-                if card.blocked || preview != PreviewTools::Hidden {
+                if preview != PreviewTools::Hidden {
                     div { class: "card-tools",
-                        if card.blocked {
-                            button {
-                                class: "card-icon-btn unblock",
-                                title: "Mark unblocked",
-                                "aria-label": "Mark unblocked",
-                                onclick: move |e| {
-                                    e.stop_propagation();
-                                    state.send(ExecutorCommand::SetBlocked { card_id: id, blocked: false, note: None });
-                                },
-                                IconUnlock {}
-                            }
-                        }
-                        if preview != PreviewTools::Hidden {
-                            PreviewControls { card_id: id, tools: preview }
-                        }
+                        PreviewControls { card_id: id, tools: preview }
                     }
                 }
             }
