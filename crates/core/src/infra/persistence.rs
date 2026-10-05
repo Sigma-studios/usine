@@ -227,6 +227,24 @@ struct CardFixExtraRecord {
     extra: String,
 }
 
+/// The branch tip from before an in-flight update-from-base merged the base
+/// in — where Cancel (or abandoning a faulted update) rewinds the branch to,
+/// when nothing past it has been published. Its own record so adding it
+/// doesn't change the `Card` record layout.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 14, version = 1, with = Json)]
+#[native_db]
+struct CardUpdateRecord {
+    #[primary_key]
+    card_id: String,
+    /// Empty when the backend reported no head (nothing to rewind to).
+    pre_merge_head: String,
+    /// What a run parked on a question got through — shown on its question,
+    /// kept apart from the fixes recap the gate underneath displays.
+    #[serde(default)]
+    progress: String,
+}
+
 /// A pull request the user is reviewing (someone else's PR). Its own top-level
 /// record — distinct from `CardRecord` — because a foreign PR has no owned
 /// branch/worktree/card. `project_id` is lifted for the per-project filter.
@@ -337,6 +355,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<CardFixExtraRecord>()
         .expect("define CardFixExtraRecord");
+    models
+        .define::<CardUpdateRecord>()
+        .expect("define CardUpdateRecord");
     models
         .define::<ReviewTaskRecord>()
         .expect("define ReviewTaskRecord");
@@ -635,6 +656,9 @@ impl Store {
         {
             rw.remove(rec)?;
         }
+        if let Some(rec) = rw.get().primary::<CardUpdateRecord>(id.to_string())? {
+            rw.remove(rec)?;
+        }
         rw.commit()?;
         Ok(())
     }
@@ -823,6 +847,43 @@ impl Store {
         Ok(())
     }
 
+    /// Append the recap of an update-from-base run that carried no note to the
+    /// card's log, titled after the base it merged. Clears `superseded` (the
+    /// recap describes the work as it now stands); a stashed question or
+    /// change request is left for its own run.
+    pub fn record_update(&self, card_id: Uuid, base: &str, recap: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAnswerRecord> = rw.get().primary(card_id.to_string())?;
+        let mut history = old
+            .as_ref()
+            .map(|o| o.clone().answers().exchanges)
+            .unwrap_or_default();
+        history.push(QaExchange {
+            question: format!("Update from {base}"),
+            answer: recap.to_string(),
+            asked_at: crate::now_millis(),
+            kind: ExchangeKind::Update,
+        });
+        let rec = match &old {
+            Some(o) => CardAnswerRecord {
+                history,
+                superseded: false,
+                ..o.clone()
+            },
+            None => CardAnswerRecord {
+                card_id: card_id.to_string(),
+                history,
+                ..Default::default()
+            },
+        };
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
     /// The card's most recent answer, if it has ever answered a question.
     pub fn get_answer(&self, card_id: Uuid) -> Result<Option<String>> {
         Ok(self
@@ -944,6 +1005,81 @@ impl Store {
         let r = self.db.r_transaction()?;
         let rec: Option<CardFixExtraRecord> = r.get().primary(card_id.to_string())?;
         Ok(rec.map(|r| r.extra))
+    }
+
+    // --- update-from-base origin ----------------------------------------
+
+    /// Record (or, with `None`, clear) the pre-merge commit of an in-flight
+    /// update-from-base (see the record's doc).
+    pub fn set_update_origin(&self, card_id: Uuid, pre_merge_head: Option<&str>) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardUpdateRecord> = rw.get().primary(card_id.to_string())?;
+        match (old, pre_merge_head) {
+            (old, Some(head)) => {
+                // A new update starts with no progress of its own.
+                let rec = CardUpdateRecord {
+                    card_id: card_id.to_string(),
+                    pre_merge_head: head.to_string(),
+                    progress: String::new(),
+                };
+                match old {
+                    Some(old) => rw.update(old, rec)?,
+                    None => rw.insert(rec)?,
+                }
+            }
+            (Some(old), None) => rw.remove(old).map(|_| ())?,
+            (None, None) => {}
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    pub fn get_update_origin(&self, card_id: Uuid) -> Result<Option<String>> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CardUpdateRecord> = r.get().primary(card_id.to_string())?;
+        Ok(rec.map(|r| r.pre_merge_head).filter(|h| !h.is_empty()))
+    }
+
+    /// Record what an in-flight update's run got through before it stopped on
+    /// a question (empty clears it). Dropped with the rest of the update's
+    /// record when it lands or is cancelled.
+    pub fn set_update_progress(&self, card_id: Uuid, progress: &str) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardUpdateRecord> = rw.get().primary(card_id.to_string())?;
+        match old {
+            Some(old) => {
+                let rec = CardUpdateRecord {
+                    progress: progress.to_string(),
+                    ..old.clone()
+                };
+                rw.update(old, rec)?;
+            }
+            None if progress.is_empty() => {}
+            None => rw.insert(CardUpdateRecord {
+                card_id: card_id.to_string(),
+                pre_merge_head: String::new(),
+                progress: progress.to_string(),
+            })?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// All in-flight updates' parked progress, keyed by card id (loaded once
+    /// at startup).
+    pub fn all_update_progress(&self) -> Result<HashMap<Uuid, String>> {
+        let r = self.db.r_transaction()?;
+        let mut out = HashMap::new();
+        for rec in r.scan().primary::<CardUpdateRecord>()?.all()? {
+            let rec = rec?;
+            if rec.progress.is_empty() {
+                continue;
+            }
+            if let Ok(id) = Uuid::parse_str(&rec.card_id) {
+                out.insert(id, rec.progress);
+            }
+        }
+        Ok(out)
     }
 
     // --- per-card options ----------------------------------------------
@@ -1510,6 +1646,79 @@ mod tests {
         );
         assert_eq!(store.load_transcript(all[0].id).unwrap(), vec!["hello"]);
         store.upsert_card(&all[0]).unwrap();
+    }
+
+    #[test]
+    fn update_origin_round_trips_and_clears() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        assert_eq!(store.get_update_origin(id).unwrap(), None);
+        store.set_update_origin(id, Some("abc123")).unwrap();
+        assert_eq!(
+            store.get_update_origin(id).unwrap().as_deref(),
+            Some("abc123")
+        );
+        store.set_update_origin(id, Some("def456")).unwrap();
+        assert_eq!(
+            store.get_update_origin(id).unwrap().as_deref(),
+            Some("def456")
+        );
+        store.set_update_origin(id, None).unwrap();
+        assert_eq!(store.get_update_origin(id).unwrap(), None);
+        // Clearing an absent record is a no-op.
+        store.set_update_origin(id, None).unwrap();
+    }
+
+    #[test]
+    fn update_progress_lives_and_dies_with_the_update() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store.set_update_origin(id, Some("abc123")).unwrap();
+        store.set_update_progress(id, "merged; adapting").unwrap();
+        assert_eq!(
+            store
+                .all_update_progress()
+                .unwrap()
+                .get(&id)
+                .map(String::as_str),
+            Some("merged; adapting")
+        );
+        // Progress doesn't disturb the rewind target…
+        assert_eq!(
+            store.get_update_origin(id).unwrap().as_deref(),
+            Some("abc123")
+        );
+        // …a new update starts without it, and the update landing drops it.
+        store.set_update_origin(id, Some("def456")).unwrap();
+        assert!(store.all_update_progress().unwrap().is_empty());
+        store.set_update_progress(id, "again").unwrap();
+        store.set_update_origin(id, None).unwrap();
+        assert!(store.all_update_progress().unwrap().is_empty());
+        // Without an origin, progress alone reports no rewind target.
+        store.set_update_progress(id, "no head").unwrap();
+        assert_eq!(store.get_update_origin(id).unwrap(), None);
+    }
+
+    #[test]
+    fn record_update_appends_an_update_entry() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store.set_question(id, "why?").unwrap();
+        store.set_answer(id, "because").unwrap();
+        store.set_question(id, "next?").unwrap();
+        store
+            .record_update(id, "main", "adapted the call sites")
+            .unwrap();
+        let log = store.get_answers(id).unwrap();
+        assert_eq!(log.exchanges.len(), 2);
+        assert_eq!(log.exchanges[0].kind, ExchangeKind::Question);
+        let last = &log.exchanges[1];
+        assert_eq!(last.kind, ExchangeKind::Update);
+        assert_eq!(last.question, "Update from main");
+        assert_eq!(last.answer, "adapted the call sites");
+        assert!(!log.superseded);
+        // The stashed question is left for its own run.
+        assert_eq!(store.get_question(id).unwrap().as_deref(), Some("next?"));
     }
 
     #[test]

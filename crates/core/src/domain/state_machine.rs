@@ -81,6 +81,10 @@ pub enum Transition {
     AskQuestion {
         question: String,
     },
+    /// Merge the base branch into the card's branch and run an agent to adapt
+    /// the card's work to what landed. Wraps the parked gate it was started
+    /// from in `Updating`, so the run returns there once done (or cancelled).
+    UpdateFromBase,
     // --- agent-driven ---
     AgentNeedsInput(Intervention),
     AgentPlanReady {
@@ -131,6 +135,10 @@ pub enum Transition {
     /// The question run finished (its answer recorded elsewhere); unwrap
     /// `Answering` back to the state the question was asked from.
     QuestionAnswered,
+    /// The update-from-base run finished; unwrap `Updating` back to the gate
+    /// it was started from (a parked validation failure re-enters the gate at
+    /// `ReadyForPr`, since the code it failed on has changed).
+    UpdateDone,
 }
 
 /// Compute the next state, or [`CoreError::IllegalTransition`] if the move is
@@ -406,6 +414,62 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         // Cancelling a question restores the exact state it was asked from.
         (S::Answering { previous, .. }, T::Cancel) => (**previous).clone(),
 
+        // Update from base: from any parked gate around the PR, merge the base
+        // in and let an agent adapt the work. The gate is wrapped, not
+        // replaced, so the run returns to it.
+        (s, T::UpdateFromBase)
+            if matches!(
+                s,
+                S::AwaitingReview(ReviewSub::ReadyForPr | ReviewSub::ValidationFailed { .. })
+                    | S::PrReview(PrReviewSub::Idle)
+                    | S::ReadyToMerge
+            ) =>
+        {
+            S::Updating {
+                previous: Box::new(s.clone()),
+                sub: RunSub::Running,
+            }
+        }
+        (
+            S::Updating {
+                previous,
+                sub: RunSub::Running,
+            },
+            T::AgentNeedsInput(i),
+        ) => S::Updating {
+            previous: previous.clone(),
+            sub: RunSub::Intervention(i),
+        },
+        (
+            S::Updating {
+                previous,
+                sub: RunSub::Intervention(_),
+            },
+            T::AnswerIntervention,
+        ) => S::Updating {
+            previous: previous.clone(),
+            sub: RunSub::Running,
+        },
+        // Both subs, tolerating a terminal that races the park (as the other
+        // phases do).
+        (S::Updating { previous, .. }, T::UpdateDone) => match &**previous {
+            // The code changed, so the old failure no longer applies —
+            // re-enter the gate.
+            S::AwaitingReview(ReviewSub::ValidationFailed { .. }) => {
+                S::AwaitingReview(ReviewSub::ReadyForPr)
+            }
+            p => p.clone(),
+        },
+        (S::Updating { previous, .. }, T::Cancel) => (**previous).clone(),
+        // Abandoning a faulted update: the executor rolls the merge back, so
+        // the card returns to the gate it was updated from.
+        (S::Failed { previous, .. }, T::Cancel) if matches!(**previous, S::Updating { .. }) => {
+            match &**previous {
+                S::Updating { previous, .. } => (**previous).clone(),
+                _ => unreachable!(),
+            }
+        }
+
         // Any active run can fault.
         (s, T::AgentError { message }) if s.is_running() => S::Failed {
             previous: Box::new(s.clone()),
@@ -540,6 +604,161 @@ mod tests {
     use crate::domain::model::{
         CardState, DesignSub, Intervention, PrReviewSub, ReviewComment, ReviewSub, RunSub,
     };
+
+    fn updating(previous: CardState, sub: RunSub) -> CardState {
+        CardState::Updating {
+            previous: Box::new(previous),
+            sub,
+        }
+    }
+
+    fn update_sources() -> Vec<CardState> {
+        vec![
+            CardState::AwaitingReview(ReviewSub::ReadyForPr),
+            CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                attempt: 3,
+                output: "boom".into(),
+            }),
+            CardState::PrReview(PrReviewSub::Idle),
+            CardState::ReadyToMerge,
+        ]
+    }
+
+    #[test]
+    fn update_from_base_enters_from_the_parked_gates() {
+        for s in update_sources() {
+            assert_eq!(
+                transition(&s, Transition::UpdateFromBase).unwrap(),
+                updating(s.clone(), RunSub::Running)
+            );
+        }
+    }
+
+    #[test]
+    fn update_from_base_rejected_elsewhere() {
+        for s in [
+            CardState::AwaitingReview(ReviewSub::ReadyForReview),
+            CardState::PrReview(PrReviewSub::ApplyingFixes),
+            CardState::Implementing(RunSub::Running),
+            updating(CardState::ReadyToMerge, RunSub::Running),
+            updating(
+                CardState::ReadyToMerge,
+                RunSub::Intervention(intervention()),
+            ),
+        ] {
+            assert!(transition(&s, Transition::UpdateFromBase).is_err(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn update_parks_on_a_question_and_resumes() {
+        let running = updating(CardState::PrReview(PrReviewSub::Idle), RunSub::Running);
+        let parked = transition(&running, Transition::AgentNeedsInput(intervention())).unwrap();
+        assert_eq!(
+            parked,
+            updating(
+                CardState::PrReview(PrReviewSub::Idle),
+                RunSub::Intervention(intervention())
+            )
+        );
+        assert_eq!(
+            transition(&parked, Transition::AnswerIntervention).unwrap(),
+            running
+        );
+        // No second question while one is parked, and no answer while running.
+        assert!(transition(&parked, Transition::AgentNeedsInput(intervention())).is_err());
+        assert!(transition(&running, Transition::AnswerIntervention).is_err());
+    }
+
+    #[test]
+    fn update_done_returns_to_previous() {
+        for s in update_sources() {
+            let expected = match &s {
+                // The failure was on the old code — re-enter the gate.
+                CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => {
+                    CardState::AwaitingReview(ReviewSub::ReadyForPr)
+                }
+                other => other.clone(),
+            };
+            for sub in [RunSub::Running, RunSub::Intervention(intervention())] {
+                assert_eq!(
+                    transition(&updating(s.clone(), sub), Transition::UpdateDone).unwrap(),
+                    expected
+                );
+            }
+        }
+        assert!(transition(&CardState::ReadyToMerge, Transition::UpdateDone).is_err());
+    }
+
+    #[test]
+    fn cancel_update_restores_previous_exactly() {
+        for s in update_sources() {
+            for sub in [RunSub::Running, RunSub::Intervention(intervention())] {
+                // A cancelled update never ran its check — ValidationFailed
+                // stays ValidationFailed.
+                assert_eq!(
+                    transition(&updating(s.clone(), sub), Transition::Cancel).unwrap(),
+                    s
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn faulted_update_retries_or_abandons() {
+        let prev = CardState::PrReview(PrReviewSub::Idle);
+        let running = updating(prev.clone(), RunSub::Running);
+        let failed = transition(
+            &running,
+            Transition::AgentError {
+                message: "markers".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            failed,
+            CardState::Failed {
+                previous: Box::new(running.clone()),
+                message: "markers".into(),
+            }
+        );
+        assert_eq!(transition(&failed, Transition::Retry).unwrap(), running);
+        assert_eq!(transition(&failed, Transition::Cancel).unwrap(), prev);
+
+        // Other faulted runs still have no Cancel exit.
+        let other = CardState::Failed {
+            previous: Box::new(CardState::Implementing(RunSub::Running)),
+            message: "boom".into(),
+        };
+        assert!(transition(&other, Transition::Cancel).is_err());
+    }
+
+    #[test]
+    fn no_question_while_updating() {
+        for sub in [RunSub::Running, RunSub::Intervention(intervention())] {
+            let s = updating(CardState::ReadyToMerge, sub);
+            assert!(transition(
+                &s,
+                Transition::AskQuestion {
+                    question: "?".into()
+                }
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn stop_target_of_an_update_is_its_previous() {
+        let mut card = Card::new(
+            uuid::Uuid::new_v4(),
+            "t",
+            "d",
+            crate::domain::config::CardConfig::default(),
+        );
+        card.state = updating(CardState::ReadyToMerge, RunSub::Running);
+        assert!(matches!(stop_transition(&card), Transition::Cancel));
+        assert_eq!(stop_target(&card), Some(CardState::ReadyToMerge));
+    }
 
     fn intervention() -> Intervention {
         Intervention {

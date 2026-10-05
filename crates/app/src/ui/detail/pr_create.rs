@@ -104,6 +104,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
         _ => None,
     };
     let handoff = state.handoffs.read().get(&id).cloned();
+    let base = state.base_branch_of(project_id);
     // A requested change lands here via the auto self-review, and so do the
     // validation passes after it — none of which render the chat section. Keep
     // its recap (and any answers) in view through them, read-only: no send box
@@ -249,6 +250,8 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                     }
                 }
             }
+            // The failure may come from the base having moved on.
+            super::UpdateFromBase { card_id: id, base: base.clone() }
             // The parked failure can also bounce the work back wholesale.
             super::AgentChatSection {
                 card_id: id,
@@ -405,6 +408,8 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
 
+            // Catch up with the base before opening the PR.
+            super::UpdateFromBase { card_id: id, base: base.clone() }
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,

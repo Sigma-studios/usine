@@ -100,6 +100,9 @@ pub struct AppState {
     pub attachments: Signal<HashMap<Uuid, Vec<PathBuf>>>,
     /// Per-card fixes recap, seeded at startup and updated via `RecapUpdated`.
     pub review_recaps: Signal<HashMap<Uuid, String>>,
+    /// Per-card progress of an update parked on a question, seeded at startup
+    /// and updated via `UpdateProgress` (empty removes the entry).
+    pub update_progress: Signal<HashMap<Uuid, String>>,
     /// Per-card fix-run report — the findings the last fix run was asked to
     /// address joined to the outcomes it reported. Seeded at startup and updated
     /// via `FixReportUpdated` (an empty report removes the entry).
@@ -206,6 +209,7 @@ impl AppState {
         let auto_reviews = store.auto_review_flags().unwrap_or_default();
         let attachments = store.all_attachments().unwrap_or_default();
         let review_recaps = store.all_review_recaps().unwrap_or_default();
+        let update_progress = store.all_update_progress().unwrap_or_default();
         let fix_reports = store.all_fix_reports().unwrap_or_default();
         let answers = store.all_answers().unwrap_or_default();
         let handoffs = store.all_handoffs().unwrap_or_default();
@@ -270,6 +274,7 @@ impl AppState {
             auto_reviews: Signal::new(auto_reviews),
             attachments: Signal::new(attachments),
             review_recaps: Signal::new(review_recaps),
+            update_progress: Signal::new(update_progress),
             fix_reports: Signal::new(fix_reports),
             answers: Signal::new(answers),
             handoffs: Signal::new(handoffs),
@@ -524,6 +529,14 @@ impl AppState {
             ExecutorEventKind::RecapUpdated { recap } => {
                 let mut recaps = self.review_recaps;
                 recaps.write().insert(evt.card_id, recap);
+            }
+            ExecutorEventKind::UpdateProgress { progress } => {
+                let mut map = self.update_progress;
+                if progress.is_empty() {
+                    map.write().remove(&evt.card_id);
+                } else {
+                    map.write().insert(evt.card_id, progress);
+                }
             }
             // An empty report means the run had no checklist (or it was cleared
             // by "back to start"): drop the entry so nothing stale is rendered.
@@ -1093,6 +1106,17 @@ impl AppState {
             .find(|p| p.id == id)
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "—".into())
+    }
+
+    /// The branch a project's cards fork from and merge into — what "Update
+    /// from <base>" names. `main` for an unknown project.
+    pub fn base_branch_of(&self, project_id: Uuid) -> String {
+        self.projects
+            .read()
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.config.effective_base_branch().to_string())
+            .unwrap_or_else(|| "main".into())
     }
 
     /// The code host a project's PRs live on — what every "on GitHub" /
