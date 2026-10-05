@@ -388,6 +388,9 @@ select option { background: var(--panel-2); color: var(--text); }
 /* The last preview start failed: the retry stays a Play button, in red. */
 .card-icon-btn.is-failed { color: var(--red); opacity: 1; }
 .card-icon-btn.is-failed:hover { color: var(--red); background: var(--red-wash); }
+/* Unblock on a blocked card: amber like the marker it lifts, always fully visible. */
+.card-icon-btn.unblock { color: var(--amber); opacity: 1; }
+.card-icon-btn.unblock:hover { color: var(--amber); background: var(--amber-wash-hover); }
 .card-icon-btn.is-busy:hover { background: transparent; }
 .btn {
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);

@@ -5,7 +5,7 @@ use usine_core::{
 };
 use uuid::Uuid;
 
-use super::icons::{IconExternal, IconPlay, IconStop};
+use super::icons::{IconExternal, IconPlay, IconStop, IconUnlock};
 use crate::state::AppState;
 
 /// What the card's preview controls offer, from its live preview status.
@@ -440,7 +440,8 @@ pub fn CardView(card: Card) -> Element {
                 onkeydown: move |e| e.stop_propagation(),
                 // A blocked card is waiting on something outside Usine, so hide
                 // the actions that would advance it. The preview controls below
-                // and the chevron menu (the only way to unmark) stay.
+                // stay, and the unblock icon beside them or the chevron menu
+                // lifts the marker.
                 if !card.blocked {
                     if can_start {
                         button {
@@ -613,9 +614,23 @@ pub fn CardView(card: Card) -> Element {
                     }
                 }
                 // Pushed to the bottom-right corner, away from the state's primary action.
-                if preview != PreviewTools::Hidden {
+                if card.blocked || preview != PreviewTools::Hidden {
                     div { class: "card-tools",
-                        PreviewControls { card_id: id, tools: preview }
+                        if card.blocked {
+                            button {
+                                class: "card-icon-btn unblock",
+                                title: "Mark unblocked",
+                                "aria-label": "Mark unblocked",
+                                onclick: move |e| {
+                                    e.stop_propagation();
+                                    state.send(ExecutorCommand::SetBlocked { card_id: id, blocked: false, note: None });
+                                },
+                                IconUnlock {}
+                            }
+                        }
+                        if preview != PreviewTools::Hidden {
+                            PreviewControls { card_id: id, tools: preview }
+                        }
                     }
                 }
             }
