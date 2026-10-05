@@ -16,8 +16,8 @@ use usine_core::{
     DesignSub, DiffState, DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent,
     ExecutorEventKind, ExecutorHandle, FixItem, FixOutcome, FixReport, ForgeKind, ForgeRegistry,
     GitOps, Handoff, OpenPr, Outcome, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig,
-    Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewSub, ReviewTask, RunSub,
-    Severity, SimFactory, SimForge, SimGit, Store, TestItem, UsageSnapshot,
+    Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewStatus, ReviewSub,
+    ReviewTask, RunSub, Severity, SimFactory, SimForge, SimGit, Store, TestItem, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -796,6 +796,26 @@ impl AppState {
         (waiting, urgent)
     }
 
+    /// Whether a project's PR review has finished agent work that now waits on
+    /// the user: drafts to validate, a fix at the gate, or a faulted run. A
+    /// fresh `ToReview` PR is left out — the eye badge already announces it, and
+    /// it would keep the sidebar dot blue for any repo with open PRs.
+    pub fn project_review_awaits_user(&self, project_id: Uuid) -> bool {
+        self.review_tasks
+            .read()
+            .get(&project_id)
+            .is_some_and(|tasks| {
+                tasks.iter().any(|t| {
+                    matches!(
+                        t.status,
+                        ReviewStatus::AwaitingValidation { .. }
+                            | ReviewStatus::FixReady { .. }
+                            | ReviewStatus::Failed { .. }
+                    )
+                })
+            })
+    }
+
     /// Whether any of a project's cards or PR reviews has work in flight — the
     /// same definition as the quit guard's `active_work`. Previews are left out
     /// on purpose: they are long-lived servers and would keep the sidebar dot
@@ -810,11 +830,15 @@ impl AppState {
             .filter(|c| c.project_id == project_id)
             .any(|c| is_active(c.id, c.state.is_running(), &busy, &queued));
         card_working
-            || self.review_tasks.read().get(&project_id).is_some_and(|tasks| {
-                tasks
-                    .iter()
-                    .any(|t| is_active(t.id, t.status.is_running(), &busy, &queued))
-            })
+            || self
+                .review_tasks
+                .read()
+                .get(&project_id)
+                .is_some_and(|tasks| {
+                    tasks
+                        .iter()
+                        .any(|t| is_active(t.id, t.status.is_running(), &busy, &queued))
+                })
     }
 
     /// Total review tasks needing attention across unmuted projects (dock badge).

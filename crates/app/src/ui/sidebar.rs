@@ -66,13 +66,20 @@ pub fn Sidebar() -> Element {
                         // the counts leaves no red/blue dot, no count and no eye
                         // badge. Work in flight isn't a notification, so a muted
                         // project still spins.
-                        let (review_count, (attention_count, urgent_count)) = if muted {
-                            (0, (0, 0))
+                        let (review_count, review_waiting, (attention_count, urgent_count)) = if muted {
+                            (0, false, (0, 0))
                         } else {
-                            (state.project_review_count(pid), state.project_attention_counts(pid))
+                            (
+                                state.project_review_count(pid),
+                                state.project_review_awaits_user(pid),
+                                state.project_attention_counts(pid),
+                            )
                         };
                         let working = state.project_is_working(pid);
-                        let dot_class = dot_class(attention_count, urgent_count, working);
+                        // The count stays cards-only (its tooltip says "cards");
+                        // a review waiting on you still turns the dot blue.
+                        let waiting = attention_count + usize::from(review_waiting);
+                        let dot_class = dot_class(waiting, urgent_count, working);
                         rsx! {
                             div {
                                 key: "{pid}",
