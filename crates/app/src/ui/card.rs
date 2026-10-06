@@ -5,7 +5,7 @@ use usine_core::{
 };
 use uuid::Uuid;
 
-use super::icons::{IconExternal, IconPlay, IconStop};
+use super::icons::{IconExternal, IconPlay, IconStop, IconUnlock};
 use crate::state::AppState;
 
 /// What the card's preview controls offer, from its live preview status.
@@ -243,6 +243,7 @@ pub fn CardView(card: Card) -> Element {
     // Kept in step with the marker by `Card::set_blocked`: a note only
     // exists while the card is blocked.
     let blocked_note = card.blocked_note.clone();
+    let unblock_in_tools = card.blocked && blocked_note.is_none();
     // From the card, not the state alone — "ready to merge" must not sit on a
     // card whose button says "Resolve conflicts". While a lifecycle command is
     // in flight the card is doing something its state can't show yet, so say so
@@ -432,15 +433,22 @@ pub fn CardView(card: Card) -> Element {
             // The reason the user left when marking the card blocked. Clamped to
             // three lines so a long note can't stretch the column; the title
             // attribute keeps the whole thing readable on hover.
+            // The unblock icon sits at the end of the note's row rather than in
+            // the actions row, so it costs a blocked card no extra height. With
+            // no note there's no row to borrow: it joins the tools corner instead.
             if let Some(note) = blocked_note {
-                div { class: "blocked-note", title: "{note}", "{note}" }
+                div { class: "blocked-row",
+                    div { class: "blocked-note", title: "{note}", "{note}" }
+                    UnblockButton { card_id: id }
+                }
             }
             div { class: if frozen { "card-actions is-busy" } else { "card-actions" },
                 // Shield the action buttons' keydowns from the card handler too.
                 onkeydown: move |e| e.stop_propagation(),
                 // A blocked card is waiting on something outside Usine, so hide
                 // the actions that would advance it. The preview controls below
-                // and the chevron menu (the only way to unmark) stay.
+                // stay; the unblock icon (by the note, or in the tools corner
+                // when there's none) or the chevron menu lifts the marker.
                 if !card.blocked {
                     if can_start {
                         button {
@@ -613,12 +621,37 @@ pub fn CardView(card: Card) -> Element {
                     }
                 }
                 // Pushed to the bottom-right corner, away from the state's primary action.
-                if preview != PreviewTools::Hidden {
+                if unblock_in_tools || preview != PreviewTools::Hidden {
                     div { class: "card-tools",
-                        PreviewControls { card_id: id, tools: preview }
+                        if unblock_in_tools {
+                            UnblockButton { card_id: id }
+                        }
+                        if preview != PreviewTools::Hidden {
+                            PreviewControls { card_id: id, tools: preview }
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+/// One-click lift of a card's blocked marker. Its click and Enter are stopped
+/// from reaching the card, which would select it.
+#[component]
+fn UnblockButton(card_id: Uuid) -> Element {
+    let state = use_context::<AppState>();
+    rsx! {
+        button {
+            class: "card-icon-btn unblock",
+            title: "Mark unblocked",
+            "aria-label": "Mark unblocked",
+            onclick: move |e| {
+                e.stop_propagation();
+                state.send(ExecutorCommand::SetBlocked { card_id, blocked: false, note: None });
+            },
+            onkeydown: move |e: KeyboardEvent| e.stop_propagation(),
+            IconUnlock {}
         }
     }
 }
