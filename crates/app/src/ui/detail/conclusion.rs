@@ -59,7 +59,7 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
             }
         }
 
-        div { class: "section",
+        div { class: "section", "data-submit-scope": "1",
             h3 { "Dig deeper" }
             div { class: "field",
                 for g in [pushback.key()] {
@@ -78,7 +78,11 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
             button {
                 class: "btn",
                 disabled: blank,
-                title: "The agent re-investigates with this conclusion and every earlier round as context",
+                "data-submit": "1",
+                title: format!(
+                    "The agent re-investigates with this conclusion and every earlier round as context ({})",
+                    crate::ui::shortcuts::submit_hint()
+                ),
                 onclick: move |_| {
                     // Answers and free-form text are one blob, same as the plan
                     // panel's send-back: neither input is lost.

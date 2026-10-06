@@ -154,7 +154,7 @@ fn ReviewPanel(task: ReviewTask) -> Element {
 
         match &task.status {
             ReviewStatus::ToReview => rsx! {
-                div { class: "section",
+                div { class: "section", "data-submit-scope": "1",
                     h3 { "Review" }
                     div { class: "hint",
                         "Check out the PR in a worktree and have an agent draft review comments — you approve each one before anything is posted. Already read the PR yourself? Approve it directly, no agent pass needed."
@@ -174,6 +174,8 @@ fn ReviewPanel(task: ReviewTask) -> Element {
                     div { class: "row",
                         button {
                             class: "btn primary",
+                            "data-submit": "1",
+                            title: format!("Review this PR ({})", crate::ui::shortcuts::submit_hint()),
                             onclick: move |_| {
                                 state.start_review(id, guidance.read().clone());
                                 // Consumed by the run (it becomes `task.guidance`,
@@ -371,7 +373,7 @@ fn DraftSelection(
     });
 
     rsx! {
-        div { class: "section",
+        div { class: "section", "data-submit-scope": "1",
             div { class: "row",
                 h3 { "Drafted comments" }
                 span { class: "badge", "{checked_count}/{edits.comments.len()}" }
@@ -483,6 +485,8 @@ fn DraftSelection(
             div { class: "row",
                 button {
                     class: "btn primary",
+                    "data-submit": "1",
+                    title: format!("{publish_label} ({})", crate::ui::shortcuts::submit_hint()),
                     onclick: move |_| {
                         crate::ui::confirm_publish_review(
                             state,

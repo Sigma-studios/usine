@@ -87,7 +87,7 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
 
     let rows_snapshot = edits.read().clone();
     rsx! {
-        div { class: "section",
+        div { class: "section", "data-submit-scope": "1",
             h3 { "{heading}" }
             for (i, v) in rows_snapshot.iter().enumerate() {
                 {
@@ -294,6 +294,8 @@ pub(super) fn FixSelection(card_id: Uuid, verdicts: Vec<FixVerdict>, self_review
             div { class: "row",
                 button {
                     class: "btn primary",
+                    "data-submit": "1",
+                    title: format!("{apply_label} ({})", crate::ui::shortcuts::submit_hint()),
                     onclick: move |_| {
                         let verdicts = edits.read().clone();
                         let text = note.read().trim().to_string();
