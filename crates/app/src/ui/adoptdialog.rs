@@ -198,6 +198,8 @@ fn AdoptDialog(project_id: Uuid) -> Element {
         div { class: "modal-overlay confirm-overlay", onclick: move |_| dismiss(),
             div {
                 class: "modal",
+                // ⌘↩ presses the `data-submit` button (see `shortcuts.rs`).
+                "data-submit-scope": "1",
                 "role": "dialog",
                 "aria-modal": "true",
                 tabindex: "-1",
@@ -385,6 +387,8 @@ fn AdoptDialog(project_id: Uuid) -> Element {
                     button { class: "btn", onclick: move |_| dismiss(), "Cancel" }
                     button {
                         class: "btn primary",
+                        "data-submit": "1",
+                        title: format!("Adopt ({})", super::shortcuts::submit_hint()),
                         disabled: !can_submit,
                         onclick: submit,
                         match &pick {

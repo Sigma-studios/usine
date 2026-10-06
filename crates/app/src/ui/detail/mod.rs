@@ -440,8 +440,13 @@ fn CardPanel(card: Card) -> Element {
 
     rsx! {
         if is_start {
-            EditableTask { card: card.clone() }
-            ConfigForm { card: card.clone() }
+            // One ⌘↩ scope over the description and the config form, whose
+            // Start button it presses (see `shortcuts.rs`). `display: contents`
+            // keeps the wrapper out of the panel's layout.
+            div { class: "submit-scope", "data-submit-scope": "1",
+                EditableTask { card: card.clone() }
+                ConfigForm { card: card.clone() }
+            }
         } else if !card.description.trim().is_empty() {
             // Past the starting block the task is reference material, not
             // something to act on — but it used to open every panel with up to
@@ -849,7 +854,7 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
     };
 
     rsx! {
-        div { class: "section",
+        div { class: "section", "data-submit-scope": "1",
             h3 { "Needs your input" }
             div { class: "{qcls}",
                 div { "{question}" }
@@ -892,6 +897,8 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                     }
                     button {
                         class: "btn primary",
+                        "data-submit": "1",
+                        title: format!("Answer ({})", crate::ui::shortcuts::submit_hint()),
                         disabled: !can_send,
                         onclick: move |_| {
                             let mut parts: Vec<String> = Vec::new();

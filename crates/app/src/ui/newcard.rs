@@ -70,11 +70,14 @@ fn ProjectPicker(intent: NewCardIntent) -> Element {
         NewCardIntent::Adopt => ("Adopt a branch or PR", "Continue"),
     };
     let target = Uuid::parse_str(&chosen).ok();
+    let hint = super::shortcuts::submit_hint();
 
     rsx! {
         div { class: "modal-overlay confirm-overlay", onclick: move |_| dismiss(),
             div {
                 class: "modal",
+                // ⌘↩ presses the `data-submit` button (see `shortcuts.rs`).
+                "data-submit-scope": "1",
                 "role": "dialog",
                 "aria-modal": "true",
                 tabindex: "-1",
@@ -117,6 +120,8 @@ fn ProjectPicker(intent: NewCardIntent) -> Element {
                     button { class: "btn", onclick: move |_| dismiss(), "Cancel" }
                     button {
                         class: "btn primary",
+                        "data-submit": "1",
+                        title: "{confirm_label} ({hint})",
                         disabled: target.is_none(),
                         onclick: move |_| {
                             let Some(pid) = target else { return };

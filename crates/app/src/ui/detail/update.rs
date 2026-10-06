@@ -33,7 +33,7 @@ pub(super) fn UpdateFromBase(card_id: Uuid, base: String) -> Element {
     }
 
     rsx! {
-        div { class: "section update-from-base",
+        div { class: "section update-from-base", "data-submit-scope": "1",
             h3 { "Update from {base}" }
             div { class: "hint",
                 "Merges origin/{base} into this branch, then the agent checks this card's work against what landed (renamed symbols, changed APIs, migrations) and adapts it — or says nothing needs to change. The card comes back here afterwards."
@@ -48,6 +48,8 @@ pub(super) fn UpdateFromBase(card_id: Uuid, base: String) -> Element {
             div { class: "row",
                 button {
                     class: "btn primary",
+                    "data-submit": "1",
+                    title: format!("Merge {base} and check ({})", crate::ui::shortcuts::submit_hint()),
                     onclick: move |_| {
                         let t = note.read().trim().to_string();
                         state.send(ExecutorCommand::UpdateFromBase {
