@@ -39,6 +39,17 @@ pub(super) fn IconStop() -> Element {
     }
 }
 
+/// Lift the card's "blocked" marker: an open padlock.
+#[component]
+pub(super) fn IconUnlock() -> Element {
+    rsx! {
+        Glyph {
+            rect { x: "3", y: "11", width: "18", height: "11", rx: "2" }
+            path { d: "M7 11V7a5 5 0 0 1 9.9-1" }
+        }
+    }
+}
+
 /// Open the running app in a browser.
 #[component]
 pub(super) fn IconExternal() -> Element {
