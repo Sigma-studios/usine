@@ -329,10 +329,12 @@ select option { background: var(--panel-2); color: var(--text); }
 .card .blocked-note { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .detail-header .blocked-note { margin-top: 8px; }
 /* A blocked card's note with its unblock icon at the row's end, top-aligned
-   so a multi-line note keeps the icon in the corner. */
+   so a multi-line note keeps the icon in the corner. The negative margins let
+   the 26px button overhang a ~15px line: the row stays at text height and the
+   glyph lines up with the note's first line, with the hit area intact. */
 .blocked-row { display: flex; align-items: flex-start; gap: 6px; }
 .blocked-row .blocked-note { flex: 1; min-width: 0; }
-.blocked-row .card-icon-btn { margin-left: auto; flex: none; }
+.blocked-row .card-icon-btn { margin: -5px -4px -5px auto; flex: none; }
 .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .card-title { font-weight: 600; font-size: 13px; line-height: 1.3; flex: 1; min-width: 0; }
 /* Per-card actions: a chevron button opening a floating dropdown (rendered at
