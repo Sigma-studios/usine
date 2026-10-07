@@ -404,10 +404,14 @@ pub struct QaExchange {
 /// A card's Agent Chat log: every answered exchange, oldest first.
 /// `superseded` records that a write run has since changed the work, so the
 /// panel shows nothing expanded — the history is kept, just not resurfaced.
+/// `unread` records that a question answer landed and the card has not been
+/// opened since, so the board can point at it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CardAnswers {
     pub exchanges: Vec<QaExchange>,
     pub superseded: bool,
+    #[serde(default)]
+    pub unread: bool,
 }
 
 /// A clarifying question raised by the agent that requires the user.

@@ -178,7 +178,8 @@ pub(super) fn ChatLog(card_id: Uuid) -> Element {
         return rsx! {};
     }
     rsx! {
-        div { class: "qa-log",
+        // The board's "Read unread answer" scrolls here.
+        div { class: "qa-log", id: "agent-chat",
             // Newest first, and only it is ever rendered `open` — an older row
             // the user expanded keeps `open: false` in the vdom, so no
             // re-render force-collapses it.

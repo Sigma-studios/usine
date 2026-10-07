@@ -307,6 +307,25 @@ impl AppState {
     pub fn select_card(&self, id: Option<Uuid>) {
         let mut sc = self.selected_card;
         sc.set(id);
+        // Opening a card — however it happens — reads its waiting answer.
+        if let Some(id) = id {
+            self.mark_answers_read(id);
+        }
+    }
+
+    /// Clear a card's unread-answer flag: locally first, so the board button
+    /// disappears on the same click, then in the store. A no-op (no command
+    /// sent) when nothing is unread.
+    fn mark_answers_read(&self, id: Uuid) {
+        let unread = self.answers.peek().get(&id).is_some_and(|l| l.unread);
+        if !unread {
+            return;
+        }
+        let mut answers = self.answers;
+        if let Some(log) = answers.write().get_mut(&id) {
+            log.unread = false;
+        }
+        self.send(ExecutorCommand::MarkAnswersRead { card_id: id });
     }
 
     pub fn select_review(&self, id: Option<Uuid>) {
@@ -550,11 +569,20 @@ impl AppState {
             }
             // An empty log means it was cleared ("back to start"): drop the
             // entry so the panel shows nothing.
-            ExecutorEventKind::AnswersUpdated { answers: log } => {
+            ExecutorEventKind::AnswersUpdated { answers: mut log } => {
                 let mut answers = self.answers;
                 if log.exchanges.is_empty() {
                     answers.write().remove(&evt.card_id);
                 } else {
+                    // An answer landing while its card is open is read on the
+                    // spot: the panel already shows it.
+                    let open = *self.selected_card.peek() == Some(evt.card_id);
+                    if log.unread && open {
+                        log.unread = false;
+                        self.send(ExecutorCommand::MarkAnswersRead {
+                            card_id: evt.card_id,
+                        });
+                    }
                     answers.write().insert(evt.card_id, log);
                 }
             }

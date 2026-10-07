@@ -793,6 +793,17 @@ impl Executor {
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
                 Ok(())
             }
+            ExecutorCommand::MarkAnswersRead { card_id } => {
+                // Only a real transition is worth an event: selection fires
+                // this on every open.
+                if self.store.mark_answers_read(card_id)? {
+                    let answers = self.store.get_answers(card_id)?;
+                    let _ = self
+                        .evt_tx
+                        .unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
+                }
+                Ok(())
+            }
             ExecutorCommand::AttachImage { card_id, src } => {
                 let dest = copy_attachment(card_id, &src)?;
                 let mut paths = self.store.get_attachments(card_id).unwrap_or_default();

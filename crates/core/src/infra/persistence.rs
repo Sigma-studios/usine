@@ -293,6 +293,8 @@ struct CardAnswerRecord {
     superseded: bool,
     #[serde(default)]
     pending_change: String,
+    #[serde(default)]
+    unread: bool,
 }
 
 impl CardAnswerRecord {
@@ -312,6 +314,7 @@ impl CardAnswerRecord {
         CardAnswers {
             exchanges,
             superseded: self.superseded,
+            unread: self.unread,
         }
     }
 }
@@ -723,6 +726,7 @@ impl Store {
                 .as_ref()
                 .map(|o| o.pending_change.clone())
                 .unwrap_or_default(),
+            unread: prior.unread,
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -765,6 +769,8 @@ impl Store {
                 .as_ref()
                 .map(|o| o.pending_change.clone())
                 .unwrap_or_default(),
+            // The board flags it until the card is opened.
+            unread: true,
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -838,6 +844,7 @@ impl Store {
             history,
             superseded: false,
             pending_change: String::new(),
+            unread: old.as_ref().is_some_and(|o| o.unread),
         };
         match old {
             Some(old) => rw.update(old, rec)?,
@@ -902,18 +909,39 @@ impl Store {
     }
 
     /// Mark the log as superseded by a write run: the exchanges stay, but the
-    /// panel stops showing any of them expanded. Idempotent.
+    /// panel stops showing any of them expanded — and an unread answer is no
+    /// longer worth pointing at, since the work changed since. Idempotent.
     pub fn supersede_answers(&self, card_id: Uuid) -> Result<()> {
         let rw = self.db.rw_transaction()?;
         if let Some(old) = rw.get().primary::<CardAnswerRecord>(card_id.to_string())? {
             let rec = CardAnswerRecord {
                 superseded: true,
+                unread: false,
                 ..old.clone()
             };
             rw.update(old, rec)?;
         }
         rw.commit()?;
         Ok(())
+    }
+
+    /// Mark the card's latest answer as read (the card was opened). Returns
+    /// whether anything changed, so callers only notify on a real transition.
+    pub fn mark_answers_read(&self, card_id: Uuid) -> Result<bool> {
+        let rw = self.db.rw_transaction()?;
+        let changed = match rw.get().primary::<CardAnswerRecord>(card_id.to_string())? {
+            Some(old) if old.unread => {
+                let rec = CardAnswerRecord {
+                    unread: false,
+                    ..old.clone()
+                };
+                rw.update(old, rec)?;
+                true
+            }
+            _ => false,
+        };
+        rw.commit()?;
+        Ok(changed)
     }
 
     /// Drop a card's whole Agent Chat log (used by "back to start"). Idempotent.
@@ -1936,6 +1964,54 @@ mod tests {
     }
 
     #[test]
+    fn a_question_answer_stays_unread_until_marked_read() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        // Nothing to mark on a card without a log.
+        assert!(!store.mark_answers_read(id).unwrap());
+
+        store.set_question(id, "why?").unwrap();
+        assert!(!store.get_answers(id).unwrap().unread, "asking isn't an answer");
+        store.set_answer(id, "because").unwrap();
+        assert!(store.get_answers(id).unwrap().unread);
+
+        // A change or update recap landing meanwhile keeps the flag…
+        store.set_pending_change(id, "tweak").unwrap();
+        store.record_change(id, "tweaked").unwrap();
+        assert!(store.get_answers(id).unwrap().unread);
+        store.record_update(id, "main", "merged").unwrap();
+        assert!(store.get_answers(id).unwrap().unread);
+        // …and so does stashing the next question.
+        store.set_question(id, "and?").unwrap();
+        assert!(store.get_answers(id).unwrap().unread);
+
+        assert!(store.mark_answers_read(id).unwrap());
+        assert!(!store.get_answers(id).unwrap().unread);
+        assert!(!store.mark_answers_read(id).unwrap(), "already read");
+    }
+
+    #[test]
+    fn recaps_alone_never_mark_the_log_unread() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store.set_pending_change(id, "tweak").unwrap();
+        store.record_change(id, "tweaked").unwrap();
+        store.record_update(id, "main", "merged").unwrap();
+        assert!(!store.get_answers(id).unwrap().unread);
+    }
+
+    #[test]
+    fn superseding_the_log_clears_an_unread_answer() {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store.set_question(id, "why?").unwrap();
+        store.set_answer(id, "because").unwrap();
+        store.supersede_answers(id).unwrap();
+        let log = store.get_answers(id).unwrap();
+        assert!(log.superseded && !log.unread);
+    }
+
+    #[test]
     fn a_legacy_answer_row_folds_before_the_next_question() {
         // A pre-`history` row carries its lone answer in `answer`. Stashing the
         // next question must fold it into an exchange, or the read-side fold
@@ -1951,10 +2027,15 @@ mod tests {
                 history: Vec::new(),
                 superseded: false,
                 pending_change: String::new(),
+                unread: false,
             })
             .unwrap();
             rw.commit().unwrap();
         }
+        assert!(
+            !store.get_answers(card_id).unwrap().unread,
+            "a legacy row reads as already read"
+        );
 
         store.set_question(card_id, "new question").unwrap();
         let pending = store.get_answers(card_id).unwrap();
