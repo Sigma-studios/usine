@@ -313,6 +313,16 @@ impl AppState {
         }
     }
 
+    /// Back to the card board. The card panel shows again for a selection the
+    /// review board kept, so an answer that landed meanwhile is now read.
+    fn show_normal_board(&self) {
+        let mut bm = self.board_mode;
+        bm.set(BoardMode::Normal);
+        if let Some(id) = *self.selected_card.peek() {
+            self.mark_answers_read(id);
+        }
+    }
+
     /// Clear a card's unread-answer flag: locally first, so the board button
     /// disappears on the same click, then in the store. A no-op (no command
     /// sent) when nothing is unread.
@@ -338,8 +348,7 @@ impl AppState {
         sv.set(view);
         // Navigating always returns to the normal card board; review mode is
         // entered explicitly via the sidebar review icon.
-        let mut bm = self.board_mode;
-        bm.set(BoardMode::Normal);
+        self.show_normal_board();
         self.select_review(None);
     }
 
@@ -576,7 +585,10 @@ impl AppState {
                 } else {
                     // An answer landing while its card is open is read on the
                     // spot: the panel already shows it.
-                    let open = *self.selected_card.peek() == Some(evt.card_id);
+                    // The PR-review board hides the card panel without
+                    // clearing the selection, so it doesn't count as open.
+                    let open = *self.selected_card.peek() == Some(evt.card_id)
+                        && *self.board_mode.peek() == BoardMode::Normal;
                     if log.unread && open {
                         log.unread = false;
                         self.send(ExecutorCommand::MarkAnswersRead {
@@ -785,8 +797,7 @@ impl AppState {
     }
 
     pub fn exit_review_mode(&self) {
-        let mut bm = self.board_mode;
-        bm.set(BoardMode::Normal);
+        self.show_normal_board();
         self.select_review(None);
     }
 

@@ -35,8 +35,10 @@ pub fn CardView(card: Card) -> Element {
     let host = forge.display_name();
     let selected = *state.selected_card.read() == Some(id);
     // An Agent Chat answer landed while the card was closed. Opening the card
-    // (see `AppState::select_card`) reads it.
-    let unread_answer = state.answers.read().get(&id).is_some_and(|l| l.unread);
+    // (see `AppState::select_card`) reads it. Only offered where the panel
+    // renders the chat log — a Done/merged card has none to scroll to.
+    let unread_answer = super::detail::renders_chat(&card.state)
+        && state.answers.read().get(&id).is_some_and(|l| l.unread);
 
     // A lifecycle command is in flight for this card. Its git/forge work runs
     // before the transition, so the card's own state still reads as idle —

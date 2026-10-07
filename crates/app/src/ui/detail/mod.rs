@@ -30,6 +30,7 @@ mod transcript;
 mod update;
 
 use chat::{AgentChatSection, ChatLog};
+pub(super) use chat::renders_chat;
 use conclusion::ConclusionPanel;
 use done::{DonePanel, OutcomeArtifacts};
 use edit::{Attachments, ConfigForm, EditableTask};

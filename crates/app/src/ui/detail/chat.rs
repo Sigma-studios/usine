@@ -265,7 +265,7 @@ pub(super) fn summary_line(question: &str) -> String {
 /// no attach affordance at all) is caught by the `debug_assert!` below, which
 /// fires whenever a state renders this section while this function says it
 /// doesn't.
-pub(super) fn renders_chat(state: &CardState) -> bool {
+pub(in crate::ui) fn renders_chat(state: &CardState) -> bool {
     match state.effective() {
         CardState::Designing(DesignSub::AwaitingApproval { .. })
         | CardState::AwaitingReview(
