@@ -1300,7 +1300,14 @@ impl Executor {
                     .push_refspec(&scratch, "origin", &format!("HEAD:refs/heads/{base}"))
                     .await
                     .map_err(|e| {
-                        CoreError::other(format!("{base} moved on origin — merge again ({e})"))
+                        // Only a non-fast-forward rejection means a retry can
+                        // succeed; protected branches, hooks and auth can't.
+                        let text = e.to_string();
+                        if text.contains("non-fast-forward") || text.contains("fetch first") {
+                            CoreError::other(format!("{base} moved on origin — merge again ({e})"))
+                        } else {
+                            CoreError::other(format!("couldn't push to origin/{base}: {e}"))
+                        }
                     })?;
             } else if let Some(checkout) = git::checkout_of_branch(&project.path, &base) {
                 git::merge_ff_only(&checkout, &new).await.map_err(|e| {
@@ -1620,7 +1627,7 @@ impl Executor {
             // Kept for a later "back to start", like a requested change.
             self.record_qa(card_id, format!("Requested on update from {base}: {n}"));
         }
-        let extra = update_prompt(&base, &up, &conflicted, note.as_deref());
+        let extra = update_prompt(&base, &upstream, &up, &conflicted, note.as_deref());
         // Stash the task before entering the running state, so a retry of a
         // faulted run (or the answer to a question) can restate it.
         self.store.set_fix_extra(card_id, Some(&extra))?;

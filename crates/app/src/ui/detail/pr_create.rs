@@ -105,7 +105,8 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
     };
     let handoff = state.handoffs.read().get(&id).cloned();
     let base = state.base_branch_of(project_id);
-    let has_origin = state.has_origin(project_id);
+    // Opens the repo, so once per mount rather than on every keystroke.
+    let has_origin = use_hook(|| state.has_origin(project_id));
     let merge_target = if has_origin {
         format!("origin/{base}")
     } else {
@@ -258,7 +259,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
             // The failure may come from the base having moved on.
-            super::UpdateFromBase { card_id: id, base: base.clone() }
+            super::UpdateFromBase { card_id: id, project_id, base: base.clone() }
             // The parked failure can also bounce the work back wholesale.
             super::AgentChatSection {
                 card_id: id,
@@ -470,7 +471,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
             }
 
             // Catch up with the base before opening the PR.
-            super::UpdateFromBase { card_id: id, base: base.clone() }
+            super::UpdateFromBase { card_id: id, project_id, base: base.clone() }
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,
