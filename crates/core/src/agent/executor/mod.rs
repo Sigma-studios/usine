@@ -335,6 +335,21 @@ fn cancel_run(runs: &RunMap, card_id: Uuid, run_id: Uuid) {
     }
 }
 
+/// Drop a card's runs-map entry iff it's still the run identified by `run_id`.
+/// For a one-shot run that parks on a question: until the entry is gone,
+/// `Executor::answer`'s live-run check would route the user's answer into the
+/// finished provider, which ignores it — losing the answer.
+fn release_run(runs: &RunMap, card_id: Uuid, run_id: Uuid) {
+    let mut map = lock(runs);
+    if map
+        .get(&card_id)
+        .map(|(rid, _)| *rid == run_id)
+        .unwrap_or(false)
+    {
+        map.remove(&card_id);
+    }
+}
+
 /// Per-project locks serializing review scans (see `Executor::scan_reviews`).
 /// Entries are created on first scan and kept: one `Arc<Mutex<()>>` per project
 /// is nothing, and dropping one mid-scan would defeat the point.
@@ -791,6 +806,17 @@ impl Executor {
                     Ok(())
                 })?;
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                Ok(())
+            }
+            ExecutorCommand::MarkAnswersRead { card_id } => {
+                // Only a real transition is worth an event: selection fires
+                // this on every open.
+                if self.store.mark_answers_read(card_id)? {
+                    let answers = self.store.get_answers(card_id)?;
+                    let _ = self
+                        .evt_tx
+                        .unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
+                }
                 Ok(())
             }
             ExecutorCommand::AttachImage { card_id, src } => {

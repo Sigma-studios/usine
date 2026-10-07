@@ -438,6 +438,9 @@ pub enum ExecutorCommand {
         blocked: bool,
         note: Option<String>,
     },
+    /// The user opened the card: its unread Agent Chat answer counts as read.
+    /// A no-op when there is none.
+    MarkAnswersRead { card_id: Uuid },
     /// Copy an image into the card's managed attachments dir (`src` = the file
     /// the user picked). Claude-only; the path is injected into the prompt.
     AttachImage { card_id: Uuid, src: PathBuf },
@@ -505,6 +508,7 @@ impl ExecutorCommand {
             | ExecutorCommand::SetSkipPlan { card_id, .. }
             | ExecutorCommand::SetAutoReview { card_id, .. }
             | ExecutorCommand::SetBlocked { card_id, .. }
+            | ExecutorCommand::MarkAnswersRead { card_id }
             | ExecutorCommand::AttachImage { card_id, .. }
             | ExecutorCommand::AttachImageBytes { card_id, .. }
             | ExecutorCommand::DetachImage { card_id, .. } => *card_id,
@@ -625,6 +629,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::SetSkipPlan { .. }
                 | ExecutorCommand::SetAutoReview { .. }
                 | ExecutorCommand::SetBlocked { .. }
+                | ExecutorCommand::MarkAnswersRead { .. }
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }
