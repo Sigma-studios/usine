@@ -323,6 +323,12 @@ pub fn merge_args(gitref: &str) -> Vec<String> {
     vec!["merge".into(), "--no-edit".into(), gitref.into()]
 }
 
+/// Squash `gitref` into the checked-out tree and index without committing —
+/// the caller commits the result as one commit with its own message.
+pub fn squash_args(gitref: &str) -> Vec<String> {
+    vec!["merge".into(), "--squash".into(), gitref.into()]
+}
+
 /// The paths left unresolved by a stopped merge (`U` = unmerged),
 /// NUL-separated. `-z` because these paths are both read as files and listed
 /// in the agent's brief; C-quoted, they'd name nothing.
@@ -477,6 +483,12 @@ pub trait GitOps: Send + Sync {
     /// outcome, not an error — the worktree is left mid-merge for the caller to
     /// resolve. Any other failure (dirty tree, unknown ref) is an error.
     async fn merge_ref(&self, dir: &Path, gitref: &str) -> Result<MergeOutcome>;
+    /// Squash-merge `gitref` into `dir`'s working tree and index, leaving the
+    /// commit to the caller ([`commit_all`](Self::commit_all)). Conflicts are
+    /// an outcome, exactly as for [`merge_ref`](Self::merge_ref).
+    async fn squash_ref(&self, _dir: &Path, _gitref: &str) -> Result<MergeOutcome> {
+        Ok(MergeOutcome::Clean)
+    }
     /// Stage everything and commit. Returns `true` if a commit landed, `false`
     /// if there was nothing to commit (a clean tree) — the caller uses this to
     /// tell "the run produced work" from "the run changed nothing".
@@ -703,27 +715,11 @@ impl GitOps for RealGit {
     }
 
     async fn merge_ref(&self, dir: &Path, gitref: &str) -> Result<MergeOutcome> {
-        let Err(e) = run_git(dir, &merge_args(gitref)).await else {
-            return Ok(MergeOutcome::Clean);
-        };
-        // `git merge` exits non-zero both for a conflict and for a genuine
-        // failure (dirty tree, unknown ref, a merge already in progress). Only
-        // unmerged paths distinguish the two — without them, the worktree isn't
-        // mid-merge and there's nothing for an agent to resolve, so report the
-        // original error rather than sending it into an empty conflict.
-        // `-z`: the paths go straight into the agent's brief, and a C-quoted
-        // `"cr\303\251\303\251.txt"` names no file it could open.
-        let files: Vec<String> = run_git_bytes(dir, &unmerged_files_z_args())
-            .await
-            .unwrap_or_default()
-            .split(|b| *b == 0)
-            .filter(|e| !e.is_empty())
-            .map(|e| path_from_bytes(e).to_string_lossy().into_owned())
-            .collect();
-        if files.is_empty() {
-            return Err(e);
-        }
-        Ok(MergeOutcome::Conflicted(files))
+        run_merge(dir, &merge_args(gitref)).await
+    }
+
+    async fn squash_ref(&self, dir: &Path, gitref: &str) -> Result<MergeOutcome> {
+        run_merge(dir, &squash_args(gitref)).await
     }
 
     async fn commit_all(&self, dir: &Path, message: &str) -> Result<bool> {
@@ -898,6 +894,33 @@ impl GitOps for SimGit {
     async fn push(&self, _: &Path, _: &str) -> Result<()> {
         Ok(())
     }
+}
+
+/// Run a `git merge` variant (`args`) in `dir`, telling a conflict apart from
+/// a genuine failure — shared by [`GitOps::merge_ref`] and
+/// [`GitOps::squash_ref`].
+async fn run_merge(dir: &Path, args: &[String]) -> Result<MergeOutcome> {
+    let Err(e) = run_git(dir, args).await else {
+        return Ok(MergeOutcome::Clean);
+    };
+    // `git merge` exits non-zero both for a conflict and for a genuine
+    // failure (dirty tree, unknown ref, a merge already in progress). Only
+    // unmerged paths distinguish the two — without them, the worktree isn't
+    // mid-merge and there's nothing for an agent to resolve, so report the
+    // original error rather than sending it into an empty conflict.
+    // `-z`: the paths go straight into the agent's brief, and a C-quoted
+    // `"cr\303\251\303\251.txt"` names no file it could open.
+    let files: Vec<String> = run_git_bytes(dir, &unmerged_files_z_args())
+        .await
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| path_from_bytes(e).to_string_lossy().into_owned())
+        .collect();
+    if files.is_empty() {
+        return Err(e);
+    }
+    Ok(MergeOutcome::Conflicted(files))
 }
 
 async fn run_git(cwd: &Path, args: &[String]) -> Result<String> {
@@ -1187,6 +1210,43 @@ pub fn force_branch(repo: &Path, branch: &str, target: &str) -> Result<()> {
     let commit = r.revparse_single(target)?.peel_to_commit()?;
     r.branch(branch, &commit, true)?;
     Ok(())
+}
+
+/// The commit `refname` points at, as a hex sha — resolved exactly as given
+/// (no `origin/` fallback, unlike [`commitish_exists`]), or `None` when it
+/// doesn't resolve.
+pub fn ref_sha(repo: &Path, refname: &str) -> Option<String> {
+    let r = git2::Repository::open(repo).ok()?;
+    let commit = r.revparse_single(refname).ok()?.peel_to_commit().ok()?;
+    Some(commit.id().to_string())
+}
+
+/// Move local `branch` from commit `expected_old` to commit `new` — an atomic
+/// compare-and-swap that fails when the branch no longer points at
+/// `expected_old`, so a branch that moved meanwhile is never overwritten. Like
+/// [`force_branch`], only for a branch that is checked out nowhere.
+pub fn advance_branch(repo: &Path, branch: &str, expected_old: &str, new: &str) -> Result<()> {
+    let r = git2::Repository::open(repo)?;
+    // Resolved rather than parsed: callers may hold abbreviated shas.
+    let old = r.revparse_single(expected_old)?.peel_to_commit()?.id();
+    let new = r.revparse_single(new)?.peel_to_commit()?.id();
+    r.reference_matching(
+        &format!("refs/heads/{branch}"),
+        new,
+        true,
+        old,
+        "usine: merge without PR",
+    )?;
+    Ok(())
+}
+
+/// Fast-forward the branch checked out in `dir` to `gitref` (`git merge
+/// --ff-only`). Git refuses when the branch has moved past `gitref`'s history
+/// or when the update would overwrite the checkout's uncommitted changes.
+pub async fn merge_ff_only(dir: &Path, gitref: &str) -> Result<()> {
+    run_git(dir, &["merge".into(), "--ff-only".into(), gitref.into()])
+        .await
+        .map(|_| ())
 }
 
 /// Whether `name` resolves to a commit in the repo (tolerating bare branch
@@ -1608,6 +1668,43 @@ mod tests {
             merge_args("origin/dev"),
             vec!["merge", "--no-edit", "origin/dev"]
         );
+    }
+
+    #[test]
+    fn squash_stages_without_committing() {
+        assert_eq!(
+            squash_args("usine/feat"),
+            vec!["merge", "--squash", "usine/feat"]
+        );
+    }
+
+    #[test]
+    fn advance_branch_is_a_compare_and_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let one = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let two = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "side", &one]);
+
+        advance_branch(repo, "side", &one, &two).unwrap();
+        assert_eq!(git(&["rev-parse", "side"]), two);
+        // `side` no longer sits at `one`: a stale swap must not move it.
+        assert!(advance_branch(repo, "side", &one, &one).is_err());
+        assert_eq!(git(&["rev-parse", "side"]), two);
     }
 
     /// Fetching the remote wholesale (not `fetch origin dev`) is what refreshes

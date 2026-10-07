@@ -1158,6 +1158,16 @@ impl AppState {
             .unwrap_or_else(|| "main".into())
     }
 
+    /// Whether a project's repo has an `origin` remote — where a merge without
+    /// PR lands (origin's base branch) versus the local base branch.
+    pub fn has_origin(&self, project_id: Uuid) -> bool {
+        self.projects
+            .read()
+            .iter()
+            .find(|p| p.id == project_id)
+            .is_some_and(|p| usine_core::origin_url(&p.path).is_some())
+    }
+
     /// The code host a project's PRs live on — what every "on GitHub" /
     /// "on Azure DevOps" in the UI names. GitHub for an unknown project.
     pub fn forge_of(&self, project_id: Uuid) -> ForgeKind {

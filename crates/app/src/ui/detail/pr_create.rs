@@ -105,6 +105,14 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
     };
     let handoff = state.handoffs.read().get(&id).cloned();
     let base = state.base_branch_of(project_id);
+    // Opens the repo, so once per mount rather than on every keystroke.
+    let has_origin = use_hook(|| state.has_origin(project_id));
+    let merge_target = if has_origin {
+        format!("origin/{base}")
+    } else {
+        base.clone()
+    };
+    let mut delete_branch = use_signal(|| true);
     // A requested change lands here via the auto self-review, and so do the
     // validation passes after it — none of which render the chat section. Keep
     // its recap (and any answers) in view through them, read-only: no send box
@@ -251,7 +259,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
             // The failure may come from the base having moved on.
-            super::UpdateFromBase { card_id: id, base: base.clone() }
+            super::UpdateFromBase { card_id: id, project_id, base: base.clone() }
             // The parked failure can also bounce the work back wholesale.
             super::AgentChatSection {
                 card_id: id,
@@ -410,8 +418,60 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
             }
 
+            // …or land the work on the base branch with no PR at all.
+            div { class: "section",
+                h3 { "Or merge without a pull request" }
+                label { class: "checkbox-row",
+                    input {
+                        r#type: "checkbox",
+                        checked: delete_branch(),
+                        onchange: move |_| {
+                            let v = !delete_branch();
+                            delete_branch.set(v);
+                        },
+                    }
+                    "Delete the local branch after merging"
+                }
+                button {
+                    class: "btn",
+                    title: "Squashes the branch into one commit on {merge_target}, using the title and description above as its message",
+                    disabled: !has_branch,
+                    onclick: {
+                        let base = base.clone();
+                        let merge_target = merge_target.clone();
+                        move |_| {
+                            let message = if has_origin {
+                                format!(
+                                    "Squash this card's branch into {base} and push it to origin — no pull \
+                                     request, no review on {host}. The card's worktree is removed."
+                                )
+                            } else {
+                                format!(
+                                    "Squash this card's branch into your local {base} — this repo has no \
+                                     origin, nothing is pushed. If {base} is checked out, it's \
+                                     fast-forwarded there. The card's worktree is removed."
+                                )
+                            };
+                            crate::ui::confirm_then_send(
+                                state,
+                                "Merge without a pull request",
+                                message,
+                                &format!("Merge into {merge_target}"),
+                                ExecutorCommand::MergeLocally {
+                                    card_id: id,
+                                    title: title.read().clone(),
+                                    body: body.read().clone(),
+                                    delete_branch: delete_branch(),
+                                },
+                            );
+                        }
+                    },
+                    "Merge into {merge_target}"
+                }
+            }
+
             // Catch up with the base before opening the PR.
-            super::UpdateFromBase { card_id: id, base: base.clone() }
+            super::UpdateFromBase { card_id: id, project_id, base: base.clone() }
             // Still bounce the work back to the agent before opening the PR.
             super::AgentChatSection {
                 card_id: id,

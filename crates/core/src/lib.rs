@@ -87,7 +87,7 @@ pub use infra::forge::{
     PrSummary, RemoteForge, ReviewScope, SimForge, AZURE_DEVOPS_PAT_ENV,
 };
 pub use infra::git::{
-    remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
+    origin_url, remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
     UpstreamChanges,
 };
 pub use infra::persistence::{rebuild_database, Store};

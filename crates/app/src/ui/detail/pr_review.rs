@@ -140,7 +140,7 @@ pub(super) fn PrReviewPanel(card: Card) -> Element {
             }
         }
         if is_idle {
-            super::UpdateFromBase { card_id: id, base: state.base_branch_of(card.project_id) }
+            super::UpdateFromBase { card_id: id, project_id: card.project_id, base: state.base_branch_of(card.project_id) }
             super::AgentChatSection {
                 card_id: id,
                 request_title: "The agent commits and pushes to the PR's branch — this updates the open pull request in place",
