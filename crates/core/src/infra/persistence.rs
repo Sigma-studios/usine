@@ -1971,7 +1971,10 @@ mod tests {
         assert!(!store.mark_answers_read(id).unwrap());
 
         store.set_question(id, "why?").unwrap();
-        assert!(!store.get_answers(id).unwrap().unread, "asking isn't an answer");
+        assert!(
+            !store.get_answers(id).unwrap().unread,
+            "asking isn't an answer"
+        );
         store.set_answer(id, "because").unwrap();
         assert!(store.get_answers(id).unwrap().unread);
 

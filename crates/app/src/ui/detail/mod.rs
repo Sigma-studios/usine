@@ -29,8 +29,8 @@ mod review;
 mod transcript;
 mod update;
 
-use chat::{AgentChatSection, ChatLog};
 pub(super) use chat::renders_chat;
+use chat::{AgentChatSection, ChatLog};
 use conclusion::ConclusionPanel;
 use done::{DonePanel, OutcomeArtifacts};
 use edit::{Attachments, ConfigForm, EditableTask};
