@@ -2,7 +2,11 @@
 //!
 //! Each phase is a one-shot run: we pass the prompt as a positional arg, stream
 //! the NDJSON stdout through [`super::stream::parse_claude_line`], and exit when
-//! the process does. The plan phase runs read-only (`--permission-mode plan`);
+//! the process does. A run ends when the process exits, not at its first
+//! `result` line: that line only closes a *turn*, and while background work
+//! (`Monitor`, `Bash run_in_background`) is pending the CLI keeps the process
+//! alive and wakes the agent for further turns. The last `result` is the run's
+//! answer (see [`TurnGate`]). The plan phase runs read-only (`--permission-mode plan`);
 //! implement/fix phases run autonomously (`--dangerously-skip-permissions`) in
 //! the card's worktree. Relies on the user's existing `claude` auth.
 
@@ -15,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::agent::events::{AgentEvent, RunControl};
-use crate::domain::model::{supported_efforts, Provider};
+use crate::domain::model::{supported_efforts, Provider, Usage};
 use crate::error::{CoreError, Result};
 
 use super::stream::{errored_tool_result_ids, exit_plan_mode_tool_id, parse_claude_line};
@@ -34,7 +38,9 @@ use super::{AgentProvider, RunConfig, RunHandle, RunMode};
 /// `ScheduleWakeup`, `Workflow`): a one-shot `claude -p` run is single-turn, but
 /// those tools let the agent launch async sub-agents and end its turn early, so
 /// the run reports that interim turn as its result instead of the real
-/// plan/edits. Denying them forces the agent to finish in one turn.
+/// plan/edits. Denying them forces the agent to finish in one turn. (Interim
+/// turns from the tools we *do* allow — `Monitor`, background `Bash` — are
+/// handled in [`pump`] by [`TurnGate`], which waits for the process to exit.)
 pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     // Claude Code clamps an unsupported `--effort` itself, but we clamp here too so
     // the flag we pass reflects the model's real capability (e.g. Haiku, which has
@@ -221,8 +227,73 @@ impl PlanGate {
     }
 }
 
-/// Read the NDJSON stream to completion, forwarding normalized events. Reacts to
-/// Cancel by killing the child. (One-shot runs can't inject answers mid-flight,
+/// Holds the run's terminal event until the `claude` process exits.
+///
+/// A `result` line ends a *turn*, not the run: when the agent ended its turn
+/// waiting on background work (`Monitor`, `Bash run_in_background`), the CLI
+/// keeps the process alive, wakes the agent when that work reports, and emits a
+/// fresh `result` per turn. Forwarding the first one as `Done` finalized the
+/// card on an interim "waiting for…" message and dropped the real answer (with
+/// its `usine-commit`/`usine-handoff` blocks). So every `Done`/`Error` is held,
+/// each later one replaces it, and [`TurnGate::finish`] releases the last at EOF.
+#[derive(Default)]
+struct TurnGate {
+    /// The latest terminal event (`Done`/`Error`) seen, not yet forwarded.
+    held: Option<AgentEvent>,
+    /// Token usage summed over every turn's `result` (each reports its own turn).
+    usage: Usage,
+    /// Whether the current resumption has been announced in the activity log.
+    resumed_announced: bool,
+}
+
+impl TurnGate {
+    /// Hold back terminal events, passing everything else through. The first
+    /// event after a held result means the agent resumed: say so once.
+    fn hold(&mut self, events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::with_capacity(events.len());
+        for evt in events {
+            match evt {
+                AgentEvent::Done {
+                    result,
+                    cost_usd,
+                    usage,
+                } => {
+                    self.usage += usage;
+                    // `total_cost_usd` is cumulative for the process: the last wins.
+                    self.held = Some(AgentEvent::Done {
+                        result,
+                        cost_usd,
+                        usage: self.usage,
+                    });
+                    self.resumed_announced = false;
+                }
+                AgentEvent::Error { .. } => {
+                    self.held = Some(evt);
+                    self.resumed_announced = false;
+                }
+                other => {
+                    if self.held.is_some() && !self.resumed_announced {
+                        self.resumed_announced = true;
+                        out.push(AgentEvent::Progress {
+                            text: "Previous turn ended; agent resumed after background work".into(),
+                        });
+                    }
+                    out.push(other);
+                }
+            }
+        }
+        out
+    }
+
+    /// The run's final terminal event, released once the process has exited.
+    fn finish(&mut self) -> Option<AgentEvent> {
+        self.held.take()
+    }
+}
+
+/// Read the NDJSON stream to completion, forwarding normalized events. The run's
+/// `Done`/`Error` is sent only at EOF — earlier `result` lines are interim turns
+/// (see [`TurnGate`]). Reacts to Cancel by killing the child. (One-shot runs can't inject answers mid-flight,
 /// so `Answer` controls are ignored.)
 async fn pump(
     mut child: Child,
@@ -248,6 +319,8 @@ async fn pump(
     let mut ctl_open = true;
     // Holds an ExitPlanMode plan until its approve/reject verdict is known.
     let mut gate = PlanGate::default();
+    // Holds each turn's result until the process exits; the last one wins.
+    let mut turns = TurnGate::default();
 
     loop {
         tokio::select! {
@@ -255,13 +328,9 @@ async fn pump(
                 Ok(Some(line)) => {
                     gate.observe(&line);
                     if let Ok(events) = parse_claude_line(&line) {
-                        for evt in gate.gate(&line, events) {
-                            if matches!(
-                                evt,
-                                AgentEvent::Done { .. } | AgentEvent::Error { .. } | AgentEvent::PlanReady { .. }
-                            ) {
-                                saw_terminal = true;
-                            }
+                        // Terminal events (Done/Error, and the PlanReady resolved
+                        // against them) are held until EOF, so none pass here.
+                        for evt in gate.gate(&line, turns.hold(events)) {
                             let _ = evt_tx.unbounded_send(evt);
                         }
                     }
@@ -280,10 +349,17 @@ async fn pump(
         }
     }
 
-    // End-of-stream: surface any plan still held by the gate (an un-rejected
-    // plan whose run produced no trailing `result` line to resolve it at).
-    if !cancelled && !saw_terminal {
-        if let Some(evt) = gate.finish() {
+    // End-of-stream: release the final turn's result, resolving any held plan
+    // against it; failing that, surface a plan still held by the gate (an
+    // un-rejected plan whose run produced no trailing `result` line). A
+    // cancelled run forwards neither.
+    if !cancelled {
+        let tail = match turns.finish() {
+            // `line` is only read for PlanReady tool ids; none arrive here.
+            Some(evt) => gate.gate("", vec![evt]),
+            None => gate.finish().into_iter().collect(),
+        };
+        for evt in tail {
             saw_terminal = true;
             let _ = evt_tx.unbounded_send(evt);
         }
@@ -439,18 +515,46 @@ mod tests {
         assert_eq!(build_args(&c).last().map(String::as_str), Some("--"));
     }
 
-    /// Drive a `PlanGate` over the raw lines of a run, returning the forwarded
-    /// events — mirrors exactly what `pump` does per line.
+    /// Drive a `TurnGate` + `PlanGate` over the raw lines of a run, returning the
+    /// forwarded events — mirrors exactly what `pump` does per line and at EOF.
     fn drive_gate(lines: &[&str]) -> Vec<AgentEvent> {
         let mut gate = PlanGate::default();
+        let mut turns = TurnGate::default();
         let mut out = Vec::new();
         for line in lines {
             gate.observe(line);
-            out.extend(gate.gate(line, parse_claude_line(line).unwrap()));
+            out.extend(gate.gate(line, turns.hold(parse_claude_line(line).unwrap())));
         }
-        out.extend(gate.finish());
+        match turns.finish() {
+            Some(evt) => out.extend(gate.gate("", vec![evt])),
+            None => out.extend(gate.finish()),
+        }
         out
     }
+
+    fn kinds(events: &[AgentEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|e| match e {
+                AgentEvent::PlanReady { .. } => "plan",
+                AgentEvent::Done { .. } => "done",
+                AgentEvent::Error { .. } => "error",
+                AgentEvent::Progress { .. } => "progress",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    fn resumed_notes(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, AgentEvent::Progress { text } if text.contains("agent resumed")),
+            )
+            .count()
+    }
+
+    const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
 
     fn plans(events: &[AgentEvent]) -> Vec<String> {
         events
@@ -527,5 +631,106 @@ mod tests {
         ]);
         assert!(plans(&events).is_empty());
         assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+    }
+
+    // A turn that ends waiting on background work is interim: the run's single
+    // Done is the *last* result, with usage summed and the last cost.
+    #[test]
+    fn turn_gate_forwards_only_the_final_result() {
+        let events = drive_gate(&[
+            INIT,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Waiting for the app to come up…","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":1}}"#,
+            INIT,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"app is up, testing"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Waiting on the preview file.","total_cost_usd":0.8,"usage":{"input_tokens":20,"output_tokens":2}}"#,
+            INIT,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Done.\n```usine-handoff\n{}\n```","total_cost_usd":1.2,"usage":{"input_tokens":30,"output_tokens":3}}"#,
+        ]);
+        let dones: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Done {
+                    result,
+                    cost_usd,
+                    usage,
+                } => Some((result.clone(), *cost_usd, *usage)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 1, "exactly one Done per process");
+        let (result, cost, usage) = &dones[0];
+        assert!(
+            result.contains("usine-handoff"),
+            "Done must carry the final answer"
+        );
+        assert_eq!(*cost, 1.2);
+        assert_eq!(
+            *usage,
+            Usage {
+                input_tokens: 60,
+                output_tokens: 6
+            }
+        );
+        assert_eq!(kinds(&events).last(), Some(&"done"));
+        // One note per resumption.
+        assert_eq!(resumed_notes(&events), 2);
+    }
+
+    // The plan is resolved against the *final* result, even when the
+    // ExitPlanMode rejection happened in an earlier turn.
+    #[test]
+    fn plan_gate_resolves_against_the_last_turn() {
+        let events = drive_gate(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"ExitPlanMode","input":{"plan":"early draft"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"rejected"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Waiting on the build.","total_cost_usd":0.1}"#,
+            INIT,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Full plan.\n```usine-questions\n[{\"question\":\"A?\"}]\n```","total_cost_usd":0.2}"#,
+        ]);
+        let plans = plans(&events);
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].contains("usine-questions"));
+        let tail: Vec<_> = kinds(&events)
+            .into_iter()
+            .filter(|k| *k != "progress" && *k != "other")
+            .collect();
+        assert_eq!(tail, vec!["plan", "done"]);
+    }
+
+    // An interim failed turn followed by a successful one: the run succeeded.
+    #[test]
+    fn turn_gate_a_later_success_supersedes_an_interim_error() {
+        let events = drive_gate(&[
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"tool blew up"}"#,
+            INIT,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"recovered","total_cost_usd":0.3}"#,
+        ]);
+        let k = kinds(&events);
+        assert!(!k.contains(&"error"));
+        assert_eq!(k.iter().filter(|k| **k == "done").count(), 1);
+    }
+
+    // A single-turn run gets no resumption note.
+    #[test]
+    fn turn_gate_single_turn_has_no_resumption_note() {
+        let events = drive_gate(&[
+            INIT,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1}"#,
+        ]);
+        assert_eq!(resumed_notes(&events), 0);
+        assert_eq!(kinds(&events), vec!["other", "progress", "done"]);
+    }
+
+    // A held result is only released by `finish`; a cancelled run never calls
+    // it, so nothing terminal is forwarded mid-stream.
+    #[test]
+    fn turn_gate_holds_terminal_events_until_finish() {
+        let mut turns = TurnGate::default();
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"interim","total_cost_usd":0.1}"#;
+        assert!(turns.hold(parse_claude_line(line).unwrap()).is_empty());
+        assert!(matches!(turns.finish(), Some(AgentEvent::Done { .. })));
+        assert!(turns.finish().is_none());
     }
 }
