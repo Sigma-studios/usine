@@ -293,6 +293,16 @@ pub enum ExecutorCommand {
         delete_branch: bool,
         force: bool,
     },
+    /// From `ReadyForPr`: squash the card's branch into the base branch with
+    /// no PR — pushed to `origin/<base>` when the repo has an origin, else
+    /// applied to the local `<base>` — committed as `title` (+ `body`). Then
+    /// clean up as after a PR merge (`delete_branch` = the local branch).
+    MergeLocally {
+        card_id: Uuid,
+        title: String,
+        body: String,
+        delete_branch: bool,
+    },
     /// From `ReadyToMerge` (or `PrReview(Idle)`), after a merge failed on
     /// conflicts: merge the base branch into the card's branch inside its
     /// worktree and hand the conflicts to an agent. Loops back through
@@ -477,6 +487,7 @@ impl ExecutorCommand {
             | ExecutorCommand::FollowUpInvestigation { card_id, .. }
             | ExecutorCommand::ConvertToImplementation { card_id, .. }
             | ExecutorCommand::Merge { card_id, .. }
+            | ExecutorCommand::MergeLocally { card_id, .. }
             | ExecutorCommand::ResolveConflicts { card_id }
             | ExecutorCommand::UpdateFromBase { card_id, .. }
             | ExecutorCommand::FixChecks { card_id }
@@ -593,6 +604,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::FollowUpInvestigation { .. }
                 | ExecutorCommand::ConvertToImplementation { .. }
                 | ExecutorCommand::Merge { .. }
+                | ExecutorCommand::MergeLocally { .. }
                 | ExecutorCommand::ResolveConflicts { .. }
                 | ExecutorCommand::UpdateFromBase { .. }
                 | ExecutorCommand::FixChecks { .. }

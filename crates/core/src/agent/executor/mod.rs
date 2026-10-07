@@ -600,6 +600,15 @@ impl Executor {
                 delete_branch,
                 force,
             } => self.merge(card_id, delete_branch, force).await,
+            ExecutorCommand::MergeLocally {
+                card_id,
+                title,
+                body,
+                delete_branch,
+            } => {
+                self.merge_locally(card_id, title, body, delete_branch)
+                    .await
+            }
             ExecutorCommand::ResolveConflicts { card_id } => self.resolve_conflicts(card_id).await,
             ExecutorCommand::UpdateFromBase { card_id, note } => {
                 self.update_from_base(card_id, note).await
@@ -1136,6 +1145,12 @@ fn worktree_path(repo: &Path, id: Uuid) -> PathBuf {
 /// distinct from the card's real worktree path (`{id}` vs `{id}-selfreview`).
 fn self_review_worktree_path(repo: &Path, id: Uuid) -> PathBuf {
     worktree_path(repo, id).with_file_name(format!("{id}-selfreview"))
+}
+
+/// A short-lived, detached worktree path where a card's branch is squashed onto
+/// the base for a merge without PR (`{id}-merge`).
+fn local_merge_worktree_path(repo: &Path, id: Uuid) -> PathBuf {
+    worktree_path(repo, id).with_file_name(format!("{id}-merge"))
 }
 
 /// A short-lived, detached worktree path for a card's read-only DESIGN phase

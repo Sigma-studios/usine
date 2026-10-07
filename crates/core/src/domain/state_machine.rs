@@ -60,6 +60,11 @@ pub enum Transition {
     /// without review", when no reviewer is coming). Either way the card lands
     /// in `Done`.
     Merge,
+    /// Squash the card's branch straight into the base branch — on origin
+    /// when the repo has one, else locally — without a PR. Legal only from
+    /// `AwaitingReview(ReadyForPr)`: reviewed and validated (or explicitly
+    /// skipped) work.
+    MergeLocally,
     Cancel,
     /// Stop a designing / investigating / implementing run, stepping back to
     /// the parked state it was entered from (the card's
@@ -260,6 +265,9 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         }
         // Ready for the PR: open it (executor renames the branch + pushes first).
         (S::AwaitingReview(ReviewSub::ReadyForPr), T::CreatePr) => S::PrReview(PrReviewSub::Idle),
+        // …or skip the PR entirely: the executor squashes the branch into the
+        // base branch (origin's when there is one, else the local one).
+        (S::AwaitingReview(ReviewSub::ReadyForPr), T::MergeLocally) => S::Done,
 
         // Validation gate. The executor applies `StartValidation` right after
         // any edge that lands on `ReadyForPr` when the project has a validate
@@ -952,6 +960,37 @@ mod tests {
         ] {
             let done = transition(&s, Transition::MarkDone).unwrap();
             assert!(matches!(done, CardState::Done), "{s:?} → done");
+        }
+    }
+
+    #[test]
+    fn merge_locally_only_from_ready_for_pr() {
+        assert!(matches!(
+            transition(
+                &CardState::AwaitingReview(ReviewSub::ReadyForPr),
+                Transition::MergeLocally
+            )
+            .unwrap(),
+            CardState::Done
+        ));
+        for s in [
+            CardState::AwaitingReview(ReviewSub::ValidationFailed {
+                attempt: 3,
+                output: "boom".into(),
+            }),
+            CardState::AwaitingReview(ReviewSub::Validating { attempt: 1 }),
+            CardState::PrReview(PrReviewSub::Idle),
+            CardState::ReadyToMerge,
+            CardState::Implementing(RunSub::Running),
+            updating(
+                CardState::AwaitingReview(ReviewSub::ReadyForPr),
+                RunSub::Running,
+            ),
+        ] {
+            assert!(
+                transition(&s, Transition::MergeLocally).is_err(),
+                "{s:?} must not merge locally"
+            );
         }
     }
 
