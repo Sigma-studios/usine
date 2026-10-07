@@ -2415,7 +2415,13 @@ mod tests {
 
     #[test]
     fn update_prompt_carries_the_note_and_conflicts_only_when_present() {
-        let clean = update_prompt("main", "origin/main", &upstream(1), &[], Some("  watch the migration  "));
+        let clean = update_prompt(
+            "main",
+            "origin/main",
+            &upstream(1),
+            &[],
+            Some("  watch the migration  "),
+        );
         assert!(clean.contains("What to look out for:\nwatch the migration\n"));
         assert!(clean.contains("already committed"));
         assert!(!clean.contains("Conflicted files"));
@@ -2423,7 +2429,13 @@ mod tests {
         assert!(clean.contains("If nothing needs adapting, change nothing"));
         assert!(clean.contains("usine-questions"));
 
-        let conflicted = update_prompt("main", "origin/main", &upstream(1), &["src/lib.rs".into()], None);
+        let conflicted = update_prompt(
+            "main",
+            "origin/main",
+            &upstream(1),
+            &["src/lib.rs".into()],
+            None,
+        );
         assert!(conflicted.contains("Conflicted files:\n- src/lib.rs\n"));
         assert!(conflicted.contains("git merge --abort") && conflicted.contains("Do not push"));
         assert!(!conflicted.contains("What to look out for"));
