@@ -11,12 +11,14 @@
 //! the card's worktree. Relies on the user's existing `claude` auth.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::time::{sleep_until, timeout, Instant};
 
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider, Usage};
@@ -285,22 +287,58 @@ impl TurnGate {
         out
     }
 
-    /// The run's final terminal event, released once the process has exited.
+    /// Whether a turn's result is waiting for the run to end.
+    fn is_holding(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The run's final terminal event, released once the run has ended.
     fn finish(&mut self) -> Option<AgentEvent> {
         self.held.take()
     }
 }
 
+/// How long a run may stay silent with a turn's `result` held before that
+/// result is taken as final and the process is killed.
+///
+/// The end of a run is normally stdout EOF, but EOF can be held off forever: a
+/// long, quiet background task, or a grandchild still holding the CLI's stdout
+/// after `claude` has exited. Without this, the executor's idle watchdog would
+/// cancel the run and fail the card, throwing away a complete answer. It must be
+/// longer than the CLI's 10-minute cap on `Monitor`/background `Bash` (those
+/// wake the agent when they expire) and shorter than the executor's
+/// `RUN_IDLE_TIMEOUT`, which is asserted there. Both measure time since the last
+/// event forwarded to the executor.
+pub(crate) const HELD_RESULT_GRACE: Duration = Duration::from_secs(12 * 60);
+
+/// How long to keep reading stdout once `claude` itself has exited, for lines
+/// still in the pipe. A grandchild holding the pipe open won't delay us longer.
+const EXIT_DRAIN: Duration = Duration::from_secs(2);
+
 /// Read the NDJSON stream to completion, forwarding normalized events. The run's
-/// `Done`/`Error` is sent only at EOF — earlier `result` lines are interim turns
-/// (see [`TurnGate`]). Reacts to Cancel by killing the child. (One-shot runs can't inject answers mid-flight,
-/// so `Answer` controls are ignored.)
+/// `Done`/`Error` is sent only at the end — earlier `result` lines are interim
+/// turns (see [`TurnGate`]). The end is stdout EOF, `claude` exiting, or
+/// [`HELD_RESULT_GRACE`] of silence after a turn's result. Reacts to Cancel by
+/// killing the child. (One-shot runs can't inject answers mid-flight, so
+/// `Answer` controls are ignored.)
 async fn pump(
+    child: Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: Option<tokio::process::ChildStderr>,
+    evt_tx: mpsc::UnboundedSender<AgentEvent>,
+    ctl_rx: mpsc::UnboundedReceiver<RunControl>,
+) {
+    pump_with_grace(child, stdout, stderr, evt_tx, ctl_rx, HELD_RESULT_GRACE).await
+}
+
+/// [`pump`] with the held-result grace as a parameter, so tests can shorten it.
+async fn pump_with_grace(
     mut child: Child,
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
     evt_tx: mpsc::UnboundedSender<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<RunControl>,
+    grace: Duration,
 ) {
     // Drain stderr concurrently so a useful message survives a non-zero exit.
     let stderr_task = tokio::spawn(async move {
@@ -319,28 +357,49 @@ async fn pump(
     let mut ctl_open = true;
     // Holds an ExitPlanMode plan until its approve/reject verdict is known.
     let mut gate = PlanGate::default();
-    // Holds each turn's result until the process exits; the last one wins.
+    // Holds each turn's result until the run ends; the last one wins.
     let mut turns = TurnGate::default();
+    // When the executor last received an event: its idle watchdog counts from
+    // here, so the held-result grace does too.
+    let mut last_sent = Instant::now();
+    let mut exit_status = None;
+    let mut timed_out = false;
+
+    let forward =
+        |line: &str, gate: &mut PlanGate, turns: &mut TurnGate, last_sent: &mut Instant| {
+            gate.observe(line);
+            if let Ok(events) = parse_claude_line(line) {
+                // Terminal events (Done/Error, and the PlanReady resolved
+                // against them) are held until the end, so none pass here.
+                for evt in gate.gate(line, turns.hold(events)) {
+                    *last_sent = Instant::now();
+                    let _ = evt_tx.unbounded_send(evt);
+                }
+            }
+        };
 
     loop {
         tokio::select! {
             line = lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    gate.observe(&line);
-                    if let Ok(events) = parse_claude_line(&line) {
-                        // Terminal events (Done/Error, and the PlanReady resolved
-                        // against them) are held until EOF, so none pass here.
-                        for evt in gate.gate(&line, turns.hold(events)) {
-                            let _ = evt_tx.unbounded_send(evt);
-                        }
-                    }
-                }
+                Ok(Some(line)) => forward(&line, &mut gate, &mut turns, &mut last_sent),
                 _ => break, // EOF or read error
+            },
+            status = child.wait(), if exit_status.is_none() => {
+                exit_status = Some(status);
+                // `claude` is gone; read what's left in the pipe, but don't wait
+                // on a grandchild (a background task) that still holds it open.
+                while let Ok(Ok(Some(line))) = timeout(EXIT_DRAIN, lines.next_line()).await {
+                    forward(&line, &mut gate, &mut turns, &mut last_sent);
+                }
+                break;
+            },
+            _ = sleep_until(last_sent + grace), if turns.is_holding() => {
+                timed_out = true;
+                break;
             },
             ctl = ctl_rx.next(), if ctl_open => match ctl {
                 Some(RunControl::Cancel) | Some(RunControl::Interrupt) => {
                     cancelled = true;
-                    let _ = child.start_kill();
                     break;
                 }
                 Some(RunControl::Answer { .. }) => { /* one-shot: no stdin to write to */ }
@@ -349,7 +408,19 @@ async fn pump(
         }
     }
 
-    // End-of-stream: release the final turn's result, resolving any held plan
+    if exit_status.is_none() && (cancelled || timed_out) {
+        let _ = child.start_kill();
+    }
+    if timed_out {
+        let _ = evt_tx.unbounded_send(AgentEvent::Progress {
+            text: format!(
+                "No output for {} min since the agent's last turn; using that turn's result",
+                grace.as_secs() / 60
+            ),
+        });
+    }
+
+    // End of run: release the final turn's result, resolving any held plan
     // against it; failing that, surface a plan still held by the gate (an
     // un-rejected plan whose run produced no trailing `result` line). A
     // cancelled run forwards neither.
@@ -365,8 +436,18 @@ async fn pump(
         }
     }
 
-    let status = child.wait().await.ok();
-    let stderr_text = stderr_task.await.unwrap_or_default();
+    let status = match exit_status {
+        Some(status) => status.ok(),
+        None => child.wait().await.ok(),
+    };
+    // A grandchild may still hold stderr open too; don't wait on it for a run
+    // that already has its answer.
+    let stderr_text = if saw_terminal {
+        stderr_task.abort();
+        String::new()
+    } else {
+        stderr_task.await.unwrap_or_default()
+    };
 
     if !saw_terminal && !cancelled {
         let code = status.and_then(|s| s.code()).unwrap_or(-1);
@@ -732,5 +813,68 @@ mod tests {
         assert!(turns.hold(parse_claude_line(line).unwrap()).is_empty());
         assert!(matches!(turns.finish(), Some(AgentEvent::Done { .. })));
         assert!(turns.finish().is_none());
+    }
+
+    const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"final answer","total_cost_usd":0.1}"#;
+
+    /// Run `pump_with_grace` over a `sh -c script` child and collect what it
+    /// forwards, failing if the run doesn't end within `limit`.
+    async fn pump_script(script: &str, grace: Duration, limit: Duration) -> Vec<AgentEvent> {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
+        let (evt_tx, evt_rx) = mpsc::unbounded();
+        let (_ctl_tx, ctl_rx) = mpsc::unbounded();
+        timeout(
+            limit,
+            pump_with_grace(child, stdout, stderr, evt_tx, ctl_rx, grace),
+        )
+        .await
+        .expect("run should have ended");
+        evt_rx.collect().await
+    }
+
+    fn final_done(events: &[AgentEvent]) -> bool {
+        matches!(events.last(), Some(AgentEvent::Done { result, .. }) if result == "final answer")
+    }
+
+    // `claude` exited but a background grandchild still holds stdout: the run
+    // ends at the process exit with its result, not at a never-coming EOF.
+    #[tokio::test]
+    async fn pump_ends_when_claude_exits_even_if_a_grandchild_holds_stdout() {
+        let script = format!("echo '{RESULT}'; sleep 30 & exit 0");
+        let events = pump_script(&script, Duration::from_secs(60), Duration::from_secs(10)).await;
+        assert!(final_done(&events), "{:?}", kinds(&events));
+    }
+
+    // A held result and then silence: after the grace the result is released
+    // rather than left for the executor's watchdog to fail the run.
+    #[tokio::test]
+    async fn pump_releases_a_held_result_after_the_quiet_grace() {
+        let script = format!("echo '{RESULT}'; exec sleep 30");
+        let events =
+            pump_script(&script, Duration::from_millis(300), Duration::from_secs(10)).await;
+        assert!(final_done(&events), "{:?}", kinds(&events));
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::Progress { text } if text.contains("using that turn's result"))
+        ));
+    }
+
+    // The grace only runs while a result is held: a slow first turn isn't cut
+    // short.
+    #[tokio::test]
+    async fn pump_grace_does_not_apply_before_any_result() {
+        let script = format!("sleep 1; echo '{RESULT}'");
+        let events =
+            pump_script(&script, Duration::from_millis(100), Duration::from_secs(10)).await;
+        assert!(final_done(&events), "{:?}", kinds(&events));
     }
 }
