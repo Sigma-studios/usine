@@ -1249,6 +1249,7 @@ impl Executor {
         for scratch in [
             self_review_worktree_path(repo, card.id),
             design_worktree_path(repo, card.id),
+            local_merge_worktree_path(repo, card.id),
         ] {
             if scratch.exists() {
                 let _ = self.git.remove_worktree(repo, &scratch).await;

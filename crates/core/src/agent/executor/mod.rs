@@ -600,6 +600,15 @@ impl Executor {
                 delete_branch,
                 force,
             } => self.merge(card_id, delete_branch, force).await,
+            ExecutorCommand::MergeLocally {
+                card_id,
+                title,
+                body,
+                delete_branch,
+            } => {
+                self.merge_locally(card_id, title, body, delete_branch)
+                    .await
+            }
             ExecutorCommand::ResolveConflicts { card_id } => self.resolve_conflicts(card_id).await,
             ExecutorCommand::UpdateFromBase { card_id, note } => {
                 self.update_from_base(card_id, note).await
@@ -1138,6 +1147,12 @@ fn self_review_worktree_path(repo: &Path, id: Uuid) -> PathBuf {
     worktree_path(repo, id).with_file_name(format!("{id}-selfreview"))
 }
 
+/// A short-lived, detached worktree path where a card's branch is squashed onto
+/// the base for a merge without PR (`{id}-merge`).
+fn local_merge_worktree_path(repo: &Path, id: Uuid) -> PathBuf {
+    worktree_path(repo, id).with_file_name(format!("{id}-merge"))
+}
+
 /// A short-lived, detached worktree path for a card's read-only DESIGN phase
 /// (plan / investigate / pre-worktree Q&A), cut at a freshly fetched
 /// `origin/<base>`. Distinct from both the card's real worktree and the
@@ -1586,14 +1601,15 @@ which conflicts you resolved and which are blocked on the answer. Nothing is com
 pushed while a question is outstanding, and you'll be run again with the answer to finish the \
 merge. Do not use this to hand back a conflict you could have worked out by reading the code.";
 
-/// Build the update-from-base brief: `origin/<base>` was just merged into the
-/// card's branch (cleanly, or stopping on `conflicted`), and the agent checks
+/// Build the update-from-base brief: `upstream` (`origin/<base>`, or the local
+/// `<base>` in a repo without an origin) was just merged into the card's branch (cleanly, or stopping on `conflicted`), and the agent checks
 /// the card's own work against what landed — `up` lists it, with the files
 /// this branch also touches flagged first — plus the user's optional `note`.
 /// "Nothing needs adapting" is an allowed outcome, explained in the final
 /// message (`finalize_run` quotes it back to the user).
 fn update_prompt(
     base: &str,
+    upstream: &str,
     up: &crate::UpstreamChanges,
     conflicted: &[String],
     note: Option<&str>,
@@ -1602,7 +1618,7 @@ fn update_prompt(
     const MAX_FILES: usize = 100;
     let mut s = format!(
         "{UPDATE_BRIEF_OPENER}\n\n\
-         `origin/{base}` was just merged into this branch, and your work must stay correct on top \
+         `{upstream}` was just merged into this branch, and your work must stay correct on top \
          of it.\n\n\
          What landed on `{base}`:\n"
     );
@@ -2378,17 +2394,17 @@ mod tests {
 
     #[test]
     fn update_prompt_caps_subjects() {
-        let p = update_prompt("main", &upstream(53), &[], None);
+        let p = update_prompt("main", "origin/main", &upstream(53), &[], None);
         assert!(p.contains("upstream commit 49"));
         assert!(!p.contains("upstream commit 50"));
         assert!(p.contains("+3 more"));
-        let p = update_prompt("main", &upstream(2), &[], None);
+        let p = update_prompt("main", "origin/main", &upstream(2), &[], None);
         assert!(!p.contains("more\n"));
     }
 
     #[test]
     fn update_prompt_lists_overlap_first_and_tagged() {
-        let p = update_prompt("main", &upstream(1), &[], None);
+        let p = update_prompt("main", "origin/main", &upstream(1), &[], None);
         let shared = p.find("- shared.rs (also changed by this branch)").unwrap();
         let a = p.find("- a.rs\n").unwrap();
         assert!(shared < a);
@@ -2399,7 +2415,13 @@ mod tests {
 
     #[test]
     fn update_prompt_carries_the_note_and_conflicts_only_when_present() {
-        let clean = update_prompt("main", &upstream(1), &[], Some("  watch the migration  "));
+        let clean = update_prompt(
+            "main",
+            "origin/main",
+            &upstream(1),
+            &[],
+            Some("  watch the migration  "),
+        );
         assert!(clean.contains("What to look out for:\nwatch the migration\n"));
         assert!(clean.contains("already committed"));
         assert!(!clean.contains("Conflicted files"));
@@ -2407,7 +2429,13 @@ mod tests {
         assert!(clean.contains("If nothing needs adapting, change nothing"));
         assert!(clean.contains("usine-questions"));
 
-        let conflicted = update_prompt("main", &upstream(1), &["src/lib.rs".into()], None);
+        let conflicted = update_prompt(
+            "main",
+            "origin/main",
+            &upstream(1),
+            &["src/lib.rs".into()],
+            None,
+        );
         assert!(conflicted.contains("Conflicted files:\n- src/lib.rs\n"));
         assert!(conflicted.contains("git merge --abort") && conflicted.contains("Do not push"));
         assert!(!conflicted.contains("What to look out for"));
@@ -2418,7 +2446,7 @@ mod tests {
 
     #[test]
     fn update_brief_is_told_apart_from_the_conflict_brief() {
-        let update = update_prompt("main", &upstream(1), &[], None);
+        let update = update_prompt("main", "origin/main", &upstream(1), &[], None);
         assert!(is_update_brief(&update));
         assert!(!is_conflict_brief(&update));
         let conflict = conflict_prompt("main", &["src/lib.rs".into()]);

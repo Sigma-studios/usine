@@ -14,8 +14,15 @@ use crate::ui::drafts;
 /// confirm. The note is a draft (it survives the panel's remounts), and a
 /// panel that mounts with one restored opens straight onto it.
 #[component]
-pub(super) fn UpdateFromBase(card_id: Uuid, base: String) -> Element {
+pub(super) fn UpdateFromBase(card_id: Uuid, project_id: Uuid, base: String) -> Element {
     let state = use_context::<AppState>();
+    // What actually gets merged: the local base in a repo without an origin.
+    let has_origin = use_hook(|| state.has_origin(project_id));
+    let upstream = if has_origin {
+        format!("origin/{base}")
+    } else {
+        base.clone()
+    };
     let mut note = drafts::use_draft(card_id, "update.note", String::new);
     let mut open = use_signal(|| !note.peek().is_empty());
 
@@ -24,7 +31,7 @@ pub(super) fn UpdateFromBase(card_id: Uuid, base: String) -> Element {
             div { class: "row",
                 button {
                     class: "btn",
-                    title: "Merge origin/{base} into this card's branch, then have the agent check the card's work against what landed and adapt it",
+                    title: "Merge {upstream} into this card's branch, then have the agent check the card's work against what landed and adapt it",
                     onclick: move |_| open.set(true),
                     "Update from {base}…"
                 }
@@ -36,7 +43,7 @@ pub(super) fn UpdateFromBase(card_id: Uuid, base: String) -> Element {
         div { class: "section update-from-base", "data-submit-scope": "1",
             h3 { "Update from {base}" }
             div { class: "hint",
-                "Merges origin/{base} into this branch, then the agent checks this card's work against what landed (renamed symbols, changed APIs, migrations) and adapts it — or says nothing needs to change. The card comes back here afterwards."
+                "Merges {upstream} into this branch, then the agent checks this card's work against what landed (renamed symbols, changed APIs, migrations) and adapts it — or says nothing needs to change. The card comes back here afterwards."
             }
             div { class: "field",
                 textarea {

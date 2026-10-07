@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::infra::forge::normalize_reviewer;
-use crate::infra::git::is_dirty;
+use crate::infra::git::{self, is_dirty};
 use crate::{PrInfo, PrState};
 
 /// Base for the synthetic ids given to review-*body* triage items. Far above
@@ -1173,6 +1173,196 @@ impl Executor {
         Ok(())
     }
 
+    /// Merge without a PR: squash the card's branch into ONE commit on the base
+    /// branch — pushed to `origin/<base>` when the repo has an origin (the local
+    /// `<base>` and the user's checkout are left alone, as after a PR merge),
+    /// else applied to the local `<base>`. Legal only from `ReadyForPr`.
+    ///
+    /// The squash happens in a throwaway detached worktree cut at the target,
+    /// so a conflict (or any failure before publishing) changes nothing: the
+    /// card stays in `ReadyForPr` and neither origin nor the local base moves.
+    /// Publishing never overwrites a base that moved meanwhile — the push isn't
+    /// forced, the checked-out base is only fast-forwarded (git also refuses to
+    /// clobber the checkout's uncommitted changes), and a base checked out
+    /// nowhere is moved by compare-and-swap. Past publishing, cleanup mirrors
+    /// [`merge`](Self::merge).
+    pub(super) async fn merge_locally(
+        &self,
+        card_id: Uuid,
+        title: String,
+        body: String,
+        delete_branch: bool,
+    ) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let project = self.store.get_project(card.project_id)?;
+        let base = project.config.effective_base_branch().to_string();
+        // A stale panel (the card moved on under it) is refused before any git
+        // work.
+        transition(&card.state, Transition::MergeLocally)?;
+        let branch = card
+            .branch
+            .clone()
+            .ok_or_else(|| CoreError::other("card has no branch to merge"))?;
+        if card.pr.is_some() {
+            return Err(CoreError::other(
+                "card already has a PR — merge it from the PR panel",
+            ));
+        }
+
+        // The squash takes the branch's commits, never its worktree: refuse
+        // rather than silently leave uncommitted work out of the merge.
+        self.ensure_branch_worktree(card_id).await?;
+        let dir = self
+            .store
+            .get_card(card_id)?
+            .worktree_path
+            .ok_or_else(|| CoreError::other("card has no worktree to merge"))?;
+        if is_dirty(&dir).await? {
+            return Err(CoreError::other(
+                "the card's worktree has uncommitted changes — commit or discard them first",
+            ));
+        }
+
+        // With an origin the merge goes there, never silently to the local base.
+        let has_origin = git::origin_url(&project.path).is_some();
+        let target = if has_origin {
+            self.progress(card_id, "Fetching origin…");
+            self.git.fetch(&project.path, "origin").await?;
+            format!("refs/remotes/origin/{base}")
+        } else {
+            format!("refs/heads/{base}")
+        };
+        let Some(old) = git::ref_sha(&project.path, &target) else {
+            return Err(CoreError::other(if has_origin {
+                format!("origin has no `{base}` branch to merge into")
+            } else {
+                format!("no local `{base}` branch to merge into")
+            }));
+        };
+        let shown_base = if has_origin {
+            format!("origin/{base}")
+        } else {
+            base.clone()
+        };
+        let nothing_to_merge = || {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Info,
+                format!("Nothing to merge — {branch} has no commits beyond {base}"),
+            ));
+        };
+        if git::log_subjects(&project.path, &target, &branch)?.is_empty() {
+            nothing_to_merge();
+            return Ok(());
+        }
+
+        let scratch = local_merge_worktree_path(&project.path, card_id);
+        if scratch.exists() {
+            let _ = self.git.remove_worktree(&project.path, &scratch).await;
+            let _ = std::fs::remove_dir_all(&scratch);
+        }
+        self.progress(card_id, &format!("Squashing {branch} into {shown_base}…"));
+        self.git
+            .worktree_add_detached(&project.path, &scratch, &old)
+            .await?;
+        let title = match title.trim() {
+            "" => card.title.trim().to_string(),
+            t => t.to_string(),
+        };
+        let message = match body.trim() {
+            "" => title,
+            b => format!("{title}\n\n{b}"),
+        };
+        // `Ok(true)` = published; `Ok(false)` = a no-op already reported.
+        let published: Result<bool> = async {
+            match self.git.squash_ref(&scratch, &branch).await? {
+                MergeOutcome::Clean => {}
+                MergeOutcome::Conflicted(_) => {
+                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                        card_id,
+                        Severity::Warning,
+                        format!(
+                            "{branch} conflicts with {base} — use Update from base to bring \
+                             {base} in, then merge again"
+                        ),
+                    ));
+                    return Ok(false);
+                }
+            }
+            if !self.git.commit_all(&scratch, &message).await? {
+                nothing_to_merge();
+                return Ok(false);
+            }
+            let new = self.git.head_sha(&scratch).await?;
+            if has_origin {
+                self.progress(card_id, &format!("Pushing to origin/{base}…"));
+                self.git
+                    .push_refspec(&scratch, "origin", &format!("HEAD:refs/heads/{base}"))
+                    .await
+                    .map_err(|e| {
+                        // Only a non-fast-forward rejection means a retry can
+                        // succeed; protected branches, hooks and auth can't.
+                        let text = e.to_string();
+                        if text.contains("non-fast-forward") || text.contains("fetch first") {
+                            CoreError::other(format!("{base} moved on origin — merge again ({e})"))
+                        } else {
+                            CoreError::other(format!("couldn't push to origin/{base}: {e}"))
+                        }
+                    })?;
+            } else if let Some(checkout) = git::checkout_of_branch(&project.path, &base) {
+                git::merge_ff_only(&checkout, &new).await.map_err(|e| {
+                    CoreError::other(format!(
+                        "couldn't fast-forward your `{base}` checkout at {}: {e}",
+                        checkout.display()
+                    ))
+                })?;
+            } else {
+                git::advance_branch(&project.path, &base, &old, &new)
+                    .map_err(|e| CoreError::other(format!("{base} moved — merge again ({e})")))?;
+            }
+            Ok(true)
+        }
+        .await;
+        // The squash commit lives in the shared object store, so the scratch
+        // tree can go whatever happened.
+        let _ = self.git.remove_worktree(&project.path, &scratch).await;
+        let _ = std::fs::remove_dir_all(&scratch);
+        if !published? {
+            return Ok(());
+        }
+
+        self.apply(card_id, Transition::MergeLocally)?;
+
+        // Past this point the work is on the base: report cleanup problems,
+        // never raise them. No remote branch to delete — pre-PR branches are
+        // never pushed.
+        let (worktree_gone, mut left_behind) =
+            self.cleanup_terminal_pr_worktree(card_id, false).await;
+        if delete_branch {
+            if worktree_gone {
+                if let Err(e) = self.git.delete_branch(&project.path, &branch).await {
+                    left_behind.push(format!("local branch ({e})"));
+                }
+            } else {
+                left_behind.push("local branch (worktree still holds it)".to_string());
+            }
+        }
+
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            card_id,
+            Severity::Success,
+            format!("Merged into {shown_base} 🎉"),
+        ));
+        if !left_behind.is_empty() {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                format!("Merged, but couldn't clean up: {}", left_behind.join("; ")),
+            ));
+        }
+        Ok(())
+    }
+
     /// Local cleanup once a card's PR is terminal on the forge (merged there by
     /// us or by anyone, or closed): stop the preview, remove the worktree, and
     /// clear the card's `worktree_path` once it is actually gone. The ordering
@@ -1403,9 +1593,15 @@ impl Executor {
             .get_card(card_id)?
             .worktree_path
             .ok_or_else(|| CoreError::other("card has no worktree to update"))?;
-        self.progress(card_id, "Fetching origin…");
-        self.git.fetch(&dir, "origin").await?;
-        let upstream = format!("origin/{base}");
+        // A repo without an origin (whose cards merge into the local base
+        // without a PR) updates from the local base branch instead.
+        let upstream = if git::origin_url(&project.path).is_some() {
+            self.progress(card_id, "Fetching origin…");
+            self.git.fetch(&dir, "origin").await?;
+            format!("origin/{base}")
+        } else {
+            base.clone()
+        };
         let up = self.git.upstream_changes(&dir, &upstream).await?;
         if up.subjects.is_empty() {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
@@ -1431,7 +1627,7 @@ impl Executor {
             // Kept for a later "back to start", like a requested change.
             self.record_qa(card_id, format!("Requested on update from {base}: {n}"));
         }
-        let extra = update_prompt(&base, &up, &conflicted, note.as_deref());
+        let extra = update_prompt(&base, &upstream, &up, &conflicted, note.as_deref());
         // Stash the task before entering the running state, so a retry of a
         // faulted run (or the answer to a question) can restate it.
         self.store.set_fix_extra(card_id, Some(&extra))?;

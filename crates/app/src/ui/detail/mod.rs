@@ -782,7 +782,7 @@ fn CardPanel(card: Card) -> Element {
                     }
                 }
             }
-            UpdateFromBase { card_id: id, base: state.base_branch_of(card.project_id) }
+            UpdateFromBase { card_id: id, project_id: card.project_id, base: state.base_branch_of(card.project_id) }
             AgentChatSection {
                 card_id: id,
                 on_request: move |fb: String| {
