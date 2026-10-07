@@ -1073,6 +1073,13 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, rhs: Usage) {
+        self.input_tokens += rhs.input_tokens;
+        self.output_tokens += rhs.output_tokens;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PR review workflow (reviewing other contributors' PRs)
 // ---------------------------------------------------------------------------

@@ -252,6 +252,12 @@ struct PreviewHandle {
 /// idle while parked on a question.
 const RUN_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+// The Claude pump releases a held turn result after its own quiet period; it
+// must fire before this watchdog, which would fail the card and drop that result.
+const _: () = assert!(
+    crate::agent::provider::claude::HELD_RESULT_GRACE.as_secs() < RUN_IDLE_TIMEOUT.as_secs()
+);
+
 /// How often the background poll looks for new PRs to review and refreshes the
 /// reviewer-comment counts on our open PRs.
 const REVIEW_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
