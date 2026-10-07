@@ -178,7 +178,8 @@ pub(super) fn ChatLog(card_id: Uuid) -> Element {
         return rsx! {};
     }
     rsx! {
-        div { class: "qa-log",
+        // The board's "Read unread answer" scrolls here.
+        div { class: "qa-log", id: "agent-chat",
             // Newest first, and only it is ever rendered `open` — an older row
             // the user expanded keeps `open: false` in the vdom, so no
             // re-render force-collapses it.
@@ -264,7 +265,7 @@ pub(super) fn summary_line(question: &str) -> String {
 /// no attach affordance at all) is caught by the `debug_assert!` below, which
 /// fires whenever a state renders this section while this function says it
 /// doesn't.
-pub(super) fn renders_chat(state: &CardState) -> bool {
+pub(in crate::ui) fn renders_chat(state: &CardState) -> bool {
     match state.effective() {
         CardState::Designing(DesignSub::AwaitingApproval { .. })
         | CardState::AwaitingReview(

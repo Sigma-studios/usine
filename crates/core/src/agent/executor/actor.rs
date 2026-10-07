@@ -91,19 +91,8 @@ pub(super) async fn run_actor(
             }
             cancel_run(&runs, card_id, run_id);
             // Drop the runs-map entry now rather than at the end-of-loop
-            // cleanup below: until it's gone, `Executor::answer`'s live-run
-            // check would route the user's answer into this one-shot provider,
-            // which ignores it — losing the answer.
-            {
-                let mut map = lock(&runs);
-                if map
-                    .get(&card_id)
-                    .map(|(rid, _)| *rid == run_id)
-                    .unwrap_or(false)
-                {
-                    map.remove(&card_id);
-                }
-            }
+            // cleanup below (see `release_run`).
+            release_run(&runs, card_id, run_id);
             break;
         }
 
@@ -126,7 +115,10 @@ pub(super) async fn run_actor(
         let was_error = matches!(&evt, AgentEvent::Error { .. });
         let result = match (&evt, mode) {
             (AgentEvent::Done { .. }, RunMode::Implement | RunMode::ApplyFixes) => {
-                finalize_run(&store, &evt_tx, &git, &cmd_tx, &executor, card_id, evt).await
+                finalize_run(
+                    &store, &evt_tx, &git, &cmd_tx, &executor, &runs, card_id, run_id, evt,
+                )
+                .await
             }
             (AgentEvent::Done { .. }, RunMode::Review) => {
                 finalize_self_review(&store, &evt_tx, &executor, card_id, evt).await
@@ -254,7 +246,9 @@ async fn finalize_run(
     git: &Arc<dyn GitOps>,
     cmd_tx: &UnboundedSender<ExecutorCommand>,
     executor: &Weak<Executor>,
+    runs: &RunMap,
     card_id: Uuid,
+    run_id: Uuid,
     evt: AgentEvent,
 ) -> Result<()> {
     let (result_text, cost) = match evt {
@@ -347,6 +341,10 @@ async fn finalize_run(
                 // The stashed conflict brief and pending fix Q&A stay put:
                 // the answering run restates the brief, and the fixes it
                 // logs are only true once it commits.
+                // The run is over: release its slot BEFORE the park is
+                // announced, so an answer sent on seeing it resumes a fresh
+                // run rather than being forwarded into this finished one.
+                release_run(runs, card_id, run_id);
                 apply_transition(
                     store,
                     evt_tx,
