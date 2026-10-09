@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use super::remote::encode_segment;
 use super::{
     normalize_reviewer, FailedCheck, Forge, LivePrState, OpenPr, PrImage, PrPushTarget, PrSummary,
     ReviewScope,
@@ -939,11 +940,13 @@ pub fn name_with_owner_args() -> Vec<String> {
     ]
 }
 
-/// The hidden ref a branch's PR-description images are committed under. Not a
-/// branch (nothing lists it, merge cleanup leaves it alone), yet it keeps the
-/// image commit reachable so GitHub never garbage-collects it.
-pub fn pr_images_ref(head: &str) -> String {
-    format!("refs/usine/pr-images/{head}")
+/// The hidden ref an images commit is kept under. Not a branch (nothing lists
+/// it, merge cleanup leaves it alone), yet it keeps the commit reachable so
+/// GitHub never garbage-collects it. Keyed by the commit itself, not the PR's
+/// branch: a ref per upload is never moved off an older PR's images, and flat
+/// names can't hit git's `fix` vs `fix/typo` file/directory conflict.
+pub fn pr_images_ref(commit: &str) -> String {
+    format!("refs/usine/pr-images/{commit}")
 }
 
 /// A `gh api` call on `endpoint` (under `repos/{owner}/{repo}/`) taking its
@@ -1006,31 +1009,21 @@ pub fn commit_payload(tree: &str, head: &str) -> Value {
     })
 }
 
-/// Force-move `head`'s images ref (body: [`update_ref_payload`]). Fails with a
-/// 422 when the ref doesn't exist yet — see [`create_ref_args`].
-pub fn update_ref_args(head: &str) -> Vec<String> {
-    let full = pr_images_ref(head);
-    let name = full.strip_prefix("refs/").unwrap_or(&full);
-    git_data_args("PATCH", &format!("git/refs/{name}"), ".ref")
-}
-
-pub fn update_ref_payload(sha: &str) -> Value {
-    serde_json::json!({ "sha": sha, "force": true })
-}
-
-/// Create `head`'s images ref (body: [`create_ref_payload`]).
+/// Create an images commit's ref (body: [`create_ref_payload`]).
 pub fn create_ref_args() -> Vec<String> {
     git_data_args("POST", "git/refs", ".ref")
 }
 
-pub fn create_ref_payload(head: &str, sha: &str) -> Value {
-    serde_json::json!({ "ref": pr_images_ref(head), "sha": sha })
+pub fn create_ref_payload(commit: &str) -> Value {
+    serde_json::json!({ "ref": pr_images_ref(commit), "sha": commit })
 }
 
 /// The URL a PR description embeds a hosted image from. Pinned to the commit,
-/// so it keeps rendering when the ref later moves on; `?raw=true` makes GitHub
-/// serve the bytes (to anyone who can read the repo, private ones included).
+/// and the file name percent-encoded (a picked attachment keeps its original
+/// name: spaces, `#`, `?`, unicode); `?raw=true` makes GitHub serve the bytes
+/// (to anyone who can read the repo, private ones included).
 pub fn pr_image_url(name_with_owner: &str, commit: &str, file: &str) -> String {
+    let file = encode_segment(file);
     format!("https://github.com/{name_with_owner}/blob/{commit}/{file}?raw=true")
 }
 
@@ -1346,17 +1339,7 @@ impl Forge for GhForge {
         }
         let tree = run_gh_json(repo, &create_tree_args(), &tree_payload(&entries)).await?;
         let commit = run_gh_json(repo, &create_commit_args(), &commit_payload(&tree, head)).await?;
-        // Move the ref if it exists (a retry, or an earlier PR from this
-        // branch), else create it. Only a 422 means "doesn't exist yet";
-        // anything else (auth, ref rules) is the error to report.
-        if let Err(moved) =
-            run_gh_json(repo, &update_ref_args(head), &update_ref_payload(&commit)).await
-        {
-            if !moved.to_string().contains("HTTP 422") {
-                return Err(moved);
-            }
-            run_gh_json(repo, &create_ref_args(), &create_ref_payload(head, &commit)).await?;
-        }
+        run_gh_json(repo, &create_ref_args(), &create_ref_payload(&commit)).await?;
         Ok(images
             .iter()
             .map(|i| pr_image_url(nwo, &commit, &i.name))
@@ -2182,17 +2165,10 @@ mod tests {
     }
 
     #[test]
-    fn pr_image_ref_is_force_moved_under_refs_usine() {
-        let args = update_ref_args("feat/x");
-        assert!(args.windows(2).any(|w| w == ["--method", "PATCH"]));
-        assert!(args
-            .iter()
-            .any(|a| a == "repos/{owner}/{repo}/git/refs/usine/pr-images/feat/x"));
-        assert_eq!(update_ref_payload("abc")["force"], true);
-        assert_eq!(
-            create_ref_payload("feat/x", "abc")["ref"],
-            "refs/usine/pr-images/feat/x"
-        );
+    fn pr_image_ref_is_keyed_by_its_commit_under_refs_usine() {
+        let payload = create_ref_payload("abc");
+        assert_eq!(payload["ref"], "refs/usine/pr-images/abc");
+        assert_eq!(payload["sha"], "abc");
     }
 
     #[test]
@@ -2213,6 +2189,10 @@ mod tests {
         assert_eq!(
             pr_image_url("o/r", "c0ffee", "0a1b2c3d-pasted-1.png"),
             "https://github.com/o/r/blob/c0ffee/0a1b2c3d-pasted-1.png?raw=true"
+        );
+        assert_eq!(
+            pr_image_url("o/r", "c0ffee", "0a1b2c3d-my shot #2?é.png"),
+            "https://github.com/o/r/blob/c0ffee/0a1b2c3d-my%20shot%20%232%3F%C3%A9.png?raw=true"
         );
     }
 

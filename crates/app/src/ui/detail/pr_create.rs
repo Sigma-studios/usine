@@ -312,23 +312,21 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                 }
                 div { class: "field",
                     label { r#for: "pr-body", "Description" }
+                    textarea {
+                        id: "pr-body",
+                        initial_value: "{body.peek()}",
+                        oninput: move |e| body.set(e.value()),
+                        onpaste: move |_| {
+                            if embeds_images {
+                                super::edit::paste_image_into(state, id, "pr-body");
+                            }
+                        },
+                    }
                     if embeds_images {
-                        textarea {
-                            id: "pr-body",
-                            initial_value: "{body.peek()}",
-                            oninput: move |e| body.set(e.value()),
-                            onpaste: move |_| super::edit::paste_image_into(state, id, "pr-body"),
-                        }
                         // Pasted images are card attachments: preview or drop
                         // them here (a dropped one must leave the text too).
                         super::edit::AttachmentChips { card_id: id }
                         div { class: "hint", "Paste a screenshot to embed it in the PR." }
-                    } else {
-                        textarea {
-                            id: "pr-body",
-                            initial_value: "{body.peek()}",
-                            oninput: move |e| body.set(e.value()),
-                        }
                     }
                 }
                 div { class: "field",
