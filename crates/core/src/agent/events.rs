@@ -456,7 +456,13 @@ pub enum ExecutorCommand {
     AttachImage { card_id: Uuid, src: PathBuf },
     /// Write pasted image bytes (already PNG-encoded) into the card's managed
     /// attachments dir. Same as `AttachImage` but sourced from the clipboard.
-    AttachImageBytes { card_id: Uuid, data: Vec<u8> },
+    /// `id` pins the file's 8-hex name prefix — what a PR-description
+    /// placeholder (`usine-image:<id>`) refers to; `None` picks a random one.
+    AttachImageBytes {
+        card_id: Uuid,
+        data: Vec<u8>,
+        id: Option<String>,
+    },
     /// Remove a previously attached image (by its managed path).
     DetachImage { card_id: Uuid, path: PathBuf },
     /// Refresh the usage bar's rate-limit data now (its manual refresh button)

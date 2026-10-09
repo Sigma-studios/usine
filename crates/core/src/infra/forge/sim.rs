@@ -6,7 +6,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use super::{normalize_reviewer, Forge, OpenPr, PrPushTarget, PrSummary, ReviewScope};
+use super::{normalize_reviewer, Forge, OpenPr, PrImage, PrPushTarget, PrSummary, ReviewScope};
 use crate::domain::model::{
     CheckStatus, DraftComment, Mergeable, PrInfo, PrState, ReviewComment, ReviewEvent,
     ReviewSummary, ReviewThread,
@@ -250,6 +250,20 @@ impl Forge for SimForge {
         _comment_ids: &[u64],
     ) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Hosts nothing: a made-up URL per image, so the paste-into-PR flow runs
+    /// end to end in demo mode and tests.
+    async fn host_pr_images(
+        &self,
+        _repo: &Path,
+        head: &str,
+        images: &[PrImage],
+    ) -> Result<Vec<String>> {
+        Ok(images
+            .iter()
+            .map(|i| format!("https://sim.usine/pr-images/{head}/{}", i.name))
+            .collect())
     }
 
     async fn list_threads(&self, _repo: &Path, _pr_number: u64) -> Result<Vec<ReviewThread>> {
