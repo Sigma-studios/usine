@@ -1022,9 +1022,10 @@ impl AppState {
         }
     }
 
-    /// Attach a pasted image (PNG bytes) to a card.
-    pub fn attach_image_bytes(&self, card_id: Uuid, data: Vec<u8>) {
-        self.send(ExecutorCommand::AttachImageBytes { card_id, data });
+    /// Attach a pasted image (PNG bytes) to a card. `id` pins the file's 8-hex
+    /// name prefix (what a PR-description placeholder names); `None` = random.
+    pub fn attach_image_bytes(&self, card_id: Uuid, data: Vec<u8>, id: Option<String>) {
+        self.send(ExecutorCommand::AttachImageBytes { card_id, data, id });
     }
 
     /// Remove a previously attached image by its managed path.

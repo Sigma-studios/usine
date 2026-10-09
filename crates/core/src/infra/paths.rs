@@ -66,9 +66,61 @@ pub fn attachment_label(path: &std::path::Path) -> String {
     }
 }
 
+/// Next free number for a pasted screenshot, from the card's existing
+/// attachments. Max-based rather than count-based so a removed screenshot's
+/// number is never reissued. Legacy un-numbered `pasted.png` counts as 0;
+/// non-pasted attachments are ignored. Public so the PR form can label a
+/// placeholder with the name its chip will show.
+pub fn next_pasted_number(existing: &[PathBuf]) -> u32 {
+    existing
+        .iter()
+        .filter_map(|p| {
+            let original = attachment_label(p);
+            if original == "pasted.png" {
+                return Some(0);
+            }
+            original
+                .strip_prefix("pasted-")?
+                .strip_suffix(".png")?
+                .parse::<u32>()
+                .ok()
+        })
+        .max()
+        .map_or(1, |m| m + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_pasted_number_starts_at_one() {
+        assert_eq!(next_pasted_number(&[]), 1);
+    }
+
+    #[test]
+    fn next_pasted_number_legacy_unnumbered_counts_as_zero() {
+        let existing = [PathBuf::from("/att/ab12cd34-pasted.png")];
+        assert_eq!(next_pasted_number(&existing), 1);
+    }
+
+    #[test]
+    fn next_pasted_number_skips_gaps_never_reissues() {
+        let existing = [
+            PathBuf::from("/att/ab12cd34-pasted-1.png"),
+            PathBuf::from("/att/ef56ab78-pasted-3.png"),
+        ];
+        assert_eq!(next_pasted_number(&existing), 4);
+    }
+
+    #[test]
+    fn next_pasted_number_ignores_non_pasted_names() {
+        let existing = [
+            PathBuf::from("/att/ab12cd34-screenshot.png"),
+            PathBuf::from("/att/ef56ab78-notes-2.txt"),
+        ];
+        assert_eq!(next_pasted_number(&existing), 1);
+    }
 
     /// One combined test on purpose: env vars are process-global and the test
     /// harness runs tests on parallel threads, so a second test mutating

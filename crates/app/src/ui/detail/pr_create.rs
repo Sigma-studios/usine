@@ -17,6 +17,7 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
     let project_id = card.project_id;
     let forge = state.forge_of(project_id);
     let host = forge.display_name();
+    let embeds_images = forge.embeds_pr_images();
     let identity_label = forge.identity_label();
     // The form fields are drafts: typed-but-unsent text survives deselects and
     // the card moving between the parked states. The seeded ones (title,
@@ -315,6 +316,17 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
                         id: "pr-body",
                         initial_value: "{body.peek()}",
                         oninput: move |e| body.set(e.value()),
+                        onpaste: move |_| {
+                            if embeds_images {
+                                super::edit::paste_image_into(state, id, "pr-body");
+                            }
+                        },
+                    }
+                    if embeds_images {
+                        // Pasted images are card attachments: preview or drop
+                        // them here (a dropped one must leave the text too).
+                        super::edit::AttachmentChips { card_id: id }
+                        div { class: "hint", "Paste a screenshot to embed it in the PR." }
                     }
                 }
                 div { class: "field",

@@ -16,6 +16,7 @@ mcp = ["tokio/net"]
 
 [dependencies]
 async-trait = "0.1.92"
+base64 = "0.22.1"
 directories.workspace = true
 futures.workspace = true
 git2 = "0.21.0"

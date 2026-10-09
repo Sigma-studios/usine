@@ -49,6 +49,7 @@ mod gate;
 mod lifecycle;
 mod output;
 mod pr;
+mod pr_images;
 mod pr_review;
 mod preview;
 mod self_review;
@@ -844,9 +845,9 @@ impl Executor {
                     .unbounded_send(ExecutorEvent::attachments_changed(card_id, paths));
                 Ok(())
             }
-            ExecutorCommand::AttachImageBytes { card_id, data } => {
+            ExecutorCommand::AttachImageBytes { card_id, data, id } => {
                 let mut paths = self.store.get_attachments(card_id).unwrap_or_default();
-                let dest = copy_attachment_bytes(card_id, &data, &paths)?;
+                let dest = copy_attachment_bytes(card_id, &data, id.as_deref(), &paths)?;
                 paths.push(dest);
                 self.store.set_attachments(card_id, &paths)?;
                 let _ = self
@@ -958,38 +959,45 @@ fn copy_attachment(card_id: Uuid, src: &Path) -> Result<PathBuf> {
 /// managed attachments dir and return the destination path. Pasted screenshots
 /// are numbered (`pasted-1.png`, `pasted-2.png`, …) so their chips stay
 /// distinguishable.
-fn copy_attachment_bytes(card_id: Uuid, data: &[u8], existing: &[PathBuf]) -> Result<PathBuf> {
-    let dir = crate::infra::paths::attachments_dir(card_id);
-    std::fs::create_dir_all(&dir)?;
-    let n = next_pasted_number(existing);
-    let dest = dir.join(format!(
-        "{}-pasted-{n}.png",
-        &Uuid::new_v4().to_string()[..8]
-    ));
+fn copy_attachment_bytes(
+    card_id: Uuid,
+    data: &[u8],
+    id: Option<&str>,
+    existing: &[PathBuf],
+) -> Result<PathBuf> {
+    let dest =
+        pasted_attachment_path(&crate::infra::paths::attachments_dir(card_id), id, existing)?;
+    std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")))?;
     std::fs::write(&dest, data)?;
     Ok(dest)
 }
 
-/// Next free number for a pasted screenshot, from the card's existing
-/// attachments. Max-based rather than count-based so a removed screenshot's
-/// number is never reissued. Legacy un-numbered `pasted.png` counts as 0;
-/// non-pasted attachments are ignored.
-fn next_pasted_number(existing: &[PathBuf]) -> u32 {
-    existing
-        .iter()
-        .filter_map(|p| {
-            let original = crate::infra::paths::attachment_label(p);
-            if original == "pasted.png" {
-                return Some(0);
+/// Where a pasted screenshot lands in `dir`: `<id>-pasted-<N>.png`. A given id
+/// must be 8 hex chars — it ends up in a file name and is matched back by
+/// prefix — and is refused when another attachment already uses it.
+fn pasted_attachment_path(dir: &Path, id: Option<&str>, existing: &[PathBuf]) -> Result<PathBuf> {
+    let prefix = match id {
+        Some(id) if !pr_images::is_placeholder_id(id) => {
+            return Err(CoreError::other(format!(
+                "`{id}` is not a valid attachment id (8 hex characters)"
+            )))
+        }
+        Some(id) => {
+            let taken = format!("{id}-");
+            if existing.iter().any(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(&taken))
+            }) {
+                return Err(CoreError::other(format!(
+                    "attachment id `{id}` is already in use"
+                )));
             }
-            original
-                .strip_prefix("pasted-")?
-                .strip_suffix(".png")?
-                .parse::<u32>()
-                .ok()
-        })
-        .max()
-        .map_or(1, |m| m + 1)
+            id.to_string()
+        }
+        None => Uuid::new_v4().to_string()[..8].to_string(),
+    };
+    let n = crate::infra::paths::next_pasted_number(existing);
+    Ok(dir.join(format!("{prefix}-pasted-{n}.png")))
 }
 
 /// Fold the captured clarifying Q&A and change requests into a task description
@@ -1949,32 +1957,29 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn next_pasted_number_starts_at_one() {
-        assert_eq!(next_pasted_number(&[]), 1);
+    fn a_pasted_image_keeps_the_id_it_is_given() {
+        let existing = [PathBuf::from("/att/ab12cd34-pasted-1.png")];
+        let dest = pasted_attachment_path(Path::new("/att"), Some("0a1b2c3d"), &existing).unwrap();
+        assert_eq!(dest, PathBuf::from("/att/0a1b2c3d-pasted-2.png"));
     }
 
     #[test]
-    fn next_pasted_number_legacy_unnumbered_counts_as_zero() {
-        let existing = [PathBuf::from("/att/ab12cd34-pasted.png")];
-        assert_eq!(next_pasted_number(&existing), 1);
+    fn a_pasted_image_id_must_be_lowercase_hex_and_unused() {
+        let existing = [PathBuf::from("/att/ab12cd34-pasted-1.png")];
+        for bad in ["../evil", "0A1B2C3D", "abc", "0a1b2c3d9"] {
+            assert!(pasted_attachment_path(Path::new("/att"), Some(bad), &existing).is_err());
+        }
+        assert!(pasted_attachment_path(Path::new("/att"), Some("ab12cd34"), &existing).is_err());
     }
 
     #[test]
-    fn next_pasted_number_skips_gaps_never_reissues() {
-        let existing = [
-            PathBuf::from("/att/ab12cd34-pasted-1.png"),
-            PathBuf::from("/att/ef56ab78-pasted-3.png"),
-        ];
-        assert_eq!(next_pasted_number(&existing), 4);
-    }
-
-    #[test]
-    fn next_pasted_number_ignores_non_pasted_names() {
-        let existing = [
-            PathBuf::from("/att/ab12cd34-screenshot.png"),
-            PathBuf::from("/att/ef56ab78-notes-2.txt"),
-        ];
-        assert_eq!(next_pasted_number(&existing), 1);
+    fn a_pasted_image_without_an_id_gets_a_random_one() {
+        let dest = pasted_attachment_path(Path::new("/att"), None, &[]).unwrap();
+        let name = dest.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.ends_with("-pasted-1.png") && name.len() == 21,
+            "{name}"
+        );
     }
 
     #[test]
