@@ -1,8 +1,9 @@
 //! Opening the card's own pull request and driving its review: creating the
 //! PR, fetching + applying reviewer comments, marking ready, and merging.
 
+use super::pr_images;
 use super::*;
-use crate::infra::forge::normalize_reviewer;
+use crate::infra::forge::{normalize_reviewer, PrImage};
 use crate::infra::git::{self, is_dirty};
 use crate::{PrInfo, PrState};
 
@@ -54,6 +55,51 @@ pub(super) fn mark_mergeable_stale(card: &mut Card) {
 }
 
 impl Executor {
+    /// `body` with each pasted-image placeholder (`usine-image:<id>`) swapped
+    /// for the URL the forge hosted that card attachment at. A body without
+    /// placeholders comes back as is, without touching the forge.
+    async fn embed_pr_images(
+        &self,
+        card_id: Uuid,
+        project: &Project,
+        head: &str,
+        body: String,
+    ) -> Result<String> {
+        let ids = pr_images::find_placeholders(&body);
+        if ids.is_empty() {
+            return Ok(body);
+        }
+        let attachments = self.store.get_attachments(card_id).unwrap_or_default();
+        let paths = pr_images::resolve(&ids, &attachments)?;
+        let mut images = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let bytes = std::fs::read(path)
+                .map_err(|e| CoreError::other(format!("could not read {}: {e}", path.display())))?;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            images.push(PrImage { name, bytes });
+        }
+        self.progress(
+            card_id,
+            &format!("uploading {} image(s) for the PR description", images.len()),
+        );
+        let urls = self
+            .forge_for(project)
+            .host_pr_images(&project.path, head, &images)
+            .await?;
+        if urls.len() != ids.len() {
+            return Err(CoreError::forge(format!(
+                "the forge hosted {} of {} images",
+                urls.len(),
+                ids.len()
+            )));
+        }
+        let map = ids.into_iter().zip(urls).collect();
+        Ok(pr_images::rewrite(&body, &map))
+    }
+
     pub(super) async fn create_pr(
         &self,
         card_id: Uuid,
@@ -142,8 +188,11 @@ impl Executor {
         // First push: the pre-PR branch is kept local until now.
         self.git.push(&dir, &head).await?;
 
-        // Draft PRs let the user add screenshots on GitHub (no API embeds images
-        // in a PR body) then mark it ready; a non-draft opens straight for review.
+        // Screenshots pasted into the description are placeholders until the
+        // forge hosts them. Any failure here stops before the PR exists, so a
+        // retry (the push is then a no-op) starts clean.
+        let body = self.embed_pr_images(card_id, &project, &head, body).await?;
+
         let created = self
             .forge_for(&project)
             .create_pr(

@@ -84,8 +84,33 @@ pub(super) fn EditableTask(card: Card) -> Element {
 /// webview's own paste has already run.
 pub(super) fn attach_from_clipboard(state: AppState, card_id: Uuid) {
     if let Some(png) = clipboard_image_png() {
-        state.attach_image_bytes(card_id, png);
+        state.attach_image_bytes(card_id, png, None);
     }
+}
+
+/// The `onpaste` handler of a field whose text embeds what is pasted (the PR
+/// description): attach the clipboard image like [`attach_from_clipboard`],
+/// under a chosen id, and insert `![pasted-N](usine-image:<id>)` at the caret
+/// of textarea `textarea_id`. Creating the PR swaps the placeholder for the
+/// hosted image. The insert dispatches `input`, so the field's draft follows.
+pub(super) fn paste_image_into(state: AppState, card_id: Uuid, textarea_id: &str) {
+    let Some(png) = clipboard_image_png() else {
+        return;
+    };
+    let id = Uuid::new_v4().to_string()[..8].to_string();
+    // The number the executor will give the file, so the alt text matches the
+    // chip (a second paste racing the first's echo can repeat it — cosmetic).
+    let n = usine_core::infra::paths::next_pasted_number(&state.card_attachments(card_id));
+    state.attach_image_bytes(card_id, png, Some(id.clone()));
+    dioxus::document::eval(&format!(
+        "(function(){{\
+           var el = document.getElementById('{textarea_id}');\
+           if (!el) return;\
+           el.focus();\
+           el.setRangeText('![pasted-{n}](usine-image:{id})', el.selectionStart, el.selectionEnd, 'end');\
+           el.dispatchEvent(new Event('input', {{ bubbles: true }}));\
+         }})();"
+    ));
 }
 
 /// Read an image off the OS clipboard and PNG-encode it, if one is present.

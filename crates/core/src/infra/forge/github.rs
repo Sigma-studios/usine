@@ -17,8 +17,9 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use super::remote::encode_segment;
 use super::{
-    normalize_reviewer, FailedCheck, Forge, LivePrState, OpenPr, PrPushTarget, PrSummary,
+    normalize_reviewer, FailedCheck, Forge, LivePrState, OpenPr, PrImage, PrPushTarget, PrSummary,
     ReviewScope,
 };
 use crate::domain::model::{
@@ -939,6 +940,93 @@ pub fn name_with_owner_args() -> Vec<String> {
     ]
 }
 
+/// The hidden ref an images commit is kept under. Not a branch (nothing lists
+/// it, merge cleanup leaves it alone), yet it keeps the commit reachable so
+/// GitHub never garbage-collects it. Keyed by the commit itself, not the PR's
+/// branch: a ref per upload is never moved off an older PR's images, and flat
+/// names can't hit git's `fix` vs `fix/typo` file/directory conflict.
+pub fn pr_images_ref(commit: &str) -> String {
+    format!("refs/usine/pr-images/{commit}")
+}
+
+/// A `gh api` call on `endpoint` (under `repos/{owner}/{repo}/`) taking its
+/// JSON body on stdin and printing just the response's `jq` field.
+fn git_data_args(method: &str, endpoint: &str, jq: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "--method".into(),
+        method.into(),
+        format!("repos/{{owner}}/{{repo}}/{endpoint}"),
+        "--input".into(),
+        "-".into(),
+        "--jq".into(),
+        jq.into(),
+    ]
+}
+
+/// Upload one blob (body: [`blob_payload`]); prints its sha. Stdin rather
+/// than `-f`, since a base64 screenshot easily outgrows argv.
+pub fn create_blob_args() -> Vec<String> {
+    git_data_args("POST", "git/blobs", ".sha")
+}
+
+pub fn blob_payload(bytes: &[u8]) -> Value {
+    use base64::Engine as _;
+    serde_json::json!({
+        "content": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "encoding": "base64",
+    })
+}
+
+/// Create a tree (body: [`tree_payload`]); prints its sha.
+pub fn create_tree_args() -> Vec<String> {
+    git_data_args("POST", "git/trees", ".sha")
+}
+
+/// A fresh tree (no `base_tree`) holding exactly the `(file name, blob sha)`
+/// entries.
+pub fn tree_payload(entries: &[(String, String)]) -> Value {
+    let tree: Vec<Value> = entries
+        .iter()
+        .map(|(path, sha)| {
+            serde_json::json!({ "path": path, "mode": "100644", "type": "blob", "sha": sha })
+        })
+        .collect();
+    serde_json::json!({ "tree": tree })
+}
+
+/// Create a commit (body: [`commit_payload`]); prints its sha.
+pub fn create_commit_args() -> Vec<String> {
+    git_data_args("POST", "git/commits", ".sha")
+}
+
+/// A parentless commit of `tree`: it shares no history with the repo.
+pub fn commit_payload(tree: &str, head: &str) -> Value {
+    serde_json::json!({
+        "message": format!("usine: PR images for {head}"),
+        "tree": tree,
+        "parents": [],
+    })
+}
+
+/// Create an images commit's ref (body: [`create_ref_payload`]).
+pub fn create_ref_args() -> Vec<String> {
+    git_data_args("POST", "git/refs", ".ref")
+}
+
+pub fn create_ref_payload(commit: &str) -> Value {
+    serde_json::json!({ "ref": pr_images_ref(commit), "sha": commit })
+}
+
+/// The URL a PR description embeds a hosted image from. Pinned to the commit,
+/// and the file name percent-encoded (a picked attachment keeps its original
+/// name: spaces, `#`, `?`, unicode); `?raw=true` makes GitHub serve the bytes
+/// (to anyone who can read the repo, private ones included).
+pub fn pr_image_url(name_with_owner: &str, commit: &str, file: &str) -> String {
+    let file = encode_segment(file);
+    format!("https://github.com/{name_with_owner}/blob/{commit}/{file}?raw=true")
+}
+
 /// Real GitHub forge via the `gh` CLI.
 pub struct GhForge;
 
@@ -1236,6 +1324,28 @@ impl Forge for GhForge {
         Ok(prs)
     }
 
+    async fn host_pr_images(
+        &self,
+        repo: &Path,
+        head: &str,
+        images: &[PrImage],
+    ) -> Result<Vec<String>> {
+        let nwo = run_gh(repo, &name_with_owner_args()).await?;
+        let nwo = nwo.trim();
+        let mut entries = Vec::with_capacity(images.len());
+        for image in images {
+            let sha = run_gh_json(repo, &create_blob_args(), &blob_payload(&image.bytes)).await?;
+            entries.push((image.name.clone(), sha));
+        }
+        let tree = run_gh_json(repo, &create_tree_args(), &tree_payload(&entries)).await?;
+        let commit = run_gh_json(repo, &create_commit_args(), &commit_payload(&tree, head)).await?;
+        run_gh_json(repo, &create_ref_args(), &create_ref_payload(&commit)).await?;
+        Ok(images
+            .iter()
+            .map(|i| pr_image_url(nwo, &commit, &i.name))
+            .collect())
+    }
+
     async fn pr_by_number(&self, repo: &Path, pr_number: u64) -> Result<Option<PrInfo>> {
         // Unlike `pr_for_head`, a failure here is an error, not "no PR": the
         // caller must tell "closed" from "couldn't ask". `gh pr view` takes a
@@ -1300,6 +1410,12 @@ async fn run_gh_as(cwd: &Path, args: &[String], cmd: &str) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// [`run_gh_stdin`] with a JSON body, trimming the (`--jq`-picked) output.
+async fn run_gh_json(cwd: &Path, args: &[String], body: &Value) -> Result<String> {
+    let out = run_gh_stdin(cwd, args, &serde_json::to_string(body)?).await?;
+    Ok(out.trim().to_string())
 }
 
 /// Like [`run_gh`] but pipes `stdin` into the process (for `gh api --input -`).
@@ -2029,6 +2145,55 @@ mod tests {
         assert!(parse_push_target("not json").is_none());
         assert!(parse_push_target(r#"{"headRefName":""}"#).is_none());
         assert!(parse_push_target("{}").is_none());
+    }
+
+    #[test]
+    fn pr_image_uploads_post_git_data_via_stdin() {
+        for (args, endpoint) in [
+            (create_blob_args(), "repos/{owner}/{repo}/git/blobs"),
+            (create_tree_args(), "repos/{owner}/{repo}/git/trees"),
+            (create_commit_args(), "repos/{owner}/{repo}/git/commits"),
+            (create_ref_args(), "repos/{owner}/{repo}/git/refs"),
+        ] {
+            assert!(
+                args.windows(2).any(|w| w == ["--method", "POST"]),
+                "{args:?}"
+            );
+            assert!(args.iter().any(|a| a == endpoint), "{args:?}");
+            assert!(args.windows(2).any(|w| w == ["--input", "-"]), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn pr_image_ref_is_keyed_by_its_commit_under_refs_usine() {
+        let payload = create_ref_payload("abc");
+        assert_eq!(payload["ref"], "refs/usine/pr-images/abc");
+        assert_eq!(payload["sha"], "abc");
+    }
+
+    #[test]
+    fn pr_image_payloads() {
+        assert_eq!(blob_payload(b"hi")["content"], "aGk=");
+        assert_eq!(blob_payload(b"hi")["encoding"], "base64");
+        let tree = tree_payload(&[("a-pasted-1.png".into(), "s1".into())]);
+        assert_eq!(tree["tree"][0]["path"], "a-pasted-1.png");
+        assert_eq!(tree["tree"][0]["mode"], "100644");
+        assert!(tree.get("base_tree").is_none());
+        let commit = commit_payload("t1", "feat/x");
+        assert_eq!(commit["tree"], "t1");
+        assert_eq!(commit["parents"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn pr_image_url_is_pinned_to_the_commit() {
+        assert_eq!(
+            pr_image_url("o/r", "c0ffee", "0a1b2c3d-pasted-1.png"),
+            "https://github.com/o/r/blob/c0ffee/0a1b2c3d-pasted-1.png?raw=true"
+        );
+        assert_eq!(
+            pr_image_url("o/r", "c0ffee", "0a1b2c3d-my shot #2?é.png"),
+            "https://github.com/o/r/blob/c0ffee/0a1b2c3d-my%20shot%20%232%3F%C3%A9.png?raw=true"
+        );
     }
 
     #[test]

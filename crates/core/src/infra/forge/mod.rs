@@ -143,6 +143,14 @@ impl PrPushTarget {
     }
 }
 
+/// One image to host for a PR description: its file name (unique within the
+/// batch) and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrImage {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Which open PRs the review board should track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewScope {
@@ -333,6 +341,21 @@ pub trait Forge: Send + Sync {
     async fn pr_by_number(&self, _repo: &Path, _pr_number: u64) -> Result<Option<PrInfo>> {
         Ok(None)
     }
+
+    /// Upload `images` somewhere a PR description on branch `head` can embed
+    /// them from, returning one URL per image, in order. Called before the PR
+    /// exists. The default refuses, so a forge only claims the feature (see
+    /// [`ForgeKind::embeds_pr_images`]) once it overrides this.
+    async fn host_pr_images(
+        &self,
+        _repo: &Path,
+        _head: &str,
+        _images: &[PrImage],
+    ) -> Result<Vec<String>> {
+        Err(CoreError::forge(
+            "this forge can't embed images in a PR description yet",
+        ))
+    }
 }
 
 // --- per-kind behavior that needs no forge instance --------------------------
@@ -372,6 +395,16 @@ impl ForgeKind {
                  above; `az pipelines runs show --id <build-id>` works too when the Azure \
                  CLI is installed and signed in."
             }
+        }
+    }
+
+    /// Whether screenshots pasted into the PR form can be embedded in the
+    /// description — i.e. whether this kind's forge implements
+    /// [`Forge::host_pr_images`]. The PR form only offers pasting when it does.
+    pub fn embeds_pr_images(self) -> bool {
+        match self {
+            ForgeKind::GitHub => true,
+            ForgeKind::AzureDevOps => false,
         }
     }
 
@@ -556,6 +589,9 @@ impl Forge for UnavailableForge {
     async fn pr_by_number(&self, _: &Path, _: u64) -> Result<Option<PrInfo>> {
         self.err()
     }
+    async fn host_pr_images(&self, _: &Path, _: &str, _: &[PrImage]) -> Result<Vec<String>> {
+        self.err()
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +649,12 @@ mod tests {
         );
         // Defaulted reads fail too, instead of answering "no CI".
         assert!(forge.pr_checks(Path::new("/"), 1).await.is_err());
+    }
+
+    #[test]
+    fn only_github_embeds_pr_images() {
+        assert!(ForgeKind::GitHub.embeds_pr_images());
+        assert!(!ForgeKind::AzureDevOps.embeds_pr_images());
     }
 
     #[test]
