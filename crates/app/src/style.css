@@ -707,6 +707,8 @@ select option { background: var(--panel-2); color: var(--text); }
 .task-collapsed > summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .task-collapsed > .plan-box { margin-top: 6px; }
 .qa-item > .hint { margin-top: 6px; }
+/* An earlier investigation round, expanded: its Conclusion / Findings tabs. */
+.qa-item > .round-body { margin-top: 6px; }
 
 /* The fix task itself, collapsed under the picker: what the agent will receive,
    editable. Monospace and scrollable — unlike the autogrown edit boxes, a long
