@@ -37,6 +37,13 @@ impl Executor {
         // clears any stale stash from an earlier life of the card.
         self.store
             .set_investigation_extra(card_id, extra.as_deref())?;
+        // A fresh first round starts a new history too.
+        if extra.is_none() {
+            self.store.mutate_card(card_id, |c| {
+                c.investigation_rounds.clear();
+                Ok(())
+            })?;
+        }
         self.start_run(
             card_id,
             RunMode::Investigate,
@@ -67,7 +74,19 @@ impl Executor {
         // Build the extra from the qa_log BEFORE recording this round, so it
         // holds exactly the earlier rounds (same ordering as RejectPlan).
         let extra = followup_extra(prev.as_deref(), &card.qa_log, &feedback);
-        self.record_qa(card_id, format!("Follow-up: {}", feedback.trim()));
+        // Keep the round being followed up on, so the panel can still show it
+        // next to the next round's questions.
+        let _ = self.store.mutate_card(card_id, |c| {
+            if let CardState::Concluded { conclusion } = &c.state {
+                c.investigation_rounds.push(InvestigationRound {
+                    conclusion: conclusion.clone(),
+                    follow_up: feedback.trim().to_string(),
+                    at: now_millis(),
+                });
+            }
+            c.qa_log.push(format!("Follow-up: {}", feedback.trim()));
+            Ok(())
+        });
         self.start_investigate(card_id, Some(extra)).await
     }
 
@@ -105,6 +124,7 @@ impl Executor {
                 c.description = fold_qa(&c.description, &qa);
             }
             c.qa_log.clear();
+            c.investigation_rounds.clear();
             c.config.kind = CardKind::Task;
             c.state = transition(&c.state, Transition::ResetToStart)?;
             // The next run is a fresh conversation with the findings in-prompt.
@@ -848,6 +868,7 @@ impl Executor {
         let landed = match self.store.mutate_card(card_id, |c| {
             c.state = transition(&c.state, stop_transition(c))?;
             c.entered_from = None;
+            unrecord_abandoned_round(c);
             c.updated_at = now_millis();
             Ok(())
         }) {
@@ -1180,6 +1201,7 @@ impl Executor {
                 c.description = fold_qa(&c.description, &c.qa_log);
                 c.qa_log.clear();
             }
+            c.investigation_rounds.clear();
             c.state = transition(&c.state, Transition::ResetToStart)?;
             // A genuine do-over: drop the run artifacts so the next Start is fresh.
             c.last_session = None;
@@ -1473,6 +1495,27 @@ impl Executor {
 }
 
 /// Whether two (possibly abbreviated) shas name the same commit.
+/// After Stop stepped a follow-up investigation back to its conclusion: forget
+/// the round that follow-up recorded at launch. Kept, the restored conclusion
+/// would show both as the current one and as an earlier round, and the
+/// abandoned follow-up would reach the next round as already addressed.
+fn unrecord_abandoned_round(c: &mut Card) {
+    let CardState::Concluded { conclusion } = &c.state else {
+        return;
+    };
+    let Some(round) = c.investigation_rounds.last() else {
+        return;
+    };
+    if &round.conclusion != conclusion {
+        return;
+    }
+    let entry = format!("Follow-up: {}", round.follow_up);
+    if let Some(i) = c.qa_log.iter().rposition(|e| *e == entry) {
+        c.qa_log.remove(i);
+    }
+    c.investigation_rounds.pop();
+}
+
 fn same_commit(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
 }

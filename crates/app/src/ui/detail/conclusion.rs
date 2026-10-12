@@ -3,7 +3,7 @@
 //! an implementation whose prompt carries the findings.
 
 use dioxus::prelude::*;
-use usine_core::ExecutorCommand;
+use usine_core::{ExecutorCommand, InvestigationRound};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -12,7 +12,11 @@ use crate::ui::textfield::use_push_back;
 use crate::ui::widgets::{ArtifactTabs, ArtifactText};
 
 #[component]
-pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
+pub(super) fn ConclusionPanel(
+    card_id: Uuid,
+    conclusion: String,
+    rounds: Vec<InvestigationRound>,
+) -> Element {
     let state = use_context::<AppState>();
     // The prose conclusion is the payload — it is what a follow-up quotes back
     // and what "turn into implementation" folds into the description — so the
@@ -57,6 +61,10 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
                 }
                 super::plan::QuestionList { questions: questions.clone(), answers }
             }
+        }
+
+        if !rounds.is_empty() {
+            EarlierRounds { card_id, rounds }
         }
 
         div { class: "section", "data-submit-scope": "1",
@@ -121,6 +129,44 @@ pub(super) fn ConclusionPanel(card_id: Uuid, conclusion: String) -> Element {
                     drafts::clear(card_id, "investigate.answers", answers, vec![String::new(); n]);
                 },
                 "Turn into implementation"
+            }
+        }
+    }
+}
+
+/// The investigation's earlier rounds, newest first, each collapsed to its
+/// verdict: what was concluded then and what the user sent back, kept within
+/// reach while answering the current round's questions.
+#[component]
+pub(super) fn EarlierRounds(card_id: Uuid, rounds: Vec<InvestigationRound>) -> Element {
+    rsx! {
+        div { class: "section",
+            h3 { "Earlier rounds" }
+            div { class: "hint", "What earlier rounds concluded, and what you sent back." }
+            div { class: "qa-log",
+                for (n , round) in rounds.iter().enumerate().rev() {
+                    details { key: "{round.at}", class: "qa-item",
+                        {
+                            let prose = usine_core::conclusion_prose(&round.conclusion);
+                            let findings = usine_core::parse_findings(&round.conclusion);
+                            let verdict = findings
+                                .as_ref()
+                                .map(|f| f.verdict.trim().to_string())
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| super::chat::summary_line(&prose));
+                            rsx! {
+                                summary { title: "{verdict}", "Round {n + 1} — {verdict}" }
+                                div { class: "round-body",
+                                    ConclusionTabs { card_id, prose, findings }
+                                }
+                                if !round.follow_up.is_empty() {
+                                    div { class: "hint", "You followed up with" }
+                                    div { class: "plan-box", "{round.follow_up}" }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

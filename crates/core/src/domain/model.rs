@@ -1649,8 +1649,29 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub entered_from: Option<CardState>,
+    /// The earlier rounds of an investigation, oldest first: each conclusion the
+    /// user followed up on, with what they sent back. Recorded when "Investigate
+    /// further" launches, so the panel can keep them next to the current round's
+    /// questions. Cleared on a fresh first round, a conversion to an
+    /// implementation, and `BackToStart`. `#[serde(default)]` keeps older
+    /// records loadable.
+    #[serde(default)]
+    pub investigation_rounds: Vec<InvestigationRound>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One finished investigation round the user followed up on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvestigationRound {
+    /// The round's conclusion, verbatim (findings block included), so the panel
+    /// can re-render its Conclusion / Findings tabs.
+    pub conclusion: String,
+    /// What the user sent back: their answers to the round's questions plus the
+    /// dig-deeper note, as one combined feedback.
+    pub follow_up: String,
+    /// When the follow-up was launched, in epoch millis.
+    pub at: i64,
 }
 
 impl Card {
@@ -1687,6 +1708,7 @@ impl Card {
             blocked: false,
             blocked_note: None,
             entered_from: None,
+            investigation_rounds: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -2268,6 +2290,23 @@ mod tests {
         card.blocked = false;
         assert!(card.needs_attention());
         assert!(card.needs_urgent_attention());
+    }
+
+    #[test]
+    fn card_without_investigation_rounds_still_loads() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.investigation_rounds.push(InvestigationRound {
+            conclusion: "c".into(),
+            follow_up: "f".into(),
+            at: 1,
+        });
+        let mut json = serde_json::to_value(&card).unwrap();
+        let back: Card = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.investigation_rounds, card.investigation_rounds);
+
+        json.as_object_mut().unwrap().remove("investigation_rounds");
+        let legacy: Card = serde_json::from_value(json).unwrap();
+        assert!(legacy.investigation_rounds.is_empty());
     }
 
     #[test]
