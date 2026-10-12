@@ -31,26 +31,27 @@ impl Executor {
         card_id: Uuid,
         extra: Option<String>,
     ) -> Result<()> {
+        // Transition first, and wipe the history of a fresh first round in the
+        // same mutation: a stray `Start` on a card that can't start must fail
+        // before it erases anything.
+        let card = self.store.mutate_card(card_id, |c| {
+            let next = transition(&c.state, Transition::StartInvestigate)?;
+            note_entry(&c.state, &next, &mut c.entered_from);
+            c.state = next;
+            c.updated_at = now_millis();
+            if extra.is_none() {
+                c.investigation_rounds.clear();
+            }
+            Ok(())
+        })?;
         // Stash this round's context so a retry of a faulted run re-launches
         // the SAME round (`relaunch` reads it back) instead of silently
         // re-answering the original description. The initial round (`None`)
         // clears any stale stash from an earlier life of the card.
         self.store
             .set_investigation_extra(card_id, extra.as_deref())?;
-        // A fresh first round starts a new history too.
-        if extra.is_none() {
-            self.store.mutate_card(card_id, |c| {
-                c.investigation_rounds.clear();
-                Ok(())
-            })?;
-        }
-        self.start_run(
-            card_id,
-            RunMode::Investigate,
-            Transition::StartInvestigate,
-            extra,
-        )
-        .await
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(card.clone()));
+        self.launch(card, RunMode::Investigate, extra, None).await
     }
 
     /// From `Concluded`: re-run the investigation with the prior conclusion, all

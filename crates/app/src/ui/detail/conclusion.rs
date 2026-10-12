@@ -153,9 +153,19 @@ pub(super) fn EarlierRounds(card_id: Uuid, rounds: Vec<InvestigationRound>) -> E
                                 .as_ref()
                                 .map(|f| f.verdict.trim().to_string())
                                 .filter(|v| !v.is_empty())
-                                .unwrap_or_else(|| super::chat::summary_line(&prose));
+                                .or_else(|| {
+                                    // `summary_line` reads "Answer" on empty
+                                    // input — meaningless for a round.
+                                    (!prose.trim().is_empty())
+                                        .then(|| super::chat::summary_line(&prose))
+                                });
+                            let label = match &verdict {
+                                Some(v) => format!("Round {} — {v}", n + 1),
+                                None => format!("Round {}", n + 1),
+                            };
+                            let verdict = verdict.unwrap_or_default();
                             rsx! {
-                                summary { title: "{verdict}", "Round {n + 1} — {verdict}" }
+                                summary { title: "{verdict}", "{label}" }
                                 div { class: "round-body",
                                     ConclusionTabs { card_id, prose, findings }
                                 }
