@@ -50,7 +50,9 @@ impl Executor {
         // clears any stale stash from an earlier life of the card.
         self.store
             .set_investigation_extra(card_id, extra.as_deref())?;
-        let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(card.clone()));
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::updated(card.clone()));
         self.launch(card, RunMode::Investigate, extra, None).await
     }
 
