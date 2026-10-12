@@ -71,10 +71,11 @@ pub use domain::config::{
 };
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardAnswers, CardState, CheckStatus, Column, Cost,
-    DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, Mergeable, ModelSpec,
-    PrInfo, PrReviewSub, PrState, PreviewStatus, PreviewUrl, Project, Provider, QaExchange,
-    ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask,
-    ReviewThread, RunSub, Usage, CI_REGISTER_GRACE, MERGEABILITY_RECOMPUTE_GRACE,
+    DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, InvestigationRound,
+    Mergeable, ModelSpec, PrInfo, PrReviewSub, PrState, PreviewStatus, PreviewUrl, Project,
+    Provider, QaExchange, ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,
+    ReviewSummary, ReviewTask, ReviewThread, RunSub, Usage, CI_REGISTER_GRACE,
+    MERGEABILITY_RECOMPUTE_GRACE,
 };
 pub use domain::state_machine::{
     stop_can_return_to, stop_target, stop_transition, transition, Transition,

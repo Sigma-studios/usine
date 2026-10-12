@@ -33,8 +33,8 @@ use crate::agent::provider::{ProviderFactory, RunConfig, RunMode, UsageSource};
 use crate::domain::config::CardKind;
 use crate::domain::model::{
     now_millis, Card, CardAnswers, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict,
-    Intervention, Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent, ReviewStatus,
-    ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
+    Intervention, InvestigationRound, Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent,
+    ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
 };
 use crate::domain::state_machine::{note_entry, stop_transition, transition, Transition};
 use crate::error::{CoreError, Result};

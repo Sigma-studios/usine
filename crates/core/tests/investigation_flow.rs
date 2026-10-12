@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    spawn_executor, AgentProvider, Card, CardConfig, CardKind, CardState, CoreError,
+    spawn_executor, AgentEvent, AgentProvider, Card, CardConfig, CardKind, CardState, CoreError,
     ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Project, ProjectConfig,
     Provider, ProviderFactory, Result, RunConfig, RunHandle, RunMode, SimFactory, SimForge, SimGit,
     Store,
@@ -27,6 +27,8 @@ struct SpyProvider {
     /// When armed, the next `start` fails (before recording) — simulates a run
     /// that can't launch at all, e.g. the CLI missing.
     fail_next: Arc<AtomicBool>,
+    /// When armed, the next run starts and keeps working until cancelled.
+    hang_next: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -45,13 +47,30 @@ impl AgentProvider for SpyProvider {
             .lock()
             .unwrap()
             .push((cfg.mode, cfg.project_dir.clone(), cfg.full_prompt()));
+        if self.hang_next.swap(false, Ordering::SeqCst) {
+            let (evt_tx, evt_rx) = futures::channel::mpsc::unbounded();
+            let (ctl_tx, mut ctl_rx) = futures::channel::mpsc::unbounded();
+            let _ = evt_tx.unbounded_send(AgentEvent::Started {
+                session_id: "sess-hang".into(),
+            });
+            tokio::spawn(async move {
+                let _ = ctl_rx.next().await;
+                drop(evt_tx);
+            });
+            return Ok(RunHandle {
+                events: evt_rx.boxed(),
+                control: ctl_tx,
+            });
+        }
         self.inner.start(cfg).await
     }
 }
 
+#[derive(Default)]
 struct SpyFactory {
     runs: Runs,
     fail_next: Arc<AtomicBool>,
+    hang_next: Arc<AtomicBool>,
 }
 
 impl ProviderFactory for SpyFactory {
@@ -60,6 +79,7 @@ impl ProviderFactory for SpyFactory {
             inner: SimFactory.make(provider),
             runs: self.runs.clone(),
             fail_next: self.fail_next.clone(),
+            hang_next: self.hang_next.clone(),
         })
     }
 }
@@ -117,6 +137,7 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         providers: Arc::new(SpyFactory {
             runs: runs.clone(),
             fail_next: fail_next.clone(),
+            ..Default::default()
         }),
         forge: Arc::new(SimForge),
         git: Arc::new(SimGit),
@@ -201,6 +222,14 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         );
         assert!(prompt.contains("How big does it get under real traffic?"));
     }
+    // The round followed up on is kept once — the failed launch and its Retry
+    // don't record it twice — for the panel to show next to the new questions.
+    assert_eq!(card.investigation_rounds.len(), 1);
+    assert_eq!(card.investigation_rounds[0].conclusion, first_conclusion);
+    assert_eq!(
+        card.investigation_rounds[0].follow_up,
+        "How big does it get under real traffic?"
+    );
 
     // Convert → same card, back in the starting block as a Task, findings in
     // the description, follow-up folded as context, cost kept, session cleared.
@@ -231,6 +260,10 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         "earlier rounds first, then the conversion's answers and note"
     );
     assert!(card.qa_log.is_empty(), "the folded Q&A log is cleared");
+    assert!(
+        card.investigation_rounds.is_empty(),
+        "the round history goes with the investigation"
+    );
     assert!(
         !card.cost.is_zero(),
         "investigation spend stays on the card"
@@ -273,4 +306,75 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_eq!(mode, RunMode::Plan);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_follow_up_forgets_its_round() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new("p", PathBuf::from("/tmp/p"), ProjectConfig::default());
+    store.upsert_project(&project).unwrap();
+    let config = CardConfig {
+        kind: CardKind::Investigation,
+        ..Default::default()
+    };
+    let card = Card::new(
+        project.id,
+        "Audit the cache",
+        "Is the cache bounded?",
+        config,
+    );
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+
+    let hang_next = Arc::new(AtomicBool::new(false));
+    let (exec, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SpyFactory {
+            hang_next: hang_next.clone(),
+            ..Default::default()
+        }),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+
+    exec.send(ExecutorCommand::Start { card_id });
+    let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Concluded { .. })).await;
+    let CardState::Concluded {
+        conclusion: first_conclusion,
+    } = card.state
+    else {
+        unreachable!()
+    };
+
+    // A follow-up round that keeps running: its round is recorded at launch…
+    hang_next.store(true, Ordering::SeqCst);
+    exec.send(ExecutorCommand::FollowUpInvestigation {
+        card_id,
+        feedback: "How big does it get?".into(),
+    });
+    let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Investigating(_))).await;
+    assert_eq!(card.investigation_rounds.len(), 1);
+    wait_for(&mut rx, |evt| match &evt.kind {
+        ExecutorEventKind::CardBusy { busy: false } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // …and Stop, stepping back to that same conclusion, forgets it again: it
+    // must not show both as the current conclusion and as an earlier round,
+    // nor reach the next round as an already-asked follow-up.
+    exec.send(ExecutorCommand::Cancel { card_id });
+    let card = wait_for_state(&mut rx, |s| matches!(s, CardState::Concluded { .. })).await;
+    assert_eq!(
+        card.state,
+        CardState::Concluded {
+            conclusion: first_conclusion
+        }
+    );
+    assert!(card.investigation_rounds.is_empty());
+    assert!(
+        !card.qa_log.iter().any(|e| e.starts_with("Follow-up:")),
+        "the abandoned follow-up is dropped from the Q&A log, got {:?}",
+        card.qa_log
+    );
 }

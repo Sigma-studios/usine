@@ -31,7 +31,7 @@ mod update;
 
 pub(super) use chat::renders_chat;
 use chat::{AgentChatSection, ChatLog};
-use conclusion::ConclusionPanel;
+use conclusion::{ConclusionPanel, EarlierRounds};
 use done::{DonePanel, OutcomeArtifacts};
 use edit::{Attachments, ConfigForm, EditableTask};
 use fixes::FixSelection;
@@ -552,6 +552,12 @@ fn CardPanel(card: Card) -> Element {
             }
         }
 
+        // A follow-up round in flight (or parked on a question): the rounds
+        // it builds on stay in view, next to any question it asks.
+        if matches!(st, CardState::Investigating(_)) && !card.investigation_rounds.is_empty() {
+            EarlierRounds { card_id: id, rounds: card.investigation_rounds.clone() }
+        }
+
         if let CardState::Designing(DesignSub::AwaitingApproval { plan }) = st {
             // Stable anchors for the board buttons that only open the card:
             // they scroll here rather than looking like they did nothing.
@@ -562,7 +568,11 @@ fn CardPanel(card: Card) -> Element {
 
         if let CardState::Concluded { conclusion } = st {
             div { class: "section-group", id: "conclusion",
-                ConclusionPanel { card_id: id, conclusion: conclusion.clone() }
+                ConclusionPanel {
+                    card_id: id,
+                    conclusion: conclusion.clone(),
+                    rounds: card.investigation_rounds.clone(),
+                }
             }
         }
 
