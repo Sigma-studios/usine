@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 use super::diffdialog::{open_diff_dialog, open_diff_dialog_at};
 use super::icons::IconDiff;
-use crate::state::{AppState, BoardMode};
+use crate::state::{AppState, BoardMode, SelectedView};
 use crate::ui::widgets::{provider_value, same_path, ArtifactTabs, ArtifactText};
 use crate::ui::{Panel, PanelResizer};
 
@@ -34,12 +34,17 @@ use chat::{AgentChatSection, ChatLog};
 use conclusion::{ConclusionPanel, EarlierRounds};
 use done::{DonePanel, OutcomeArtifacts};
 use edit::{Attachments, ConfigForm, EditableTask};
+// Shared with the sessions panel, which attaches files to its messages the
+// same way.
+pub(crate) use edit::{
+    attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
+};
 use fixes::FixSelection;
 use plan::PlanApproval;
 use pr_create::PrCreateForm;
 use pr_review::PrReviewPanel;
 use review::ReviewDetail;
-use transcript::TranscriptView;
+pub(crate) use transcript::TranscriptView;
 use update::UpdateFromBase;
 
 /// The detail panel for whichever board is up. Mirrors `BoardArea`: the two
@@ -48,6 +53,9 @@ use update::UpdateFromBase;
 #[component]
 pub fn DetailArea() -> Element {
     let state = use_context::<AppState>();
+    if *state.selected_view.read() == SelectedView::Sessions {
+        return rsx! { crate::ui::sessions::SessionDetail {} };
+    }
     match state.board_mode() {
         BoardMode::Review => rsx! { ReviewDetail {} },
         BoardMode::Normal => rsx! { CardDetail {} },
@@ -838,7 +846,14 @@ fn CardPanel(card: Card) -> Element {
 // ---------------------------------------------------------------------------
 
 #[component]
-fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> Element {
+pub(crate) fn InterventionPanel(
+    card_id: Uuid,
+    question: String,
+    options: Vec<String>,
+    /// Where the answer goes; a card's `Answer` command when unset. The
+    /// sessions panel routes it to its own command.
+    on_answer: Option<EventHandler<String>>,
+) -> Element {
     let state = use_context::<AppState>();
     // Both fields are drafts keyed by the question they answer: the half-typed
     // answer survives deselects, but a *different* intervention arriving later
@@ -921,7 +936,11 @@ fn InterventionPanel(card_id: Uuid, question: String, options: Vec<String>) -> E
                                 parts.push(typed);
                             }
                             if !parts.is_empty() {
-                                state.send(ExecutorCommand::Answer { card_id, text: parts.join("\n\n") });
+                                let text = parts.join("\n\n");
+                                match on_answer {
+                                    Some(h) => h.call(text),
+                                    None => state.send(ExecutorCommand::Answer { card_id, text }),
+                                }
                                 crate::ui::drafts::clear(card_id, "intervention.option", selected, None);
                                 crate::ui::drafts::clear(card_id, "intervention.answer", answer, String::new());
                                 generation += 1;

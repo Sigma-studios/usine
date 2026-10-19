@@ -72,6 +72,11 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
             "-c".into(),
             format!("model_reasoning_effort={}", effort.codex_value()),
         ];
+        // A session's folder need not be a git repo; codex refuses to run
+        // outside one unless told otherwise.
+        if cfg.mode.is_session() {
+            args.push("--skip-git-repo-check".into());
+        }
         args.extend(image_args);
         args.push("--".into());
         args.push(session.clone());
@@ -96,6 +101,20 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
         | RunMode::Investigate => {
             args.push("--sandbox".into());
             args.push("read-only".into());
+        }
+        RunMode::SessionReadOnly => {
+            args.push("--sandbox".into());
+            args.push("read-only".into());
+            args.push("--skip-git-repo-check".into());
+        }
+        RunMode::SessionFull => {
+            // Same trust as a card's write phases, minus the linked-git-dir
+            // root, which only applies to card worktrees.
+            args.push("--sandbox".into());
+            args.push("workspace-write".into());
+            args.push("-c".into());
+            args.push("sandbox_workspace_write.network_access=true".into());
+            args.push("--skip-git-repo-check".into());
         }
         RunMode::Implement | RunMode::ApplyFixes => {
             args.push("--sandbox".into());
@@ -311,6 +330,32 @@ mod tests {
             resume_session: None,
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn session_resume_passes_only_image_attachments_before_the_terminator() {
+        let mut c = cfg(RunMode::SessionFull, Effort::Medium);
+        c.resume_session = Some("thread-1".into());
+        c.attachments = vec![PathBuf::from("/a/shot.png"), PathBuf::from("/a/log.txt")];
+        let args = build_args(&c);
+        assert_eq!(&args[..2], ["exec", "resume"]);
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 1);
+        assert!(args.windows(2).any(|w| w == ["-i", "/a/shot.png"]));
+        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+        assert_eq!(&args[args.len() - 2..], ["--", "thread-1"]);
+    }
+
+    #[test]
+    fn session_access_picks_the_sandbox() {
+        let full = build_args(&cfg(RunMode::SessionFull, Effort::Medium));
+        assert!(full
+            .windows(2)
+            .any(|w| w == ["--sandbox", "workspace-write"]));
+        assert!(!full.contains(&"--add-dir".to_string()));
+        assert!(full.contains(&"--skip-git-repo-check".to_string()));
+        let ro = build_args(&cfg(RunMode::SessionReadOnly, Effort::Medium));
+        assert!(ro.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert_eq!(ro.last().map(String::as_str), Some("--"));
     }
 
     #[test]

@@ -17,7 +17,8 @@ use usine_core::{
     ExecutorEventKind, ExecutorHandle, FixItem, FixOutcome, FixReport, ForgeKind, ForgeRegistry,
     GitOps, Handoff, OpenPr, Outcome, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig,
     Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewStatus, ReviewSub,
-    ReviewTask, RunSub, Severity, SimFactory, SimForge, SimGit, Store, TestItem, UsageSnapshot,
+    ReviewTask, RunSub, Session, SessionStatus, Severity, SimFactory, SimForge, SimGit, Store,
+    TestItem, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -33,6 +34,8 @@ pub(crate) const INTERRUPTED_MSG: &str =
 pub enum SelectedView {
     Global,
     Project(Uuid),
+    /// The one-off sessions list (ad-hoc agent chats in any folder).
+    Sessions,
 }
 
 /// Whether the board shows the normal card lanes or the PR-review lanes. Review
@@ -138,6 +141,14 @@ pub struct AppState {
     /// refreshed by the executor's background poll and rendered by the bottom
     /// usage bar. In-memory only — it's refetched shortly after launch.
     pub usage: Signal<UsageSnapshot>,
+    /// One-off sessions by id, seeded at startup and kept in sync via
+    /// `SessionUpdated` / `SessionDeleted`.
+    pub sessions: Signal<HashMap<Uuid, Session>>,
+    /// The session open in the detail panel while the Sessions view is up.
+    pub selected_session: Signal<Option<Uuid>>,
+    /// Whether the app window has focus — a session that ends while the user
+    /// is looking at it neither notifies nor stays unread.
+    pub window_focused: Signal<bool>,
     event_rx: Signal<Option<UnboundedReceiver<ExecutorEvent>>>,
 }
 
@@ -196,12 +207,27 @@ impl AppState {
             // reclaims have already been stranded for however long, so finishing
             // a few seconds after launch is soon enough.
             std::thread::spawn(usine_core::reconcile_orphaned_worktree_stacks);
+            let _ = usine_core::reconcile_interrupted_sessions(&store, INTERRUPTED_MSG);
         }
+        if demo_mode() && store.list_sessions().map(|s| s.is_empty()).unwrap_or(false) {
+            if let Err(e) = seed_demo_sessions(&store, &settings) {
+                push_toast(
+                    Severity::Warning,
+                    format!("could not seed demo sessions: {e}"),
+                );
+            }
+        }
+        let _ = usine_core::auto_archive_stale_sessions(&store, usine_core::now_millis());
 
         // Rewrite stored records into canonical form so ones written before newer
         // `#[serde(default)]` fields (or the Cost change) round-trip — otherwise
         // native_db rejects the next edit/delete of them with IncorrectInputData.
         store.canonicalize_records();
+        if !demo_mode() {
+            // Files staged in a new-session dialog that never got to clean up
+            // (a crash, a force quit).
+            let _ = usine_core::sweep_orphan_attachments(&store);
+        }
 
         let projects = store.list_projects().unwrap_or_default();
         let cards = store.list_cards().unwrap_or_default();
@@ -212,6 +238,12 @@ impl AppState {
         let update_progress = store.all_update_progress().unwrap_or_default();
         let fix_reports = store.all_fix_reports().unwrap_or_default();
         let answers = store.all_answers().unwrap_or_default();
+        let sessions: HashMap<Uuid, Session> = store
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
         let handoffs = store.all_handoffs().unwrap_or_default();
         // Group persisted review tasks by project for the review board.
         let mut review_tasks: HashMap<Uuid, Vec<ReviewTask>> = HashMap::new();
@@ -283,6 +315,9 @@ impl AppState {
             busy: Signal::new(HashSet::new()),
             run_queue: Signal::new(Vec::new()),
             usage: Signal::new(UsageSnapshot::default()),
+            sessions: Signal::new(sessions),
+            selected_session: Signal::new(None),
+            window_focused: Signal::new(true),
             event_rx: Signal::new(Some(rx)),
         }
     }
@@ -661,8 +696,146 @@ impl AppState {
                 let mut usage = self.usage;
                 usage.set(snapshot);
             }
-            ExecutorEventKind::Toast { severity, message } => push_toast(severity, message),
+            ExecutorEventKind::Toast { severity, message } => {
+                if severity == Severity::Error {
+                    crate::ui::sessions::session_start_rejected(evt.card_id);
+                }
+                push_toast(severity, message)
+            }
+            ExecutorEventKind::SessionUpdated(session) => self.apply_session(*session),
+            ExecutorEventKind::SessionDeleted { session_id } => {
+                let mut sessions = self.sessions;
+                sessions.write().remove(&session_id);
+                let mut attachments = self.attachments;
+                attachments.write().remove(&session_id);
+                let mut transcripts = self.transcripts;
+                transcripts.write().remove(&session_id);
+                let mut loaded = self.transcripts_loaded;
+                loaded.write().remove(&session_id);
+                crate::ui::drafts::forget_owner(session_id);
+                if *self.selected_session.peek() == Some(session_id) {
+                    let mut sel = self.selected_session;
+                    sel.set(None);
+                }
+            }
         }
+    }
+
+    /// Reduce a `SessionUpdated`: store it, post the OS notification a turn
+    /// ending calls for, and read it on the spot when the user is looking at it.
+    fn apply_session(&self, mut session: Session) {
+        let previous = self
+            .sessions
+            .peek()
+            .get(&session.id)
+            .map(|s| s.status.clone());
+        let watching = self.is_watching_session(session.id);
+        if let Some((subtitle, body)) =
+            crate::notify::session_notification(previous.as_ref(), &session)
+        {
+            if !watching && self.settings.peek().session_notifications {
+                crate::notify::notify(subtitle, body);
+            }
+        }
+        if session.unread && watching {
+            session.unread = false;
+            self.send(ExecutorCommand::MarkSessionRead {
+                session_id: session.id,
+            });
+        }
+        let mut sessions = self.sessions;
+        sessions.write().insert(session.id, session);
+    }
+
+    /// Whether the session is on screen: the window has focus and the
+    /// Sessions view shows it.
+    fn is_watching_session(&self, id: Uuid) -> bool {
+        *self.window_focused.peek()
+            && *self.selected_view.peek() == SelectedView::Sessions
+            && *self.selected_session.peek() == Some(id)
+    }
+
+    // --- one-off sessions ---------------------------------------------------
+
+    /// Open a session (or close the panel with `None`), reading it.
+    pub fn select_session(&self, id: Option<Uuid>) {
+        let mut sel = self.selected_session;
+        sel.set(id);
+        if let Some(id) = id {
+            self.mark_session_read(id);
+        }
+    }
+
+    /// Clear a session's unread flag: locally first, then in the store. A
+    /// no-op when it isn't unread.
+    fn mark_session_read(&self, id: Uuid) {
+        let unread = self.sessions.peek().get(&id).is_some_and(|s| s.unread);
+        if !unread {
+            return;
+        }
+        let mut sessions = self.sessions;
+        if let Some(s) = sessions.write().get_mut(&id) {
+            s.unread = false;
+        }
+        self.send(ExecutorCommand::MarkSessionRead { session_id: id });
+    }
+
+    /// The window gained or lost focus. Coming back to an open session reads
+    /// it.
+    pub fn set_window_focused(&self, focused: bool) {
+        let mut f = self.window_focused;
+        if *f.peek() != focused {
+            f.set(focused);
+        }
+        if focused && *self.selected_view.peek() == SelectedView::Sessions {
+            if let Some(id) = *self.selected_session.peek() {
+                self.mark_session_read(id);
+            }
+        }
+    }
+
+    /// Show the Sessions view, opening `id` when given.
+    pub fn show_sessions(&self, id: Option<Uuid>) {
+        self.select_view(SelectedView::Sessions);
+        if id.is_some() {
+            self.select_session(id);
+        } else if let Some(sel) = *self.selected_session.peek() {
+            self.mark_session_read(sel);
+        }
+    }
+
+    pub fn session(&self, id: Uuid) -> Option<Session> {
+        self.sessions.read().get(&id).cloned()
+    }
+
+    /// Non-archived sessions wanting the user (unread, or a question waiting).
+    pub fn session_attention_count(&self) -> usize {
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| s.needs_attention())
+            .count()
+    }
+
+    /// Whether any non-archived session waits on an answer (the red dot).
+    pub fn sessions_urgent(&self) -> usize {
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| !s.archived && matches!(s.status, SessionStatus::NeedsAnswer(_)))
+            .count()
+    }
+
+    pub fn sessions_working(&self) -> bool {
+        self.sessions.read().values().any(|s| s.is_running())
+    }
+
+    pub fn send_session_message(&self, session_id: Uuid, text: String) {
+        self.send(ExecutorCommand::SendSessionMessage { session_id, text });
+    }
+
+    pub fn answer_session(&self, session_id: Uuid, text: String) {
+        self.send(ExecutorCommand::AnswerSession { session_id, text });
     }
 
     /// Ask the executor for a project's reviewer candidates (collaborators). The
@@ -772,7 +945,11 @@ impl AppState {
             let title = format!("PR #{} {}", t.pr_number, t.pr_title);
             (t.id, t.status.is_running(), title)
         });
-        active_titles(cards.chain(reviews), &busy, &queued)
+        let sessions = self.sessions.peek();
+        let sessions = sessions
+            .values()
+            .map(|s| (s.id, s.is_running(), format!("Session: {}", s.title)));
+        active_titles(cards.chain(reviews).chain(sessions), &busy, &queued)
     }
 
     /// The current computed diff state for a card, if one has been requested this
@@ -1127,7 +1304,7 @@ impl AppState {
             .read()
             .iter()
             .filter(|c| match view {
-                SelectedView::Global => true,
+                SelectedView::Global | SelectedView::Sessions => true,
                 SelectedView::Project(id) => c.project_id == id,
             })
             .cloned()
@@ -1246,6 +1423,72 @@ fn count_unmuted_attention(
     items
         .filter(|(pid, needs)| *needs && !muted.contains(pid))
         .count()
+}
+
+/// Demo-mode sample sessions: one finished and unread (with a screenshot on
+/// its first message), one waiting on an answer — enough to see the list,
+/// the badge and the answer panel without a real agent.
+fn seed_demo_sessions(store: &Store, settings: &AppSettings) -> usine_core::Result<()> {
+    use usine_core::{Intervention, SessionAccess, SessionTurn, SessionTurnKind};
+
+    let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let spec = settings.default_implement.clone();
+    let provider = settings.default_provider;
+    let now = usine_core::now_millis();
+
+    let id = Uuid::new_v4();
+    let dir = usine_core::infra::paths::attachments_dir(id);
+    std::fs::create_dir_all(&dir)?;
+    let shot = dir.join("1a2b3c4d-screenshot.png");
+    let img = image::RgbaImage::from_fn(160, 100, |x, y| {
+        image::Rgba([(x * 255 / 160) as u8, (y * 255 / 100) as u8, 180, 255])
+    });
+    img.save(&shot)
+        .map_err(|e| usine_core::CoreError::other(e.to_string()))?;
+    let mut done = Session::new(
+        id,
+        folder.clone(),
+        provider,
+        spec.clone(),
+        SessionAccess::FullAccess,
+        "Why does the build warn about an unused import?",
+        vec![shot],
+    );
+    done.status = SessionStatus::Finished;
+    done.push_turn(SessionTurn::new(
+        SessionTurnKind::Agent,
+        "The warning comes from `crates/app/src/main.rs` — the `use std::fmt` at the top is \
+         left over from a removed helper. Deleting it silences the warning; nothing else \
+         references it.",
+    ));
+    done.unread = true;
+    done.cost = usine_core::Cost::from_usd(0.04);
+    done.created_at = now - 40 * 60 * 1000;
+    done.last_activity_at = now - 25 * 60 * 1000;
+    store.upsert_session(&done)?;
+
+    let mut asking = Session::new(
+        Uuid::new_v4(),
+        folder,
+        provider,
+        spec,
+        SessionAccess::ReadOnly,
+        "Tidy up the README's install section",
+        vec![],
+    );
+    asking.status = SessionStatus::NeedsAnswer(Intervention {
+        request_id: "sim-s1".into(),
+        question: "Should the Homebrew instructions stay, or only the cargo ones?".into(),
+        options: vec!["Keep both".into(), "Cargo only".into()],
+    });
+    asking.push_turn(SessionTurn::new(
+        SessionTurnKind::Question,
+        "Should the Homebrew instructions stay, or only the cargo ones?",
+    ));
+    asking.unread = true;
+    asking.last_activity_at = now - 5 * 60 * 1000;
+    store.upsert_session(&asking)?;
+    Ok(())
 }
 
 /// Seed a demo project with cards spread across columns so a first-run board

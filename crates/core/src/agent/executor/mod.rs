@@ -53,6 +53,7 @@ mod pr_images;
 mod pr_review;
 mod preview;
 mod self_review;
+mod session;
 mod usage;
 mod validation;
 
@@ -159,6 +160,7 @@ pub fn spawn_with_forges(
                     cmd_tx: cmd_tx_internal,
                     runs: Arc::new(Mutex::new(HashMap::new())),
                     review_runs: Arc::new(Mutex::new(HashMap::new())),
+                    session_runs: Arc::new(Mutex::new(HashMap::new())),
                     in_flight: Arc::new(Mutex::new(HashSet::new())),
                     previews: previews_for_exec,
                     validations: validations_for_exec,
@@ -374,6 +376,8 @@ struct Executor {
     /// Active PR-review runs, keyed by review-task id (parallel to `runs`, which
     /// is keyed by card id — review tasks are a separate entity).
     review_runs: RunMap,
+    /// Active one-off session runs, keyed by session id.
+    session_runs: RunMap,
     /// Cards with an exclusive command in flight, so a duplicate can't race it.
     in_flight: InFlight,
     /// Running previews (the app run from a card's worktree), keyed by card id.
@@ -855,6 +859,34 @@ impl Executor {
                     .unbounded_send(ExecutorEvent::attachments_changed(card_id, paths));
                 Ok(())
             }
+            ExecutorCommand::CreateSession {
+                id,
+                folder,
+                provider,
+                spec,
+                access,
+                prompt,
+            } => {
+                self.create_session(id, folder, provider, spec, access, prompt)
+                    .await
+            }
+            ExecutorCommand::SendSessionMessage { session_id, text } => {
+                self.send_session_message(session_id, text).await
+            }
+            ExecutorCommand::AnswerSession { session_id, text } => {
+                self.answer_session(session_id, text).await
+            }
+            ExecutorCommand::CancelSession { session_id } => self.cancel_session(session_id),
+            ExecutorCommand::RetrySession { session_id } => self.retry_session(session_id).await,
+            ExecutorCommand::RenameSession { session_id, title } => {
+                self.rename_session(session_id, title)
+            }
+            ExecutorCommand::ArchiveSession {
+                session_id,
+                archived,
+            } => self.archive_session(session_id, archived),
+            ExecutorCommand::MarkSessionRead { session_id } => self.mark_session_read(session_id),
+            ExecutorCommand::DeleteSession { session_id } => self.delete_session(session_id),
             ExecutorCommand::DetachImage { card_id, path } => {
                 let _ = std::fs::remove_file(&path); // best-effort
                 let mut paths = self.store.get_attachments(card_id).unwrap_or_default();

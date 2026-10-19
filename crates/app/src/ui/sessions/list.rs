@@ -1,0 +1,316 @@
+//! The Sessions view's main area: every session, grouped by what it wants from
+//! the user.
+
+use dioxus::prelude::*;
+use usine_core::{ExecutorCommand, Session, SessionStatus, SessionTurnKind};
+
+use super::{ago, home_dir, open_new_session, session_dot, shorten_home};
+use crate::state::AppState;
+use crate::ui::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
+
+/// Which list section a session sits in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Section {
+    NeedsYou,
+    Unread,
+    Running,
+    Earlier,
+    Archived,
+}
+
+impl Section {
+    fn title(self) -> &'static str {
+        match self {
+            Section::NeedsYou => "Needs you",
+            Section::Unread => "Unread",
+            Section::Running => "Running",
+            Section::Earlier => "Earlier",
+            Section::Archived => "Archived",
+        }
+    }
+}
+
+pub(crate) fn section_of(s: &Session) -> Section {
+    if s.archived {
+        Section::Archived
+    } else if matches!(s.status, SessionStatus::NeedsAnswer(_)) {
+        Section::NeedsYou
+    } else if s.is_running() {
+        Section::Running
+    } else if s.unread {
+        Section::Unread
+    } else {
+        Section::Earlier
+    }
+}
+
+/// The sessions in display order: by section, newest activity first within
+/// each.
+pub(crate) fn grouped(sessions: Vec<Session>) -> Vec<(Section, Vec<Session>)> {
+    let order = [
+        Section::NeedsYou,
+        Section::Unread,
+        Section::Running,
+        Section::Earlier,
+        Section::Archived,
+    ];
+    order
+        .into_iter()
+        .filter_map(|sec| {
+            let mut items: Vec<Session> = sessions
+                .iter()
+                .filter(|s| section_of(s) == sec)
+                .cloned()
+                .collect();
+            items.sort_by_key(|s| std::cmp::Reverse(s.last_activity_at));
+            (!items.is_empty()).then_some((sec, items))
+        })
+        .collect()
+}
+
+/// One line previewing a session's latest turn.
+fn preview(s: &Session) -> (String, usize) {
+    let Some(turn) = s.turns.last() else {
+        return (String::new(), 0);
+    };
+    let prefix = match turn.kind {
+        SessionTurnKind::User | SessionTurnKind::Answer => "You: ",
+        SessionTurnKind::Question => "Asks: ",
+        SessionTurnKind::Error => "⚠ ",
+        SessionTurnKind::Agent => "",
+    };
+    let line = turn
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    (format!("{prefix}{line}"), turn.attachments.len())
+}
+
+#[component]
+pub(crate) fn SessionList() -> Element {
+    let state = use_context::<AppState>();
+    let mut show_archived = use_signal(|| false);
+    let sessions: Vec<Session> = state.sessions.read().values().cloned().collect();
+    let archived_count = sessions.iter().filter(|s| s.archived).count();
+    let empty = sessions.iter().all(|s| s.archived);
+    let groups: Vec<(Section, Vec<Session>)> = grouped(sessions)
+        .into_iter()
+        .filter(|(sec, _)| *sec != Section::Archived || show_archived())
+        .collect();
+    let selected = *state.selected_session.read();
+    let now = usine_core::now_millis();
+    let home = home_dir();
+
+    rsx! {
+        div { class: "sessions-area",
+            div { class: "sessions-header",
+                h2 { "Sessions" }
+                span { class: "hint", "One-off agent chats in any folder. You're notified when one finishes or asks." }
+                div { class: "spacer" }
+                if archived_count > 0 {
+                    button {
+                        class: "btn subtle",
+                        onclick: move |_| show_archived.toggle(),
+                        if show_archived() { "Hide archived" } else { "Archived ({archived_count})" }
+                    }
+                }
+                button {
+                    class: "btn primary",
+                    title: "New session (⌘⇧N)",
+                    onclick: move |_| open_new_session(),
+                    "New session"
+                }
+            }
+            if empty && !show_archived() {
+                div { class: "sessions-empty",
+                    p { "No sessions yet." }
+                    p { class: "hint",
+                        "Start Claude or Codex in any folder — no project or git needed. Usine tells you when it's done."
+                    }
+                    button { class: "btn primary", onclick: move |_| open_new_session(), "Start a session" }
+                }
+            }
+            div { class: "sessions-list",
+                for (sec , items) in groups {
+                    div { key: "{sec:?}", class: "sessions-section",
+                        div { class: "sessions-section-title", "{sec.title()}" }
+                        for s in items {
+                            SessionRow {
+                                key: "{s.id}",
+                                session: s.clone(),
+                                active: selected == Some(s.id),
+                                when: ago(s.last_activity_at, now),
+                                folder: shorten_home(&s.folder, home.as_deref()),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SessionRow(session: Session, active: bool, when: String, folder: String) -> Element {
+    let state = use_context::<AppState>();
+    let id = session.id;
+    let (line, n_files) = preview(&session);
+    let dot = session_dot(&session);
+    let mut class = String::from("session-row");
+    if active {
+        class.push_str(" active");
+    }
+    if session.unread && !session.archived {
+        class.push_str(" unread");
+    }
+    let model = crate::ui::widgets::model_label(&session.spec.model).to_string();
+    let provider = session.provider.label();
+    let archived = session.archived;
+    let running = session.is_running();
+    let title = session.title.clone();
+
+    rsx! {
+        div {
+            class: "{class}",
+            onclick: move |_| state.select_session(Some(id)),
+            span { class: "{dot}" }
+            div { class: "session-row-main",
+                div { class: "session-row-top",
+                    span { class: "session-title", "{session.title}" }
+                    span { class: "session-when", "{when}" }
+                }
+                div { class: "session-row-meta",
+                    span { class: "session-folder", title: "{session.folder.display()}", "{folder}" }
+                    span { "· {provider} · {model}" }
+                }
+                if !line.is_empty() || n_files > 0 {
+                    div { class: "session-preview",
+                        if n_files > 0 {
+                            span { class: "session-files", "📎 {n_files} " }
+                        }
+                        "{line}"
+                    }
+                }
+            }
+            div { class: "session-row-actions",
+                button {
+                    class: "proj-action",
+                    title: if archived { "Unarchive" } else { "Archive" },
+                    "aria-label": if archived { "Unarchive" } else { "Archive" },
+                    disabled: running,
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        state.send(ExecutorCommand::ArchiveSession { session_id: id, archived: !archived });
+                    },
+                    svg {
+                        width: "13",
+                        height: "13",
+                        view_box: "0 0 24 24",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        polyline { points: "21 8 21 21 3 21 3 8" }
+                        rect { x: "1", y: "3", width: "22", height: "5" }
+                        line { x1: "10", y1: "12", x2: "14", y2: "12" }
+                    }
+                }
+                button {
+                    class: "proj-trash",
+                    title: "Delete session",
+                    "aria-label": "Delete session",
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        request_confirm(ConfirmRequest {
+                            title: "Delete session".into(),
+                            message: format!(
+                                "Delete “{title}” and its conversation from Usine? The folder and its files are not touched."
+                            ),
+                            confirm_label: "Delete".into(),
+                            danger: true,
+                            action: ConfirmAction::Send(ExecutorCommand::DeleteSession { session_id: id }),
+                        });
+                    },
+                    svg {
+                        width: "13",
+                        height: "13",
+                        view_box: "0 0 24 24",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        polyline { points: "3 6 5 6 21 6" }
+                        path { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use usine_core::{Effort, Intervention, ModelSpec, Provider, SessionAccess};
+    use uuid::Uuid;
+
+    fn session(status: SessionStatus, unread: bool, archived: bool, at: i64) -> Session {
+        let mut s = Session::new(
+            Uuid::new_v4(),
+            PathBuf::from("/tmp"),
+            Provider::Claude,
+            ModelSpec::new("opus", Effort::High),
+            SessionAccess::FullAccess,
+            "x",
+            vec![],
+        );
+        s.status = status;
+        s.unread = unread;
+        s.archived = archived;
+        s.last_activity_at = at;
+        s
+    }
+
+    #[test]
+    fn sections_follow_what_the_session_wants() {
+        let q = SessionStatus::NeedsAnswer(Intervention {
+            request_id: "r".into(),
+            question: "q".into(),
+            options: vec![],
+        });
+        assert_eq!(
+            section_of(&session(q.clone(), true, false, 0)),
+            Section::NeedsYou
+        );
+        assert_eq!(section_of(&session(q, true, true, 0)), Section::Archived);
+        assert_eq!(
+            section_of(&session(SessionStatus::Running, false, false, 0)),
+            Section::Running
+        );
+        assert_eq!(
+            section_of(&session(SessionStatus::Finished, true, false, 0)),
+            Section::Unread
+        );
+        assert_eq!(
+            section_of(&session(SessionStatus::Finished, false, false, 0)),
+            Section::Earlier
+        );
+    }
+
+    #[test]
+    fn groups_are_ordered_and_newest_first() {
+        let old = session(SessionStatus::Finished, false, false, 1);
+        let new = session(SessionStatus::Finished, false, false, 2);
+        let unread = session(SessionStatus::Finished, true, false, 0);
+        let groups = grouped(vec![old.clone(), unread.clone(), new.clone()]);
+        assert_eq!(groups[0].0, Section::Unread);
+        assert_eq!(groups[1].0, Section::Earlier);
+        assert_eq!(groups[1].1[0].id, new.id);
+        assert_eq!(groups[1].1[1].id, old.id);
+    }
+}

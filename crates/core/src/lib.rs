@@ -58,8 +58,9 @@ pub use agent::review::{
     REVIEW_TRIAGE_INSTRUCTION, SELF_REVIEW_INSTRUCTION, SEVERITY_LEVELS,
 };
 pub use agent::startup::{
-    binary_on_path, reconcile_interrupted_reviews, reconcile_interrupted_runs,
-    reconcile_orphaned_worktree_stacks, seed_default_provider, sync_base_branches,
+    auto_archive_stale_sessions, binary_on_path, reconcile_interrupted_reviews,
+    reconcile_interrupted_runs, reconcile_interrupted_sessions, reconcile_orphaned_worktree_stacks,
+    seed_default_provider, sweep_orphan_attachments, sync_base_branches, SESSION_AUTO_ARCHIVE_DAYS,
 };
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
@@ -67,7 +68,7 @@ pub use diff::{
     DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus, Token,
 };
 pub use domain::config::{
-    AppSettings, CardConfig, CardKind, ForgeKind, PreviewPort, ProjectConfig,
+    AppSettings, CardConfig, CardKind, ForgeKind, PreviewPort, ProjectConfig, SessionDefaults,
 };
 pub use domain::model::{
     now_millis, supported_efforts, Card, CardAnswers, CardState, CheckStatus, Column, Cost,
@@ -76,6 +77,10 @@ pub use domain::model::{
     Provider, QaExchange, ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,
     ReviewSummary, ReviewTask, ReviewThread, RunSub, Usage, CI_REGISTER_GRACE,
     MERGEABILITY_RECOMPUTE_GRACE,
+};
+pub use domain::session::{
+    derive_title as derive_session_title, truncate_chars, Session, SessionAccess, SessionStatus,
+    SessionTransition, SessionTurn, SessionTurnKind,
 };
 pub use domain::state_machine::{
     stop_can_return_to, stop_target, stop_transition, transition, Transition,

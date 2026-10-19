@@ -70,8 +70,14 @@ impl AgentProvider for SimProvider {
     async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
         let (evt_tx, evt_rx) = mpsc::unbounded::<AgentEvent>();
         let (ctl_tx, ctl_rx) = mpsc::unbounded::<RunControl>();
-        let session = cfg.session_id.to_string();
-        tokio::spawn(simulate(cfg.mode, session, evt_tx, ctl_rx));
+        let session = if cfg.mode.is_session() {
+            // A CLI-style session id, so the executor's resume bookkeeping
+            // looks the same as with a real provider.
+            format!("sim-session-{}", &cfg.session_id.simple().to_string()[..8])
+        } else {
+            cfg.session_id.to_string()
+        };
+        tokio::spawn(simulate(cfg, session, evt_tx, ctl_rx));
         Ok(RunHandle {
             events: evt_rx.boxed(),
             control: ctl_tx,
@@ -80,7 +86,7 @@ impl AgentProvider for SimProvider {
 }
 
 async fn simulate(
-    mode: RunMode,
+    cfg: RunConfig,
     session: String,
     evt_tx: mpsc::UnboundedSender<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<RunControl>,
@@ -100,7 +106,7 @@ async fn simulate(
         session_id: session
     });
 
-    match mode {
+    match cfg.mode {
         RunMode::Plan => {
             emit!(AgentEvent::Progress {
                 text: "📖 Reading project files…".into()
@@ -282,6 +288,61 @@ async fn simulate(
                 usage: Usage {
                     input_tokens: 5_000,
                     output_tokens: 900,
+                },
+            });
+        }
+        RunMode::SessionFull | RunMode::SessionReadOnly => {
+            if !cfg.attachments.is_empty() {
+                emit!(AgentEvent::Progress {
+                    text: format!("📎 Reading {} attached file(s)…", cfg.attachments.len())
+                });
+                pause!(300);
+            }
+            emit!(AgentEvent::Progress {
+                text: format!("📂 Looking around {}…", cfg.project_dir.display())
+            });
+            pause!(400);
+            let prompt = cfg.full_prompt();
+            if prompt.contains("[ask]") {
+                emit!(AgentEvent::NeedsInput {
+                    request_id: "sim-s1".into(),
+                    question: "Should I go ahead and make the change?".into(),
+                    options: vec!["Yes, go ahead".into(), "No, just explain".into()],
+                });
+                match ctl_rx.next().await {
+                    Some(RunControl::Answer { text }) => {
+                        emit!(AgentEvent::Progress {
+                            text: format!("✅ Got it — {text}")
+                        });
+                    }
+                    Some(RunControl::Cancel) | None => {
+                        emit!(AgentEvent::Error {
+                            message: "run cancelled".into()
+                        });
+                        return;
+                    }
+                    Some(RunControl::Interrupt) => {}
+                }
+            }
+            emit!(AgentEvent::Progress {
+                text: "🛠️ Working on it…".into()
+            });
+            pause!(600);
+            let first_line = prompt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("your request");
+            emit!(AgentEvent::Done {
+                result: format!(
+                    "Done. I looked into \"{first_line}\" in `{}` and everything checks out \
+                     — no changes were needed.",
+                    cfg.project_dir.display()
+                ),
+                cost_usd: 0.02,
+                usage: Usage {
+                    input_tokens: 1_500,
+                    output_tokens: 300,
                 },
             });
         }

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 #[component]
-pub(super) fn TranscriptView(id: Uuid) -> Element {
+pub(crate) fn TranscriptView(id: Uuid) -> Element {
     let state = use_context::<AppState>();
 
     // Lines are persisted but only streamed to the UI while a run is live, so a

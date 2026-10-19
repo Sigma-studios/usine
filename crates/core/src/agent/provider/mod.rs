@@ -42,6 +42,11 @@ pub enum RunMode {
     /// freshly fetched `origin/<base>`; the final response is the conclusion the
     /// card parks on.
     Investigate,
+    /// A one-off session turn with full access (edits and commands, no
+    /// prompts), in the user's chosen folder. The prompt is the user's own.
+    SessionFull,
+    /// A one-off session turn that may only inspect its folder.
+    SessionReadOnly,
 }
 
 impl RunMode {
@@ -50,9 +55,19 @@ impl RunMode {
     /// autonomous modes do; `Question` (Agent Chat) and `Triage` (PR-comment
     /// triage) are exempt — both are short, read-only, spawn only the bare CLI
     /// (no preview/worktree build/validation), and are user-blocking, so parking
-    /// them behind implement runs would make the app feel broken.
+    /// them behind implement runs would make the app feel broken. Sessions are
+    /// exempt too: a quick terminal-style session must not sit behind a busy
+    /// board.
     pub fn is_capped(&self) -> bool {
-        !matches!(self, RunMode::Question | RunMode::Triage)
+        !matches!(
+            self,
+            RunMode::Question | RunMode::Triage | RunMode::SessionFull | RunMode::SessionReadOnly
+        )
+    }
+
+    /// Whether this is a one-off session turn (see [`RunMode::SessionFull`]).
+    pub fn is_session(&self) -> bool {
+        matches!(self, RunMode::SessionFull | RunMode::SessionReadOnly)
     }
 }
 

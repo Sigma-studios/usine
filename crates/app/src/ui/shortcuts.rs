@@ -1,6 +1,7 @@
 //! App-level keyboard shortcuts that no single component owns:
 //!  - Escape closes the topmost dismissable thing — an open card menu first,
 //!    otherwise the detail panel.
+//!  - ⌘⇧N (Ctrl+Shift+N off macOS) opens the new-session dialog from anywhere.
 //!  - ⌘↩ (Ctrl+↩ off macOS) presses a form's main button from anywhere in the
 //!    form. A form opts in with two plain attributes: `data-submit-scope` on
 //!    the dialog / section, and `data-submit` on the button to press. See
@@ -13,7 +14,7 @@
 
 use dioxus::prelude::*;
 
-use crate::state::AppState;
+use crate::state::{AppState, SelectedView};
 use crate::ui::cardmenu::{card_menu_open, close_card_menu};
 
 /// The submit shortcut as shown to the user, for `data-submit` tooltips.
@@ -80,12 +81,18 @@ pub fn ShortcutHost() -> Element {
         let js = "if (window.__usineEscKeydown)\
                     document.removeEventListener('keydown', window.__usineEscKeydown);\
                   window.__usineEscKeydown = function(e){\
+                    if ((e.key === 'n' || e.key === 'N') && e.shiftKey && (e.metaKey || e.ctrlKey)\
+                        && !e.altKey) {\
+                      e.preventDefault();\
+                      dioxus.send('new-session');\
+                      return;\
+                    }\
                     if (e.key !== 'Escape') return;\
                     if (document.querySelector('.modal-overlay')) return;\
                     var a = document.activeElement;\
                     if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA'\
                               || a.tagName === 'SELECT' || a.isContentEditable)) return;\
-                    dioxus.send(true);\
+                    dioxus.send('escape');\
                   };\
                   document.addEventListener('keydown', window.__usineEscKeydown);";
         // Registered on the same eval so a webview reload re-installs both.
@@ -95,10 +102,16 @@ pub fn ShortcutHost() -> Element {
         // behind, so re-registering never stacks handlers.
         loop {
             let mut listener = dioxus::document::eval(&js);
-            while listener.recv::<bool>().await.is_ok() {
+            while let Ok(key) = listener.recv::<String>().await {
+                if key == "new-session" {
+                    crate::ui::sessions::open_new_session();
+                    continue;
+                }
                 // Topmost first: an open menu is what Escape means to close.
                 if card_menu_open() {
                     close_card_menu();
+                } else if *state.selected_view.peek() == SelectedView::Sessions {
+                    state.select_session(None);
                 } else {
                     state.select_card(None);
                 }

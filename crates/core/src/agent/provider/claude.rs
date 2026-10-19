@@ -36,13 +36,17 @@ use super::{AgentProvider, RunConfig, RunHandle, RunMode};
 ///   edit files and run commands autonomously inside the isolated worktree. The
 ///   approved plan / fix list rides along in the prompt, so no resume is needed.
 ///
-/// Every mode also denies the background-orchestration tools (`Agent`, `Task`,
+/// - SessionFull / SessionReadOnly → the same two permission levels, for a
+///   one-off session in the user's folder.
+///
+/// Every card mode also denies the background-orchestration tools (`Agent`, `Task`,
 /// `ScheduleWakeup`, `Workflow`): a one-shot `claude -p` run is single-turn, but
 /// those tools let the agent launch async sub-agents and end its turn early, so
 /// the run reports that interim turn as its result instead of the real
 /// plan/edits. Denying them forces the agent to finish in one turn. (Interim
 /// turns from the tools we *do* allow — `Monitor`, background `Bash` — are
 /// handled in [`pump`] by [`TurnGate`], which waits for the process to exit.)
+/// Sessions allow `Agent`/`Task` and rely on that same gate.
 pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     // Claude Code clamps an unsupported `--effort` itself, but we clamp here too so
     // the flag we pass reflects the model's real capability (e.g. Haiku, which has
@@ -73,8 +77,15 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     // or schedule a later turn. Pushed *before* the mode flag below so this
     // variadic option is bounded by the next flag and can't swallow the trailing
     // prompt positional that `start` appends.
+    // Sessions keep `Agent`/`Task`: a terminal-style session is expected to
+    // use subagents, and [`TurnGate`] already holds the result until the
+    // process exits, so the subagents' work is covered.
     args.push("--disallowedTools".into());
-    args.push("Agent,Task,ScheduleWakeup,Workflow".into());
+    args.push(if cfg.mode.is_session() {
+        "ScheduleWakeup,Workflow".into()
+    } else {
+        "Agent,Task,ScheduleWakeup,Workflow".into()
+    });
 
     match cfg.mode {
         // Read-only phases (planning, self-review, comment triage, Q&A,
@@ -84,11 +95,12 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
         | RunMode::Review
         | RunMode::Triage
         | RunMode::Question
-        | RunMode::Investigate => {
+        | RunMode::Investigate
+        | RunMode::SessionReadOnly => {
             args.push("--permission-mode".into());
             args.push("plan".into());
         }
-        RunMode::Implement | RunMode::ApplyFixes => {
+        RunMode::Implement | RunMode::ApplyFixes | RunMode::SessionFull => {
             args.push("--dangerously-skip-permissions".into());
         }
     }
@@ -135,7 +147,12 @@ impl AgentProvider for ClaudeProvider {
         let (evt_tx, evt_rx) = mpsc::unbounded::<AgentEvent>();
         let (ctl_tx, ctl_rx) = mpsc::unbounded::<RunControl>();
 
-        tokio::spawn(pump(child, stdout, stderr, evt_tx, ctl_rx));
+        let grace = if cfg.mode.is_session() {
+            SESSION_HELD_RESULT_GRACE
+        } else {
+            HELD_RESULT_GRACE
+        };
+        tokio::spawn(pump(child, stdout, stderr, evt_tx, ctl_rx, grace));
 
         Ok(RunHandle {
             events: evt_rx.boxed(),
@@ -311,6 +328,15 @@ impl TurnGate {
 /// event forwarded to the executor.
 pub(crate) const HELD_RESULT_GRACE: Duration = Duration::from_secs(12 * 60);
 
+/// [`HELD_RESULT_GRACE`] for one-off sessions. Sessions allow `Agent`/`Task`,
+/// and a `run_in_background` subagent has no 10-minute cap: the parent's
+/// interim result ("waiting on the subagent") is followed by silence until the
+/// subagent reports back. Releasing it early would mark the session Finished
+/// and kill the subagent mid-work — the exact failure sessions exist to avoid.
+/// The user can always Stop a session, so a long wait costs little. Must stay
+/// below the session actor's `SESSION_IDLE_TIMEOUT`, asserted there.
+pub(crate) const SESSION_HELD_RESULT_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// How long to keep reading stdout once `claude` itself has exited, for lines
 /// still in the pipe. A grandchild holding the pipe open won't delay us longer.
 const EXIT_DRAIN: Duration = Duration::from_secs(2);
@@ -318,21 +344,11 @@ const EXIT_DRAIN: Duration = Duration::from_secs(2);
 /// Read the NDJSON stream to completion, forwarding normalized events. The run's
 /// `Done`/`Error` is sent only at the end — earlier `result` lines are interim
 /// turns (see [`TurnGate`]). The end is stdout EOF, `claude` exiting, or
-/// [`HELD_RESULT_GRACE`] of silence after a turn's result. Reacts to Cancel by
-/// killing the child. (One-shot runs can't inject answers mid-flight, so
-/// `Answer` controls are ignored.)
+/// `grace` of silence after a turn's result ([`HELD_RESULT_GRACE`], or
+/// [`SESSION_HELD_RESULT_GRACE`] for sessions). Reacts to Cancel by killing the
+/// child. (One-shot runs can't inject answers mid-flight, so `Answer` controls
+/// are ignored.)
 async fn pump(
-    child: Child,
-    stdout: tokio::process::ChildStdout,
-    stderr: Option<tokio::process::ChildStderr>,
-    evt_tx: mpsc::UnboundedSender<AgentEvent>,
-    ctl_rx: mpsc::UnboundedReceiver<RunControl>,
-) {
-    pump_with_grace(child, stdout, stderr, evt_tx, ctl_rx, HELD_RESULT_GRACE).await
-}
-
-/// [`pump`] with the held-result grace as a parameter, so tests can shorten it.
-async fn pump_with_grace(
     mut child: Child,
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
@@ -570,6 +586,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sessions_allow_subagents_with_their_access_level() {
+        for (mode, flag) in [
+            (RunMode::SessionFull, "--dangerously-skip-permissions"),
+            (RunMode::SessionReadOnly, "--permission-mode"),
+        ] {
+            let mut c = cfg(mode);
+            c.resume_session = Some("sess-1".into());
+            let args = build_args(&c);
+            let denied = pair(&args, "--disallowedTools").unwrap();
+            assert_eq!(denied, "ScheduleWakeup,Workflow");
+            assert!(!denied.contains("Agent"));
+            let di = args.iter().position(|a| a == "--disallowedTools").unwrap();
+            let mf = args.iter().position(|a| a == flag).unwrap();
+            assert!(di < mf);
+            assert!(args.windows(2).any(|w| w == ["--resume", "sess-1"]));
+            assert_eq!(args.last().map(String::as_str), Some("--"));
+        }
+        assert_eq!(
+            pair(
+                &build_args(&cfg(RunMode::SessionReadOnly)),
+                "--permission-mode"
+            )
+            .as_deref(),
+            Some("plan")
+        );
+    }
+
     /// The prompt is appended by `start`, so argv must end with `--`: a
     /// description opening on a markdown bullet would otherwise be parsed as a
     /// flag and the run would die at "unknown option '- ...'".
@@ -583,6 +627,8 @@ mod tests {
             RunMode::Triage,
             RunMode::Question,
             RunMode::Investigate,
+            RunMode::SessionFull,
+            RunMode::SessionReadOnly,
         ] {
             let args = build_args(&cfg(mode));
             assert_eq!(
@@ -833,12 +879,9 @@ mod tests {
         let stderr = child.stderr.take();
         let (evt_tx, evt_rx) = mpsc::unbounded();
         let (_ctl_tx, ctl_rx) = mpsc::unbounded();
-        timeout(
-            limit,
-            pump_with_grace(child, stdout, stderr, evt_tx, ctl_rx, grace),
-        )
-        .await
-        .expect("run should have ended");
+        timeout(limit, pump(child, stdout, stderr, evt_tx, ctl_rx, grace))
+            .await
+            .expect("run should have ended");
         evt_rx.collect().await
     }
 

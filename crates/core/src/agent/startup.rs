@@ -7,6 +7,7 @@ use std::process::Command;
 
 use crate::domain::config::AppSettings;
 use crate::domain::model::{now_millis, Provider, ReviewStatus};
+use crate::domain::session::{SessionStatus, SessionTransition, SessionTurn, SessionTurnKind};
 use crate::domain::state_machine::{transition, Transition};
 use crate::error::Result;
 use crate::infra::forge::detect_forge;
@@ -123,6 +124,71 @@ pub fn reconcile_interrupted_reviews(store: &Store, message: &str) -> Result<usi
         }
     }
     Ok(reconciled)
+}
+
+/// After a restart, a session persisted mid-turn has no agent behind it. Mark
+/// each `Failed` (Retry resumes it) and unread, carrying `message`. Returns how
+/// many sessions were reconciled.
+pub fn reconcile_interrupted_sessions(store: &Store, message: &str) -> Result<usize> {
+    let mut reconciled = 0;
+    for mut session in store.list_sessions()? {
+        if session.is_running() {
+            session.apply(SessionTransition::TurnFailed {
+                message: message.to_string(),
+            })?;
+            session.push_turn(SessionTurn::new(SessionTurnKind::Error, message));
+            session.unread = true;
+            store.upsert_session(&session)?;
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Sessions untouched for this long, once ended and read, leave the main list.
+pub const SESSION_AUTO_ARCHIVE_DAYS: i64 = 7;
+
+/// Archive every ended (Finished/Failed), read, non-archived session whose last
+/// activity is older than [`SESSION_AUTO_ARCHIVE_DAYS`] before `now` (ms).
+/// Returns how many were archived.
+pub fn auto_archive_stale_sessions(store: &Store, now: i64) -> Result<usize> {
+    let cutoff = now - SESSION_AUTO_ARCHIVE_DAYS * 24 * 60 * 60 * 1000;
+    let mut archived = 0;
+    for mut session in store.list_sessions()? {
+        let ended = matches!(
+            session.status,
+            SessionStatus::Finished | SessionStatus::Failed { .. }
+        );
+        if ended && !session.unread && !session.archived && session.last_activity_at < cutoff {
+            session.archived = true;
+            store.upsert_session(&session)?;
+            archived += 1;
+        }
+    }
+    Ok(archived)
+}
+
+/// Drop attachment records (and their managed copies) whose id is no longer a
+/// card, session or review task — files staged in a new-session dialog the app
+/// never got to clean up (a crash, a force quit). Returns how many were swept.
+///
+/// Deletion is irreversible, so the sweep is skipped entirely when any card,
+/// session or review task fails to decode (schema drift): its id is unknown and
+/// its attachments would otherwise look orphaned.
+pub fn sweep_orphan_attachments(store: &Store) -> Result<usize> {
+    let Some(live) = store.attachment_owner_ids()? else {
+        tracing::warn!("undecodable records present; skipping orphan attachment sweep");
+        return Ok(0);
+    };
+    let mut swept = 0;
+    for id in store.all_attachments()?.into_keys() {
+        if !live.contains(&id) {
+            store.set_attachments(id, &[])?;
+            let _ = std::fs::remove_dir_all(crate::infra::paths::attachments_dir(id));
+            swept += 1;
+        }
+    }
+    Ok(swept)
 }
 
 /// Keep each project's *detected* base branch and forge in sync with what its

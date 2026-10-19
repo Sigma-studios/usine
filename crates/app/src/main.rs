@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod notify;
 mod state;
 #[cfg(debug_assertions)]
 mod stress;
@@ -31,8 +32,8 @@ use state::AppState;
 use toast::ToastHost;
 use ui::{
     AdoptDialogHost, BoardArea, CardMenuHost, ConfirmHost, DetailArea, DiffDialogHost, NewCardHost,
-    PanelResizeHost, ProjectSettingsModal, SearchHost, SettingsModal, ShortcutHost, Sidebar,
-    UsageBar,
+    NewSessionHost, PanelResizeHost, ProjectSettingsModal, SearchHost, SettingsModal, ShortcutHost,
+    Sidebar, UsageBar,
 };
 
 const CSS: &str = include_str!("style.css");
@@ -391,7 +392,9 @@ fn use_dock_badge(state: AppState) {
     use_effect(move || {
         // PRs waiting on the user's review count toward the badge too; muted
         // projects count toward neither.
-        let count = state.card_attention_count() + state.review_attention_count();
+        let count = state.card_attention_count()
+            + state.review_attention_count()
+            + state.session_attention_count();
         window
             .window
             .set_badge_label((count > 0).then(|| count.to_string()));
@@ -448,6 +451,12 @@ fn App() -> Element {
             event: WindowEvent::CloseRequested,
             ..
         } => request_quit(state, &window),
+        // Tracked so a session ending in plain sight neither notifies nor
+        // stays unread.
+        Event::WindowEvent {
+            event: WindowEvent::Focused(focused),
+            ..
+        } => state.set_window_focused(*focused),
         _ => {}
     });
     #[cfg(target_os = "macos")]
@@ -492,6 +501,7 @@ fn App() -> Element {
         ConfirmHost {}
         AdoptDialogHost {}
         NewCardHost {}
+        NewSessionHost {}
         DiffDialogHost {}
         SettingsModal {}
         ProjectSettingsModal {}

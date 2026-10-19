@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::model::{Column, Effort, ModelSpec, Provider};
+use crate::domain::session::SessionAccess;
 
 /// The token replaced by a path in the configured commands that take one: the
 /// target directory in an "open in terminal/editor" command (see
@@ -427,6 +428,28 @@ pub struct AppSettings {
     /// fully expanded.
     #[serde(default)]
     pub collapsed_columns: Vec<Column>,
+    /// What the new-session dialog last started with, so the next one opens
+    /// on the same provider/model/access. `None` until a session is created.
+    #[serde(default)]
+    pub session_defaults: Option<SessionDefaults>,
+    /// Post an OS notification when a session finishes, fails or asks a
+    /// question.
+    #[serde(default = "default_true")]
+    pub session_notifications: bool,
+}
+
+/// The new-session dialog's remembered choices (see
+/// [`AppSettings::session_defaults`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDefaults {
+    pub provider: Provider,
+    pub spec: ModelSpec,
+    #[serde(default)]
+    pub access: SessionAccess,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Serde default for [`AppSettings::max_concurrent_runs`]: a settings record
@@ -470,6 +493,8 @@ impl AppSettings {
             sidebar_width: default_sidebar_width(),
             detail_width: default_detail_width(),
             collapsed_columns: Vec::new(),
+            session_defaults: None,
+            session_notifications: true,
         }
     }
 
