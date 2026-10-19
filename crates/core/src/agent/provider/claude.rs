@@ -16,16 +16,18 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{sleep_until, timeout, Instant};
 
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider, Usage};
 use crate::error::{CoreError, Result};
 
-use super::stream::{errored_tool_result_ids, exit_plan_mode_tool_id, parse_claude_line};
-use super::{AgentProvider, RunConfig, RunHandle, RunMode};
+use super::stream::{
+    errored_tool_result_ids, exit_plan_mode_tool_id, parse_claude_line, replayed_user_text,
+};
+use super::{AgentProvider, RunConfig, RunHandle, RunMode, SESSION_STATUS_PROMPT};
 
 /// Build the argv for a `claude` headless run, **excluding** the binary name and
 /// the prompt (the prompt is appended as the final positional arg by `start`).
@@ -47,6 +49,12 @@ use super::{AgentProvider, RunConfig, RunHandle, RunMode};
 /// turns from the tools we *do* allow — `Monitor`, background `Bash` — are
 /// handled in [`pump`] by [`TurnGate`], which waits for the process to exit.)
 /// Sessions allow `Agent`/`Task` and rely on that same gate.
+///
+/// Sessions also take their input as stream-json on stdin (`start` writes the
+/// prompt there instead of appending it), echoed back with
+/// `--replay-user-messages`, so the user can write to the agent mid-turn (see
+/// [`LiveInput`]), and get [`SESSION_STATUS_PROMPT`] appended to the system
+/// prompt on every turn.
 pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     // Claude Code clamps an unsupported `--effort` itself, but we clamp here too so
     // the flag we pass reflects the model's real capability (e.g. Haiku, which has
@@ -71,6 +79,18 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     if let Some(session) = &cfg.resume_session {
         args.push("--resume".into());
         args.push(session.clone());
+    }
+
+    // Session-only options, each taking exactly one value, kept ahead of the
+    // variadic `--disallowedTools` below.
+    if cfg.mode.is_session() {
+        args.extend([
+            "--input-format".into(),
+            "stream-json".into(),
+            "--replay-user-messages".into(),
+            "--append-system-prompt".into(),
+            SESSION_STATUS_PROMPT.into(),
+        ]);
     }
 
     // Single-turn guard: deny the tools that let the agent spawn background work
@@ -123,13 +143,20 @@ impl AgentProvider for ClaudeProvider {
     }
 
     async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
+        let session = cfg.mode.is_session();
         let mut args = build_args(&cfg);
-        args.push(cfg.full_prompt());
+        if !session {
+            args.push(cfg.full_prompt());
+        }
 
         let mut child = Command::new("claude")
             .args(&args)
             .current_dir(&cfg.project_dir)
-            .stdin(Stdio::null())
+            .stdin(if session {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -143,21 +170,132 @@ impl AgentProvider for ClaudeProvider {
             .take()
             .ok_or_else(|| CoreError::provider("claude stdout unavailable"))?;
         let stderr = child.stderr.take();
+        let live = match child.stdin.take() {
+            Some(stdin) => Some(
+                LiveInput::open(stdin, &cfg.full_prompt())
+                    .await
+                    .map_err(|e| CoreError::provider(format!("could not write to claude: {e}")))?,
+            ),
+            None => None,
+        };
 
         let (evt_tx, evt_rx) = mpsc::unbounded::<AgentEvent>();
         let (ctl_tx, ctl_rx) = mpsc::unbounded::<RunControl>();
 
-        let grace = if cfg.mode.is_session() {
+        let grace = if session {
             SESSION_HELD_RESULT_GRACE
         } else {
             HELD_RESULT_GRACE
         };
-        tokio::spawn(pump(child, stdout, stderr, evt_tx, ctl_rx, grace));
+        tokio::spawn(pump(child, stdout, stderr, evt_tx, ctl_rx, grace, live));
 
         Ok(RunHandle {
             events: evt_rx.boxed(),
             control: ctl_tx,
         })
+    }
+}
+
+/// A session run's stdin, kept open so the user can write to the agent while
+/// it works (`--input-format stream-json`).
+///
+/// Verified live on CLI 2.1.303: a message written mid-turn is picked up at the
+/// next tool boundary (its `--replay-user-messages` echo arrives right after
+/// the running tool's result) and handled before that turn's `result`; once
+/// stdin closes the process still finishes pending background subagents and
+/// exits. So stdin is closed at a `result` with no written message still
+/// unechoed — that is what lets the process end, and [`TurnGate`] keeps ending
+/// the run at process exit as before.
+struct LiveInput {
+    /// `None` once closed: later messages are refused (and get queued).
+    stdin: Option<ChildStdin>,
+    /// Messages written whose echo hasn't come back yet.
+    pending: usize,
+    /// Whether the turn's own prompt has been echoed: later echoes are the
+    /// user's live messages.
+    seen_prompt: bool,
+}
+
+/// After a `result` with a written message still unechoed, how long stdout
+/// may stay quiet before stdin is closed anyway, so a lost echo can't keep
+/// the process (and the session) alive.
+const UNECHOED_CLOSE: Duration = Duration::from_secs(60);
+
+impl LiveInput {
+    /// Write the turn's prompt as the first message.
+    async fn open(stdin: ChildStdin, prompt: &str) -> std::io::Result<Self> {
+        let mut live = LiveInput {
+            stdin: Some(stdin),
+            pending: 0,
+            seen_prompt: false,
+        };
+        live.write(prompt).await?;
+        Ok(live)
+    }
+
+    async fn write(&mut self, text: &str) -> std::io::Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        };
+        let mut line = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        })
+        .to_string();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
+        self.pending += 1;
+        Ok(())
+    }
+
+    /// Write a live message; whether the agent will get it this run.
+    async fn send(&mut self, text: &str) -> bool {
+        if self.stdin.is_none() {
+            return false;
+        }
+        match self.write(text).await {
+            Ok(()) => true,
+            Err(_) => {
+                self.stdin = None;
+                false
+            }
+        }
+    }
+
+    /// Track one stdout line: echoes settle written messages, and a turn's
+    /// `result` closes stdin once nothing written is still in flight. Returns
+    /// the activity note for a picked-up live message.
+    fn observe(&mut self, line: &str, events: &[AgentEvent]) -> Option<AgentEvent> {
+        if let Some(text) = replayed_user_text(line) {
+            self.pending = self.pending.saturating_sub(1);
+            if !self.seen_prompt {
+                self.seen_prompt = true;
+                return None;
+            }
+            let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+            return Some(AgentEvent::Progress {
+                text: format!(
+                    "↪ picked up: {}",
+                    crate::domain::session::truncate_chars(first, 60)
+                ),
+            });
+        }
+        let result = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Error { .. }));
+        if result && self.pending == 0 {
+            self.close();
+        }
+        None
+    }
+
+    fn is_open(&self) -> bool {
+        self.stdin.is_some()
+    }
+
+    fn close(&mut self) {
+        self.stdin = None;
     }
 }
 
@@ -255,10 +393,17 @@ impl PlanGate {
 /// card on an interim "waiting for…" message and dropped the real answer (with
 /// its `usine-commit`/`usine-handoff` blocks). So every `Done`/`Error` is held,
 /// each later one replaces it, and [`TurnGate::finish`] releases the last at EOF.
+/// The exception is a result kept by [`TurnGate::keep_held`] (it answered the
+/// turn before a live message): it is joined ahead of the final one.
 #[derive(Default)]
 struct TurnGate {
     /// The latest terminal event (`Done`/`Error`) seen, not yet forwarded.
     held: Option<AgentEvent>,
+    /// Results of earlier turns that must reach the final answer.
+    kept: Vec<String>,
+    /// Whether `held` is the last of `kept`, so the next event is the agent
+    /// picking up the live message rather than resuming after background work.
+    held_kept: bool,
     /// Token usage summed over every turn's `result` (each reports its own turn).
     usage: Usage,
     /// Whether the current resumption has been announced in the activity log.
@@ -285,13 +430,15 @@ impl TurnGate {
                         usage: self.usage,
                     });
                     self.resumed_announced = false;
+                    self.held_kept = false;
                 }
                 AgentEvent::Error { .. } => {
                     self.held = Some(evt);
                     self.resumed_announced = false;
+                    self.held_kept = false;
                 }
                 other => {
-                    if self.held.is_some() && !self.resumed_announced {
+                    if self.held.is_some() && !self.resumed_announced && !self.held_kept {
                         self.resumed_announced = true;
                         out.push(AgentEvent::Progress {
                             text: "Previous turn ended; agent resumed after background work".into(),
@@ -309,9 +456,40 @@ impl TurnGate {
         self.held.is_some()
     }
 
-    /// The run's final terminal event, released once the run has ended.
+    /// Keep the held result: a live message written before it was read
+    /// makes the CLI run another turn, whose result must not replace it.
+    fn keep_held(&mut self) {
+        if let Some(AgentEvent::Done { result, .. }) = &self.held {
+            if !result.trim().is_empty() {
+                self.kept.push(result.clone());
+            }
+            self.held_kept = true;
+        }
+    }
+
+    /// The run's final terminal event, released once the run has ended, with
+    /// any kept results joined ahead of a final `Done`.
     fn finish(&mut self) -> Option<AgentEvent> {
-        self.held.take()
+        let kept = std::mem::take(&mut self.kept);
+        match self.held.take()? {
+            AgentEvent::Done {
+                result,
+                cost_usd,
+                usage,
+            } if !kept.is_empty() => {
+                // A still-kept held result is already the last of `kept`.
+                let mut parts = kept;
+                if !self.held_kept && !result.trim().is_empty() {
+                    parts.push(result);
+                }
+                Some(AgentEvent::Done {
+                    result: parts.join("\n\n"),
+                    cost_usd,
+                    usage,
+                })
+            }
+            evt => Some(evt),
+        }
     }
 }
 
@@ -346,8 +524,9 @@ const EXIT_DRAIN: Duration = Duration::from_secs(2);
 /// turns (see [`TurnGate`]). The end is stdout EOF, `claude` exiting, or
 /// `grace` of silence after a turn's result ([`HELD_RESULT_GRACE`], or
 /// [`SESSION_HELD_RESULT_GRACE`] for sessions). Reacts to Cancel by killing the
-/// child. (One-shot runs can't inject answers mid-flight, so `Answer` controls
-/// are ignored.)
+/// child. A session run (`live`) writes `Message` controls to the agent's
+/// stdin while it is open; other runs refuse them. (Questions can't be
+/// answered mid-flight, so `Answer` controls are ignored.)
 async fn pump(
     mut child: Child,
     stdout: tokio::process::ChildStdout,
@@ -355,6 +534,7 @@ async fn pump(
     evt_tx: mpsc::UnboundedSender<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<RunControl>,
     grace: Duration,
+    mut live: Option<LiveInput>,
 ) {
     // Drain stderr concurrently so a useful message survives a non-zero exit.
     let stderr_task = tokio::spawn(async move {
@@ -381,23 +561,45 @@ async fn pump(
     let mut exit_status = None;
     let mut timed_out = false;
 
-    let forward =
-        |line: &str, gate: &mut PlanGate, turns: &mut TurnGate, last_sent: &mut Instant| {
-            gate.observe(line);
-            if let Ok(events) = parse_claude_line(line) {
-                // Terminal events (Done/Error, and the PlanReady resolved
-                // against them) are held until the end, so none pass here.
-                for evt in gate.gate(line, turns.hold(events)) {
-                    *last_sent = Instant::now();
-                    let _ = evt_tx.unbounded_send(evt);
-                }
-            }
-        };
+    // When stdout last produced a line (for closing a stuck live stdin).
+    let mut last_line = Instant::now();
+
+    let forward = |line: &str,
+                   gate: &mut PlanGate,
+                   turns: &mut TurnGate,
+                   live: &mut Option<LiveInput>,
+                   last_sent: &mut Instant| {
+        gate.observe(line);
+        let events = parse_claude_line(line).unwrap_or_default();
+        if let Some(note) = live.as_mut().and_then(|l| l.observe(line, &events)) {
+            *last_sent = Instant::now();
+            let _ = evt_tx.unbounded_send(note);
+        }
+        // A result read while a live message is still unechoed answers the
+        // turn before it: the CLI takes the message as a next turn in this
+        // process, so that answer must not be replaced by the next result.
+        let late_message = live.as_ref().is_some_and(|l| l.pending > 0)
+            && events.iter().any(|e| matches!(e, AgentEvent::Done { .. }));
+        // Terminal events (Done/Error, and the PlanReady resolved against
+        // them) are held until the end, so none pass here.
+        let passed = turns.hold(events);
+        if late_message {
+            turns.keep_held();
+        }
+        for evt in gate.gate(line, passed) {
+            *last_sent = Instant::now();
+            let _ = evt_tx.unbounded_send(evt);
+        }
+    };
 
     loop {
+        let stdin_open = live.as_ref().is_some_and(LiveInput::is_open);
         tokio::select! {
             line = lines.next_line() => match line {
-                Ok(Some(line)) => forward(&line, &mut gate, &mut turns, &mut last_sent),
+                Ok(Some(line)) => {
+                    last_line = Instant::now();
+                    forward(&line, &mut gate, &mut turns, &mut live, &mut last_sent)
+                }
                 _ => break, // EOF or read error
             },
             status = child.wait(), if exit_status.is_none() => {
@@ -405,9 +607,16 @@ async fn pump(
                 // `claude` is gone; read what's left in the pipe, but don't wait
                 // on a grandchild (a background task) that still holds it open.
                 while let Ok(Ok(Some(line))) = timeout(EXIT_DRAIN, lines.next_line()).await {
-                    forward(&line, &mut gate, &mut turns, &mut last_sent);
+                    forward(&line, &mut gate, &mut turns, &mut live, &mut last_sent);
                 }
                 break;
+            },
+            _ = sleep_until(last_line + UNECHOED_CLOSE), if stdin_open && turns.is_holding() => {
+                // A written message's echo never came: stop waiting on it so
+                // the process can end.
+                if let Some(l) = live.as_mut() {
+                    l.close();
+                }
             },
             _ = sleep_until(last_sent + grace), if turns.is_holding() => {
                 timed_out = true;
@@ -418,7 +627,14 @@ async fn pump(
                     cancelled = true;
                     break;
                 }
-                Some(RunControl::Answer { .. }) => { /* one-shot: no stdin to write to */ }
+                Some(RunControl::Message { text, accepted }) => {
+                    let ok = match live.as_mut() {
+                        Some(l) => l.send(&text).await,
+                        None => false,
+                    };
+                    let _ = accepted.send(ok);
+                }
+                Some(RunControl::Answer { .. }) => { /* no question to answer mid-flight */ }
                 None => ctl_open = false,
             },
         }
@@ -612,6 +828,30 @@ mod tests {
             .as_deref(),
             Some("plan")
         );
+    }
+
+    #[test]
+    fn sessions_take_stream_input_and_the_status_prompt_before_the_variadic_option() {
+        for mode in [RunMode::SessionFull, RunMode::SessionReadOnly] {
+            let args = build_args(&cfg(mode));
+            assert_eq!(
+                pair(&args, "--input-format").as_deref(),
+                Some("stream-json")
+            );
+            assert!(args.contains(&"--replay-user-messages".to_string()));
+            assert_eq!(
+                pair(&args, "--append-system-prompt").as_deref(),
+                Some(SESSION_STATUS_PROMPT)
+            );
+            let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+            assert!(at("--append-system-prompt") < at("--disallowedTools"));
+            assert!(at("--input-format") < at("--disallowedTools"));
+            assert!(at("--append-system-prompt") < at("--"));
+        }
+        // Card runs keep the prompt on argv and get no status instruction.
+        let args = build_args(&cfg(RunMode::Implement));
+        assert!(!args.contains(&"--input-format".to_string()));
+        assert!(!args.contains(&"--append-system-prompt".to_string()));
     }
 
     /// The prompt is appended by `start`, so argv must end with `--`: a
@@ -861,6 +1101,37 @@ mod tests {
         assert!(turns.finish().is_none());
     }
 
+    // A result read while a live message was unechoed answered the turn
+    // before it: it is joined ahead of the reply to the late message, and the
+    // agent picking that message up is not taken for a background resumption.
+    #[test]
+    fn turn_gate_keeps_a_result_read_before_a_late_live_message() {
+        let mut turns = TurnGate::default();
+        let first = r#"{"type":"result","subtype":"success","is_error":false,"result":"main answer","total_cost_usd":0.1}"#;
+        let next = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"on it"}]}}"#;
+        let second = r#"{"type":"result","subtype":"success","is_error":false,"result":"steer reply","total_cost_usd":0.2}"#;
+        assert!(turns.hold(parse_claude_line(first).unwrap()).is_empty());
+        turns.keep_held();
+        let passed = turns.hold(parse_claude_line(next).unwrap());
+        assert_eq!(resumed_notes(&passed), 0);
+        assert!(turns.hold(parse_claude_line(second).unwrap()).is_empty());
+        match turns.finish() {
+            Some(AgentEvent::Done { result, .. }) => {
+                assert_eq!(result, "main answer\n\nsteer reply")
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // No later result (the message was never handled): the kept one stands.
+        let mut turns = TurnGate::default();
+        turns.hold(parse_claude_line(first).unwrap());
+        turns.keep_held();
+        match turns.finish() {
+            Some(AgentEvent::Done { result, .. }) => assert_eq!(result, "main answer"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
     const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"final answer","total_cost_usd":0.1}"#;
 
     /// Run `pump_with_grace` over a `sh -c script` child and collect what it
@@ -879,10 +1150,136 @@ mod tests {
         let stderr = child.stderr.take();
         let (evt_tx, evt_rx) = mpsc::unbounded();
         let (_ctl_tx, ctl_rx) = mpsc::unbounded();
-        timeout(limit, pump(child, stdout, stderr, evt_tx, ctl_rx, grace))
-            .await
-            .expect("run should have ended");
+        timeout(
+            limit,
+            pump(child, stdout, stderr, evt_tx, ctl_rx, grace, None),
+        )
+        .await
+        .expect("run should have ended");
         evt_rx.collect().await
+    }
+
+    const REPLAY_PROMPT: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"do it"}]},"isReplay":true}"#;
+    const REPLAY_STEER: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"also this"}]},"isReplay":true}"#;
+
+    /// Start a session-style run over a fake `claude` (`sh -c script`) whose
+    /// stdin is piped and already carries the prompt, as `start` does.
+    async fn live_script(
+        script: &str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedSender<RunControl>,
+        mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let live = LiveInput::open(child.stdin.take().unwrap(), "do it")
+            .await
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
+        let (evt_tx, evt_rx) = mpsc::unbounded();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded();
+        let task = tokio::spawn(pump(
+            child,
+            stdout,
+            stderr,
+            evt_tx,
+            ctl_rx,
+            Duration::from_secs(60),
+            Some(live),
+        ));
+        (task, ctl_tx, evt_rx)
+    }
+
+    async fn message(ctl: &mpsc::UnboundedSender<RunControl>, text: &str) -> bool {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        ctl.unbounded_send(RunControl::Message {
+            text: text.into(),
+            accepted: tx,
+        })
+        .unwrap();
+        rx.await.unwrap_or(false)
+    }
+
+    // A live message is written while stdin is open, its echo is noted, and
+    // the turn's result then closes stdin — which is what lets the CLI exit
+    // (the fake waits on `cat` for EOF).
+    #[tokio::test]
+    async fn pump_writes_live_messages_and_closes_stdin_at_the_result() {
+        let script = format!(
+            "read p; echo '{REPLAY_PROMPT}'; read m; echo '{REPLAY_STEER}'; \
+             echo '{RESULT}'; cat >/dev/null; exit 0"
+        );
+        let (task, ctl, events) = live_script(&script).await;
+        assert!(message(&ctl, "also this").await);
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("stdin should close at the result so the run ends")
+            .unwrap();
+        let events: Vec<AgentEvent> = events.collect().await;
+        assert!(final_done(&events), "{:?}", kinds(&events));
+        let picked: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Progress { text } if text.starts_with("↪ picked up") => Some(text),
+                _ => None,
+            })
+            .collect();
+        // The turn's own prompt is echoed too, but only the live message is noted.
+        assert_eq!(picked, vec!["↪ picked up: also this"]);
+    }
+
+    // Once the result closed stdin, a later message is refused (the caller
+    // queues it), even though the process is still finishing up.
+    #[tokio::test]
+    async fn pump_refuses_live_messages_once_stdin_is_closed() {
+        let script =
+            format!("read p; echo '{REPLAY_PROMPT}'; echo '{RESULT}'; cat >/dev/null; sleep 1");
+        let (task, ctl, events) = live_script(&script).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!message(&ctl, "too late").await);
+        timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let events: Vec<AgentEvent> = events.collect().await;
+        assert!(final_done(&events), "{:?}", kinds(&events));
+    }
+
+    // Non-session runs have no stdin to write to.
+    #[tokio::test]
+    async fn pump_refuses_live_messages_without_live_input() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (evt_tx, _evt_rx) = mpsc::unbounded();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded();
+        let task = tokio::spawn(pump(
+            child,
+            stdout,
+            None,
+            evt_tx,
+            ctl_rx,
+            Duration::from_secs(60),
+            None,
+        ));
+        assert!(!message(&ctl_tx, "hi").await);
+        ctl_tx.unbounded_send(RunControl::Cancel).unwrap();
+        task.await.unwrap();
     }
 
     fn final_done(events: &[AgentEvent]) -> bool {

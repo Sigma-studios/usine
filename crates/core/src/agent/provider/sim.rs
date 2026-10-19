@@ -134,7 +134,7 @@ async fn simulate(
                     });
                     return;
                 }
-                Some(RunControl::Interrupt) => {}
+                Some(RunControl::Interrupt) | Some(RunControl::Message { .. }) => {}
             }
             pause!(700);
             emit!(AgentEvent::PlanReady {
@@ -299,7 +299,10 @@ async fn simulate(
                 pause!(300);
             }
             emit!(AgentEvent::Progress {
-                text: format!("📂 Looking around {}…", cfg.project_dir.display())
+                text: format!(
+                    "📂 Looking around {}…\nusine-status: Looking around the folder",
+                    cfg.project_dir.display()
+                )
             });
             pause!(400);
             let prompt = cfg.full_prompt();
@@ -321,24 +324,64 @@ async fn simulate(
                         });
                         return;
                     }
-                    Some(RunControl::Interrupt) => {}
+                    Some(RunControl::Interrupt) | Some(RunControl::Message { .. }) => {}
                 }
             }
-            emit!(AgentEvent::Progress {
-                text: "🛠️ Working on it…".into()
-            });
-            pause!(600);
+            // `[slow]` stretches the work over several seconds, long enough to
+            // queue or steer by hand. A simulated Claude takes live messages
+            // like the real CLI does; a simulated Codex refuses them.
+            let steps = if prompt.contains("[slow]") { 8 } else { 1 };
+            let steerable = cfg.provider == Provider::Claude;
+            let mut picked: Vec<String> = Vec::new();
+            for step in 1..=steps {
+                emit!(AgentEvent::Progress {
+                    text: format!(
+                        "🛠️ Working on it…\nusine-status: Working on it (step {step} of {steps})"
+                    )
+                });
+                let pause =
+                    tokio::time::sleep(Duration::from_millis(if steps > 1 { 1500 } else { 600 }));
+                tokio::pin!(pause);
+                loop {
+                    tokio::select! {
+                        _ = &mut pause => break,
+                        ctl = ctl_rx.next() => match ctl {
+                            Some(RunControl::Message { text, accepted }) => {
+                                let _ = accepted.send(steerable);
+                                if steerable {
+                                    emit!(AgentEvent::Progress {
+                                        text: format!("↪ picked up: {text}")
+                                    });
+                                    picked.push(text);
+                                }
+                            }
+                            Some(RunControl::Cancel) | None => {
+                                emit!(AgentEvent::Error {
+                                    message: "run cancelled".into()
+                                });
+                                return;
+                            }
+                            Some(_) => {}
+                        },
+                    }
+                }
+            }
             let first_line = prompt
                 .lines()
                 .map(str::trim)
                 .find(|l| !l.is_empty())
                 .unwrap_or("your request");
+            let mut result = format!(
+                "usine-status: Wrapping up\nDone. I looked into \"{first_line}\" in `{}` and \
+                 everything checks out — no changes were needed.",
+                cfg.project_dir.display()
+            );
+            if !picked.is_empty() {
+                result.push_str("\n\nWhile working I also took into account: ");
+                result.push_str(&picked.join("; "));
+            }
             emit!(AgentEvent::Done {
-                result: format!(
-                    "Done. I looked into \"{first_line}\" in `{}` and everything checks out \
-                     — no changes were needed.",
-                    cfg.project_dir.display()
-                ),
+                result,
                 cost_usd: 0.02,
                 usage: Usage {
                     input_tokens: 1_500,

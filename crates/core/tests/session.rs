@@ -577,3 +577,179 @@ fn unstaging_keeps_files_staged_after_the_send_was_read() {
     assert!(store.unstage_attachments(id, &late).unwrap().is_empty());
     assert!(store.get_attachments(id).unwrap().is_empty());
 }
+
+fn create_with(handle: &ExecutorHandle, id: Uuid, folder: &Path, provider: Provider, prompt: &str) {
+    let spec = CardConfig::default_for(provider).implement;
+    handle.send(ExecutorCommand::CreateSession {
+        id,
+        folder: folder.to_path_buf(),
+        provider,
+        spec,
+        access: SessionAccess::FullAccess,
+        prompt: prompt.into(),
+    });
+}
+
+fn send(handle: &ExecutorHandle, id: Uuid, text: &str) {
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: text.into(),
+    });
+}
+
+/// Send while running and wait for the command to release its claim: a send
+/// arriving while the previous one still holds it is dropped as a double
+/// submit.
+async fn send_settled(
+    handle: &ExecutorHandle,
+    rx: &mut UnboundedReceiver<ExecutorEvent>,
+    id: Uuid,
+    text: &str,
+) {
+    send(handle, id, text);
+    wait_for(rx, |e| match &e.kind {
+        ExecutorEventKind::CardBusy { busy: false } if e.card_id == id => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+/// Wait for a `SessionUpdated` for `id` matching `pred`.
+async fn wait_session(
+    rx: &mut UnboundedReceiver<ExecutorEvent>,
+    id: Uuid,
+    pred: impl Fn(&Session) -> bool,
+) -> Session {
+    wait_for(rx, |e| match &e.kind {
+        ExecutorEventKind::SessionUpdated(s) if s.id == id && pred(s) => Some((**s).clone()),
+        _ => None,
+    })
+    .await
+}
+
+fn user_texts(s: &Session) -> Vec<String> {
+    s.turns
+        .iter()
+        .filter(|t| t.kind == SessionTurnKind::User)
+        .map(|t| t.text.clone())
+        .collect()
+}
+
+// Codex can't take live messages: what the user sends mid-turn is queued, can
+// be taken back, and goes out as ONE resumed turn when the turn ends — the
+// session staying Running throughout (so it pings once, at the very end).
+#[tokio::test]
+async fn messages_sent_while_running_are_queued_and_sent_as_one_turn() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create_with(&handle, id, folder.path(), Provider::Codex, "[slow] start");
+    // The agent's `usine-status:` line becomes the session's note.
+    let s = wait_session(&mut rx, id, |s| s.status_note.is_some()).await;
+    assert!(s.is_running());
+    assert!(spy.last().full_prompt().contains("usine-status:"));
+
+    send_settled(&handle, &mut rx, id, "one").await;
+    send_settled(&handle, &mut rx, id, "two").await;
+    let s = store.get_session(id).unwrap();
+    assert_eq!(s.queued.len(), 2);
+    handle.send(ExecutorCommand::UnqueueSessionMessage {
+        session_id: id,
+        ts: s.queued[0].ts,
+    });
+    wait_session(&mut rx, id, |s| s.queued.len() == 1).await;
+    send_settled(&handle, &mut rx, id, "three").await;
+    assert_eq!(store.get_session(id).unwrap().queued.len(), 2);
+    assert_eq!(spy.count(), 1, "nothing launches while the turn runs");
+
+    // The first Finished is the end of the queued turn: no stop in between.
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(user_texts(&s), ["[slow] start", "two", "three"]);
+    assert!(s.queued.is_empty());
+    let kinds: Vec<_> = s.turns.iter().map(|t| t.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            SessionTurnKind::User,
+            SessionTurnKind::Agent,
+            SessionTurnKind::User,
+            SessionTurnKind::User,
+            SessionTurnKind::Agent
+        ]
+    );
+    // Status lines are progress, not part of the reply.
+    assert!(s.turns.iter().all(|t| !t.text.contains("usine-status")));
+    assert_eq!(spy.count(), 2);
+    let cfg = spy.last();
+    assert!(cfg.resume_session.is_some());
+    let prompt = cfg.full_prompt();
+    assert!(prompt.starts_with("The user sent these messages while you were working"));
+    assert!(prompt.contains("1. two\n\n2. three"), "{prompt}");
+    assert!(!prompt.contains(". one"), "{prompt}");
+}
+
+// A simulated Claude takes a message mid-turn, like the real CLI: it joins
+// the conversation at once and the same run handles it.
+#[tokio::test]
+async fn a_message_sent_to_a_running_claude_session_steers_it_live() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create(&handle, id, folder.path(), "[slow] start");
+    wait_session(&mut rx, id, |s| s.status_note.is_some()).await;
+
+    send(&handle, id, "steer me");
+    let s = wait_session(&mut rx, id, |s| user_texts(s).len() == 2).await;
+    assert!(s.is_running());
+    assert!(s.queued.is_empty());
+
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(spy.count(), 1, "the running turn handled it");
+    let agent = s.last_turn_of(SessionTurnKind::Agent).unwrap();
+    assert!(agent.text.contains("steer me"), "{}", agent.text);
+    assert!(
+        s.status_note.is_some(),
+        "the last note stays until the next turn"
+    );
+}
+
+// A Stop keeps the queue; the next Send carries it first.
+#[tokio::test]
+async fn a_stop_keeps_the_queue_for_the_next_message() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create_with(&handle, id, folder.path(), Provider::Codex, "[slow] start");
+    wait_session(&mut rx, id, |s| s.status_note.is_some()).await;
+    send(&handle, id, "later");
+    wait_session(&mut rx, id, |s| s.queued.len() == 1).await;
+
+    handle.send(ExecutorCommand::CancelSession { session_id: id });
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(s.queued.len(), 1);
+
+    send(&handle, id, "now");
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    let s = wait_status(&mut rx, id, finished).await;
+    assert!(s.queued.is_empty());
+    assert_eq!(user_texts(&s), ["[slow] start", "later", "now"]);
+    assert!(spy.last().full_prompt().contains("1. later\n\n2. now"));
+
+    // A blank send flushes a queue on its own.
+    let mut stored = store.get_session(id).unwrap();
+    assert!(stored.queued.is_empty());
+    stored
+        .queued
+        .push(usine_core::SessionTurn::new(SessionTurnKind::User, "solo"));
+    store.upsert_session(&stored).unwrap();
+    send(&handle, id, "  ");
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    wait_status(&mut rx, id, finished).await;
+    assert!(spy.last().full_prompt().starts_with("solo"));
+}

@@ -58,10 +58,18 @@ pub enum AgentEvent {
 }
 
 /// Control messages sent *into* an active run (UI → provider via executor).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum RunControl {
     /// Answer the pending intervention with free text.
     Answer { text: String },
+    /// A user message for the agent while it works (live steering). The run
+    /// replies on `accepted` whether it took the message; a run that can't
+    /// (one-shot, or already past its last turn) says no — or drops the
+    /// sender — and the caller queues it for the next turn instead.
+    Message {
+        text: String,
+        accepted: futures::channel::oneshot::Sender<bool>,
+    },
     /// Ask the agent to stop the current turn.
     Interrupt,
     /// Tear the run down entirely.
@@ -638,6 +646,11 @@ pub enum ExecutorCommand {
     RetrySession {
         session_id: Uuid,
     },
+    /// Drop a message queued while the session's turn runs (by its stamp).
+    UnqueueSessionMessage {
+        session_id: Uuid,
+        ts: i64,
+    },
     RenameSession {
         session_id: Uuid,
         title: String,
@@ -721,6 +734,7 @@ impl ExecutorCommand {
             | ExecutorCommand::AnswerSession { session_id, .. }
             | ExecutorCommand::CancelSession { session_id }
             | ExecutorCommand::RetrySession { session_id }
+            | ExecutorCommand::UnqueueSessionMessage { session_id, .. }
             | ExecutorCommand::RenameSession { session_id, .. }
             | ExecutorCommand::ArchiveSession { session_id, .. }
             | ExecutorCommand::MarkSessionRead { session_id }
@@ -856,6 +870,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::RenameSession { .. }
                 | ExecutorCommand::ArchiveSession { .. }
                 | ExecutorCommand::MarkSessionRead { .. }
+                | ExecutorCommand::UnqueueSessionMessage { .. }
         )
     }
 }

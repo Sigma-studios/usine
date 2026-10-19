@@ -97,6 +97,14 @@ impl SessionTurn {
     }
 }
 
+/// The agent's latest self-reported progress line (`usine-status: …`), shown
+/// in place of a bare "Working…" while a turn runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusNote {
+    pub text: String,
+    pub ts: i64,
+}
+
 /// A status change, applied by [`Session::apply`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTransition {
@@ -138,6 +146,13 @@ pub struct Session {
     pub archived: bool,
     #[serde(rename = "cost_usd", default)]
     pub cost: Cost,
+    /// What the agent last said it is doing; cleared whenever a turn starts.
+    #[serde(default)]
+    pub status_note: Option<StatusNote>,
+    /// Messages the user sent while a turn ran, waiting for it to end: they go
+    /// out together as the next resumed turn.
+    #[serde(default)]
+    pub queued: Vec<SessionTurn>,
 }
 
 impl Session {
@@ -170,6 +185,8 @@ impl Session {
             unread: false,
             archived: false,
             cost: Cost::ZERO,
+            status_note: None,
+            queued: Vec::new(),
         }
     }
 
@@ -202,6 +219,34 @@ impl Session {
         self.turns.push(turn);
     }
 
+    /// Hold a message sent while a turn runs, for the next turn. Refused
+    /// unless a turn is running: an idle session sends it right away. Its
+    /// stamp is made unique in the queue (it keys the UI row and
+    /// [`Session::unqueue`]), nudged a millisecond past the latest if needed.
+    pub fn queue(&mut self, mut turn: SessionTurn) -> Result<()> {
+        if !self.is_running() {
+            return Err(illegal("nothing is running to queue behind"));
+        }
+        if let Some(latest) = self.queued.iter().map(|t| t.ts).max() {
+            turn.ts = turn.ts.max(latest + 1);
+        }
+        self.last_activity_at = turn.ts.max(self.last_activity_at);
+        self.queued.push(turn);
+        Ok(())
+    }
+
+    /// Drop the queued message stamped `ts`. Whether one was removed.
+    pub fn unqueue(&mut self, ts: i64) -> bool {
+        let before = self.queued.len();
+        self.queued.retain(|t| t.ts != ts);
+        self.queued.len() != before
+    }
+
+    /// Empty the queue, oldest message first.
+    pub fn take_queued(&mut self) -> Vec<SessionTurn> {
+        std::mem::take(&mut self.queued)
+    }
+
     /// Apply a status transition. Only the status moves here; turns, unread
     /// and cost are the executor's business.
     pub fn apply(&mut self, t: SessionTransition) -> Result<()> {
@@ -228,6 +273,10 @@ impl Session {
                 )))
             }
         };
+        if matches!(next, S::Running) {
+            // A new turn: the previous one's progress line is stale.
+            self.status_note = None;
+        }
         self.status = next;
         Ok(())
     }
@@ -261,6 +310,45 @@ fn file_label(path: &Path) -> String {
         Some((prefix, original)) if prefix.len() == 8 => original.to_string(),
         _ => name,
     }
+}
+
+/// The marker opening an agent's progress line (see [`StatusNote`]).
+pub const STATUS_PREFIX: &str = "usine-status:";
+
+/// Longest status note kept, in chars.
+pub const STATUS_MAX: usize = 80;
+
+/// The text of a `usine-status:` line, if `line` is one (case-insensitive,
+/// surrounding backticks tolerated).
+fn status_of(line: &str) -> Option<&str> {
+    let line = line.trim().trim_matches('`').trim();
+    let head = line.get(..STATUS_PREFIX.len())?;
+    head.eq_ignore_ascii_case(STATUS_PREFIX)
+        .then(|| line[STATUS_PREFIX.len()..].trim())
+}
+
+/// The last non-empty `usine-status:` line in `text`, trimmed and cut to
+/// [`STATUS_MAX`] chars.
+pub fn last_status_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .filter_map(status_of)
+        .find(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, STATUS_MAX))
+}
+
+/// `text` without its `usine-status:` lines — they are progress, not part of
+/// the agent's reply.
+pub fn strip_status_lines(text: &str) -> String {
+    if !text.lines().any(|l| status_of(l).is_some()) {
+        return text.to_string();
+    }
+    text.lines()
+        .filter(|l| status_of(l).is_none())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// `s` cut to at most `max` chars, with an ellipsis when cut.
@@ -355,6 +443,66 @@ mod tests {
         s.apply(SessionTransition::Cancelled).unwrap();
         assert_eq!(s.status, SessionStatus::Finished);
         assert!(s.apply(SessionTransition::Cancelled).is_err());
+    }
+
+    #[test]
+    fn queue_only_while_running_and_unqueue_by_stamp() {
+        let mut s = session();
+        let mut a = SessionTurn::new(SessionTurnKind::User, "a");
+        a.ts = 1;
+        let mut b = SessionTurn::new(SessionTurnKind::User, "b");
+        b.ts = 2;
+        s.queue(a).unwrap();
+        s.queue(b.clone()).unwrap();
+        assert!(s.unqueue(1));
+        assert!(!s.unqueue(1));
+        assert_eq!(s.queued, vec![b.clone()]);
+        s.apply(SessionTransition::TurnDone).unwrap();
+        assert!(s
+            .queue(SessionTurn::new(SessionTurnKind::User, "c"))
+            .is_err());
+        assert_eq!(s.take_queued(), vec![b]);
+        assert!(s.queued.is_empty());
+    }
+
+    #[test]
+    fn queued_messages_of_the_same_millisecond_get_distinct_stamps() {
+        let mut s = session();
+        let mut a = SessionTurn::new(SessionTurnKind::User, "a");
+        a.ts = 5;
+        let mut b = SessionTurn::new(SessionTurnKind::User, "b");
+        b.ts = 5;
+        s.queue(a).unwrap();
+        s.queue(b).unwrap();
+        assert_eq!(s.queued[1].ts, 6);
+        assert!(s.unqueue(5));
+        assert_eq!(s.queued.len(), 1);
+        assert_eq!(s.queued[0].text, "b");
+    }
+
+    #[test]
+    fn status_lines_are_found_and_stripped() {
+        let text = "Looking.\nusine-status: Reading the parser\n`USINE-STATUS: Running tests`\nok";
+        assert_eq!(last_status_line(text).as_deref(), Some("Running tests"));
+        assert_eq!(last_status_line("no status here"), None);
+        assert_eq!(last_status_line("usine-status:   "), None);
+        let long = format!("usine-status: {}", "x".repeat(200));
+        assert_eq!(last_status_line(&long).unwrap().chars().count(), STATUS_MAX);
+        assert_eq!(strip_status_lines(text), "Looking.\nok");
+        assert_eq!(strip_status_lines("  keep  as is \n"), "  keep  as is \n");
+    }
+
+    #[test]
+    fn a_new_turn_clears_the_status_note() {
+        let mut s = session();
+        s.status_note = Some(StatusNote {
+            text: "Reading".into(),
+            ts: 1,
+        });
+        s.apply(SessionTransition::TurnDone).unwrap();
+        assert!(s.status_note.is_some(), "kept until the next turn");
+        s.apply(SessionTransition::StartTurn).unwrap();
+        assert!(s.status_note.is_none());
     }
 
     #[test]

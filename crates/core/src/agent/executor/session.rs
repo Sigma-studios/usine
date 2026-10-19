@@ -22,12 +22,13 @@ use uuid::Uuid;
 
 use super::{append_attachments, lock, release_run, transcript, Executor, RunMap};
 use crate::agent::events::{AgentEvent, ExecutorEvent, RunControl, Severity};
-use crate::agent::provider::{RunConfig, RunMode};
+use crate::agent::provider::stream::TODO_PROGRESS_PREFIX;
+use crate::agent::provider::{RunConfig, RunMode, SESSION_STATUS_PROMPT};
 use crate::domain::config::SessionDefaults;
 use crate::domain::model::{now_millis, Cost, Intervention, ModelSpec, Provider};
 use crate::domain::session::{
-    truncate_chars, Session, SessionAccess, SessionStatus, SessionTransition, SessionTurn,
-    SessionTurnKind,
+    last_status_line, strip_status_lines, truncate_chars, Session, SessionAccess, SessionStatus,
+    SessionTransition, SessionTurn, SessionTurnKind, StatusNote, STATUS_MAX,
 };
 use crate::error::{CoreError, Result};
 use crate::infra::persistence::Store;
@@ -49,6 +50,14 @@ const _: () = assert!(
 
 /// The prompt of a message that is only attachments.
 pub(crate) const ATTACHMENTS_ONLY_PROMPT: &str = "See the attached files.";
+
+/// Heads the prompt of a turn that carries several messages queued while the
+/// agent worked.
+const QUEUED_HEADER: &str =
+    "The user sent these messages while you were working — handle them in order:";
+
+/// How long a live message waits for the run to say whether it took it.
+const LIVE_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many earlier turns a fresh fallback (after a failed `--resume`)
 /// replays, and how much of each.
@@ -132,30 +141,119 @@ impl Executor {
         self.launch_session_turn(&session, input, None).await
     }
 
+    /// Send a message. While a turn runs it goes to the agent live when the
+    /// run can take it (Claude, text only), else it is queued for the next
+    /// turn. An idle session starts a turn with it, carrying any queued
+    /// messages first.
     pub(super) async fn send_session_message(&self, id: Uuid, text: String) -> Result<()> {
-        let mut probe = self.store.get_session(id)?;
-        probe.apply(SessionTransition::StartTurn)?;
+        let probe = self.store.get_session(id)?;
         let staged = self.store.get_attachments(id).unwrap_or_default();
-        if text.trim().is_empty() && staged.iter().all(|p| !p.exists()) {
+        let attachments = existing(&staged);
+        let blank = text.trim().is_empty();
+        if probe.is_running() {
+            if blank && attachments.is_empty() {
+                return Err(CoreError::other("write a message or attach a file"));
+            }
+            if attachments.is_empty() && self.steer_session(id, text.trim()).await {
+                return Ok(());
+            }
+            let turn = SessionTurn::new(SessionTurnKind::User, text.trim())
+                .with_attachments(attachments.clone());
+            let mut queued = false;
+            let session = self.store.mutate_session(id, |s| {
+                // The turn may have ended meanwhile: then send it below.
+                if s.is_running() {
+                    s.queue(turn)?;
+                    queued = true;
+                }
+                Ok(())
+            })?;
+            if queued {
+                self.unstage(id, &staged)?;
+                self.emit_session(session);
+                transcript(
+                    &self.store,
+                    &self.evt_tx,
+                    id,
+                    "⏸ message queued for when this turn ends".into(),
+                );
+                return Ok(());
+            }
+        }
+
+        let mut check = self.store.get_session(id)?;
+        check.apply(SessionTransition::StartTurn)?;
+        if blank && attachments.is_empty() && check.queued.is_empty() {
             return Err(CoreError::other("write a message or attach a file"));
         }
-        let attachments = existing(&staged);
+        let mut batch = Vec::new();
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::StartTurn)?;
-            s.push_turn(
-                SessionTurn::new(SessionTurnKind::User, text.trim())
-                    .with_attachments(attachments.clone()),
-            );
+            batch = s.take_queued();
+            if !blank || !attachments.is_empty() {
+                batch.push(
+                    SessionTurn::new(SessionTurnKind::User, text.trim())
+                        .with_attachments(attachments.clone()),
+                );
+            }
+            for t in &batch {
+                s.push_turn(t.clone());
+            }
             Ok(())
         })?;
         self.unstage(id, &staged)?;
         self.emit_session(session.clone());
-        let input = TurnInput {
-            prompt: message_prompt(&text, &attachments),
-            attachments,
-        };
         let resume = session.last_session.clone();
-        self.launch_session_turn(&session, input, resume).await
+        self.launch_session_turn(&session, queued_input(&batch), resume)
+            .await
+    }
+
+    /// Hand `text` to the running turn's agent. Whether it took it — it then
+    /// joins the conversation at once.
+    async fn steer_session(&self, id: Uuid, text: &str) -> bool {
+        let Some(control) = lock(&self.session_runs).get(&id).map(|(_, c)| c.clone()) else {
+            return false;
+        };
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let sent = control.unbounded_send(RunControl::Message {
+            text: text.to_string(),
+            accepted: tx,
+        });
+        if sent.is_err() {
+            return false;
+        }
+        // A dropped sender (a placeholder slot, a run that just ended) is a no.
+        let accepted = matches!(
+            tokio::time::timeout(LIVE_ACCEPT_TIMEOUT, rx).await,
+            Ok(Ok(true))
+        );
+        if !accepted {
+            return false;
+        }
+        // The agent has it whatever happens next, so record it even if the
+        // turn ended meanwhile.
+        if let Ok(session) = self.store.mutate_session(id, |s| {
+            s.push_turn(SessionTurn::new(SessionTurnKind::User, text));
+            Ok(())
+        }) {
+            self.emit_session(session);
+        }
+        transcript(
+            &self.store,
+            &self.evt_tx,
+            id,
+            "↪ sent to the running agent".into(),
+        );
+        true
+    }
+
+    pub(super) fn unqueue_session_message(&self, id: Uuid, ts: i64) -> Result<()> {
+        let session = self.store.mutate_session(id, |s| {
+            s.unqueue(ts);
+            Ok(())
+        })?;
+        self.emit_session(session);
+        Ok(())
     }
 
     pub(super) async fn answer_session(&self, id: Uuid, text: String) -> Result<()> {
@@ -220,46 +318,35 @@ impl Executor {
         if !matches!(session.status, SessionStatus::Failed { .. }) {
             return Err(CoreError::other("only a failed session can be retried"));
         }
-        let idx = session
-            .turns
-            .iter()
-            .rposition(|t| matches!(t.kind, SessionTurnKind::User | SessionTurnKind::Answer))
-            .ok_or_else(|| CoreError::other("there is no message to re-send"))?;
-        let turn = session.turns[idx].clone();
-        let attachments: Vec<PathBuf> = turn
-            .attachments
-            .iter()
-            .filter(|p| p.exists())
-            .cloned()
-            .collect();
-        let prompt = match turn.kind {
-            SessionTurnKind::Answer => {
-                let question = session.turns[..idx]
-                    .iter()
-                    .rev()
-                    .find(|t| t.kind == SessionTurnKind::Question)
-                    .map(|t| t.text.clone())
-                    .unwrap_or_default();
-                answer_prompt(&question, &turn.text, &attachments)
-            }
-            _ => message_prompt(&turn.text, &attachments),
-        };
+        // The failed turn may have carried several messages (a queued batch,
+        // or a task plus a live-steered message): re-send them all.
+        let batch = last_batch(&session.turns);
+        if batch.is_empty() {
+            return Err(CoreError::other("there is no message to re-send"));
+        }
+        let mut input = batch_input(&session.turns, batch);
+        let mut queued = Vec::new();
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::StartTurn)?;
             s.last_activity_at = now_millis();
+            queued = s.take_queued();
+            for t in &queued {
+                s.push_turn(t.clone());
+            }
             Ok(())
         })?;
         self.emit_session(session.clone());
         let resume = session.last_session.clone();
-        self.launch_session_turn(
-            &session,
-            TurnInput {
-                prompt,
-                attachments,
-            },
-            resume,
-        )
-        .await
+        if !queued.is_empty() {
+            // The messages queued behind the failed turn follow it.
+            let more = queued_input(&queued);
+            input.prompt = format!(
+                "{}\n\nThen, sent while you were working:\n\n{}",
+                input.prompt, more.prompt
+            );
+            input.attachments.extend(more.attachments);
+        }
+        self.launch_session_turn(&session, input, resume).await
     }
 
     pub(super) fn rename_session(&self, id: Uuid, title: String) -> Result<()> {
@@ -348,7 +435,9 @@ impl Executor {
             mode,
             session_id: id,
             prompt: input.prompt.clone(),
-            extra_prompt: None,
+            // Claude gets it as a system prompt (see `claude::build_args`).
+            extra_prompt: (session.provider == Provider::Codex)
+                .then(|| SESSION_STATUS_PROMPT.to_string()),
             resume_session: resume.clone(),
             attachments: input.attachments.clone(),
         };
@@ -417,6 +506,22 @@ impl Executor {
         Box::pin(async move { self.relaunch_session_fresh_inner(id, input).await })
     }
 
+    /// A turn ended with messages queued (already moved into the conversation,
+    /// the session still `Running`): resume the conversation with them.
+    /// Boxed for the same reason as [`Self::relaunch_session_fresh`].
+    fn continue_session_queue(&self, id: Uuid, input: TurnInput) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let session = match self.store.get_session(id) {
+                Ok(s) if s.is_running() => s,
+                _ => return,
+            };
+            let resume = session.last_session.clone();
+            if let Err(e) = self.launch_session_turn(&session, input, resume).await {
+                tracing::warn!("session {id}: queued turn failed to start: {e}");
+            }
+        })
+    }
+
     async fn relaunch_session_fresh_inner(&self, id: Uuid, input: TurnInput) {
         let session = match self.store.get_session(id) {
             Ok(s) if s.is_running() => s,
@@ -459,6 +564,82 @@ fn message_prompt(text: &str, attachments: &[PathBuf]) -> String {
     }
 }
 
+/// What a turn carrying `turns` (user messages, oldest first) sends: a single
+/// message as is, several numbered under [`QUEUED_HEADER`], with every file
+/// still on disk listed once at the end.
+fn queued_input(turns: &[SessionTurn]) -> TurnInput {
+    let attachments: Vec<PathBuf> = turns
+        .iter()
+        .flat_map(|t| t.attachments.iter())
+        .filter(|p| p.exists())
+        .cloned()
+        .collect();
+    let prompt = match turns {
+        [one] => message_prompt(&one.text, &attachments),
+        many => {
+            let mut out = QUEUED_HEADER.to_string();
+            for (i, t) in many.iter().enumerate() {
+                let text = match t.text.trim() {
+                    "" => ATTACHMENTS_ONLY_PROMPT,
+                    text => text,
+                };
+                out.push_str(&format!("\n\n{}. {text}", i + 1));
+            }
+            if attachments.is_empty() {
+                out
+            } else {
+                append_attachments(out, &attachments)
+            }
+        }
+    };
+    TurnInput {
+        prompt,
+        attachments,
+    }
+}
+
+fn is_message(t: &SessionTurn) -> bool {
+    matches!(t.kind, SessionTurnKind::User | SessionTurnKind::Answer)
+}
+
+/// The turns the latest turn sent: the run of User/Answer turns ending at the
+/// last one — several when queued messages went out together or a message was
+/// steered in mid-turn. Trailing turns after it (a failed turn's error) are not
+/// part of it. Empty when no message was ever sent.
+fn last_batch(turns: &[SessionTurn]) -> std::ops::Range<usize> {
+    let Some(last) = turns.iter().rposition(is_message) else {
+        return turns.len()..turns.len();
+    };
+    let start = turns[..last]
+        .iter()
+        .rposition(|t| !is_message(t))
+        .map_or(0, |i| i + 1);
+    start..last + 1
+}
+
+/// What re-sending `turns[batch]` takes: a lone answer quotes its question,
+/// anything else goes as [`queued_input`] does.
+fn batch_input(turns: &[SessionTurn], batch: std::ops::Range<usize>) -> TurnInput {
+    let start = batch.start;
+    let sent = &turns[batch];
+    match sent {
+        [one] if one.kind == SessionTurnKind::Answer => {
+            let attachments = existing(&one.attachments);
+            let question = turns[..start]
+                .iter()
+                .rev()
+                .find(|t| t.kind == SessionTurnKind::Question)
+                .map(|t| t.text.clone())
+                .unwrap_or_default();
+            TurnInput {
+                prompt: answer_prompt(&question, &one.text, &attachments),
+                attachments,
+            }
+        }
+        _ => queued_input(sent),
+    }
+}
+
 fn answer_prompt(question: &str, text: &str, attachments: &[PathBuf]) -> String {
     let base = format!("Answer to your question \"{question}\": {}", text.trim());
     if attachments.is_empty() {
@@ -472,14 +653,8 @@ fn answer_prompt(question: &str, text: &str, attachments: &[PathBuf]) -> String 
 /// turns before the current message (each truncated), the earlier files that
 /// still exist, then the message itself.
 fn fresh_prompt(session: &Session, input: &TurnInput) -> String {
-    // The current message is the last User/Answer turn; history is what came
-    // before it.
-    let cut = session
-        .turns
-        .iter()
-        .rposition(|t| matches!(t.kind, SessionTurnKind::User | SessionTurnKind::Answer))
-        .unwrap_or(session.turns.len());
-    let earlier = &session.turns[..cut];
+    // The current message is the last batch; history is what came before.
+    let earlier = &session.turns[..last_batch(&session.turns).start];
     if earlier.is_empty() {
         return input.prompt.clone();
     }
@@ -529,7 +704,7 @@ struct SessionRun {
     input: TurnInput,
     resumed: bool,
     interactive: bool,
-    // A `Weak` upgrade for the fresh-relaunch continuation, never a command
+    // A `Weak` upgrade for the fresh-relaunch and queued-turn continuations, never a command
     // through `cmd_tx`: the dispatcher's per-id exclusive claim may still be
     // held by the command that started this run, so a queued command could be
     // dropped (see `finalize_run`).
@@ -567,6 +742,9 @@ async fn run_session_actor(run: SessionRun) {
     // plan; keep it in case the final result comes back empty.
     let mut plan: Option<String> = None;
     let mut settled = false;
+    // Whether the agent reported a `usine-status:` line this turn; until it
+    // does, its todo list's current item stands in.
+    let mut reported = false;
     loop {
         let evt = if interactive {
             match events.next().await {
@@ -607,6 +785,30 @@ async fn run_session_actor(run: SessionRun) {
             }
             AgentEvent::Progress { text } => {
                 saw_output = true;
+                let note = match last_status_line(&text) {
+                    Some(note) => {
+                        reported = true;
+                        Some(note)
+                    }
+                    None if !reported => text
+                        .strip_prefix(TODO_PROGRESS_PREFIX)
+                        .map(|item| truncate_chars(item.trim(), STATUS_MAX)),
+                    None => None,
+                };
+                if let Some(note) = note {
+                    let updated = store.mutate_session(id, |s| {
+                        if s.is_running() {
+                            s.status_note = Some(StatusNote {
+                                text: note,
+                                ts: now_millis(),
+                            });
+                        }
+                        Ok(())
+                    });
+                    if let Ok(s) = updated {
+                        let _ = evt_tx.unbounded_send(ExecutorEvent::session_updated(s));
+                    }
+                }
                 transcript(&store, &evt_tx, id, text);
             }
             AgentEvent::PlanReady { plan: p } => plan = Some(p),
@@ -641,20 +843,52 @@ async fn run_session_actor(run: SessionRun) {
             AgentEvent::Done {
                 result, cost_usd, ..
             } => {
+                let result = strip_status_lines(&result);
                 let text = if result.trim().is_empty() {
                     plan.take().unwrap_or_default()
                 } else {
                     result
                 };
+                // Messages queued during the turn go out at once as the next
+                // turn, in the same write: the session never leaves Running,
+                // so nothing pings in between.
+                let mut next: Option<Vec<SessionTurn>> = None;
                 let updated = store.mutate_session(id, |s| {
                     s.apply(SessionTransition::TurnDone)?;
                     s.push_turn(SessionTurn::new(SessionTurnKind::Agent, text.trim()));
                     s.cost += Cost::from_usd(cost_usd);
-                    s.unread = true;
+                    let queued = s.take_queued();
+                    if queued.is_empty() {
+                        s.unread = true;
+                    } else {
+                        s.apply(SessionTransition::StartTurn)?;
+                        for t in &queued {
+                            s.push_turn(t.clone());
+                        }
+                        next = Some(queued);
+                    }
                     Ok(())
                 });
                 if let Ok(s) = updated {
                     let _ = evt_tx.unbounded_send(ExecutorEvent::session_updated(s));
+                }
+                if let Some(queued) = next {
+                    transcript(
+                        &store,
+                        &evt_tx,
+                        id,
+                        format!(
+                            "✔ turn finished — sending {} queued message(s)",
+                            queued.len()
+                        ),
+                    );
+                    // Free the slot for the next run's launch; a direct call,
+                    // never `cmd_tx` (see `SessionRun::executor`).
+                    release_run(&session_runs, id, run_id);
+                    if let Some(exec) = executor.upgrade() {
+                        exec.continue_session_queue(id, queued_input(&queued)).await;
+                    }
+                    return;
                 }
                 transcript(&store, &evt_tx, id, "✔ finished".into());
                 settled = true;
@@ -747,5 +981,31 @@ mod tests {
         assert!(p.contains("Assistant: xxx"));
         assert!(p.len() < 1500, "agent turn is truncated");
         assert!(p.ends_with("New message:\n\nfollow up"));
+    }
+
+    #[test]
+    fn retry_batch_is_every_message_of_the_failed_turn() {
+        let turns = vec![
+            SessionTurn::new(SessionTurnKind::User, "old"),
+            SessionTurn::new(SessionTurnKind::Agent, "done"),
+            SessionTurn::new(SessionTurnKind::User, "the task"),
+            SessionTurn::new(SessionTurnKind::User, "steer: use tabs"),
+            SessionTurn::new(SessionTurnKind::Error, "boom"),
+        ];
+        assert_eq!(last_batch(&turns), 2..4);
+        let input = batch_input(&turns, last_batch(&turns));
+        assert!(input.prompt.contains("1. the task"));
+        assert!(input.prompt.contains("2. steer: use tabs"));
+        assert!(!input.prompt.contains("old"));
+
+        let answered = vec![
+            SessionTurn::new(SessionTurnKind::User, "go"),
+            SessionTurn::new(SessionTurnKind::Question, "Which db?"),
+            SessionTurn::new(SessionTurnKind::Answer, "sqlite"),
+            SessionTurn::new(SessionTurnKind::Error, "boom"),
+        ];
+        let input = batch_input(&answered, last_batch(&answered));
+        assert!(input.prompt.contains("\"Which db?\": sqlite"));
+        assert!(last_batch(&[]).is_empty());
     }
 }
