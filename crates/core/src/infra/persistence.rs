@@ -26,6 +26,7 @@ use crate::domain::config::AppSettings;
 use crate::domain::model::{
     Card, CardAnswers, ExchangeKind, Project, QaExchange, ReviewComment, ReviewTask,
 };
+use crate::domain::session::Session;
 use crate::error::{CoreError, Result};
 
 // ---------------------------------------------------------------------------
@@ -258,6 +259,17 @@ struct ReviewTaskRecord {
     task: ReviewTask,
 }
 
+/// A one-off session (an ad-hoc agent chat in any folder). Its own top-level
+/// record: a session has no project, card, branch or worktree.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 15, version = 1, with = Json)]
+#[native_db]
+struct SessionRecord {
+    #[primary_key]
+    id: String,
+    session: Session,
+}
+
 /// PR numbers the user has dismissed from a project's review board, kept so the
 /// poll never re-adds them (dismissals are permanent). Keyed by project.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -365,6 +377,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
         .define::<ReviewTaskRecord>()
         .expect("define ReviewTaskRecord");
     models
+        .define::<SessionRecord>()
+        .expect("define SessionRecord");
+    models
         .define::<DismissedReviewsRecord>()
         .expect("define DismissedReviewsRecord");
     models
@@ -426,6 +441,7 @@ impl Store {
         self.refresh_type::<ProjectRecord>();
         self.refresh_type::<CardRecord>();
         self.refresh_type::<ReviewTaskRecord>();
+        self.refresh_type::<SessionRecord>();
         self.refresh_type::<CardPlanRecord>();
         self.refresh_type::<CardOptionsRecord>();
         self.refresh_type::<CardAttachmentsRecord>();
@@ -1211,6 +1227,37 @@ impl Store {
         Ok(())
     }
 
+    /// Drop `paths` from an id's attachment list in one transaction and return
+    /// what remains — how a session message consumes the files it was sent
+    /// with, so a file attached while the send was in flight stays staged.
+    pub fn unstage_attachments(&self, card_id: Uuid, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CardAttachmentsRecord> = rw.get().primary(card_id.to_string())?;
+        let Some(old) = old else {
+            return Ok(Vec::new());
+        };
+        let remaining: Vec<PathBuf> = old
+            .paths
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| !paths.contains(p))
+            .collect();
+        if remaining.is_empty() {
+            rw.remove(old)?;
+        } else {
+            let new = CardAttachmentsRecord {
+                card_id: old.card_id.clone(),
+                paths: remaining
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            };
+            rw.update(old, new)?;
+        }
+        rw.commit()?;
+        Ok(remaining)
+    }
+
     /// All cards' attachments, keyed by card id. Loaded once into a signal at
     /// startup so the UI never reads the store on its own thread.
     pub fn all_attachments(&self) -> Result<HashMap<Uuid, Vec<PathBuf>>> {
@@ -1223,6 +1270,31 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Ids of every card, session and review task — the owners an attachment
+    /// record can belong to. `None` when any of those records fails to decode:
+    /// its id is then unknowable, so a caller deleting "orphans" must not run.
+    pub fn attachment_owner_ids(&self) -> Result<Option<std::collections::HashSet<Uuid>>> {
+        fn collect<T: ToInput>(
+            r: &transaction::RTransaction,
+            id_of: impl Fn(&T) -> Option<Uuid>,
+            out: &mut std::collections::HashSet<Uuid>,
+        ) -> Result<bool> {
+            for rec in r.scan().primary::<T>()?.all()? {
+                match rec {
+                    Ok(rec) => out.extend(id_of(&rec)),
+                    Err(_) => return Ok(false),
+                }
+            }
+            Ok(true)
+        }
+        let r = self.db.r_transaction()?;
+        let mut out = std::collections::HashSet::new();
+        let complete = collect::<CardRecord>(&r, |c| Some(c.card.id), &mut out)?
+            && collect::<SessionRecord>(&r, |s| Some(s.session.id), &mut out)?
+            && collect::<ReviewTaskRecord>(&r, |t| Some(t.task.id), &mut out)?;
+        Ok(complete.then_some(out))
     }
 
     // --- PR review (recap + pending triage comments) --------------------
@@ -1531,6 +1603,87 @@ impl Store {
         Ok(())
     }
 
+    // --- sessions (one-off agent chats) -----------------------------------
+
+    /// All sessions (loaded once at startup).
+    pub fn list_sessions(&self) -> Result<Vec<Session>> {
+        let r = self.db.r_transaction()?;
+        let mut out = Vec::new();
+        for rec in r.scan().primary::<SessionRecord>()?.all()? {
+            match rec {
+                Ok(r) => out.push(r.session),
+                Err(e) => tracing::warn!("skipping undecodable session record: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_session(&self, id: Uuid) -> Result<Session> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<SessionRecord> = r.get().primary(id.to_string())?;
+        rec.map(|r| r.session)
+            .ok_or_else(|| CoreError::NotFound(format!("session {id}")))
+    }
+
+    pub fn upsert_session(&self, session: &Session) -> Result<()> {
+        let rec = SessionRecord {
+            id: session.id.to_string(),
+            session: session.clone(),
+        };
+        let rw = self.db.rw_transaction()?;
+        let old: Option<SessionRecord> = rw.get().primary(rec.id.clone())?;
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// Atomically read-modify-write a session inside a single transaction
+    /// (mirrors [`Self::mutate_card`]). Returns the new session.
+    pub fn mutate_session<F>(&self, id: Uuid, f: F) -> Result<Session>
+    where
+        F: FnOnce(&mut Session) -> Result<()>,
+    {
+        let rw = self.db.rw_transaction()?;
+        let old: SessionRecord = rw
+            .get()
+            .primary(id.to_string())?
+            .ok_or_else(|| CoreError::NotFound(format!("session {id}")))?;
+        let mut session = old.session.clone();
+        f(&mut session)?;
+        let rec = SessionRecord {
+            id: session.id.to_string(),
+            session: session.clone(),
+        };
+        rw.update(old, rec)?;
+        rw.commit()?;
+        Ok(session)
+    }
+
+    /// Remove a session along with its transcript rows and its attachments
+    /// record (the files themselves are the caller's to delete).
+    pub fn delete_session(&self, id: Uuid) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        if let Some(rec) = rw.get().primary::<SessionRecord>(id.to_string())? {
+            rw.remove(rec)?;
+        }
+        let lines: Vec<TranscriptRecord> = rw
+            .scan()
+            .primary::<TranscriptRecord>()?
+            .all()?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for line in lines.into_iter().filter(|t| t.card_id == id.to_string()) {
+            rw.remove(line)?;
+        }
+        if let Some(rec) = rw.get().primary::<CardAttachmentsRecord>(id.to_string())? {
+            rw.remove(rec)?;
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
     // --- transcripts ----------------------------------------------------
 
     pub fn append_transcript(&self, card_id: Uuid, ts: i64, line: &str) -> Result<()> {
@@ -1626,6 +1779,7 @@ pub fn rebuild_database(old: &Path, new: &Path) -> Result<Vec<(&'static str, usi
     copy_table!(CardAttachmentsRecord, "attachments");
     copy_table!(CardReviewRecord, "reviews");
     copy_table!(ReviewTaskRecord, "review_tasks");
+    copy_table!(SessionRecord, "sessions");
     copy_table!(DismissedReviewsRecord, "dismissed_reviews");
     copy_table!(CardAnswerRecord, "answers");
 
@@ -1656,6 +1810,17 @@ mod tests {
             store.upsert_card(&card).unwrap();
             store.save_plan(card.id, "the plan").unwrap();
             store.append_transcript(card.id, 1, "hello").unwrap();
+            let mut session = crate::domain::session::Session::new(
+                Uuid::nil(),
+                PathBuf::from("/tmp"),
+                crate::domain::model::Provider::Claude,
+                crate::domain::model::ModelSpec::new("opus", crate::domain::model::Effort::High),
+                Default::default(),
+                "hi",
+                vec![PathBuf::from("/tmp/a.png")],
+            );
+            session.unread = true;
+            store.upsert_session(&session).unwrap();
         }
 
         let report = super::rebuild_database(&src_path, &out_path).unwrap();
@@ -1674,6 +1839,18 @@ mod tests {
         );
         assert_eq!(store.load_transcript(all[0].id).unwrap(), vec!["hello"]);
         store.upsert_card(&all[0]).unwrap();
+        let session = store.get_session(Uuid::nil()).unwrap();
+        assert!(session.unread);
+        assert_eq!(
+            session.turns[0].attachments,
+            vec![PathBuf::from("/tmp/a.png")]
+        );
+        store
+            .mutate_session(Uuid::nil(), |s| {
+                s.archived = true;
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

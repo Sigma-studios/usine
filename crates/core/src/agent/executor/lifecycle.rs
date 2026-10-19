@@ -237,6 +237,9 @@ impl Executor {
             // `implement` when the card has no override.
             RunMode::Review | RunMode::Triage | RunMode::Question => card.config.review_spec(),
             RunMode::Implement | RunMode::ApplyFixes => card.config.implement.clone(),
+            RunMode::SessionFull | RunMode::SessionReadOnly => {
+                return Err(card_cannot_run_session_mode())
+            }
         };
         let project_dir = match mode {
             // Read-only pre-work runs (plan, investigate) read a throwaway
@@ -294,6 +297,9 @@ impl Executor {
                     ));
                 }
                 dir
+            }
+            RunMode::SessionFull | RunMode::SessionReadOnly => {
+                return Err(card_cannot_run_session_mode())
             }
         };
         // Register the preview artifacts' exclude guard before the run starts:
@@ -1492,9 +1498,18 @@ impl Executor {
             // Unreachable: an interrupted question (`Answering`) is handled by
             // the early return above, which rebuilds its extra itself.
             RunMode::Question => None,
+            RunMode::SessionFull | RunMode::SessionReadOnly => {
+                return Err(card_cannot_run_session_mode())
+            }
         };
         self.launch(card, mode, extra, resume).await
     }
+}
+
+/// Session modes belong to one-off sessions (`executor/session.rs`), never to
+/// a card's launch path.
+fn card_cannot_run_session_mode() -> CoreError {
+    CoreError::other("a card can't run in a session mode")
 }
 
 /// Whether two (possibly abbreviated) shas name the same commit.

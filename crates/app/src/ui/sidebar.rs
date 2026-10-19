@@ -14,6 +14,17 @@ pub fn Sidebar() -> Element {
     } else {
         "nav-item home"
     };
+    let sessions_class = if matches!(view, SelectedView::Sessions) {
+        "nav-item sessions-nav active"
+    } else {
+        "nav-item sessions-nav"
+    };
+    let session_count = state.session_attention_count();
+    let session_dot = dot_class(
+        session_count,
+        state.sessions_urgent(),
+        state.sessions_working(),
+    );
 
     rsx! {
         div { class: "sidebar",
@@ -45,6 +56,34 @@ pub fn Sidebar() -> Element {
                         circle { cx: "12", cy: "12", r: "3" }
                         path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" }
                     }
+                }
+            }
+            div {
+                class: "{sessions_class}",
+                title: "One-off agent sessions in any folder",
+                onclick: move |_| state.show_sessions(None),
+                if session_dot == DOT_WORKING {
+                    span { class: "{session_dot}", title: "Sessions running" }
+                } else {
+                    span { class: "{session_dot}" }
+                }
+                span { class: "proj-name", "Sessions" }
+                if session_count > 0 {
+                    span {
+                        class: "proj-count",
+                        title: if session_count == 1 { "1 session waiting on you".to_string() } else { format!("{session_count} sessions waiting on you") },
+                        "{session_count}"
+                    }
+                }
+                button {
+                    class: "proj-action sessions-add",
+                    title: "New session (⌘⇧N)",
+                    "aria-label": "New session",
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        super::sessions::open_new_session();
+                    },
+                    "+"
                 }
             }
             div { class: "sidebar-projects",

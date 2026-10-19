@@ -67,6 +67,7 @@ pub fn SettingsModal() -> Element {
     let terminal_command = settings.terminal_command.clone().unwrap_or_default();
     let editor_command = settings.editor_command.clone().unwrap_or_default();
     let max_concurrent_runs = settings.max_concurrent_runs;
+    let session_notifications = settings.session_notifications;
     let terminal_example = terminal_command_example();
     let mut tab = use_signal(|| SettingsTab::Models);
 
@@ -242,7 +243,28 @@ pub fn SettingsModal() -> Element {
                             },
                         }
                     }
-                    div { class: "hint", "Caps concurrently running agent runs and validation checks across all projects (default 5); further runs queue and start automatically. 0 = unlimited. Agent Chat questions, PR-comment triage, and previews aren't counted." }
+                    div { class: "hint", "Caps concurrently running agent runs and validation checks across all projects (default 5); further runs queue and start automatically. 0 = unlimited. Agent Chat questions, PR-comment triage, sessions and previews aren't counted." }
+                }
+                div { class: "section",
+                    h3 { "Sessions" }
+                    div { class: "field",
+                        label { class: "adopt-choice",
+                            input {
+                                r#type: "checkbox",
+                                checked: session_notifications,
+                                onchange: {
+                                    let settings = settings.clone();
+                                    move |_| {
+                                        let mut s = settings.clone();
+                                        s.session_notifications = !session_notifications;
+                                        state.save_settings(s);
+                                    }
+                                },
+                            }
+                            "Notify me when a session finishes, fails or asks a question"
+                        }
+                    }
+                    div { class: "hint", "A macOS notification, skipped while you're looking at that session." }
                 }
                 }
                 div { class: "modal-actions",

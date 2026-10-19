@@ -13,6 +13,9 @@ use crate::state::{AppState, BoardMode, SelectedView};
 #[component]
 pub fn BoardArea() -> Element {
     let state = use_context::<AppState>();
+    if *state.selected_view.read() == SelectedView::Sessions {
+        return rsx! { super::sessions::SessionList {} };
+    }
     match state.board_mode() {
         BoardMode::Review => rsx! { ReviewBoard {} },
         BoardMode::Normal => rsx! { Board {} },
@@ -187,7 +190,7 @@ enum NewCardTarget {
 fn new_card_target(view: SelectedView, projects: &[Project]) -> Option<NewCardTarget> {
     match view {
         SelectedView::Project(id) => Some(NewCardTarget::Project(id)),
-        SelectedView::Global => match projects {
+        SelectedView::Global | SelectedView::Sessions => match projects {
             [] => None,
             [only] => Some(NewCardTarget::Project(only.id)),
             _ => Some(NewCardTarget::Ask),

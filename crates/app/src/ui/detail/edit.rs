@@ -82,7 +82,7 @@ pub(super) fn EditableTask(card: Card) -> Element {
 /// the clipboard holds an image, attach it to the card; a text paste is
 /// unaffected, since [`clipboard_image_png`] returns `None` then and the
 /// webview's own paste has already run.
-pub(super) fn attach_from_clipboard(state: AppState, card_id: Uuid) {
+pub(crate) fn attach_from_clipboard(state: AppState, card_id: Uuid) {
     if let Some(png) = clipboard_image_png() {
         state.attach_image_bytes(card_id, png, None);
     }
@@ -170,7 +170,7 @@ pub(super) fn Attachments(card_id: Uuid, #[props(default = true)] can_attach: bo
 /// The attached files, as removable chips (images also open a preview). Renders
 /// nothing when the list is empty, so it can sit above a chat box unconditionally.
 #[component]
-pub(super) fn AttachmentChips(card_id: Uuid) -> Element {
+pub(crate) fn AttachmentChips(card_id: Uuid) -> Element {
     let state = use_context::<AppState>();
     let atts = state.card_attachments(card_id);
     // Image chip clicked → preview it in a modal; None when the dialog is closed.
@@ -225,8 +225,14 @@ pub(super) fn AttachmentChips(card_id: Uuid) -> Element {
 /// The file picker itself. `icon` swaps the labelled panel button for a small
 /// paperclip, which is what sits in the corner of the chat box.
 #[component]
-pub(super) fn AttachButton(card_id: Uuid, #[props(default = false)] icon: bool) -> Element {
+pub(crate) fn AttachButton(
+    card_id: Uuid,
+    #[props(default = false)] icon: bool,
+    /// Tooltip; defaults to what a card attachment does.
+    title: Option<String>,
+) -> Element {
     let state = use_context::<AppState>();
+    let title = title.unwrap_or_else(|| ATTACH_TITLE.to_string());
     let pick = move |_| {
         spawn(async move {
             if let Some(handles) = rfd::AsyncFileDialog::new().pick_files().await {
@@ -241,12 +247,12 @@ pub(super) fn AttachButton(card_id: Uuid, #[props(default = false)] icon: bool) 
             button {
                 class: "attach-btn",
                 aria_label: "Attach file",
-                title: "{ATTACH_TITLE}",
+                title: "{title}",
                 onclick: pick,
                 IconPaperclip {}
             }
         } else {
-            button { class: "btn", title: "{ATTACH_TITLE}", onclick: pick, "Attach file" }
+            button { class: "btn", title: "{title}", onclick: pick, "Attach file" }
         }
     }
 }
@@ -257,7 +263,7 @@ const ATTACH_TITLE: &str = "Images go out with the next run — Claude reads the
 
 /// The mime type for an attachment path, if its extension is a web-renderable
 /// image — only those chips open the preview dialog.
-fn image_mime(path: &std::path::Path) -> Option<&'static str> {
+pub(crate) fn image_mime(path: &std::path::Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -271,7 +277,7 @@ fn image_mime(path: &std::path::Path) -> Option<&'static str> {
 /// Simple modal previewing an image attachment (named to avoid colliding with
 /// the card "preview" concept). Same dismiss/focus behaviour as `ConfirmHost`.
 #[component]
-fn AttachmentPreview(path: PathBuf, on_close: EventHandler<()>) -> Element {
+pub(crate) fn AttachmentPreview(path: PathBuf, on_close: EventHandler<()>) -> Element {
     let label = usine_core::infra::paths::attachment_label(&path);
     // Attachments live outside any served root, so inline the bytes as a data
     // URL (the same trick as `LOGO_URI`). None = the file could not be read.

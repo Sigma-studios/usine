@@ -14,9 +14,10 @@ use crate::agent::handoff::Handoff;
 use crate::agent::usage::UsageSnapshot;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
-    Card, CardAnswers, DraftComment, FixVerdict, PrInfo, PreviewStatus, PreviewUrl, Project,
-    ReviewEvent, ReviewTask, Usage,
+    Card, CardAnswers, DraftComment, FixVerdict, ModelSpec, PrInfo, PreviewStatus, PreviewUrl,
+    Project, Provider, ReviewEvent, ReviewTask, Usage,
 };
+use crate::domain::session::{Session, SessionAccess};
 use crate::infra::forge::OpenPr;
 
 /// Severity for a user-facing toast.
@@ -121,19 +122,33 @@ pub enum OpenTarget {
 pub enum ExecutorCommand {
     /// Start the card: the design/plan phase, or straight to implementing if the
     /// card is marked "skip plan".
-    Start { card_id: Uuid },
+    Start {
+        card_id: Uuid,
+    },
     /// Answer the active intervention.
-    Answer { card_id: Uuid, text: String },
+    Answer {
+        card_id: Uuid,
+        text: String,
+    },
     /// Approve the proposed plan and begin implementing.
-    ApprovePlan { card_id: Uuid },
+    ApprovePlan {
+        card_id: Uuid,
+    },
     /// Reject the plan and send the agent back to designing with feedback.
-    RejectPlan { card_id: Uuid, feedback: String },
+    RejectPlan {
+        card_id: Uuid,
+        feedback: String,
+    },
     /// Fetch and triage PR review comments.
-    FetchComments { card_id: Uuid },
+    FetchComments {
+        card_id: Uuid,
+    },
     /// Mark every pending review *body* on the card's PR as read — the
     /// one-click dismissal for a body-only review (e.g. a bot's pass report)
     /// the user has read on GitHub and doesn't need an agent to triage.
-    MarkReviewBodiesRead { card_id: Uuid },
+    MarkReviewBodiesRead {
+        card_id: Uuid,
+    },
     /// Apply the (edited, checked) review-comment fixes — the verdicts as the
     /// user left them, edits included: checked bodies go to the fix run,
     /// unchecked replies get posted on GitHub. `note` is the user's own
@@ -163,17 +178,26 @@ pub enum ExecutorCommand {
     },
     /// From "awaiting review", send the implementation back to the agent with
     /// requested changes; the card returns to Implementing in its worktree.
-    ReviseImplementation { card_id: Uuid, feedback: String },
+    ReviseImplementation {
+        card_id: Uuid,
+        feedback: String,
+    },
     /// Ask the agent a question about its work without sending it back for
     /// changes: a strictly read-only turn from any Agent Chat panel (plan
     /// approval, awaiting review, PR idle, ready-to-merge). The card wraps
     /// into `CardState::Answering` while answering and returns to the exact
     /// state it was asked from; the answer arrives via `AnswersUpdated`.
-    AskQuestion { card_id: Uuid, question: String },
+    AskQuestion {
+        card_id: Uuid,
+        question: String,
+    },
     /// From `Concluded`: dig deeper — re-run the investigation with the prior
     /// conclusion, the earlier rounds, and this follow-up as context (the
     /// investigation twin of `RejectPlan`'s re-plan loop).
-    FollowUpInvestigation { card_id: Uuid, feedback: String },
+    FollowUpInvestigation {
+        card_id: Uuid,
+        feedback: String,
+    },
     /// From `Concluded`: convert the card, in place, into an implementation —
     /// fold the conclusion into the description under a findings section, flip
     /// the kind to Task, and reset to the starting block so the user shapes the
@@ -189,16 +213,22 @@ pub enum ExecutorCommand {
     },
     /// List the GitHub users who can review a project's PRs. Project-scoped
     /// (not tied to a card); the result comes back as a `Reviewers` event.
-    ListReviewers { project_id: Uuid },
+    ListReviewers {
+        project_id: Uuid,
+    },
     /// List the GitHub logins with an open PR on a project's repo — the
     /// contributor picker's suggestions. Result: a `PrAuthors` event.
-    ListPrAuthors { project_id: Uuid },
+    ListPrAuthors {
+        project_id: Uuid,
+    },
 
     // --- branch adoption (turning an existing branch into a card) ---------
     /// List a project's branches that could be adopted into a card (local +
     /// `origin/*`, minus the base, usine-owned refs, and branches already
     /// belonging to cards). Result: an `AdoptSources` event.
-    ListAdoptSources { project_id: Uuid },
+    ListAdoptSources {
+        project_id: Uuid,
+    },
     /// Inspect one candidate branch for the adopt dialog: commits ahead of the
     /// base (with subjects, for the description prefill), a dirty checkout, an
     /// open PR. Result: an `AdoptProbe` event.
@@ -234,12 +264,17 @@ pub enum ExecutorCommand {
     // --- PR review workflow (reviewing other contributors' PRs) ----------
     /// Poll a project for open PRs (by its configured contributors) that the user
     /// hasn't reviewed, creating `ToReview` tasks. Result: `ReviewTasksUpdated`.
-    ScanReviews { project_id: Uuid },
+    ScanReviews {
+        project_id: Uuid,
+    },
     /// Start reviewing a PR: fetch its branch into a worktree and run the review
     /// agent. Moves the task To Review → Reviewing. `guidance` is the user's
     /// free-form steering for this pass ("focus on the migration"), empty for an
     /// unsteered review; it is stored on the task so a retry keeps it.
-    StartReview { review_id: Uuid, guidance: String },
+    StartReview {
+        review_id: Uuid,
+        guidance: String,
+    },
     /// Publish the (edited, checked) drafted comments as a GitHub review, then move
     /// the task to Reviewed.
     PublishReview {
@@ -261,29 +296,47 @@ pub enum ExecutorCommand {
     },
     /// From the fix gate: push the committed fix onto the PR's own head branch
     /// and comment on the PR saying so. The task settles at Reviewed.
-    PushReviewFix { review_id: Uuid },
+    PushReviewFix {
+        review_id: Uuid,
+    },
     /// From the fix gate: send the fix back to the agent with feedback, keeping
     /// the commits it already made.
-    ReviseReviewFix { review_id: Uuid, note: String },
+    ReviseReviewFix {
+        review_id: Uuid,
+        note: String,
+    },
     /// From the fix gate: abandon the fix, retract the pledge on the PR, and
     /// tear the checkout down. The task settles at Reviewed.
-    DiscardReviewFix { review_id: Uuid },
+    DiscardReviewFix {
+        review_id: Uuid,
+    },
     /// Drop a review task (e.g. a stale one, or one reviewed elsewhere), cancelling
     /// any run and tearing down its worktree.
-    DismissReview { review_id: Uuid },
+    DismissReview {
+        review_id: Uuid,
+    },
     /// Compute the diff of a PR under review, against the branch it targets. The
     /// PR head is fetched first if it isn't local yet, so the diff is readable
     /// before committing to a review pass. Result: a `DiffUpdated` event keyed by
     /// the *review* id.
-    ComputeReviewDiff { review_id: Uuid },
+    ComputeReviewDiff {
+        review_id: Uuid,
+    },
     /// Open a PR-under-review's checkout in a terminal or editor, materializing
     /// the checkout first if it doesn't exist.
-    OpenReviewWorktree { review_id: Uuid, target: OpenTarget },
+    OpenReviewWorktree {
+        review_id: Uuid,
+        target: OpenTarget,
+    },
     /// Run the project's app from a PR-under-review's checkout, so a UI change can
     /// be reviewed by using it. Checks out the PR on demand.
-    StartReviewPreview { review_id: Uuid },
+    StartReviewPreview {
+        review_id: Uuid,
+    },
     /// Stop a PR-under-review's preview (kill the process tree, run teardown).
-    StopReviewPreview { review_id: Uuid },
+    StopReviewPreview {
+        review_id: Uuid,
+    },
     /// Merge the pull request. `delete_branch` also deletes the head branch on the
     /// forge after a successful merge. `force` skips the CI-checks pre-check (the
     /// user's explicit "merge anyway" for flaky or still-running checks); the
@@ -307,23 +360,34 @@ pub enum ExecutorCommand {
     /// conflicts: merge the base branch into the card's branch inside its
     /// worktree and hand the conflicts to an agent. Loops back through
     /// `Updating` to the gate it was started from.
-    ResolveConflicts { card_id: Uuid },
+    ResolveConflicts {
+        card_id: Uuid,
+    },
     /// From a parked gate around the PR (`ReadyForPr`, `ValidationFailed`,
     /// `PrReview(Idle)`, `ReadyToMerge`): merge `origin/<base>` into the card's
     /// branch and run an agent that adapts the card's work to what landed,
     /// guided by the user's optional `note`. Loops back through `Updating` to
     /// the gate it was started from.
-    UpdateFromBase { card_id: Uuid, note: Option<String> },
+    UpdateFromBase {
+        card_id: Uuid,
+        note: Option<String>,
+    },
     /// From `ReadyToMerge`, after the merge gate found the PR's CI checks red:
     /// hand the failing checks (with their run logs) to an agent in the card's
     /// worktree. Loops back through applying fixes to `ReadyToMerge`; the push
     /// re-triggers CI.
-    FixChecks { card_id: Uuid },
+    FixChecks {
+        card_id: Uuid,
+    },
     /// From `AwaitingReview(ReadyForReview)`: skip the self-review pass entirely.
-    SkipReview { card_id: Uuid },
+    SkipReview {
+        card_id: Uuid,
+    },
     /// From `AwaitingReview(ReadyForReview)`: run the self-review agent over the
     /// committed diff (using the project's `review.md` or a default prompt).
-    SelfReview { card_id: Uuid },
+    SelfReview {
+        card_id: Uuid,
+    },
     /// Apply the (edited, checked) self-review fixes — the verdicts as the user
     /// left them, edits included; the checked bodies are what the fix run
     /// receives. `note` is the user's own free-form instruction, applied
@@ -340,104 +404,171 @@ pub enum ExecutorCommand {
         prompt: Option<String>,
     },
     /// From the self-review fix picker: skip applying fixes and open the PR.
-    SkipToPr { card_id: Uuid },
+    SkipToPr {
+        card_id: Uuid,
+    },
     /// Run the project's validate command in the card's worktree (the pre-PR
     /// validation gate). Dual-use: sent internally whenever a card reaches
     /// "ready for PR" with a validate command configured (and to continue the
     /// fix loop), and by the user's "Run validation again" from the parked
     /// failure. A no-op when the card isn't at the gate.
-    RunValidation { card_id: Uuid },
+    RunValidation {
+        card_id: Uuid,
+    },
     /// Launch the agent run that fixes a validation failure. Dual-use: sent
     /// internally when a check fails inside the attempt budget, and by the
     /// user's "Send to agent again" from the parked failure.
-    FixValidation { card_id: Uuid },
+    FixValidation {
+        card_id: Uuid,
+    },
     /// From the parked validation failure: give up on the gate and open the PR
     /// form anyway.
-    SkipValidation { card_id: Uuid },
+    SkipValidation {
+        card_id: Uuid,
+    },
     /// Fetch the submitted reviews on the card's PR (who reviewed + verdict).
-    RefreshReviews { card_id: Uuid },
+    RefreshReviews {
+        card_id: Uuid,
+    },
     /// Flip the card's draft PR to ready-for-review.
-    MarkPrReady { card_id: Uuid },
+    MarkPrReady {
+        card_id: Uuid,
+    },
     /// Run the project's app straight from the card's worktree for testing: run
     /// the setup script (deps, isolated DB, per-worktree ports), then launch the
     /// project's `run_script` as a persistent process, surfacing
     /// the clickable preview URLs. No effect on the card's lifecycle state.
-    StartPreview { card_id: Uuid },
+    StartPreview {
+        card_id: Uuid,
+    },
     /// Stop the card's running preview: kill the process tree, then run the
     /// project's teardown script (e.g. `docker compose down -v`).
-    StopPreview { card_id: Uuid },
+    StopPreview {
+        card_id: Uuid,
+    },
     /// Restart the running preview in place (pick up code changes): kill the app
     /// process and relaunch `run_script`, keeping the worktree's DB/infra up.
-    RelaunchPreview { card_id: Uuid },
+    RelaunchPreview {
+        card_id: Uuid,
+    },
     /// Internal: sent by `launch` alongside every write run so the card's preview
     /// comes up with the agent (setup can take minutes, so it must not block the
     /// launching command). Unlike `StartPreview` it tolerates every "nothing to
     /// do" case — preview already up, no run script, no worktree — silently.
-    EnsurePreview { card_id: Uuid },
+    EnsurePreview {
+        card_id: Uuid,
+    },
     /// Open the card's working directory in a terminal or editor. Opens the
     /// card's isolated worktree when it has one, else the project's main
     /// checkout. Purely a convenience — no effect on the card's lifecycle state.
-    OpenWorktree { card_id: Uuid, target: OpenTarget },
+    OpenWorktree {
+        card_id: Uuid,
+        target: OpenTarget,
+    },
     /// Open one file of a card's working copy in the configured editor — the
     /// `file:line` chips in agent prose and in an investigation's findings.
     /// `path` is repo-relative and comes from the agent, so it is resolved
     /// against the working copy and refused if it escapes it.
-    OpenPath { card_id: Uuid, path: String },
+    OpenPath {
+        card_id: Uuid,
+        path: String,
+    },
     /// Compute the card's committed diff over its fork point (for the in-app diff
     /// viewer). Read-only; no effect on the card's lifecycle state. The result
     /// comes back as a `DiffUpdated` event.
-    ComputeDiff { card_id: Uuid },
+    ComputeDiff {
+        card_id: Uuid,
+    },
     /// Read the card's (or review task's) persisted transcript back from the
     /// store, for the activity feed of an entity whose run happened in an
     /// earlier session. Read-only; no effect on the lifecycle state. The result
     /// comes back as a `TranscriptLoaded` event.
-    LoadTranscript { card_id: Uuid },
+    LoadTranscript {
+        card_id: Uuid,
+    },
     /// From `ReadyToMerge`: send another change to the agent (a reviewer follow-up
     /// or an unsatisfying fix) and loop back through applying fixes.
-    RequestPostPrChange { card_id: Uuid, feedback: String },
+    RequestPostPrChange {
+        card_id: Uuid,
+        feedback: String,
+    },
     /// Internal: emitted when a PR-comment fix run finishes so the executor can
     /// mark the fixed comments' review threads resolved on GitHub (best-effort).
     /// The fixed comment ids are stashed on the card's review record.
-    ResolveFixedComments { card_id: Uuid },
+    ResolveFixedComments {
+        card_id: Uuid,
+    },
     /// Cancel the active run.
-    Cancel { card_id: Uuid },
+    Cancel {
+        card_id: Uuid,
+    },
     /// Move a waiting launch to the front of the run queue, so the next freed
     /// slot goes to it. `id` is the slot-holder id — a card id or a review-task
     /// id, like `QueuedTarget::id` — since both kinds share the one queue. A
     /// no-op when the target isn't queued (it already launched, or was
     /// cancelled).
-    BumpQueued { id: Uuid },
+    BumpQueued {
+        id: Uuid,
+    },
     /// Send the card back to the starting block (a "do-over"): cancel any run,
     /// clear its execution artifacts, and fold any clarifying Q&A / change
     /// requests into the prompt so the re-run keeps that context.
-    BackToStart { card_id: Uuid },
+    BackToStart {
+        card_id: Uuid,
+    },
     /// Mark the card done (terminal) from wherever it is, cancelling any run.
-    MarkDone { card_id: Uuid },
+    MarkDone {
+        card_id: Uuid,
+    },
     /// Retry after a failure.
-    Retry { card_id: Uuid },
+    Retry {
+        card_id: Uuid,
+    },
     /// Internal: a `--resume` run failed; relaunch the phase fresh (no resume).
-    RetryFresh { card_id: Uuid },
+    RetryFresh {
+        card_id: Uuid,
+    },
 
     // --- direct CRUD (persisted off the UI thread) -----------------------
     /// Persist a newly created card.
-    CreateCard { card: Box<Card> },
+    CreateCard {
+        card: Box<Card>,
+    },
     /// Persist edits to an existing card (title / description / config).
-    SaveCard { card: Box<Card> },
+    SaveCard {
+        card: Box<Card>,
+    },
     /// Delete a card and its associated transcript/plan/options.
-    DeleteCard { card_id: Uuid },
+    DeleteCard {
+        card_id: Uuid,
+    },
     /// Persist a newly added project.
-    AddProject { project: Box<Project> },
+    AddProject {
+        project: Box<Project>,
+    },
     /// Persist edits to an existing project's config (e.g. review contributors).
-    SaveProject { project: Box<Project> },
+    SaveProject {
+        project: Box<Project>,
+    },
     /// Delete a project and (cascading) its cards.
-    DeleteProject { project_id: Uuid },
+    DeleteProject {
+        project_id: Uuid,
+    },
     /// Persist global settings.
-    SaveSettings { settings: Box<AppSettings> },
+    SaveSettings {
+        settings: Box<AppSettings>,
+    },
     /// Set a card's "skip plan" option.
-    SetSkipPlan { card_id: Uuid, skip: bool },
+    SetSkipPlan {
+        card_id: Uuid,
+        skip: bool,
+    },
     /// Set whether the card auto-starts its self-review pass when the
     /// implementation finishes (on by default).
-    SetAutoReview { card_id: Uuid, auto: bool },
+    SetAutoReview {
+        card_id: Uuid,
+        auto: bool,
+    },
     /// Set a card's cosmetic "blocked" marker: tints the card on the board and
     /// silences its attention badge. Purely an annotation — no lifecycle effect,
     /// and nothing but the user toggles it. `note` is the optional message the
@@ -450,10 +581,15 @@ pub enum ExecutorCommand {
     },
     /// The user opened the card: its unread Agent Chat answer counts as read.
     /// A no-op when there is none.
-    MarkAnswersRead { card_id: Uuid },
+    MarkAnswersRead {
+        card_id: Uuid,
+    },
     /// Copy an image into the card's managed attachments dir (`src` = the file
     /// the user picked). Claude-only; the path is injected into the prompt.
-    AttachImage { card_id: Uuid, src: PathBuf },
+    AttachImage {
+        card_id: Uuid,
+        src: PathBuf,
+    },
     /// Write pasted image bytes (already PNG-encoded) into the card's managed
     /// attachments dir. Same as `AttachImage` but sourced from the clipboard.
     /// `id` pins the file's 8-hex name prefix — what a PR-description
@@ -464,10 +600,61 @@ pub enum ExecutorCommand {
         id: Option<String>,
     },
     /// Remove a previously attached image (by its managed path).
-    DetachImage { card_id: Uuid, path: PathBuf },
+    DetachImage {
+        card_id: Uuid,
+        path: PathBuf,
+    },
     /// Refresh the usage bar's rate-limit data now (its manual refresh button)
     /// instead of waiting for the next background poll.
     RefreshUsage,
+
+    // --- one-off sessions (ad-hoc agent chats in any folder) --------------
+    /// Create a session and start its first turn. `id` is minted by the UI
+    /// when the dialog opens, so files can be staged under it beforehand; the
+    /// staged attachments ride the first turn.
+    CreateSession {
+        id: Uuid,
+        folder: PathBuf,
+        provider: Provider,
+        spec: ModelSpec,
+        access: SessionAccess,
+        prompt: String,
+    },
+    /// Send a follow-up message (with the staged attachments) as a resumed turn.
+    SendSessionMessage {
+        session_id: Uuid,
+        text: String,
+    },
+    /// Answer the session's pending question.
+    AnswerSession {
+        session_id: Uuid,
+        text: String,
+    },
+    /// Stop the running turn (or drop the pending question).
+    CancelSession {
+        session_id: Uuid,
+    },
+    /// Re-send the last message of a failed session.
+    RetrySession {
+        session_id: Uuid,
+    },
+    RenameSession {
+        session_id: Uuid,
+        title: String,
+    },
+    ArchiveSession {
+        session_id: Uuid,
+        archived: bool,
+    },
+    /// The user is looking at the session: clear `unread`.
+    MarkSessionRead {
+        session_id: Uuid,
+    },
+    /// Delete the session, its transcript and its attachment copies. Never
+    /// touches the session's folder.
+    DeleteSession {
+        session_id: Uuid,
+    },
 }
 
 impl ExecutorCommand {
@@ -529,6 +716,15 @@ impl ExecutorCommand {
             | ExecutorCommand::AttachImage { card_id, .. }
             | ExecutorCommand::AttachImageBytes { card_id, .. }
             | ExecutorCommand::DetachImage { card_id, .. } => *card_id,
+            ExecutorCommand::CreateSession { id, .. } => *id,
+            ExecutorCommand::SendSessionMessage { session_id, .. }
+            | ExecutorCommand::AnswerSession { session_id, .. }
+            | ExecutorCommand::CancelSession { session_id }
+            | ExecutorCommand::RetrySession { session_id }
+            | ExecutorCommand::RenameSession { session_id, .. }
+            | ExecutorCommand::ArchiveSession { session_id, .. }
+            | ExecutorCommand::MarkSessionRead { session_id }
+            | ExecutorCommand::DeleteSession { session_id } => *session_id,
             ExecutorCommand::CreateCard { card } | ExecutorCommand::SaveCard { card } => card.id,
             // Either entity kind: the queue is keyed by slot-holder id, and the
             // id-keyed toast / busy plumbing doesn't care which it is.
@@ -633,6 +829,12 @@ impl ExecutorCommand {
                 // trip) just like the lifecycle commands above.
                 | ExecutorCommand::RefreshReviews { .. }
                 | ExecutorCommand::MarkReviewBodiesRead { .. }
+                // Turn-starting session commands: a double ⌘↩ must not launch
+                // two runs.
+                | ExecutorCommand::CreateSession { .. }
+                | ExecutorCommand::SendSessionMessage { .. }
+                | ExecutorCommand::AnswerSession { .. }
+                | ExecutorCommand::RetrySession { .. }
         )
     }
 
@@ -651,6 +853,9 @@ impl ExecutorCommand {
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }
+                | ExecutorCommand::RenameSession { .. }
+                | ExecutorCommand::ArchiveSession { .. }
+                | ExecutorCommand::MarkSessionRead { .. }
         )
     }
 }
@@ -786,6 +991,10 @@ pub enum ExecutorEventKind {
     RunQueueChanged { entries: Vec<QueuedTarget> },
     /// Show a toast (often an error).
     Toast { severity: Severity, message: String },
+    /// A session was created or changed (status, turns, unread, …).
+    SessionUpdated(Box<Session>),
+    /// A session was deleted.
+    SessionDeleted { session_id: Uuid },
 }
 
 impl ExecutorEvent {
@@ -936,6 +1145,18 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::HandoffUpdated { handoff },
+        }
+    }
+    pub fn session_updated(session: Session) -> Self {
+        ExecutorEvent {
+            card_id: session.id,
+            kind: ExecutorEventKind::SessionUpdated(Box::new(session)),
+        }
+    }
+    pub fn session_deleted(session_id: Uuid) -> Self {
+        ExecutorEvent {
+            card_id: session_id,
+            kind: ExecutorEventKind::SessionDeleted { session_id },
         }
     }
     pub fn toast(card_id: Uuid, severity: Severity, message: impl Into<String>) -> Self {
