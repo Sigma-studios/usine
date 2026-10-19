@@ -878,6 +878,9 @@ impl Executor {
             }
             ExecutorCommand::CancelSession { session_id } => self.cancel_session(session_id),
             ExecutorCommand::RetrySession { session_id } => self.retry_session(session_id).await,
+            ExecutorCommand::UnqueueSessionMessage { session_id, ts } => {
+                self.unqueue_session_message(session_id, ts)
+            }
             ExecutorCommand::RenameSession { session_id, title } => {
                 self.rename_session(session_id, title)
             }

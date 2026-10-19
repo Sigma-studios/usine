@@ -291,6 +291,10 @@ async fn pump(
                     break;
                 }
                 Some(RunControl::Answer { .. }) => {}
+                // `codex exec` is one-shot: the caller queues it instead.
+                Some(RunControl::Message { accepted, .. }) => {
+                    let _ = accepted.send(false);
+                }
                 None => ctl_open = false,
             },
         }

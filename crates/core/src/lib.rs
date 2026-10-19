@@ -80,7 +80,7 @@ pub use domain::model::{
 };
 pub use domain::session::{
     derive_title as derive_session_title, truncate_chars, Session, SessionAccess, SessionStatus,
-    SessionTransition, SessionTurn, SessionTurnKind,
+    SessionTransition, SessionTurn, SessionTurnKind, StatusNote, STATUS_PREFIX,
 };
 pub use domain::state_machine::{
     stop_can_return_to, stop_target, stop_transition, transition, Transition,

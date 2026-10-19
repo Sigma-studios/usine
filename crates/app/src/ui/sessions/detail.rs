@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
-use usine_core::{ExecutorCommand, Session, SessionAccess, SessionStatus, SessionTurnKind};
+use usine_core::{
+    ExecutorCommand, Provider, Session, SessionAccess, SessionStatus, SessionTurn, SessionTurnKind,
+};
 use uuid::Uuid;
 
-use super::{home_dir, reveal, shorten_home};
+use super::{ago, home_dir, reveal, shorten_home};
 use crate::state::AppState;
 use crate::ui::detail::{
     attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
@@ -173,7 +175,12 @@ pub(crate) fn SessionDetail() -> Element {
                             }
                         }
                     } else {
-                        Composer { session_id: id, running }
+                        Composer {
+                            session_id: id,
+                            running,
+                            steerable: running && session.provider == Provider::Claude,
+                            has_queue: !session.queued.is_empty(),
+                        }
                     }
                 }
             }
@@ -263,10 +270,62 @@ fn Conversation(session: Session) -> Element {
             if session.is_running() {
                 div { class: "turn turn-working",
                     span { class: "spinner" }
-                    span { "Working… you'll be notified when it's done." }
+                    if let Some(note) = &session.status_note {
+                        span { class: "status-note", "{note.text}" }
+                        span { class: "status-note-age", "· {ago(note.ts, usine_core::now_millis())}" }
+                    } else {
+                        span { "Working…" }
+                    }
+                }
+            }
+            if !session.queued.is_empty() {
+                // A pending question counts as in flight: the queue follows the
+                // answer's turn.
+                QueuedTurns {
+                    session_id: id,
+                    turns: session.queued.clone(),
+                    running: matches!(session.status, SessionStatus::Running | SessionStatus::NeedsAnswer(_)),
                 }
             }
             div { id: "session-end-{id}" }
+        }
+    }
+}
+
+/// Messages sent while a turn ran, waiting to go out together as the next
+/// turn; each can be taken back.
+#[component]
+fn QueuedTurns(session_id: Uuid, turns: Vec<SessionTurn>, running: bool) -> Element {
+    let state = use_context::<AppState>();
+    rsx! {
+        div { class: "queued-turns",
+            div { class: "turn-label",
+                if running { "Queued — sent when this turn ends" } else { "Queued — will be sent with your next message" }
+            }
+            for turn in turns {
+                {
+                    let ts = turn.ts;
+                    rsx! {
+                        div { key: "{ts}", class: "turn turn-user queued",
+                            div { class: "queued-row",
+                                div { class: "queued-body",
+                                    if !turn.text.is_empty() {
+                                        div { class: "turn-text", "{turn.text}" }
+                                    }
+                                    TurnAttachments { paths: turn.attachments.clone() }
+                                }
+                                button {
+                                    class: "chip-remove",
+                                    title: "Remove from the queue",
+                                    "aria-label": "Remove from the queue",
+                                    onclick: move |_| state.send(ExecutorCommand::UnqueueSessionMessage { session_id, ts }),
+                                    "×"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -352,10 +411,11 @@ pub(crate) fn drop_files(state: AppState, id: Uuid, e: &DragEvent) {
 }
 
 /// The message box: text (draft-backed), pasted/picked/dropped files staged
-/// as chips, ⌘↩ to send. Disabled while a turn runs — files can still be
-/// staged for the next message.
+/// as chips, ⌘↩ to send. While a turn runs it stays open: a text-only message
+/// to a Claude run goes to the agent live ("Send now"); anything else is
+/// queued for when the turn ends.
 #[component]
-fn Composer(session_id: Uuid, running: bool) -> Element {
+fn Composer(session_id: Uuid, running: bool, steerable: bool, has_queue: bool) -> Element {
     let state = use_context::<AppState>();
     let mut text = drafts::use_draft(session_id, "session-message", String::new);
     // Uncontrolled field (see `chat.rs`); a send clears it via a remount.
@@ -363,7 +423,27 @@ fn Composer(session_id: Uuid, running: bool) -> Element {
     let mut dragging = use_signal(|| false);
     let has_files = !state.card_attachments(session_id).is_empty();
     let blank = text.read().trim().is_empty();
-    let can_send = !running && (!blank || has_files);
+    let can_send = !blank || has_files || (!running && has_queue);
+    let live = steerable && !has_files;
+    let (label, tip, placeholder) = if live {
+        (
+            "Send now",
+            "The agent reads it at its next step",
+            "Message the agent — it reads this at its next step",
+        )
+    } else if running {
+        (
+            "Queue",
+            "Sent when the agent finishes this turn",
+            "Add a follow-up — sent when the agent finishes this turn",
+        )
+    } else {
+        (
+            "Send",
+            "",
+            "Reply, or ask for something else… (paste or drop files to attach)",
+        )
+    };
     let hint = crate::ui::shortcuts::submit_hint();
     let field_class = if dragging() {
         "field attach-field drop-active"
@@ -391,8 +471,7 @@ fn Composer(session_id: Uuid, running: bool) -> Element {
                     textarea {
                         key: "{g}",
                         id: "session-input",
-                        disabled: running,
-                        placeholder: if running { "Agent is working — you'll be notified" } else { "Reply, or ask for something else… (paste or drop files to attach)" },
+                        placeholder: "{placeholder}",
                         initial_value: "{text.peek()}",
                         oninput: move |e| text.set(e.value()),
                         onpaste: move |_| attach_from_clipboard(state, session_id),
@@ -401,22 +480,25 @@ fn Composer(session_id: Uuid, running: bool) -> Element {
                 AttachButton { card_id: session_id, icon: true, title: SESSION_ATTACH_TITLE.to_string() }
             }
             div { class: "row",
-                if running {
-                    span { class: "hint", "Agent is working — you'll be notified." }
+                if running && has_files && steerable {
+                    span { class: "hint", "Files can't reach a running agent — this will be queued." }
                 }
                 div { class: "spacer" }
                 button {
                     class: "btn primary",
                     "data-submit": "1",
-                    title: "Send ({hint})",
+                    title: if tip.is_empty() { format!("Send ({hint})") } else { format!("{tip} ({hint})") },
                     disabled: !can_send,
                     onclick: move |_| {
+                        if !can_send {
+                            return;
+                        }
                         let t = text.read().trim().to_string();
                         state.send_session_message(session_id, t);
                         drafts::clear(session_id, "session-message", text, String::new());
                         generation += 1;
                     },
-                    "Send"
+                    "{label}"
                 }
             }
         }

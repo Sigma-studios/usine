@@ -87,7 +87,24 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
             .map(|p| shorten_home(p, home.as_deref()))
             .unwrap_or_default()
     });
-    let mut more = use_signal(|| None::<Vec<PathBuf>>);
+    // Recent Claude Code folders, read off the UI thread: the chips appear
+    // once `~/.claude/projects` has been scanned.
+    let claude_folders = use_resource({
+        let known = suggestions.clone();
+        move || {
+            let known = known.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let found = home_dir()
+                        .map(|h| claude_code_folders(&h, 12))
+                        .unwrap_or_default();
+                    dedup_existing(found, &known)
+                })
+                .await
+                .unwrap_or_default()
+            }
+        }
+    });
     let mut prompt = use_signal(String::new);
     let mut dragging = use_signal(|| false);
 
@@ -135,7 +152,6 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
     let current_provider = provider();
     let current_spec = spec();
     let current_access = access();
-    let home_for_list = home.clone();
 
     rsx! {
         div { class: "modal-overlay confirm-overlay", onclick: move |_| cancel(),
@@ -192,64 +208,19 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
                         div { class: "hint warn", "Not an existing folder." }
                     }
                     if !suggestions.is_empty() {
-                        div { class: "folder-suggestions",
-                            for p in suggestions.iter() {
-                                {
-                                    let label = shorten_home(p, home_for_list.as_deref());
-                                    let pick = label.clone();
-                                    let active = resolved == *p;
-                                    rsx! {
-                                        button {
-                                            key: "{label}",
-                                            class: if active { "folder-chip active" } else { "folder-chip" },
-                                            title: "{p.display()}",
-                                            onclick: move |_| folder.set(pick.clone()),
-                                            "{label}"
-                                        }
-                                    }
-                                }
-                            }
+                        FolderChips {
+                            folders: suggestions.clone(),
+                            selected: resolved.clone(),
+                            on_pick: move |label: String| folder.set(label),
                         }
                     }
-                    match more() {
-                        None => rsx! {
-                            button {
-                                class: "btn link",
-                                title: "Folders your recent Claude Code sessions ran in",
-                                onclick: {
-                                    let known = suggestions.clone();
-                                    move |_| {
-                                        let found = home_dir()
-                                            .map(|h| claude_code_folders(&h, 12))
-                                            .unwrap_or_default();
-                                        more.set(Some(dedup_existing(found, &known)));
-                                    }
-                                },
-                                "More from Claude Code…"
-                            }
-                        },
-                        Some(list) if list.is_empty() => rsx! {
-                            div { class: "hint", "No other recent Claude Code folders." }
-                        },
-                        Some(list) => rsx! {
-                            div { class: "folder-suggestions",
-                                for p in list.iter() {
-                                    {
-                                        let label = shorten_home(p, home_for_list.as_deref());
-                                        let pick = label.clone();
-                                        rsx! {
-                                            button {
-                                                key: "{label}",
-                                                class: "folder-chip",
-                                                title: "{p.display()}",
-                                                onclick: move |_| folder.set(pick.clone()),
-                                                "{label}"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
+                    if let Some(list) = claude_folders.read().as_ref().filter(|l| !l.is_empty()) {
+                        div { class: "hint folder-suggestions-label", "Recent Claude Code folders" }
+                        FolderChips {
+                            folders: list.clone(),
+                            selected: resolved.clone(),
+                            on_pick: move |label: String| folder.set(label),
+                        }
                     }
                 }
                 div { class: "field",
@@ -330,6 +301,33 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
                             }
                         },
                         if starting { "Starting…" } else { "Start session" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One row of folder chips; a click picks the folder (as its `~` label). The
+/// chip of the folder currently typed is highlighted.
+#[component]
+fn FolderChips(folders: Vec<PathBuf>, selected: PathBuf, on_pick: EventHandler<String>) -> Element {
+    let home = home_dir();
+    rsx! {
+        div { class: "folder-suggestions",
+            for p in folders.iter() {
+                {
+                    let label = shorten_home(p, home.as_deref());
+                    let pick = label.clone();
+                    let active = selected == *p;
+                    rsx! {
+                        button {
+                            key: "{label}",
+                            class: if active { "folder-chip active" } else { "folder-chip" },
+                            title: "{p.display()}",
+                            onclick: move |_| on_pick.call(pick.clone()),
+                            "{label}"
+                        }
                     }
                 }
             }

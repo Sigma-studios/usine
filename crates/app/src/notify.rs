@@ -125,6 +125,19 @@ mod tests {
         assert_eq!(session_notification(None, &s), None);
     }
 
+    // A turn ending straight into the queued messages' turn stays Running:
+    // one ping, at the very end.
+    #[test]
+    fn a_turn_continuing_into_queued_messages_does_not_notify() {
+        let mut s = session();
+        s.push_turn(SessionTurn::new(SessionTurnKind::Agent, "first part"));
+        s.push_turn(SessionTurn::new(SessionTurnKind::User, "queued"));
+        assert_eq!(
+            session_notification(Some(&SessionStatus::Running), &s),
+            None
+        );
+    }
+
     #[test]
     fn questions_and_failures_notify_but_a_stop_does_not() {
         let mut s = session();

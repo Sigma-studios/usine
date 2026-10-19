@@ -68,8 +68,12 @@ pub(crate) fn grouped(sessions: Vec<Session>) -> Vec<(Section, Vec<Session>)> {
         .collect()
 }
 
-/// One line previewing a session's latest turn.
+/// One line previewing a session: what a running agent last said it is doing,
+/// else its latest turn.
 fn preview(s: &Session) -> (String, usize) {
+    if let (true, Some(note)) = (s.is_running(), &s.status_note) {
+        return (format!("⟳ {}", note.text), 0);
+    }
     let Some(turn) = s.turns.last() else {
         return (String::new(), 0);
     };
@@ -300,6 +304,19 @@ mod tests {
             section_of(&session(SessionStatus::Finished, false, false, 0)),
             Section::Earlier
         );
+    }
+
+    #[test]
+    fn a_running_session_previews_its_status_note() {
+        let mut s = session(SessionStatus::Running, false, false, 0);
+        assert_eq!(preview(&s).0, "You: x");
+        s.status_note = Some(usine_core::StatusNote {
+            text: "Running tests".into(),
+            ts: 0,
+        });
+        assert_eq!(preview(&s).0, "⟳ Running tests");
+        s.status = SessionStatus::Finished;
+        assert_eq!(preview(&s).0, "You: x");
     }
 
     #[test]

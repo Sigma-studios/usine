@@ -67,6 +67,12 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
                                         options,
                                     });
                                 }
+                                "TodoWrite" => out.push(AgentEvent::Progress {
+                                    text: match current_todo(block) {
+                                        Some(item) => format!("{TODO_PROGRESS_PREFIX}{item}"),
+                                        None => "→ TodoWrite".into(),
+                                    },
+                                }),
                                 other => out.push(AgentEvent::Progress {
                                     text: format!("→ {other}"),
                                 }),
@@ -122,6 +128,48 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
     }
 
     Ok(out)
+}
+
+/// How a `TodoWrite` call's progress line starts when it names the item in
+/// progress; sessions fall back to that item as their status note.
+pub const TODO_PROGRESS_PREFIX: &str = "→ TodoWrite: ";
+
+/// The in-progress item of a `TodoWrite` call (its `activeForm`, else its
+/// `content`).
+fn current_todo(block: &Value) -> Option<String> {
+    let todos = block.pointer("/input/todos")?.as_array()?;
+    let item = todos
+        .iter()
+        .find(|t| t.get("status").and_then(Value::as_str) == Some("in_progress"))?;
+    ["activeForm", "content"]
+        .iter()
+        .filter_map(|k| item.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The text of a user message the CLI echoed back from stdin
+/// (`--replay-user-messages`): it marks the moment the agent took that message.
+/// `None` for anything else, tool results included.
+pub(crate) fn replayed_user_text(line: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("user")
+        || v.get("isReplay").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let content = v.pointer("/message/content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let text: Vec<&str> = content
+        .as_array()?
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect();
+    Some(text.join("\n"))
 }
 
 /// If `line` is an assistant message whose content includes an `ExitPlanMode`
@@ -318,6 +366,28 @@ fn parse_usage(v: Option<&Value>) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn todo_write_names_the_item_in_progress() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"Read","status":"completed","activeForm":"Reading"},{"content":"Fix the parser","status":"in_progress","activeForm":"Fixing the parser"}]}}]}}"#;
+        let evts = parse_claude_line(line).unwrap();
+        assert!(
+            matches!(&evts[0], AgentEvent::Progress { text } if text == "→ TodoWrite: Fixing the parser")
+        );
+        let none = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[]}}]}}"#;
+        assert!(
+            matches!(&parse_claude_line(none).unwrap()[0], AgentEvent::Progress { text } if text == "→ TodoWrite")
+        );
+    }
+
+    #[test]
+    fn only_echoed_user_messages_count_as_replays() {
+        let echo = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"say hi"}]},"isReplay":true}"#;
+        assert_eq!(replayed_user_text(echo).as_deref(), Some("say hi"));
+        let tool = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"a"}]}}"#;
+        assert_eq!(replayed_user_text(tool), None);
+        assert!(parse_claude_line(echo).unwrap().is_empty());
+    }
 
     #[test]
     fn claude_system_init_yields_started() {
