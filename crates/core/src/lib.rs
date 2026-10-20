@@ -79,8 +79,9 @@ pub use domain::model::{
     MERGEABILITY_RECOMPUTE_GRACE,
 };
 pub use domain::session::{
-    derive_title as derive_session_title, truncate_chars, Session, SessionAccess, SessionStatus,
-    SessionTransition, SessionTurn, SessionTurnKind, StatusNote, STATUS_PREFIX,
+    derive_title as derive_session_title, strip_status_lines, truncate_chars, Session,
+    SessionAccess, SessionStatus, SessionTransition, SessionTurn, SessionTurnKind, StatusNote,
+    STATUS_PREFIX,
 };
 pub use domain::state_machine::{
     stop_can_return_to, stop_target, stop_transition, transition, Transition,

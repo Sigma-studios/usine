@@ -74,7 +74,13 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
                                     },
                                 }),
                                 other => out.push(AgentEvent::Progress {
-                                    text: format!("→ {other}"),
+                                    text: match block
+                                        .get("input")
+                                        .and_then(|i| tool_brief(other, i))
+                                    {
+                                        Some(brief) => format!("→ {other} {brief}"),
+                                        None => format!("→ {other}"),
+                                    },
                                 }),
                             }
                         }
@@ -128,6 +134,25 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
     }
 
     Ok(out)
+}
+
+/// The one input field that says what a tool call does — the command, the
+/// file, the pattern — first line only, cut to 120 chars. `None` for tools
+/// with no such field, which then log as their bare name.
+fn tool_brief(name: &str, input: &Value) -> Option<String> {
+    let field = match name {
+        "Bash" => "command",
+        "Read" | "Edit" | "MultiEdit" | "Write" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        "Grep" | "Glob" => "pattern",
+        "WebFetch" => "url",
+        "WebSearch" => "query",
+        "Task" | "Agent" => "description",
+        _ => return None,
+    };
+    let text = input.get(field).and_then(Value::as_str)?.trim();
+    let first = text.lines().next().unwrap_or("").trim();
+    (!first.is_empty()).then(|| crate::domain::session::truncate_chars(first, 120))
 }
 
 /// How a `TodoWrite` call's progress line starts when it names the item in
@@ -366,6 +391,30 @@ fn parse_usage(v: Option<&Value>) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_line(name: &str, input: &str) -> String {
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{name}","input":{input}}}]}}}}"#
+        );
+        match &parse_claude_line(&line).unwrap()[0] {
+            AgentEvent::Progress { text } => text.clone(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_calls_name_what_they_act_on() {
+        assert_eq!(
+            tool_line("Bash", r#"{"command":"cargo test\necho done"}"#),
+            "→ Bash cargo test"
+        );
+        assert_eq!(
+            tool_line("Read", r#"{"file_path":"/repo/src/main.rs"}"#),
+            "→ Read /repo/src/main.rs"
+        );
+        assert_eq!(tool_line("Frobnicate", "{}"), "→ Frobnicate");
+        assert_eq!(tool_line("Bash", "{}"), "→ Bash");
+    }
 
     #[test]
     fn todo_write_names_the_item_in_progress() {
