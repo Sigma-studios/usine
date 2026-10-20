@@ -176,6 +176,8 @@ async fn a_session_runs_its_first_turn_to_an_unread_finish() {
     let id = Uuid::new_v4();
 
     create(&handle, id, folder.path(), "Tidy up the downloads\nplease");
+    let s = wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    assert!(!s.needs_attention(), "a running turn doesn't count");
     let s = wait_status(&mut rx, id, finished).await;
 
     assert_eq!(s.title, "Tidy up the downloads");
@@ -202,11 +204,48 @@ async fn a_session_runs_its_first_turn_to_an_unread_finish() {
     assert_eq!(defaults.spec.model, "opus");
 
     handle.send(ExecutorCommand::MarkSessionRead { session_id: id });
-    wait_for(&mut rx, |e| match &e.kind {
-        ExecutorEventKind::SessionUpdated(s) if s.id == id && !s.unread => Some(()),
+    let s = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::SessionUpdated(s) if s.id == id && !s.unread => Some(s.clone()),
         _ => None,
     })
     .await;
+    assert!(
+        s.needs_attention(),
+        "reading it doesn't clear it from the counts"
+    );
+
+    handle.send(ExecutorCommand::SetSessionBlocked {
+        session_id: id,
+        blocked: true,
+    });
+    let s = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::SessionUpdated(s) if s.id == id && s.blocked => Some(s.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!s.needs_attention(), "a blocked session doesn't count");
+
+    // Running more work keeps the marker: only the user lifts it.
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "and the desktop".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    let s = wait_status(&mut rx, id, finished).await;
+    assert!(s.blocked, "a turn never unblocks the session");
+    assert!(!s.needs_attention());
+    assert!(store.get_session(id).unwrap().blocked);
+
+    handle.send(ExecutorCommand::SetSessionBlocked {
+        session_id: id,
+        blocked: false,
+    });
+    let s = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::SessionUpdated(s) if s.id == id && !s.blocked => Some(s.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(s.needs_attention(), "unblocked, it counts again");
 }
 
 #[tokio::test]

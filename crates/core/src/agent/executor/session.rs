@@ -371,6 +371,17 @@ impl Executor {
         Ok(())
     }
 
+    /// Like cards, blocking doesn't count as activity: `last_activity_at`
+    /// stays put.
+    pub(super) fn set_session_blocked(&self, id: Uuid, blocked: bool) -> Result<()> {
+        let session = self.store.mutate_session(id, |s| {
+            s.blocked = blocked;
+            Ok(())
+        })?;
+        self.emit_session(session);
+        Ok(())
+    }
+
     pub(super) fn mark_session_read(&self, id: Uuid) -> Result<()> {
         // Only a real change is worth an event: selection fires this on every
         // open.

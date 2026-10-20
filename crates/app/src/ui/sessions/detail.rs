@@ -51,6 +51,7 @@ pub(crate) fn SessionDetail() -> Element {
     let running = session.is_running();
     let failed = matches!(session.status, SessionStatus::Failed { .. });
     let archived = session.archived;
+    let blocked = session.blocked;
     let crowded = folder_in_use(&state, &session);
 
     rsx! {
@@ -119,6 +120,9 @@ pub(crate) fn SessionDetail() -> Element {
                         "{access.label()}"
                     }
                     span { class: "{status_class}", "{status}" }
+                    if blocked {
+                        span { class: "badge blocked", title: "Out of the attention counts until you unblock it", "Blocked" }
+                    }
                     if !cost.is_zero() {
                         span { class: "badge cost", "{cost}" }
                     }
@@ -137,6 +141,13 @@ pub(crate) fn SessionDetail() -> Element {
                             title: "Re-send your last message",
                             onclick: move |_| state.send(ExecutorCommand::RetrySession { session_id: id }),
                             "Retry"
+                        }
+                    }
+                    if !archived {
+                        button {
+                            class: "btn subtle",
+                            onclick: move |_| state.send(ExecutorCommand::SetSessionBlocked { session_id: id, blocked: !blocked }),
+                            if blocked { "Mark unblocked" } else { "Mark blocked" }
                         }
                     }
                     if !running {

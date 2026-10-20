@@ -150,7 +150,8 @@ pub const SESSION_AUTO_ARCHIVE_DAYS: i64 = 7;
 
 /// Archive every ended (Finished/Failed), read, non-archived session whose last
 /// activity is older than [`SESSION_AUTO_ARCHIVE_DAYS`] before `now` (ms).
-/// Returns how many were archived.
+/// Blocked sessions are left alone: only the user lifts a block. Returns how
+/// many were archived.
 pub fn auto_archive_stale_sessions(store: &Store, now: i64) -> Result<usize> {
     let cutoff = now - SESSION_AUTO_ARCHIVE_DAYS * 24 * 60 * 60 * 1000;
     let mut archived = 0;
@@ -159,7 +160,12 @@ pub fn auto_archive_stale_sessions(store: &Store, now: i64) -> Result<usize> {
             session.status,
             SessionStatus::Finished | SessionStatus::Failed { .. }
         );
-        if ended && !session.unread && !session.archived && session.last_activity_at < cutoff {
+        if ended
+            && !session.unread
+            && !session.archived
+            && !session.blocked
+            && session.last_activity_at < cutoff
+        {
             session.archived = true;
             store.upsert_session(&session)?;
             archived += 1;
@@ -558,5 +564,46 @@ mod tests {
             Some("release/v2")
         );
         assert_eq!(synced.config.effective_base_branch(), "release/v2");
+    }
+
+    #[test]
+    fn auto_archive_skips_blocked_sessions() {
+        use crate::domain::model::{Effort, ModelSpec};
+        use crate::domain::session::Session;
+
+        let store = Store::open_in_memory().unwrap();
+        let stale = |blocked: bool| {
+            let mut s = Session::new(
+                uuid::Uuid::new_v4(),
+                PathBuf::from("/tmp"),
+                Provider::Claude,
+                ModelSpec::new("opus", Effort::High),
+                Default::default(),
+                "hi",
+                vec![],
+            );
+            s.status = SessionStatus::Finished;
+            s.unread = false;
+            s.blocked = blocked;
+            s.last_activity_at = 0;
+            store.upsert_session(&s).unwrap();
+            s.id
+        };
+        let plain = stale(false);
+        let blocked = stale(true);
+
+        let now = SESSION_AUTO_ARCHIVE_DAYS * 24 * 60 * 60 * 1000 + 1;
+        assert_eq!(auto_archive_stale_sessions(&store, now).unwrap(), 1);
+        let archived = |id| {
+            store
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .archived
+        };
+        assert!(archived(plain));
+        assert!(!archived(blocked), "a blocked session stays in its section");
     }
 }
