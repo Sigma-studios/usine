@@ -59,7 +59,7 @@ pub(crate) fn ago(ts: i64, now: i64) -> String {
 pub(crate) fn session_dot(s: &Session) -> &'static str {
     match &s.status {
         SessionStatus::Running => "proj-dot working",
-        _ if s.archived => "proj-dot idle",
+        _ if s.archived || s.blocked => "proj-dot idle",
         SessionStatus::NeedsAnswer(_) => "proj-dot urgent",
         SessionStatus::Failed { .. } if s.unread => "proj-dot urgent",
         _ if s.unread => "proj-dot",

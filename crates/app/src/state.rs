@@ -808,7 +808,8 @@ impl AppState {
         self.sessions.read().get(&id).cloned()
     }
 
-    /// Non-archived sessions wanting the user (unread, or a question waiting).
+    /// Idle sessions (ended, failed, or asking) the user hasn't archived or
+    /// blocked — read or not. A running turn doesn't count.
     pub fn session_attention_count(&self) -> usize {
         self.sessions
             .read()
@@ -817,12 +818,13 @@ impl AppState {
             .count()
     }
 
-    /// Whether any non-archived session waits on an answer (the red dot).
+    /// Sessions waiting on an answer that aren't archived or blocked (the red
+    /// dot).
     pub fn sessions_urgent(&self) -> usize {
         self.sessions
             .read()
             .values()
-            .filter(|s| !s.archived && matches!(s.status, SessionStatus::NeedsAnswer(_)))
+            .filter(|s| s.needs_answer())
             .count()
     }
 

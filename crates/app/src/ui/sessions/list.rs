@@ -15,6 +15,7 @@ pub(crate) enum Section {
     Unread,
     Running,
     Earlier,
+    Blocked,
     Archived,
 }
 
@@ -25,6 +26,7 @@ impl Section {
             Section::Unread => "Unread",
             Section::Running => "Running",
             Section::Earlier => "Earlier",
+            Section::Blocked => "Blocked",
             Section::Archived => "Archived",
         }
     }
@@ -33,6 +35,8 @@ impl Section {
 pub(crate) fn section_of(s: &Session) -> Section {
     if s.archived {
         Section::Archived
+    } else if s.blocked {
+        Section::Blocked
     } else if matches!(s.status, SessionStatus::NeedsAnswer(_)) {
         Section::NeedsYou
     } else if s.is_running() {
@@ -52,6 +56,7 @@ pub(crate) fn grouped(sessions: Vec<Session>) -> Vec<(Section, Vec<Session>)> {
         Section::Unread,
         Section::Running,
         Section::Earlier,
+        Section::Blocked,
         Section::Archived,
     ];
     order
@@ -166,12 +171,13 @@ fn SessionRow(session: Session, active: bool, when: String, folder: String) -> E
     if active {
         class.push_str(" active");
     }
-    if session.unread && !session.archived {
+    if session.unread && !session.archived && !session.blocked {
         class.push_str(" unread");
     }
     let model = crate::ui::widgets::model_label(&session.spec.model).to_string();
     let provider = session.provider.label();
     let archived = session.archived;
+    let blocked = session.blocked;
     let running = session.is_running();
     let title = session.title.clone();
 
@@ -199,6 +205,30 @@ fn SessionRow(session: Session, active: bool, when: String, folder: String) -> E
                 }
             }
             div { class: "session-row-actions",
+                if !archived {
+                    button {
+                        class: "proj-action",
+                        title: if blocked { "Mark unblocked" } else { "Mark blocked" },
+                        "aria-label": if blocked { "Mark unblocked" } else { "Mark blocked" },
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            state.send(ExecutorCommand::SetSessionBlocked { session_id: id, blocked: !blocked });
+                        },
+                        svg {
+                            width: "13",
+                            height: "13",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            rect { x: "3", y: "11", width: "18", height: "11", rx: "2" }
+                            // Open shackle to lift the marker, closed to set it.
+                            path { d: if blocked { "M7 11V7a5 5 0 0 1 9.9-1" } else { "M7 11V7a5 5 0 0 1 10 0v4" } }
+                        }
+                    }
+                }
                 button {
                     class: "proj-action",
                     title: if archived { "Unarchive" } else { "Archive" },
@@ -303,6 +333,50 @@ mod tests {
         assert_eq!(
             section_of(&session(SessionStatus::Finished, false, false, 0)),
             Section::Earlier
+        );
+    }
+
+    #[test]
+    fn blocked_sessions_get_their_own_section_below_earlier() {
+        let blocked = |status, unread, archived| {
+            let mut s = session(status, unread, archived, 0);
+            s.blocked = true;
+            s
+        };
+        let q = SessionStatus::NeedsAnswer(Intervention {
+            request_id: "r".into(),
+            question: "q".into(),
+            options: vec![],
+        });
+        assert_eq!(
+            section_of(&blocked(SessionStatus::Finished, false, false)),
+            Section::Blocked
+        );
+        assert_eq!(
+            section_of(&blocked(SessionStatus::Finished, true, false)),
+            Section::Blocked
+        );
+        assert_eq!(
+            section_of(&blocked(SessionStatus::Running, false, false)),
+            Section::Blocked
+        );
+        assert_eq!(section_of(&blocked(q, true, false)), Section::Blocked);
+        assert_eq!(
+            section_of(&blocked(SessionStatus::Finished, false, true)),
+            Section::Archived
+        );
+
+        let earlier = session(SessionStatus::Finished, false, false, 0);
+        let b = blocked(SessionStatus::Finished, false, false);
+        let mut a = session(SessionStatus::Finished, false, true, 0);
+        a.blocked = true;
+        let order: Vec<Section> = grouped(vec![a, b, earlier])
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            order,
+            [Section::Earlier, Section::Blocked, Section::Archived]
         );
     }
 

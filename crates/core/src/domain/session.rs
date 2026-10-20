@@ -144,6 +144,10 @@ pub struct Session {
     pub unread: bool,
     #[serde(default)]
     pub archived: bool,
+    /// The user marked it blocked: it stays out of the attention counts until
+    /// they unblock it. Running a turn never clears it.
+    #[serde(default)]
+    pub blocked: bool,
     #[serde(rename = "cost_usd", default)]
     pub cost: Cost,
     /// What the agent last said it is doing; cleared whenever a turn starts.
@@ -184,6 +188,7 @@ impl Session {
             last_activity_at: now,
             unread: false,
             archived: false,
+            blocked: false,
             cost: Cost::ZERO,
             status_note: None,
             queued: Vec::new(),
@@ -194,10 +199,17 @@ impl Session {
         matches!(self.status, SessionStatus::Running)
     }
 
-    /// Whether the session should pull the user's eye: an unread ending, or a
-    /// question waiting on them. Archived sessions never do.
+    /// Whether the session counts toward the attention badges: it sits idle
+    /// (ended, failed, or asking a question) until the user archives, deletes
+    /// or blocks it. Reading it doesn't clear it; a running turn doesn't count.
     pub fn needs_attention(&self) -> bool {
-        !self.archived && (self.unread || matches!(self.status, SessionStatus::NeedsAnswer(_)))
+        !self.archived && !self.blocked && !self.is_running()
+    }
+
+    /// An attention-worthy session asking the user a question — the urgent
+    /// case.
+    pub fn needs_answer(&self) -> bool {
+        self.needs_attention() && matches!(self.status, SessionStatus::NeedsAnswer(_))
     }
 
     /// The last turn the user sent (a message or an answer) — what Retry
@@ -508,16 +520,31 @@ mod tests {
     #[test]
     fn attention_and_resendable_turn() {
         let mut s = session();
+        // Running: doesn't count, blocked or not.
         assert!(!s.needs_attention());
+        s.blocked = true;
+        assert!(!s.needs_attention());
+        s.blocked = false;
         s.apply(SessionTransition::NeedsInput(question())).unwrap();
         assert!(s.needs_attention());
+        assert!(s.needs_answer());
         s.archived = true;
         assert!(!s.needs_attention());
+        assert!(!s.needs_answer());
         s.archived = false;
-        s.apply(SessionTransition::Cancelled).unwrap();
+        s.blocked = true;
         assert!(!s.needs_attention());
+        assert!(!s.needs_answer());
+        s.blocked = false;
+        // Ended: counts whether read or not, but isn't urgent.
+        s.apply(SessionTransition::Cancelled).unwrap();
+        assert!(s.needs_attention());
+        assert!(!s.needs_answer());
         s.unread = true;
         assert!(s.needs_attention());
+        s.blocked = true;
+        assert!(!s.needs_attention());
+        s.blocked = false;
 
         s.push_turn(SessionTurn::new(SessionTurnKind::Agent, "done"));
         s.push_turn(SessionTurn::new(SessionTurnKind::Answer, "Speed"));

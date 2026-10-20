@@ -659,6 +659,12 @@ pub enum ExecutorCommand {
         session_id: Uuid,
         archived: bool,
     },
+    /// Mark the session blocked (or not): a blocked session stays out of the
+    /// attention counts. Only this command changes it.
+    SetSessionBlocked {
+        session_id: Uuid,
+        blocked: bool,
+    },
     /// The user is looking at the session: clear `unread`.
     MarkSessionRead {
         session_id: Uuid,
@@ -737,6 +743,7 @@ impl ExecutorCommand {
             | ExecutorCommand::UnqueueSessionMessage { session_id, .. }
             | ExecutorCommand::RenameSession { session_id, .. }
             | ExecutorCommand::ArchiveSession { session_id, .. }
+            | ExecutorCommand::SetSessionBlocked { session_id, .. }
             | ExecutorCommand::MarkSessionRead { session_id }
             | ExecutorCommand::DeleteSession { session_id } => *session_id,
             ExecutorCommand::CreateCard { card } | ExecutorCommand::SaveCard { card } => card.id,
@@ -869,6 +876,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::DetachImage { .. }
                 | ExecutorCommand::RenameSession { .. }
                 | ExecutorCommand::ArchiveSession { .. }
+                | ExecutorCommand::SetSessionBlocked { .. }
                 | ExecutorCommand::MarkSessionRead { .. }
                 | ExecutorCommand::UnqueueSessionMessage { .. }
         )
