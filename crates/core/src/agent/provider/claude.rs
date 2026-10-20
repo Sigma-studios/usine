@@ -48,7 +48,8 @@ use super::{AgentProvider, RunConfig, RunHandle, RunMode, SESSION_STATUS_PROMPT}
 /// plan/edits. Denying them forces the agent to finish in one turn. (Interim
 /// turns from the tools we *do* allow — `Monitor`, background `Bash` — are
 /// handled in [`pump`] by [`TurnGate`], which waits for the process to exit.)
-/// Sessions allow `Agent`/`Task` and rely on that same gate.
+/// Sessions allow `Agent`/`Task` and rely on that same gate, plus a raised CLI
+/// background-wait ceiling (see [`cli_env`]).
 ///
 /// Sessions also take their input as stream-json on stdin (`start` writes the
 /// prompt there instead of appending it), echoed back with
@@ -99,7 +100,9 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     // prompt positional that `start` appends.
     // Sessions keep `Agent`/`Task`: a terminal-style session is expected to
     // use subagents, and [`TurnGate`] already holds the result until the
-    // process exits, so the subagents' work is covered.
+    // process exits — which, with the CLI's background-wait ceiling raised
+    // by [`cli_env`], is when the subagents are done or, past that ceiling,
+    // stopped by the CLI.
     args.push("--disallowedTools".into());
     args.push(if cfg.mode.is_session() {
         "ScheduleWakeup,Workflow".into()
@@ -134,6 +137,27 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
     args
 }
 
+/// Environment variables for the `claude` process.
+///
+/// With `-p`, the CLI waits only `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`
+/// (default 10 minutes) after the last turn's `result` for background tasks,
+/// then stops them — a session's long `run_in_background` subagent was cut
+/// off mid-work at exactly that mark. Sessions raise it to
+/// [`SESSION_BG_WAIT_CEILING`], just under our own [`SESSION_HELD_RESULT_GRACE`],
+/// so the CLI stops the subagent cleanly (marked stopped, resumable on a later
+/// turn) before we would hard-kill the process. Card runs deny `Agent`/`Task`,
+/// and their background `Bash`/`Monitor` have their own 10-minute cap.
+fn cli_env(cfg: &RunConfig) -> Vec<(&'static str, String)> {
+    if cfg.mode.is_session() {
+        vec![(
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
+            SESSION_BG_WAIT_CEILING.as_millis().to_string(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 pub struct ClaudeProvider;
 
 #[async_trait]
@@ -151,6 +175,7 @@ impl AgentProvider for ClaudeProvider {
 
         let mut child = Command::new("claude")
             .args(&args)
+            .envs(cli_env(&cfg))
             .current_dir(&cfg.project_dir)
             .stdin(if session {
                 Stdio::piped()
@@ -205,7 +230,9 @@ impl AgentProvider for ClaudeProvider {
 /// stdin closes the process still finishes pending background subagents and
 /// exits. So stdin is closed at a `result` with no written message still
 /// unechoed — that is what lets the process end, and [`TurnGate`] keeps ending
-/// the run at process exit as before.
+/// the run at process exit as before. "Finishes" holds only up to the CLI's
+/// background-wait ceiling after the last `result` (10 minutes by default,
+/// raised for sessions by [`cli_env`]); past it the CLI stops the subagents.
 struct LiveInput {
     /// `None` once closed: later messages are refused (and get queued).
     stdin: Option<ChildStdin>,
@@ -512,8 +539,20 @@ pub(crate) const HELD_RESULT_GRACE: Duration = Duration::from_secs(12 * 60);
 /// subagent reports back. Releasing it early would mark the session Finished
 /// and kill the subagent mid-work — the exact failure sessions exist to avoid.
 /// The user can always Stop a session, so a long wait costs little. Must stay
-/// below the session actor's `SESSION_IDLE_TIMEOUT`, asserted there.
+/// below the session actor's `SESSION_IDLE_TIMEOUT`, asserted there. Waiting is
+/// only useful if the CLI waits too: it stops background tasks
+/// `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` after the last `result` (10 minutes
+/// by default), which sessions raise to [`SESSION_BG_WAIT_CEILING`].
 pub(crate) const SESSION_HELD_RESULT_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// The CLI background-wait ceiling for sessions ([`cli_env`]). Kept below
+/// [`SESSION_HELD_RESULT_GRACE`] so the CLI always stops a runaway subagent
+/// itself — recording it as stopped, so a later turn can resume it — before
+/// we hard-kill the process: the CLI's clock starts at the `result`, ours at
+/// that result or a later event.
+pub(crate) const SESSION_BG_WAIT_CEILING: Duration =
+    Duration::from_secs(SESSION_HELD_RESULT_GRACE.as_secs() - 5 * 60);
+const _: () = assert!(SESSION_BG_WAIT_CEILING.as_secs() < SESSION_HELD_RESULT_GRACE.as_secs());
 
 /// How long to keep reading stdout once `claude` itself has exited, for lines
 /// still in the pipe. A grandchild holding the pipe open won't delay us longer.
@@ -718,6 +757,18 @@ mod tests {
         args.iter()
             .position(|a| a == flag)
             .map(|i| args[i + 1].clone())
+    }
+
+    #[test]
+    fn session_runs_raise_the_cli_background_wait_ceiling() {
+        let expected = vec![(
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
+            (115 * 60 * 1000).to_string(),
+        )];
+        assert_eq!(cli_env(&cfg(RunMode::SessionFull)), expected);
+        assert_eq!(cli_env(&cfg(RunMode::SessionReadOnly)), expected);
+        assert!(cli_env(&cfg(RunMode::Implement)).is_empty());
+        assert!(cli_env(&cfg(RunMode::Plan)).is_empty());
     }
 
     #[test]
