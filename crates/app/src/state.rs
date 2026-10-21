@@ -936,22 +936,27 @@ impl AppState {
     /// alone don't count — they restart freely and hold no agent work. Peeks, so
     /// it's safe from event handlers and never subscribes a component.
     pub fn active_work(&self) -> Vec<String> {
-        let busy = self.busy.peek();
-        let queued: HashSet<Uuid> = self.run_queue.peek().iter().map(|t| t.id()).collect();
-        let cards = self.cards.peek();
-        let reviews = self.review_tasks.peek();
-        let cards = cards
-            .iter()
-            .map(|c| (c.id, c.state.is_running(), c.title.clone()));
-        let reviews = reviews.values().flatten().map(|t| {
-            let title = format!("PR #{} {}", t.pr_number, t.pr_title);
-            (t.id, t.status.is_running(), title)
-        });
-        let sessions = self.sessions.peek();
-        let sessions = sessions
-            .values()
-            .map(|s| (s.id, s.is_running(), format!("Session: {}", s.title)));
-        active_titles(cards.chain(reviews).chain(sessions), &busy, &queued)
+        collect_active_work(
+            &self.cards.peek(),
+            &self.review_tasks.peek(),
+            &self.sessions.peek(),
+            &self.busy.peek(),
+            &self.run_queue.peek(),
+        )
+    }
+
+    /// How many items `active_work` would list, but *reading* the signals, so
+    /// a component re-renders as runs come and go — the update control waits
+    /// on this reaching zero before it restarts the app.
+    pub fn active_work_count(&self) -> usize {
+        collect_active_work(
+            &self.cards.read(),
+            &self.review_tasks.read(),
+            &self.sessions.read(),
+            &self.busy.read(),
+            &self.run_queue.read(),
+        )
+        .len()
     }
 
     /// The current computed diff state for a card, if one has been requested this
@@ -1783,6 +1788,29 @@ fn merge_loaded_transcript(live: &mut Vec<(i64, String)>, loaded: Vec<(i64, Stri
 
 /// The titles of `items` — `(id, running, title)` — that are running, busy or
 /// queued. Each item is listed once however many of those hold.
+/// The shared body of `active_work` / `active_work_count`: one definition of
+/// "work closing the app would interrupt", whichever way the signals are held.
+fn collect_active_work(
+    cards: &[Card],
+    reviews: &HashMap<Uuid, Vec<ReviewTask>>,
+    sessions: &HashMap<Uuid, Session>,
+    busy: &HashSet<Uuid>,
+    run_queue: &[QueuedTarget],
+) -> Vec<String> {
+    let queued: HashSet<Uuid> = run_queue.iter().map(|t| t.id()).collect();
+    let cards = cards
+        .iter()
+        .map(|c| (c.id, c.state.is_running(), c.title.clone()));
+    let reviews = reviews.values().flatten().map(|t| {
+        let title = format!("PR #{} {}", t.pr_number, t.pr_title);
+        (t.id, t.status.is_running(), title)
+    });
+    let sessions = sessions
+        .values()
+        .map(|s| (s.id, s.is_running(), format!("Session: {}", s.title)));
+    active_titles(cards.chain(reviews).chain(sessions), busy, &queued)
+}
+
 fn active_titles(
     items: impl IntoIterator<Item = (Uuid, bool, String)>,
     busy: &HashSet<Uuid>,

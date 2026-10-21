@@ -1143,6 +1143,29 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 .usage-refresh:disabled { cursor: default; background: transparent; }
 /* One tip for the whole bar, anchored under the gauges rather than the padding edge. */
 .usage-bar .info-tip { left: 14px; }
+/* The update control, last in the bar: "Check for updates", then the result
+   and — once an update is found — the "Update when idle" toggle. Its own tip
+   replaces the bar's usage tip while hovered. */
+.update-control {
+  display: flex; align-items: center; gap: 8px; flex: none; white-space: nowrap;
+  border-left: 1px solid var(--border); padding-left: 10px; margin-left: -6px;
+  border-radius: 4px; transition: background-color 1s ease, color 1s ease;
+}
+.update-check {
+  background: transparent; border: none; color: var(--muted); font: inherit;
+  cursor: pointer; padding: 2px 5px; border-radius: 4px;
+}
+.update-check:hover { color: var(--text); background: var(--surface-hover); }
+.update-status { display: inline-flex; align-items: center; gap: 6px; padding: 2px 0; }
+.update-status .spinner { width: 8px; height: 8px; }
+.update-toggle { display: inline-flex; align-items: center; gap: 4px; color: var(--text); cursor: pointer; }
+.update-toggle input { margin: 0; }
+.update-toggle.disabled { color: var(--muted); cursor: default; }
+.update-control.is-new { background: var(--accent-wash); color: var(--accent); }
+.update-control .info-tip { left: auto; right: 0; white-space: pre-line; max-width: 320px; }
+.usage-bar:has(.update-control:hover) > .info-tip { visibility: hidden; opacity: 0; }
+/* …and the bar's own hover would otherwise reveal this nested tip too. */
+.usage-bar:hover .update-control:not(:hover) > .info-tip { visibility: hidden; opacity: 0; }
 
 /* ----- Structured agent artifacts (hand-off, plan, findings) -------------- */
 /* A section's own tab strip: same look as the settings dialog's, but it sits

@@ -21,6 +21,7 @@ mod settings;
 mod shortcuts;
 mod sidebar;
 mod textfield;
+mod update;
 mod usagebar;
 mod widgets;
 

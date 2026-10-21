@@ -24,6 +24,7 @@ mod stress {
 }
 mod toast;
 mod ui;
+mod update;
 
 use dioxus::prelude::*;
 use futures::StreamExt;
@@ -65,6 +66,10 @@ fn app_display_name() -> &'static str {
 }
 
 fn main() {
+    // Before anything can replace the binary on disk (see `update`).
+    update::record_exe_path();
+    // A relaunch after an update: the old instance still holds the database.
+    update::wait_for_previous_instance();
     // Installed `usine`, launched from a shell: re-exec once into a detached
     // background session so the prompt returns immediately and the window
     // outlives the terminal. No-op in dev/hot-reload builds and on the re-exec'd
@@ -245,9 +250,6 @@ pub(crate) fn quit_app(
 ///   already makes a GUI-subsystem binary hand control back to the shell at once.
 #[cfg(unix)]
 fn detach_from_terminal() {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
     if cfg!(debug_assertions)
         || std::env::var_os("USINE_DETACHED").is_some()
         || std::env::var_os("USINE_NO_DETACH").is_some()
@@ -257,24 +259,38 @@ fn detach_from_terminal() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    if spawn_detached(&exe, &[("USINE_DETACHED", "1")]).is_ok() {
+        std::process::exit(0);
+    }
+    // Spawn failed — fall through and just run in the foreground.
+}
+
+/// Start `exe` with this process's arguments and environment plus `env`, stdio
+/// sent to `/dev/null`, in a new session (Unix) so it has no controlling
+/// terminal and survives this process and its shell exiting. Shared by the
+/// terminal detach above and the post-update relaunch (`update.rs`).
+pub(crate) fn spawn_detached(
+    exe: &std::path::Path,
+    env: &[(&str, &str)],
+) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+
     let mut cmd = Command::new(exe);
     cmd.args(std::env::args_os().skip(1))
-        .env("USINE_DETACHED", "1")
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // Start a new session in the child (after fork, before exec) so it has no
-    // controlling terminal and survives the launching shell exiting.
+    // Start a new session in the child (after fork, before exec).
+    #[cfg(unix)]
     unsafe {
+        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             let _ = libc::setsid();
             Ok(())
         });
     }
-    if cmd.spawn().is_ok() {
-        std::process::exit(0);
-    }
-    // Spawn failed — fall through and just run in the foreground.
+    cmd.spawn()
 }
 
 #[cfg(not(unix))]
