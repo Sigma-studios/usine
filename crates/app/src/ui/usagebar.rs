@@ -9,15 +9,17 @@
 //! re-rolls.
 //!
 //! Next to each provider's badge sits a global "N running" count of the agent
-//! runs currently executing on it (every project's cards and PR review tasks),
-//! hidden at zero. A provider with running agents but no visible window still
-//! gets its segment, holding just the badge and the count.
+//! runs currently executing on it (every project's cards, PR review tasks and
+//! one-off sessions), hidden at zero. A provider with running agents but no
+//! visible window still gets its segment, holding just the badge and the count.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 use usine_core::{
     now_millis, CardState, Provider, ProviderUsage, QueuedTarget, RateLimitWindow, ReviewSub,
+    Session,
 };
 use uuid::Uuid;
 
@@ -55,8 +57,9 @@ pub fn UsageBar() -> Element {
         }
     });
     let snapshot = state.usage.read().clone();
-    // Cards and review tasks change constantly across every project; the memo
-    // soaks those updates up and only re-renders the bar when a count moves.
+    // Cards, review tasks and sessions change constantly across every project;
+    // the memo soaks those updates up and only re-renders the bar when a count
+    // moves.
     let running = use_memo(move || {
         // Review runs launch on the default provider, so that's where they count.
         let review_provider = state.settings.read().default_provider;
@@ -76,6 +79,7 @@ pub fn UsageBar() -> Element {
                 .filter(|task| task.status.is_running())
                 .map(|task| (task.id, review_provider)),
         );
+        runs.extend(session_runs(&state.sessions.read()));
         let queued = state.run_queue.read();
         (
             running_count(Provider::Claude, &runs, &queued),
@@ -199,6 +203,16 @@ fn runs_agent(state: &CardState) -> bool {
             state,
             CardState::AwaitingReview(ReviewSub::Validating { .. })
         )
+}
+
+/// The `(id, provider)` pairs of the sessions with a turn in flight. Sessions
+/// run on their own provider, outside the run queue, so none is ever a queued
+/// launch; one waiting on an answer has already torn its process down.
+fn session_runs(sessions: &HashMap<Uuid, Session>) -> impl Iterator<Item = (Uuid, Provider)> + '_ {
+    sessions
+        .values()
+        .filter(|s| s.is_running())
+        .map(|s| (s.id, s.provider))
 }
 
 /// How many of the running `(id, provider)` pairs are on `provider`. A queued
@@ -330,6 +344,39 @@ mod tests {
         assert!(refresh_landed(Some(pending), Some(NOW + 5_000)));
         // Nothing in flight: an incoming snapshot has no spinner to clear.
         assert!(!refresh_landed(None, Some(NOW)));
+    }
+
+    #[test]
+    fn only_sessions_with_a_turn_in_flight_count_as_running() {
+        use std::path::PathBuf;
+        use usine_core::{Effort, Intervention, ModelSpec, SessionAccess, SessionStatus};
+
+        let session = |provider| {
+            Session::new(
+                Uuid::new_v4(),
+                PathBuf::from("/tmp"),
+                provider,
+                ModelSpec::new("opus", Effort::High),
+                SessionAccess::FullAccess,
+                "x",
+                vec![],
+            )
+        };
+        let running = session(Provider::Claude);
+        let mut finished = session(Provider::Codex);
+        finished.status = SessionStatus::Finished;
+        let mut asking = session(Provider::Codex);
+        asking.status = SessionStatus::NeedsAnswer(Intervention {
+            request_id: "q".into(),
+            question: "?".into(),
+            options: vec![],
+        });
+        let sessions: HashMap<Uuid, Session> = [running.clone(), finished, asking]
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
+        let runs: Vec<_> = session_runs(&sessions).collect();
+        assert_eq!(runs, vec![(running.id, Provider::Claude)]);
     }
 
     #[test]
