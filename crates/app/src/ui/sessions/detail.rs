@@ -10,12 +10,13 @@ use usine_core::{
 };
 use uuid::Uuid;
 
+use super::work::{section_bounds, WorkSection};
 use super::{ago, home_dir, open_file, request_block_session, reveal, shorten_home};
 use crate::state::AppState;
 use crate::ui::confirm::{request_confirm_with_note, ConfirmAction, ConfirmRequest};
 use crate::ui::detail::{
     attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
-    InterventionPanel, TranscriptView,
+    InterventionPanel,
 };
 use crate::ui::drafts;
 use crate::ui::widgets::{model_label, provider_value, ArtifactText};
@@ -221,7 +222,6 @@ pub(crate) fn SessionDetail() -> Element {
             for k in [id] {
                 div { key: "{k}", class: "detail-body",
                     Conversation { session: session.clone() }
-                    ActivitySection { id }
                 }
             }
             for k in [id] {
@@ -281,6 +281,17 @@ fn Conversation(session: Session) -> Element {
     // Scroll to the newest turn as the conversation grows.
     let n = session.turns.len();
     let id = session.id;
+    let state = use_context::<AppState>();
+    // Lines are persisted but only streamed while a run is live: ask for the
+    // stored ones once, so earlier work blocks fill in (see `TranscriptView`).
+    use_hook(move || {
+        if !state.transcripts_loaded.peek().contains(&id) {
+            state.send(ExecutorCommand::LoadTranscript { card_id: id });
+        }
+    });
+    let running = session.is_running();
+    let bounds = section_bounds(&session.turns);
+    let last_bound = bounds.len().checked_sub(1);
     use_effect(use_reactive!(|n| {
         let _ = n;
         dioxus::document::eval(&format!(
@@ -292,6 +303,7 @@ fn Conversation(session: Session) -> Element {
         div { class: "session-turns",
             for (i , turn) in session.turns.iter().enumerate() {
                 {
+                    let work_folder = folder.clone();
                     let folder = folder.clone();
                     let open_path = move |p: String| {
                         let path = folder.join(p.split(':').next().unwrap_or(&p));
@@ -300,17 +312,31 @@ fn Conversation(session: Session) -> Element {
                         }
                     };
                     match turn.kind {
-                        SessionTurnKind::User | SessionTurnKind::Answer => rsx! {
-                            div { key: "{i}", class: "turn turn-user",
-                                if turn.kind == SessionTurnKind::Answer {
-                                    div { class: "turn-label", "Your answer" }
+                        SessionTurnKind::User | SessionTurnKind::Answer => {
+                            let work = bounds.iter().position(|b| b.after_turn == i);
+                            rsx! {
+                                div { key: "{i}", class: "turn turn-user",
+                                    if turn.kind == SessionTurnKind::Answer {
+                                        div { class: "turn-label", "Your answer" }
+                                    }
+                                    if !turn.text.is_empty() {
+                                        div { class: "turn-text", "{turn.text}" }
+                                    }
+                                    TurnAttachments { paths: turn.attachments.clone() }
                                 }
-                                if !turn.text.is_empty() {
-                                    div { class: "turn-text", "{turn.text}" }
+                                if let Some(w) = work {
+                                    WorkSection {
+                                        key: "w{i}",
+                                        id,
+                                        folder: work_folder.clone(),
+                                        start: bounds[w].start,
+                                        end: bounds[w].end,
+                                        live: running && Some(w) == last_bound,
+                                        final_text: bounds[w].final_text.clone(),
+                                    }
                                 }
-                                TurnAttachments { paths: turn.attachments.clone() }
                             }
-                        },
+                        }
                         SessionTurnKind::Agent => rsx! {
                             div { key: "{i}", class: "turn turn-agent",
                                 if turn.text.trim().is_empty() {
@@ -332,9 +358,8 @@ fn Conversation(session: Session) -> Element {
                     }
                 }
             }
-            if session.is_running() {
+            if running {
                 div { class: "turn-live",
-                    LiveActivity { id, folder: folder.clone() }
                     div { class: "turn turn-working",
                         span { class: "spinner" }
                         if let Some(note) = &session.status_note {
@@ -358,139 +383,6 @@ fn Conversation(session: Session) -> Element {
             div { id: "session-end-{id}" }
         }
     }
-}
-
-/// How many activity lines the running turn shows above its status line.
-const TAIL_LINES: usize = 5;
-
-/// The running turn's last few activity lines — tool calls and interim prose —
-/// so the conversation reads live without opening "Activity". Reads the
-/// transcript itself so a new line re-renders only this, not the conversation.
-#[component]
-fn LiveActivity(id: Uuid, folder: PathBuf) -> Element {
-    let state = use_context::<AppState>();
-    let items = {
-        let map = state.transcripts.read();
-        let all = map.get(&id).map(Vec::as_slice).unwrap_or_default();
-        activity_tail(all, &folder, TAIL_LINES)
-    };
-    let newest = items.last().map(|it| it.idx);
-    // Follow new lines only when the reader is already at the bottom: someone
-    // scrolled up into earlier turns stays where they are.
-    use_effect(use_reactive!(|newest| {
-        if newest.is_none() {
-            return;
-        }
-        dioxus::document::eval(&format!(
-            "setTimeout(function(){{var end=document.getElementById('session-end-{id}');if(!end)return;\
-             var body=end.closest('.detail-body');if(!body)return;\
-             var gap=end.getBoundingClientRect().top-body.getBoundingClientRect().bottom;\
-             if(gap<120)end.scrollIntoView({{block:'end'}});}},0);"
-        ));
-    }));
-    if items.is_empty() {
-        return rsx! {};
-    }
-    let last = items.len() - 1;
-    rsx! {
-        div { class: "activity-tail",
-            for (i , item) in items.iter().enumerate() {
-                div {
-                    key: "{item.idx}",
-                    class: if i == last { "{item.kind.class()}" } else { "{item.kind.class()} older" },
-                    title: "{item.text}",
-                    "{item.text}"
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TailKind {
-    /// A tool call (`→ …`), arrow dropped.
-    Tool,
-    /// The agent's interim prose.
-    Text,
-    /// A run event worth seeing (`↪ picked up: …`, `⚠ …`).
-    Note,
-}
-
-impl TailKind {
-    fn class(self) -> &'static str {
-        match self {
-            TailKind::Tool => "tool",
-            TailKind::Text => "text",
-            TailKind::Note => "note",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TailItem {
-    /// The line's index in the transcript, a stable key as the window slides.
-    idx: usize,
-    kind: TailKind,
-    text: String,
-}
-
-/// The last `n` showable lines of the current run, oldest first. The run
-/// starts at the last `▶` line; bookkeeping lines are skipped, prose loses its
-/// `usine-status:` lines (they are the status note) and keeps its first line,
-/// and tool lines show paths relative to `folder`.
-fn activity_tail(lines: &[(i64, String)], folder: &Path, n: usize) -> Vec<TailItem> {
-    let prefix = format!("{}/", folder.display());
-    let mut out = Vec::new();
-    for (idx, (_, line)) in lines.iter().enumerate().rev() {
-        if out.len() == n || line.starts_with("▶ ") {
-            break;
-        }
-        if line.starts_with("● session")
-            || line.starts_with('⏸')
-            || line.starts_with("↪ sent to the running agent")
-        {
-            continue;
-        }
-        let item = if let Some(tool) = line.strip_prefix("→ ") {
-            let tool = tool.lines().next().unwrap_or("").trim();
-            let tool = if prefix.len() > 1 {
-                tool.replace(&prefix, "")
-            } else {
-                tool.to_string()
-            };
-            (TailKind::Tool, tool)
-        } else if ["↪", "⚠", "✔", "✖", "■"]
-            .iter()
-            .any(|m| line.starts_with(m))
-        {
-            (TailKind::Note, line.trim().to_string())
-        } else {
-            let prose = usine_core::strip_status_lines(line);
-            let first = prose
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("");
-            // Codex reasoning summaries open with a `**Title**` (or a
-            // heading); show the words, not the markdown markers.
-            let first = first
-                .trim_start_matches('#')
-                .trim()
-                .trim_matches('*')
-                .trim();
-            (TailKind::Text, usine_core::truncate_chars(first, 200))
-        };
-        if item.1.is_empty() {
-            continue;
-        }
-        out.push(TailItem {
-            idx,
-            kind: item.0,
-            text: item.1,
-        });
-    }
-    out.reverse();
-    out
 }
 
 /// Messages sent while a turn ran, waiting to go out together as the next
@@ -584,23 +476,6 @@ fn TurnAttachments(paths: Vec<PathBuf>) -> Element {
         }
         if let Some(path) = preview() {
             AttachmentPreview { path, on_close: move |_| preview.set(None) }
-        }
-    }
-}
-
-#[component]
-fn ActivitySection(id: Uuid) -> Element {
-    let mut open = use_signal(|| false);
-    rsx! {
-        div { class: "section session-activity",
-            button {
-                class: "btn link",
-                onclick: move |_| open.toggle(),
-                if open() { "▾ Activity" } else { "▸ Activity" }
-            }
-            if open() {
-                TranscriptView { id }
-            }
         }
     }
 }
@@ -712,96 +587,5 @@ fn Composer(session_id: Uuid, running: bool, steerable: bool, has_queue: bool) -
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lines(raw: &[&str]) -> Vec<(i64, String)> {
-        raw.iter().map(|l| (0, l.to_string())).collect()
-    }
-
-    fn texts(items: &[TailItem]) -> Vec<(TailKind, &str)> {
-        items.iter().map(|i| (i.kind, i.text.as_str())).collect()
-    }
-
-    #[test]
-    fn tail_covers_only_the_current_run() {
-        let all = lines(&[
-            "▶ starting",
-            "→ Read old.rs",
-            "✔ finished",
-            "▶ resuming the conversation",
-            "→ Bash cargo check",
-        ]);
-        let tail = activity_tail(&all, Path::new("/w"), 5);
-        assert_eq!(texts(&tail), vec![(TailKind::Tool, "Bash cargo check")]);
-        assert_eq!(tail[0].idx, 4);
-    }
-
-    #[test]
-    fn tail_skips_bookkeeping_and_status_only_prose() {
-        let all = lines(&[
-            "▶ starting",
-            "● session abc",
-            "⏸ message queued for when this turn ends",
-            "↪ sent to the running agent",
-            "↪ picked up: also this",
-            "usine-status: checking the build",
-            "Looking at the parser.\nusine-status: reading",
-        ]);
-        assert_eq!(
-            texts(&activity_tail(&all, Path::new("/w"), 5)),
-            vec![
-                (TailKind::Note, "↪ picked up: also this"),
-                (TailKind::Text, "Looking at the parser."),
-            ]
-        );
-    }
-
-    #[test]
-    fn tail_cuts_long_prose_to_its_first_line() {
-        let long = format!("\n{}\nsecond line", "x".repeat(300));
-        let tail = activity_tail(&lines(&[&long]), Path::new("/w"), 5);
-        assert_eq!(tail[0].text.chars().count(), 200);
-        assert!(tail[0].text.ends_with('…'));
-    }
-
-    #[test]
-    fn tail_drops_markdown_markers_from_titles() {
-        let all = lines(&["**Inspecting the parser**\n\nThe tokenizer…", "## Plan"]);
-        assert_eq!(
-            texts(&activity_tail(&all, Path::new("/w"), 5)),
-            vec![
-                (TailKind::Text, "Inspecting the parser"),
-                (TailKind::Text, "Plan"),
-            ]
-        );
-    }
-
-    #[test]
-    fn tail_shows_paths_relative_to_the_folder() {
-        let all = lines(&[
-            "→ Read /w/proj/src/main.rs",
-            "→ Bash cd /w/proj && ls /w/projx",
-        ]);
-        assert_eq!(
-            texts(&activity_tail(&all, Path::new("/w/proj"), 5)),
-            vec![
-                (TailKind::Tool, "Read src/main.rs"),
-                (TailKind::Tool, "Bash cd /w/proj && ls /w/projx"),
-            ]
-        );
-    }
-
-    #[test]
-    fn tail_keeps_the_newest_n() {
-        let all = lines(&["▶ starting", "→ A", "→ B", "→ C", "→ D"]);
-        assert_eq!(
-            texts(&activity_tail(&all, Path::new("/w"), 2)),
-            vec![(TailKind::Tool, "C"), (TailKind::Tool, "D")]
-        );
     }
 }

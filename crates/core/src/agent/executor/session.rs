@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::{append_attachments, lock, release_run, transcript, Executor, RunMap};
 use crate::agent::events::{AgentEvent, ExecutorEvent, RunControl, Severity};
-use crate::agent::provider::stream::TODO_PROGRESS_PREFIX;
+use crate::agent::provider::stream::{THINKING_PROGRESS_PREFIX, TODO_PROGRESS_PREFIX};
 use crate::agent::provider::{RunConfig, RunMode, SESSION_STATUS_PROMPT};
 use crate::domain::config::SessionDefaults;
 use crate::domain::model::{now_millis, Cost, Intervention, ModelSpec, Provider};
@@ -801,7 +801,10 @@ async fn run_session_actor(run: SessionRun) {
             }
             AgentEvent::Progress { text } => {
                 saw_output = true;
+                // Thinking is logged, but never speaks for the run's status.
+                let thinking = text.starts_with(THINKING_PROGRESS_PREFIX);
                 let note = match last_status_line(&text) {
+                    _ if thinking => None,
                     Some(note) => {
                         reported = true;
                         Some(note)

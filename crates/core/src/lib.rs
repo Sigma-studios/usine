@@ -49,6 +49,7 @@ pub use agent::plan::{
 pub use agent::provider::claude::ClaudeProvider;
 pub use agent::provider::codex::CodexProvider;
 pub use agent::provider::sim::SimFactory;
+pub use agent::provider::stream::THINKING_PROGRESS_PREFIX;
 pub use agent::provider::{
     AgentProvider, ProviderFactory, RealFactory, RunConfig, RunHandle, RunMode, UsageSource,
 };

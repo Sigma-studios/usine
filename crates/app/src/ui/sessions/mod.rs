@@ -12,6 +12,7 @@ use crate::ui::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 mod detail;
 mod list;
 mod new;
+mod work;
 
 pub(crate) use detail::SessionDetail;
 pub(crate) use list::SessionList;

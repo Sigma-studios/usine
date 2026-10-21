@@ -305,6 +305,17 @@ async fn simulate(
                 )
             });
             pause!(400);
+            // A thought and a tool call, as a real run streams them.
+            emit!(AgentEvent::Progress {
+                text: format!(
+                    "{}The request is small; reading the entry point first.",
+                    crate::agent::provider::stream::THINKING_PROGRESS_PREFIX
+                )
+            });
+            emit!(AgentEvent::Progress {
+                text: format!("→ Read {}/README.md", cfg.project_dir.display())
+            });
+            pause!(300);
             let prompt = cfg.full_prompt();
             if prompt.contains("[ask]") {
                 emit!(AgentEvent::NeedsInput {
