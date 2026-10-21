@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 use crate::ui::icons::IconPaperclip;
+use crate::ui::sessions::open_file;
 use crate::ui::widgets::{
     parse_provider, provider_value, ModelEffortPicker, OptionalModelEffortPicker,
 };
@@ -167,7 +168,8 @@ pub(super) fn Attachments(card_id: Uuid, #[props(default = true)] can_attach: bo
     }
 }
 
-/// The attached files, as removable chips (images also open a preview). Renders
+/// The attached files, as removable chips: images preview in-app, other files
+/// open in their default app, and a deleted file is greyed out. Renders
 /// nothing when the list is empty, so it can sit above a chat box unconditionally.
 #[component]
 pub(crate) fn AttachmentChips(card_id: Uuid) -> Element {
@@ -191,19 +193,32 @@ pub(crate) fn AttachmentChips(card_id: Uuid) -> Element {
                         .unwrap_or_default();
                     let label = usine_core::infra::paths::attachment_label(&path);
                     let to_remove = path.clone();
-                    let is_image = image_mime(&path).is_some();
+                    let exists = path.exists();
+                    let is_image = exists && image_mime(&path).is_some();
                     let to_preview = path.clone();
+                    let to_open = path.clone();
                     rsx! {
-                        span { key: "{key}", class: "chip",
-                            if is_image {
+                        span { key: "{key}", class: if exists { "chip" } else { "chip missing" },
+                            if !exists {
+                                span {
+                                    class: "chip-label",
+                                    title: "Missing: {path.display()}",
+                                    "{label}"
+                                }
+                            } else if is_image {
                                 span {
                                     class: "chip-label clickable",
-                                    title: "{name}",
+                                    title: "Preview {name}",
                                     onclick: move |_| preview.set(Some(to_preview.clone())),
                                     "{label}"
                                 }
                             } else {
-                                span { class: "chip-label", title: "{name}", "{label}" }
+                                span {
+                                    class: "chip-label clickable",
+                                    title: "Open {name}",
+                                    onclick: move |_| open_file(&to_open),
+                                    "{label}"
+                                }
                             }
                             button {
                                 class: "chip-remove",
