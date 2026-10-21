@@ -1718,14 +1718,7 @@ impl Card {
     /// is the same as none, and unmarking always drops it.
     pub fn set_blocked(&mut self, blocked: bool, note: Option<String>) {
         self.blocked = blocked;
-        self.blocked_note = blocked
-            .then(|| {
-                note.as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .flatten();
+        self.blocked_note = normalize_blocked_note(blocked, note);
     }
 
     pub fn column(&self) -> Column {
@@ -1955,6 +1948,19 @@ impl Card {
             && self.pending_review_bodies().is_empty()
             && !self.reviews.iter().any(ReviewSummary::requests_changes)
     }
+}
+
+/// The stored form of a blocked marker's message, shared by cards and
+/// sessions: trimmed, blank is the same as none, and unmarking drops it.
+pub(crate) fn normalize_blocked_note(blocked: bool, note: Option<String>) -> Option<String> {
+    blocked
+        .then(|| {
+            note.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .flatten()
 }
 
 #[cfg(test)]

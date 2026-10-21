@@ -5,6 +5,9 @@
 use std::path::{Path, PathBuf};
 
 use usine_core::{Session, SessionStatus};
+use uuid::Uuid;
+
+use crate::ui::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 
 mod detail;
 mod list;
@@ -65,6 +68,20 @@ pub(crate) fn session_dot(s: &Session) -> &'static str {
         _ if s.unread => "proj-dot",
         _ => "proj-dot idle",
     }
+}
+
+/// Ask for the optional message before marking session `id` blocked — the
+/// same dialog a board card's "Mark blocked" opens. Unblocking doesn't ask.
+pub(crate) fn request_block_session(id: Uuid, title: &str) {
+    request_confirm(ConfirmRequest {
+        title: "Mark blocked".into(),
+        message: format!(
+            "Mark “{title}” as blocked? It stops counting toward the attention badges until you unmark it.",
+        ),
+        confirm_label: "Mark blocked".into(),
+        danger: false,
+        action: ConfirmAction::BlockSession(id),
+    });
 }
 
 /// Show `path` in Finder (or the platform's file manager).

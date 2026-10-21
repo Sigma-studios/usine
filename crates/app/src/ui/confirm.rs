@@ -22,6 +22,9 @@ pub(crate) enum ConfirmAction {
     /// Raised for *marking* and for editing an already-blocked card's message —
     /// both send `blocked: true`. Unmarking doesn't ask.
     BlockCard(Uuid),
+    /// The same for a one-off session: marking it blocked, or editing the
+    /// message of an already-blocked one.
+    BlockSession(Uuid),
     /// Quit the app although work is still running (raised by a close/quit
     /// request, see `request_quit` in `main.rs`).
     Quit,
@@ -38,7 +41,7 @@ pub(crate) struct ConfirmRequest {
 
 static CONFIRM: GlobalSignal<Option<ConfirmRequest>> = Signal::global(|| None);
 
-/// The message typed in a `BlockCard` dialog. Global for the same reason
+/// The message typed in a `BlockCard` / `BlockSession` dialog. Global for the same reason
 /// `CONFIRM` is: the host outlives every individual dialog, so the buffer has to
 /// be reset by whoever opens one.
 static NOTE: GlobalSignal<String> = Signal::global(String::new);
@@ -66,7 +69,7 @@ pub(crate) fn request_quit_confirm(req: ConfirmRequest) {
 }
 
 /// Same as [`request_confirm`], but starts the message field from `note` —
-/// "Edit blocked message" edits what's already on the card rather than making
+/// "Edit blocked message" edits what's already on the card (or session) rather than making
 /// you type it again.
 pub(crate) fn request_confirm_with_note(req: ConfirmRequest, note: String) {
     request_confirm(req);
@@ -97,9 +100,13 @@ pub fn ConfirmHost() -> Element {
         "btn primary"
     };
     let action = req.action.clone();
-    // Only this action collects text, so the field is driven by the variant
-    // rather than by a `note` field every other request site would have to fill.
-    let with_note = matches!(req.action, ConfirmAction::BlockCard(_));
+    // Only the blocking actions collect text, so the field is driven by the
+    // variant rather than by a `note` field every other request site would have
+    // to fill.
+    let with_note = matches!(
+        req.action,
+        ConfirmAction::BlockCard(_) | ConfirmAction::BlockSession(_)
+    );
 
     rsx! {
         div { class: "modal-overlay confirm-overlay", onclick: move |_| dismiss(),
@@ -183,6 +190,14 @@ pub fn ConfirmHost() -> Element {
                                         card_id: id,
                                         blocked: true,
                                         // Trim / blank -> None lives in `Card::set_blocked`.
+                                        note: Some(NOTE.peek().clone()),
+                                    })
+                                }
+                                ConfirmAction::BlockSession(id) => {
+                                    state.send(ExecutorCommand::SetSessionBlocked {
+                                        session_id: id,
+                                        blocked: true,
+                                        // Trim / blank -> None lives in `Session::set_blocked`.
                                         note: Some(NOTE.peek().clone()),
                                     })
                                 }

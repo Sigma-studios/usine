@@ -217,6 +217,7 @@ async fn a_session_runs_its_first_turn_to_an_unread_finish() {
     handle.send(ExecutorCommand::SetSessionBlocked {
         session_id: id,
         blocked: true,
+        note: Some("  waiting on infra ".into()),
     });
     let s = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::SessionUpdated(s) if s.id == id && s.blocked => Some(s.clone()),
@@ -224,6 +225,12 @@ async fn a_session_runs_its_first_turn_to_an_unread_finish() {
     })
     .await;
     assert!(!s.needs_attention(), "a blocked session doesn't count");
+    assert_eq!(s.blocked_note.as_deref(), Some("waiting on infra"));
+    assert_eq!(
+        store.get_session(id).unwrap().blocked_note.as_deref(),
+        Some("waiting on infra"),
+        "the note is persisted"
+    );
 
     // Running more work keeps the marker: only the user lifts it.
     handle.send(ExecutorCommand::SendSessionMessage {
@@ -239,6 +246,7 @@ async fn a_session_runs_its_first_turn_to_an_unread_finish() {
     handle.send(ExecutorCommand::SetSessionBlocked {
         session_id: id,
         blocked: false,
+        note: None,
     });
     let s = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::SessionUpdated(s) if s.id == id && !s.blocked => Some(s.clone()),
@@ -246,6 +254,7 @@ async fn a_session_runs_its_first_turn_to_an_unread_finish() {
     })
     .await;
     assert!(s.needs_attention(), "unblocked, it counts again");
+    assert_eq!(s.blocked_note, None, "unblocking drops the note");
 }
 
 #[tokio::test]

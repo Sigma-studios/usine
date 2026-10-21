@@ -373,9 +373,14 @@ impl Executor {
 
     /// Like cards, blocking doesn't count as activity: `last_activity_at`
     /// stays put.
-    pub(super) fn set_session_blocked(&self, id: Uuid, blocked: bool) -> Result<()> {
+    pub(super) fn set_session_blocked(
+        &self,
+        id: Uuid,
+        blocked: bool,
+        note: Option<String>,
+    ) -> Result<()> {
         let session = self.store.mutate_session(id, |s| {
-            s.blocked = blocked;
+            s.set_blocked(blocked, note);
             Ok(())
         })?;
         self.emit_session(session);

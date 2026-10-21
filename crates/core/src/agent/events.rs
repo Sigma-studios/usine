@@ -660,10 +660,13 @@ pub enum ExecutorCommand {
         archived: bool,
     },
     /// Mark the session blocked (or not): a blocked session stays out of the
-    /// attention counts. Only this command changes it.
+    /// attention counts. Only this command changes it. `note` is the optional
+    /// message the user typed when marking; it is ignored (and any stored note
+    /// dropped) when `blocked` is false.
     SetSessionBlocked {
         session_id: Uuid,
         blocked: bool,
+        note: Option<String>,
     },
     /// The user is looking at the session: clear `unread`.
     MarkSessionRead {
