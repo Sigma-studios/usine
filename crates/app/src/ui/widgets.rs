@@ -284,9 +284,20 @@ pub(crate) fn ArtifactTabs(
 /// legible. The caller decides what a path means (a diff to open, a file to
 /// edit), because that differs by panel.
 #[component]
-pub(crate) fn ArtifactText(text: String, on_path: Option<EventHandler<String>>) -> Element {
+pub(crate) fn ArtifactText(
+    text: String,
+    on_path: Option<EventHandler<String>>,
+    /// Lay the blocks out without the boxed background — for prose that sits
+    /// inside a box of its own (the amber question boxes).
+    bare: Option<bool>,
+) -> Element {
+    let class = if bare.unwrap_or(false) {
+        "md-bare"
+    } else {
+        "artifact-box"
+    };
     rsx! {
-        div { class: "artifact-box",
+        div { class,
             for (i, block) in md_blocks(&text).into_iter().enumerate() {
                 match block {
                     MdBlock::Heading(level, line) => rsx! {
@@ -298,7 +309,17 @@ pub(crate) fn ArtifactText(text: String, on_path: Option<EventHandler<String>>) 
                     MdBlock::Bullets(items) => rsx! {
                         ul { key: "{i}", class: "md-list",
                             for (j, item) in items.into_iter().enumerate() {
-                                li { key: "{j}", MdLine { line: item, on_path } }
+                                match task_item(&item) {
+                                    Some((done, rest)) => rsx! {
+                                        li { key: "{j}", class: "md-task",
+                                            span { class: "md-check", if done { "☑" } else { "☐" } }
+                                            MdLine { line: rest.to_string(), on_path }
+                                        }
+                                    },
+                                    None => rsx! {
+                                        li { key: "{j}", MdLine { line: item.clone(), on_path } }
+                                    },
+                                }
                             }
                         }
                     },
@@ -324,6 +345,40 @@ pub(crate) fn ArtifactText(text: String, on_path: Option<EventHandler<String>>) 
                             }
                         }
                     },
+                    MdBlock::Quote(lines) => rsx! {
+                        div { key: "{i}", class: "md-quote",
+                            for (j, line) in lines.into_iter().enumerate() {
+                                div { key: "{j}", class: "md-quote-line", MdLine { line, on_path } }
+                            }
+                        }
+                    },
+                    MdBlock::Rule => rsx! {
+                        hr { key: "{i}", class: "md-hr" }
+                    },
+                    MdBlock::Table { align, header, rows } => rsx! {
+                        // Its own horizontal scroller: a wide table must not
+                        // widen the panel it sits in.
+                        div { key: "{i}", class: "md-table-wrap",
+                            table { class: "md-table",
+                                thead {
+                                    tr {
+                                        for (j, h) in header.into_iter().enumerate() {
+                                            th { key: "{j}", style: align[j].css(), MdLine { line: h, on_path } }
+                                        }
+                                    }
+                                }
+                                tbody {
+                                    for (r, row) in rows.into_iter().enumerate() {
+                                        tr { key: "{r}",
+                                            for (j, c) in row.into_iter().enumerate() {
+                                                td { key: "{j}", style: align[j].css(), MdLine { line: c, on_path } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -339,6 +394,20 @@ fn MdLine(line: String, on_path: Option<EventHandler<String>>) -> Element {
                 MdInline::Text(t) => rsx! { span { key: "{i}", "{t}" } },
                 MdInline::Code(t) => rsx! { code { key: "{i}", class: "md-code-inline", "{t}" } },
                 MdInline::Strong(t) => rsx! { strong { key: "{i}", "{t}" } },
+                MdInline::Em(t) => rsx! { em { key: "{i}", "{t}" } },
+                MdInline::Strike(t) => rsx! { del { key: "{i}", "{t}" } },
+                MdInline::Link { label, url } => rsx! {
+                    button {
+                        key: "{i}",
+                        class: "md-link",
+                        title: "{url}",
+                        onclick: {
+                            let url = url.clone();
+                            move |_| crate::ui::sessions::open_url(&url)
+                        },
+                        "{label}"
+                    }
+                },
                 MdInline::Path(t) => match on_path {
                     Some(handler) => rsx! {
                         button {
@@ -356,8 +425,9 @@ fn MdLine(line: String, on_path: Option<EventHandler<String>>) -> Element {
 }
 
 /// The block structure this renderer understands. Deliberately small: agent
-/// prose is headings, bullets, steps and code, and anything richer degrades to
-/// a paragraph rather than to markup the reader has to decode.
+/// prose is headings, bullets, steps, code and the odd table, and anything
+/// richer degrades to a paragraph rather than to markup the reader has to
+/// decode.
 #[derive(Debug, PartialEq, Eq)]
 enum MdBlock {
     Heading(u8, String),
@@ -365,6 +435,34 @@ enum MdBlock {
     Bullets(Vec<String>),
     Ordered(Vec<String>),
     Code(String),
+    Quote(Vec<String>),
+    Rule,
+    /// Every row is padded or cut to the header's width, so `align`, `header`
+    /// and each row index alike.
+    Table {
+        align: Vec<Align>,
+        header: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+}
+
+/// A table column's alignment, from the colons of its separator cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+impl Align {
+    fn css(self) -> &'static str {
+        match self {
+            Align::None | Align::Left => "",
+            Align::Center => "text-align: center",
+            Align::Right => "text-align: right",
+        }
+    }
 }
 
 /// Split prose into blocks. Unterminated fences run to the end of the text —
@@ -375,6 +473,7 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
     let mut para: Vec<String> = Vec::new();
     let mut bullets: Vec<String> = Vec::new();
     let mut ordered: Vec<String> = Vec::new();
+    let mut quote: Vec<String> = Vec::new();
     let mut code: Option<Vec<String>> = None;
 
     macro_rules! flush {
@@ -388,10 +487,17 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
             if !ordered.is_empty() {
                 out.push(MdBlock::Ordered(std::mem::take(&mut ordered)));
             }
+            if !quote.is_empty() {
+                out.push(MdBlock::Quote(std::mem::take(&mut quote)));
+            }
         };
     }
 
-    for raw in text.lines() {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let raw = lines[idx];
+        idx += 1;
         let line = raw.trim_end();
         let trimmed = line.trim_start();
         if let Some(body) = &mut code {
@@ -412,6 +518,34 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
             flush!();
             continue;
         }
+        // A table needs its separator row: a `|` in prose is just a `|`.
+        if trimmed.contains('|') {
+            let header = split_row(trimmed);
+            if let Some(align) = lines
+                .get(idx)
+                .and_then(|next| parse_sep(next.trim()))
+                .filter(|a| a.len() == header.len())
+            {
+                flush!();
+                idx += 1;
+                let mut rows = Vec::new();
+                while let Some(next) = lines.get(idx).map(|l| l.trim()) {
+                    if next.is_empty() || !next.contains('|') {
+                        break;
+                    }
+                    let mut row = split_row(next);
+                    row.resize(header.len(), String::new());
+                    rows.push(row);
+                    idx += 1;
+                }
+                out.push(MdBlock::Table {
+                    align,
+                    header,
+                    rows,
+                });
+                continue;
+            }
+        }
         if let Some(level) = heading_level(trimmed) {
             flush!();
             out.push(MdBlock::Heading(
@@ -420,15 +554,29 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
             ));
             continue;
         }
+        // Before bullets, so `* * *` is a rule and not an item. A `---` under a
+        // paragraph is a rule too: setext headings are not supported.
+        if is_rule(trimmed) {
+            flush!();
+            out.push(MdBlock::Rule);
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            if quote.is_empty() {
+                flush!();
+            }
+            quote.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            continue;
+        }
         if let Some(item) = bullet_item(trimmed) {
-            if !para.is_empty() || !ordered.is_empty() {
+            if !para.is_empty() || !ordered.is_empty() || !quote.is_empty() {
                 flush!();
             }
             bullets.push(item);
             continue;
         }
         if let Some(item) = ordered_item(trimmed) {
-            if !para.is_empty() || !bullets.is_empty() {
+            if !para.is_empty() || !bullets.is_empty() || !quote.is_empty() {
                 flush!();
             }
             ordered.push(item);
@@ -443,7 +591,7 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
                 continue;
             }
         }
-        if !bullets.is_empty() || !ordered.is_empty() {
+        if !bullets.is_empty() || !ordered.is_empty() || !quote.is_empty() {
             flush!();
         }
         para.push(line.trim_start().to_string());
@@ -455,6 +603,70 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
     out
 }
 
+/// The cells of a table row: outer pipes optional, `\|` a literal pipe, and a
+/// pipe inside a code span part of the code (agents put `a|b` in tables).
+fn split_row(line: &str) -> Vec<String> {
+    let mut s = line.trim();
+    s = s.strip_prefix('|').unwrap_or(s);
+    if s.ends_with('|') && !s.ends_with("\\|") {
+        s = &s[..s.len() - 1];
+    }
+    // An unclosed backtick would swallow every later pipe, so a row whose
+    // backticks don't pair up splits on every pipe instead.
+    let code_aware = s.matches('`').count() % 2 == 0;
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut in_code = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cur.push('|');
+                chars.next();
+            }
+            '`' if code_aware => {
+                in_code = !in_code;
+                cur.push(c);
+            }
+            '|' if !in_code => cells.push(std::mem::take(&mut cur).trim().to_string()),
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// A separator row (`|:--|:-:|--:|`), as its columns' alignments.
+fn parse_sep(line: &str) -> Option<Vec<Align>> {
+    if line.is_empty() {
+        return None;
+    }
+    split_row(line)
+        .iter()
+        .map(|cell| {
+            let left = cell.starts_with(':');
+            let right = cell.len() > 1 && cell.ends_with(':');
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            (!dashes.is_empty() && dashes.chars().all(|c| c == '-')).then_some(
+                match (left, right) {
+                    (true, true) => Align::Center,
+                    (true, false) => Align::Left,
+                    (false, true) => Align::Right,
+                    (false, false) => Align::None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// `---`, `***`, `___`, spaces allowed between.
+fn is_rule(line: &str) -> bool {
+    let marks: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+    marks.len() >= 3
+        && ['-', '*', '_'].contains(&marks[0])
+        && marks.iter().all(|c| *c == marks[0])
+}
+
 /// `#` through `######`, returning the level (which is also the byte offset of
 /// the text after the hashes).
 fn heading_level(line: &str) -> Option<u8> {
@@ -462,14 +674,25 @@ fn heading_level(line: &str) -> Option<u8> {
     ((1..=6).contains(&hashes) && line[hashes..].starts_with(' ')).then_some(hashes as u8)
 }
 
-/// The text of a `- ` / `* ` bullet.
+/// The text of a `- ` / `* ` / `+ ` bullet.
 fn bullet_item(line: &str) -> Option<String> {
     line.strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
         .map(|s| s.trim().to_string())
 }
 
-/// The text of a `1. ` numbered item.
+/// A `[ ]` / `[x]` checklist item: whether it's ticked, and its text.
+fn task_item(item: &str) -> Option<(bool, &str)> {
+    let rest = item
+        .strip_prefix("[ ]")
+        .map(|r| (false, r))
+        .or_else(|| item.strip_prefix("[x]").map(|r| (true, r)))
+        .or_else(|| item.strip_prefix("[X]").map(|r| (true, r)))?;
+    (rest.1.is_empty() || rest.1.starts_with(' ')).then(|| (rest.0, rest.1.trim_start()))
+}
+
+/// The text of a `1. ` / `1) ` numbered item.
 fn ordered_item(line: &str) -> Option<String> {
     let digits = line.chars().take_while(char::is_ascii_digit).count();
     if digits == 0 {
@@ -477,6 +700,7 @@ fn ordered_item(line: &str) -> Option<String> {
     }
     line[digits..]
         .strip_prefix(". ")
+        .or_else(|| line[digits..].strip_prefix(") "))
         .map(|s| s.trim().to_string())
 }
 
@@ -486,43 +710,159 @@ enum MdInline {
     Text(String),
     Code(String),
     Strong(String),
+    Em(String),
+    Strike(String),
+    /// Only for `http(s)` targets — anything else has nowhere to open.
+    Link { label: String, url: String },
     Path(String),
 }
 
-/// Split a line into inline runs: backticked code, `**bold**`, and file
-/// references. Anything unmatched — including a stray backtick or asterisk —
-/// stays literal text.
+/// Split a line into inline runs: backticked code, `**bold**`, `*em*` /
+/// `_em_`, `~~strike~~`, `[links](https://…)` and file references. Anything
+/// unmatched — including a stray backtick or asterisk — stays literal text.
 fn md_inline(line: &str) -> Vec<MdInline> {
     let mut out = Vec::new();
-    let mut rest = line;
     let mut plain = String::new();
+    let mut i = 0;
 
-    while !rest.is_empty() {
-        let delim = ["`", "**"]
-            .into_iter()
-            .filter_map(|d| rest.find(d).map(|i| (i, d)))
-            .min();
-        let Some((at, delim)) = delim else { break };
-        let after = &rest[at + delim.len()..];
-        let Some(end) = after.find(delim) else {
-            // Unclosed: the delimiter is literal.
-            plain.push_str(&rest[..at + delim.len()]);
-            rest = after;
+    while i < line.len() {
+        let rest = &line[i..];
+        let prev = line[..i].chars().next_back();
+        // Paired delimiters, longest first so `**` never reads as two `*`.
+        let mut matched = false;
+        for (delim, kind) in [("`", 0), ("**", 1), ("~~", 2)] {
+            if !rest.starts_with(delim) {
+                continue;
+            }
+            let after = &rest[delim.len()..];
+            let close = if kind == 0 {
+                after.find(delim)
+            } else {
+                find_outside_code(after, 0, delim)
+            };
+            match close {
+                Some(end) if kind == 0 || end > 0 => {
+                    push_plain(&mut out, &mut plain);
+                    let inner = after[..end].to_string();
+                    out.push(match kind {
+                        0 => MdInline::Code(inner),
+                        1 => MdInline::Strong(inner),
+                        _ => MdInline::Strike(inner),
+                    });
+                    i += delim.len() * 2 + end;
+                }
+                // Unclosed: the delimiter is literal.
+                _ => {
+                    plain.push_str(delim);
+                    i += delim.len();
+                }
+            }
+            matched = true;
+            break;
+        }
+        if matched {
             continue;
-        };
-        plain.push_str(&rest[..at]);
-        push_plain(&mut out, &mut plain);
-        let inner = after[..end].to_string();
-        out.push(if delim == "`" {
-            MdInline::Code(inner)
-        } else {
-            MdInline::Strong(inner)
-        });
-        rest = &after[end + delim.len()..];
+        }
+        if let Some((inner, used)) = emphasis(rest, prev) {
+            push_plain(&mut out, &mut plain);
+            out.push(MdInline::Em(inner.to_string()));
+            i += used;
+            continue;
+        }
+        if let Some((label, url, used)) = link(rest) {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                push_plain(&mut out, &mut plain);
+                out.push(MdInline::Link {
+                    label: label.to_string(),
+                    url: url.to_string(),
+                });
+            } else {
+                // A relative target has nowhere to open; its label still gets
+                // the path-chip treatment.
+                plain.push_str(label);
+            }
+            i += used;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or_default();
+        plain.push(ch);
+        i += ch.len_utf8();
     }
-    plain.push_str(rest);
     push_plain(&mut out, &mut plain);
     out
+}
+
+/// `*em*` or `_em_` at the start of `rest`: its text and the bytes consumed.
+/// The text may not start or end with a space (`a * b * c` is arithmetic), and
+/// `_` only counts at word boundaries (`snake_case_name`, `__init__`).
+fn emphasis(rest: &str, prev: Option<char>) -> Option<(&str, usize)> {
+    let d = rest.chars().next().filter(|c| *c == '*' || *c == '_')?;
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    if d == '_' && prev.is_some_and(word) {
+        return None;
+    }
+    let after = &rest[1..];
+    let first = after.chars().next()?;
+    if first.is_whitespace() || first == d {
+        return None;
+    }
+    let mut from = 0;
+    let delim = if d == '*' { "*" } else { "_" };
+    while let Some(end) = find_outside_code(after, from, delim) {
+        let inner = &after[..end];
+        let next = after[end + 1..].chars().next();
+        // A `*` that's half of a `**` run (`*args and **kwargs`) isn't a closer.
+        let closes = !inner.ends_with(char::is_whitespace)
+            && !inner.ends_with(d)
+            && next != Some(d)
+            && (d == '*' || !next.is_some_and(word));
+        if !inner.is_empty() && closes {
+            return Some((inner, end + 2));
+        }
+        from = end + 1;
+    }
+    None
+}
+
+/// The first `delim` in `s` at or after byte `from` that isn't inside a closed
+/// backtick code span — markers in code are code, never a closer.
+fn find_outside_code(s: &str, mut from: usize, delim: &str) -> Option<usize> {
+    loop {
+        let hit = from + s[from..].find(delim)?;
+        let Some(tick) = s[from..hit].find('`').map(|t| from + t) else {
+            return Some(hit);
+        };
+        match s[tick + 1..].find('`') {
+            Some(close) => from = tick + 1 + close + 1,
+            // An unclosed backtick is literal.
+            None => return Some(hit),
+        }
+    }
+}
+
+/// `[label](url)` at the start of `rest`: label, url, and the bytes consumed.
+fn link(rest: &str) -> Option<(&str, &str, usize)> {
+    let body = rest.strip_prefix('[')?;
+    let close = body.find(']')?;
+    let label = &body[..close];
+    let target = body[close + 1..].strip_prefix('(')?;
+    // Balanced parens may sit inside the URL (`wiki/Foo_(bar)`).
+    let mut depth = 0usize;
+    let end = target.char_indices().find_map(|(j, c)| match c {
+        '(' => {
+            depth += 1;
+            None
+        }
+        ')' if depth == 0 => Some(j),
+        ')' => {
+            depth -= 1;
+            None
+        }
+        _ => None,
+    })?;
+    let url = &target[..end];
+    (!label.is_empty() && !url.is_empty() && !url.contains(char::is_whitespace))
+        .then_some((label, url, 1 + close + 2 + end + 1))
 }
 
 /// Flush accumulated plain text, pulling `path:line` references out of it.
@@ -702,6 +1042,198 @@ mod md_tests {
 }
 
 #[cfg(test)]
+mod md_table_tests {
+    use super::*;
+
+    fn cells(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_table_between_paragraphs_parses_with_alignment() {
+        let text = "Before.\n| Name | Mid | Count |\n|:-----|:---:|------:|\n| a | b | 1 |\n| c | d | 22 |\nAfter.";
+        assert_eq!(
+            md_blocks(text),
+            vec![
+                MdBlock::Para(vec!["Before.".into()]),
+                MdBlock::Table {
+                    align: vec![Align::Left, Align::Center, Align::Right],
+                    header: cells(&["Name", "Mid", "Count"]),
+                    rows: vec![cells(&["a", "b", "1"]), cells(&["c", "d", "22"])],
+                },
+                MdBlock::Para(vec!["After.".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipes_without_a_separator_stay_prose() {
+        assert_eq!(
+            md_blocks("a | b\nc | d"),
+            vec![MdBlock::Para(vec!["a | b".into(), "c | d".into()])]
+        );
+        // A separator whose width disagrees with the header is not one.
+        assert!(matches!(md_blocks("a | b\n---")[0], MdBlock::Para(_)));
+    }
+
+    #[test]
+    fn escaped_and_code_pipes_do_not_split_cells() {
+        let blocks = md_blocks("| x | y |\n|---|---|\n| a \\| b | `c|d` |");
+        let MdBlock::Table { rows, .. } = &blocks[0] else {
+            panic!("expected a table, got {blocks:?}")
+        };
+        assert_eq!(rows[0], cells(&["a | b", "`c|d`"]));
+    }
+
+    #[test]
+    fn ragged_rows_are_padded_and_cut_to_the_header() {
+        let blocks = md_blocks("| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |");
+        let MdBlock::Table { rows, align, .. } = &blocks[0] else {
+            panic!("expected a table")
+        };
+        assert_eq!(align, &vec![Align::None, Align::None]);
+        assert_eq!(rows[0], cells(&["1", ""]));
+        assert_eq!(rows[1], cells(&["1", "2"]));
+    }
+
+    #[test]
+    fn a_table_without_outer_pipes_still_parses() {
+        assert_eq!(
+            md_blocks("a | b\n--|--\n1 | 2"),
+            vec![MdBlock::Table {
+                align: vec![Align::None, Align::None],
+                header: cells(&["a", "b"]),
+                rows: vec![cells(&["1", "2"])],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_table_in_a_fence_is_code() {
+        assert_eq!(
+            md_blocks("```\n| a |\n|---|\n```"),
+            vec![MdBlock::Code("| a |\n|---|".into())]
+        );
+    }
+
+    #[test]
+    fn rules_quotes_and_list_styles() {
+        for rule in ["---", "***", "* * *", "___"] {
+            assert_eq!(md_blocks(rule), vec![MdBlock::Rule], "{rule}");
+        }
+        assert_eq!(
+            md_blocks("- item\n* other"),
+            vec![MdBlock::Bullets(vec!["item".into(), "other".into()])]
+        );
+        assert_eq!(
+            md_blocks("Para\n---\nmore"),
+            vec![
+                MdBlock::Para(vec!["Para".into()]),
+                MdBlock::Rule,
+                MdBlock::Para(vec!["more".into()]),
+            ]
+        );
+        assert_eq!(
+            md_blocks("> one\n>two\n>\nafter"),
+            vec![
+                MdBlock::Quote(vec!["one".into(), "two".into(), "".into()]),
+                MdBlock::Para(vec!["after".into()]),
+            ]
+        );
+        assert_eq!(md_blocks("+ x"), vec![MdBlock::Bullets(vec!["x".into()])]);
+        assert_eq!(md_blocks("1) x"), vec![MdBlock::Ordered(vec!["x".into()])]);
+        assert_eq!(task_item("[ ] a"), Some((false, "a")));
+        assert_eq!(task_item("[x] b"), Some((true, "b")));
+        assert_eq!(task_item("[X] c"), Some((true, "c")));
+        assert_eq!(task_item("[link](x)"), None);
+        assert_eq!(task_item("plain"), None);
+    }
+
+    #[test]
+    fn emphasis_strike_and_links() {
+        assert_eq!(
+            md_inline("an *em* and _em_ and ~~gone~~"),
+            vec![
+                MdInline::Text("an ".into()),
+                MdInline::Em("em".into()),
+                MdInline::Text(" and ".into()),
+                MdInline::Em("em".into()),
+                MdInline::Text(" and ".into()),
+                MdInline::Strike("gone".into()),
+            ]
+        );
+        for literal in ["snake_case_name", "a * b * c", "__init__", "x_1 and y_2"] {
+            assert_eq!(
+                md_inline(literal),
+                vec![MdInline::Text(literal.into())],
+                "{literal} must stay as written"
+            );
+        }
+        assert_eq!(
+            md_inline("see [docs](https://example.com) now"),
+            vec![
+                MdInline::Text("see ".into()),
+                MdInline::Link {
+                    label: "docs".into(),
+                    url: "https://example.com".into()
+                },
+                MdInline::Text(" now".into()),
+            ]
+        );
+        // A relative target has nowhere to open: the label, as text — and a
+        // path-shaped label still becomes a chip.
+        assert_eq!(md_inline("[foo](./foo)"), vec![MdInline::Text("foo".into())]);
+        assert_eq!(
+            md_inline("[src/a.rs:3](src/a.rs#L3)"),
+            vec![MdInline::Path("src/a.rs:3".into())]
+        );
+        // Markers inside code are code.
+        assert_eq!(
+            md_inline("`*a* _b_ ~~c~~ [d](https://e)`"),
+            vec![MdInline::Code("*a* _b_ ~~c~~ [d](https://e)".into())]
+        );
+        // Bold still wins over emphasis.
+        assert_eq!(md_inline("**b**"), vec![MdInline::Strong("b".into())]);
+        // Half of a `**` run never closes an `*`.
+        for literal in ["accepts *args and **kwargs", "int *p and **pp"] {
+            assert_eq!(
+                md_inline(literal),
+                vec![MdInline::Text(literal.into())],
+                "{literal} must stay as written"
+            );
+        }
+        // A closer inside a code span doesn't count; the span stays whole.
+        assert_eq!(
+            md_inline("compute n*m, see `a*b`"),
+            vec![
+                MdInline::Text("compute n*m, see ".into()),
+                MdInline::Code("a*b".into()),
+            ]
+        );
+        assert_eq!(
+            md_inline("x ~~y `a~~b`"),
+            vec![MdInline::Text("x ~~y ".into()), MdInline::Code("a~~b".into())]
+        );
+        // But code may sit inside bold.
+        assert_eq!(
+            md_inline("**fix `a` now**"),
+            vec![MdInline::Strong("fix `a` now".into())]
+        );
+        // Balanced parens stay in the URL.
+        assert_eq!(
+            md_inline("[x](https://en.wikipedia.org/wiki/Foo_(bar)) ok"),
+            vec![
+                MdInline::Link {
+                    label: "x".into(),
+                    url: "https://en.wikipedia.org/wiki/Foo_(bar)".into()
+                },
+                MdInline::Text(" ok".into()),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod md_fuzz_tests {
     use super::*;
 
@@ -725,6 +1257,15 @@ mod md_fuzz_tests {
             "1. ok\n2.no space\n   deep indent",
             "",
             "\u{200b}zero width",
+            "| é | 日本 |\n|:-:|--:|\n| `a|b | \\|",
+            "|\n|-|\n|",
+            "| a |\n|---|",
+            "> — quote\n>",
+            "* * *\n- - -\n_ _",
+            "[é](https://ü) [](x) [a]( ) [b](",
+            "_日本_ *é* ~~ü~~ ~~ _ *",
+            "- [ ]\n- [x]日本",
+            "1) ok\n2)no",
         ];
         for case in cases {
             let blocks = md_blocks(case);
@@ -733,11 +1274,27 @@ mod md_fuzz_tests {
                     MdBlock::Heading(_, l) | MdBlock::Code(l) => {
                         let _ = md_inline(l);
                     }
-                    MdBlock::Para(v) | MdBlock::Bullets(v) | MdBlock::Ordered(v) => {
+                    MdBlock::Para(v)
+                    | MdBlock::Bullets(v)
+                    | MdBlock::Ordered(v)
+                    | MdBlock::Quote(v) => {
                         for l in v {
                             let _ = md_inline(l);
+                            let _ = task_item(l);
                         }
                     }
+                    MdBlock::Table {
+                        align,
+                        header,
+                        rows,
+                    } => {
+                        assert_eq!(align.len(), header.len());
+                        for l in header.iter().chain(rows.iter().flatten()) {
+                            let _ = md_inline(l);
+                        }
+                        assert!(rows.iter().all(|r| r.len() == header.len()));
+                    }
+                    MdBlock::Rule => {}
                 }
             }
             // Inline parsing must also survive the raw line.
@@ -755,6 +1312,9 @@ mod md_fuzz_tests {
             "x **y** z",
             "src/a.rs:1 tail",
             "— é 日本",
+            "a *b* c",
+            "a ~~b~~ c",
+            "a _b_ c",
         ] {
             let joined: String = md_inline(case)
                 .into_iter()
@@ -762,10 +1322,16 @@ mod md_fuzz_tests {
                     MdInline::Text(t)
                     | MdInline::Code(t)
                     | MdInline::Strong(t)
+                    | MdInline::Em(t)
+                    | MdInline::Strike(t)
                     | MdInline::Path(t) => t,
+                    MdInline::Link { label, .. } => label,
                 })
                 .collect();
-            let stripped: String = case.replace("**", "").replace('`', "");
+            let stripped: String = case
+                .replace("**", "")
+                .replace("~~", "")
+                .replace(['`', '*', '_'], "");
             assert_eq!(joined, stripped, "input: {case}");
         }
     }

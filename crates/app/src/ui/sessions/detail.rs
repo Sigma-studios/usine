@@ -349,7 +349,7 @@ fn Conversation(session: Session) -> Element {
                         SessionTurnKind::Question => rsx! {
                             div { key: "{i}", class: "turn turn-question",
                                 div { class: "turn-label", "The agent asks" }
-                                div { class: "turn-text", "{turn.text}" }
+                                ArtifactText { text: turn.text.clone(), on_path: open_path, bare: true }
                             }
                         },
                         SessionTurnKind::Error => rsx! {

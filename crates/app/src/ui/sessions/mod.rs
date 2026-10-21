@@ -101,6 +101,17 @@ pub(crate) fn reveal(path: &Path) {
     }
 }
 
+/// Open an `http(s)` URL in the default browser.
+pub(crate) fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let child = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(not(target_os = "macos"))]
+    let child = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = child {
+        tracing::warn!("could not open {url}: {e}");
+    }
+}
+
 /// Extensions the OS "open" handler would run rather than display.
 const LAUNCHABLE_EXTENSIONS: &[&str] = &[
     "app",
