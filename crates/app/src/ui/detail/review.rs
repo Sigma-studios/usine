@@ -13,7 +13,7 @@ use crate::ui::diffdialog::{event_value, open_review_diff, open_review_diff_at, 
 use crate::ui::icons::IconDiff;
 use crate::ui::reviewdraft;
 use crate::ui::textfield::use_push_back;
-use crate::ui::widgets::SeverityPicker;
+use crate::ui::widgets::{ArtifactText, SeverityPicker};
 use crate::ui::{Panel, PanelResizer};
 
 /// The detail panel for the selected review task.
@@ -563,7 +563,7 @@ fn FixGate(
                 "The review is on {host} and says you'll fix these {comment_count} comment(s)                  yourself. The fix is committed in the PR's checkout — nothing has been pushed."
             }
             if !summary.trim().is_empty() {
-                div { class: "pr-body", "{summary}" }
+                div { class: "fix-summary", ArtifactText { text: summary.clone() } }
             }
             div { class: "row",
                 button {

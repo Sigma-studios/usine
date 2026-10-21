@@ -883,7 +883,7 @@ pub(crate) fn InterventionPanel(
         div { class: "section", "data-submit-scope": "1",
             h3 { "Needs your input" }
             div { class: "{qcls}",
-                div { "{question}" }
+                ArtifactText { text: question.clone(), bare: true }
                 div { class: "option-row",
                     for opt in options.iter() {
                         {
