@@ -891,7 +891,8 @@ impl Executor {
             ExecutorCommand::SetSessionBlocked {
                 session_id,
                 blocked,
-            } => self.set_session_blocked(session_id, blocked),
+                note,
+            } => self.set_session_blocked(session_id, blocked, note),
             ExecutorCommand::MarkSessionRead { session_id } => self.mark_session_read(session_id),
             ExecutorCommand::DeleteSession { session_id } => self.delete_session(session_id),
             ExecutorCommand::DetachImage { card_id, path } => {

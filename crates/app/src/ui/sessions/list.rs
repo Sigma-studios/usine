@@ -4,7 +4,7 @@
 use dioxus::prelude::*;
 use usine_core::{ExecutorCommand, Session, SessionStatus, SessionTurnKind};
 
-use super::{ago, home_dir, open_new_session, session_dot, shorten_home};
+use super::{ago, home_dir, open_new_session, request_block_session, session_dot, shorten_home};
 use crate::state::AppState;
 use crate::ui::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 
@@ -174,12 +174,21 @@ fn SessionRow(session: Session, active: bool, when: String, folder: String) -> E
     if session.unread && !session.archived && !session.blocked {
         class.push_str(" unread");
     }
+    // Tinted like a blocked board card. Archived wins, as in `session_dot`.
+    if session.blocked && !session.archived {
+        class.push_str(" blocked");
+    }
     let model = crate::ui::widgets::model_label(&session.spec.model).to_string();
     let provider = session.provider.label();
     let archived = session.archived;
     let blocked = session.blocked;
     let running = session.is_running();
     let title = session.title.clone();
+    let block_title = session.title.clone();
+    let blocked_note = session
+        .blocked_note
+        .clone()
+        .filter(|_| blocked && !archived);
 
     rsx! {
         div {
@@ -203,16 +212,23 @@ fn SessionRow(session: Session, active: bool, when: String, folder: String) -> E
                         "{line}"
                     }
                 }
+                if let Some(note) = blocked_note {
+                    div { class: "blocked-note", title: "{note}", "{note}" }
+                }
             }
             div { class: "session-row-actions",
                 if !archived {
                     button {
-                        class: "proj-action",
+                        class: if blocked { "proj-action unblock" } else { "proj-action" },
                         title: if blocked { "Mark unblocked" } else { "Mark blocked" },
                         "aria-label": if blocked { "Mark unblocked" } else { "Mark blocked" },
                         onclick: move |e| {
                             e.stop_propagation();
-                            state.send(ExecutorCommand::SetSessionBlocked { session_id: id, blocked: !blocked });
+                            if blocked {
+                                state.send(ExecutorCommand::SetSessionBlocked { session_id: id, blocked: false, note: None });
+                            } else {
+                                request_block_session(id, &block_title);
+                            }
                         },
                         svg {
                             width: "13",

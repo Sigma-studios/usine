@@ -10,8 +10,9 @@ use usine_core::{
 };
 use uuid::Uuid;
 
-use super::{ago, home_dir, open_file, reveal, shorten_home};
+use super::{ago, home_dir, open_file, request_block_session, reveal, shorten_home};
 use crate::state::AppState;
+use crate::ui::confirm::{request_confirm_with_note, ConfirmAction, ConfirmRequest};
 use crate::ui::detail::{
     attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
     InterventionPanel, TranscriptView,
@@ -52,6 +53,19 @@ pub(crate) fn SessionDetail() -> Element {
     let failed = matches!(session.status, SessionStatus::Failed { .. });
     let archived = session.archived;
     let blocked = session.blocked;
+    let blocked_note = session.blocked_note.clone();
+    // Only point at the note when there is one to read.
+    let blocked_title = if blocked_note.is_some() {
+        "Out of the attention counts until you unblock it; the message below is your own note"
+    } else {
+        "Out of the attention counts until you unblock it"
+    };
+    let note_label = if blocked_note.is_some() {
+        "Edit blocked message"
+    } else {
+        "Add blocked message"
+    };
+    let block_title = session.title.clone();
     let crowded = folder_in_use(&state, &session);
 
     rsx! {
@@ -121,10 +135,15 @@ pub(crate) fn SessionDetail() -> Element {
                     }
                     span { class: "{status_class}", "{status}" }
                     if blocked {
-                        span { class: "badge blocked", title: "Out of the attention counts until you unblock it", "Blocked" }
+                        span { class: "badge blocked", title: "{blocked_title}", "Blocked" }
                     }
                     if !cost.is_zero() {
                         span { class: "badge cost", "{cost}" }
+                    }
+                }
+                if blocked {
+                    if let Some(note) = blocked_note.clone() {
+                        div { class: "blocked-note", "{note}" }
                     }
                 }
                 div { class: "row session-actions",
@@ -146,8 +165,43 @@ pub(crate) fn SessionDetail() -> Element {
                     if !archived {
                         button {
                             class: "btn subtle",
-                            onclick: move |_| state.send(ExecutorCommand::SetSessionBlocked { session_id: id, blocked: !blocked }),
+                            onclick: {
+                                let block_title = block_title.clone();
+                                move |_| {
+                                    if blocked {
+                                        state.send(ExecutorCommand::SetSessionBlocked { session_id: id, blocked: false, note: None });
+                                    } else {
+                                        request_block_session(id, &block_title);
+                                    }
+                                }
+                            },
                             if blocked { "Mark unblocked" } else { "Mark blocked" }
+                        }
+                    }
+                    // Unmarking drops the message, so this is the only way to
+                    // fix it in place. Saving blank keeps the session blocked.
+                    if blocked && !archived {
+                        button {
+                            class: "btn subtle",
+                            onclick: {
+                                let block_title = block_title.clone();
+                                let blocked_note = blocked_note.clone();
+                                move |_| {
+                                    request_confirm_with_note(
+                                        ConfirmRequest {
+                                            title: note_label.into(),
+                                            message: format!(
+                                                "Message shown on “{block_title}” while it stays blocked. Leave it empty to drop the message.",
+                                            ),
+                                            confirm_label: "Save".into(),
+                                            danger: false,
+                                            action: ConfirmAction::BlockSession(id),
+                                        },
+                                        blocked_note.clone().unwrap_or_default(),
+                                    );
+                                }
+                            },
+                            "{note_label}"
                         }
                     }
                     if !running {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::model::{now_millis, Cost, Intervention, ModelSpec, Provider};
+use super::model::{normalize_blocked_note, now_millis, Cost, Intervention, ModelSpec, Provider};
 use crate::error::{CoreError, Result};
 
 /// Longest derived title, in chars.
@@ -148,6 +148,10 @@ pub struct Session {
     /// they unblock it. Running a turn never clears it.
     #[serde(default)]
     pub blocked: bool,
+    /// The optional message the user typed when marking it blocked; only set
+    /// while `blocked`.
+    #[serde(default)]
+    pub blocked_note: Option<String>,
     #[serde(rename = "cost_usd", default)]
     pub cost: Cost,
     /// What the agent last said it is doing; cleared whenever a turn starts.
@@ -189,10 +193,18 @@ impl Session {
             unread: false,
             archived: false,
             blocked: false,
+            blocked_note: None,
             cost: Cost::ZERO,
             status_note: None,
             queued: Vec::new(),
         }
+    }
+
+    /// Set (or clear) the user's blocked marker and its message, like
+    /// [`Card::set_blocked`](super::model::Card::set_blocked).
+    pub fn set_blocked(&mut self, blocked: bool, note: Option<String>) {
+        self.blocked = blocked;
+        self.blocked_note = normalize_blocked_note(blocked, note);
     }
 
     pub fn is_running(&self) -> bool {
@@ -515,6 +527,30 @@ mod tests {
         assert!(s.status_note.is_some(), "kept until the next turn");
         s.apply(SessionTransition::StartTurn).unwrap();
         assert!(s.status_note.is_none());
+    }
+
+    #[test]
+    fn set_blocked_normalizes_and_clears_the_note() {
+        let mut s = session();
+        s.set_blocked(true, Some("  waiting on infra  ".into()));
+        assert!(s.blocked);
+        assert_eq!(s.blocked_note.as_deref(), Some("waiting on infra"));
+        assert!(!s.needs_attention());
+
+        // Re-marking replaces the message: the "edit blocked message" path.
+        s.set_blocked(true, Some("waiting on review".into()));
+        assert_eq!(s.blocked_note.as_deref(), Some("waiting on review"));
+
+        // Blank is the same as none, and the marker stays.
+        s.set_blocked(true, Some("   ".into()));
+        assert!(s.blocked);
+        assert_eq!(s.blocked_note, None);
+
+        // Unmarking drops the message, whatever was passed.
+        s.set_blocked(true, Some("stale".into()));
+        s.set_blocked(false, Some("ignored".into()));
+        assert!(!s.blocked);
+        assert_eq!(s.blocked_note, None);
     }
 
     #[test]
