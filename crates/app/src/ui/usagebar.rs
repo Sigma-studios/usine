@@ -12,6 +12,8 @@
 //! runs currently executing on it (every project's cards, PR review tasks and
 //! one-off sessions), hidden at zero. A provider with running agents but no
 //! visible window still gets its segment, holding just the badge and the count.
+//!
+//! The far right holds the update control (`ui/update.rs`).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,6 +26,7 @@ use usine_core::{
 use uuid::Uuid;
 
 use crate::state::AppState;
+use crate::ui::update::UpdateControl;
 use crate::ui::widgets::provider_value;
 
 #[component]
@@ -137,6 +140,7 @@ pub fn UsageBar() -> Element {
                     "↻"
                 }
             }
+            UpdateControl {}
             span { class: "info-tip up", "{label}" }
         }
     }

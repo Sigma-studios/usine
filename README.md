@@ -31,7 +31,11 @@ integration links libgit2/openssl):
 sudo apt install libwebkit2gtk-4.1-dev libssl-dev pkg-config
 ```
 
-To update later, run the same `cargo install …` command again.
+To update later, run the same `cargo install …` command again. Usine also checks for
+updates by itself shortly after launch and can install them from the bottom
+bar's **Check for updates** control — tick **Update when idle** and it rebuilds,
+then restarts once no agent work is running. Set `USINE_NO_UPDATE_CHECK=1` to
+turn the launch check off.
 
 ## Run
 

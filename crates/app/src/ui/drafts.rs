@@ -140,6 +140,12 @@ pub fn peek(owner: Uuid, field: &'static str) -> Option<String> {
     DRAFTS.peek().get(&DraftKey { owner, field }).cloned()
 }
 
+/// Whether any field holds typed-but-unsent text — the idle restart waits on
+/// it, since drafts don't survive a restart. Peeks: no subscription.
+pub fn any() -> bool {
+    !DRAFTS.peek().is_empty()
+}
+
 /// Drop every draft belonging to `owner` — called when a card or review is
 /// removed.
 pub fn forget_owner(owner: Uuid) {
