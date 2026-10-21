@@ -69,7 +69,7 @@ pub(crate) fn TranscriptView(id: Uuid) -> Element {
                         div { class: "line", span { class: "ts", "… {hidden} earlier lines" } }
                     }
                     for (i, (ts, line)) in lines.iter().enumerate() {
-                        div { key: "{hidden + i}", class: "line",
+                        div { key: "{hidden + i}", class: line_class(line),
                             span { class: "ts", "{fmt_time(*ts)} " }
                             span { "{line}" }
                         }
@@ -86,6 +86,15 @@ pub(crate) fn TranscriptView(id: Uuid) -> Element {
                 }
             }
         }
+    }
+}
+
+/// Claude's thinking reads dimmed among the rest.
+fn line_class(line: &str) -> &'static str {
+    if line.starts_with(usine_core::THINKING_PROGRESS_PREFIX) {
+        "line thinking"
+    } else {
+        "line"
     }
 }
 

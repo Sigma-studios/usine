@@ -43,6 +43,15 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
                                 }
                             }
                         }
+                        Some("thinking") => {
+                            if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                                if !text.trim().is_empty() {
+                                    out.push(AgentEvent::Progress {
+                                        text: format!("{THINKING_PROGRESS_PREFIX}{}", text.trim()),
+                                    });
+                                }
+                            }
+                        }
                         Some("tool_use") => {
                             let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                             match name {
@@ -158,6 +167,10 @@ fn tool_brief(name: &str, input: &Value) -> Option<String> {
 /// How a `TodoWrite` call's progress line starts when it names the item in
 /// progress; sessions fall back to that item as their status note.
 pub const TODO_PROGRESS_PREFIX: &str = "→ TodoWrite: ";
+
+/// How a progress line carrying Claude's visible thinking starts; it is kept
+/// in transcripts but never becomes a status note.
+pub const THINKING_PROGRESS_PREFIX: &str = "∴ ";
 
 /// The in-progress item of a `TodoWrite` call (its `activeForm`, else its
 /// `content`).
@@ -436,6 +449,20 @@ mod tests {
         let tool = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"a"}]}}"#;
         assert_eq!(replayed_user_text(tool), None);
         assert!(parse_claude_line(echo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_thinking_with_text_is_a_prefixed_progress_line() {
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"thinking","thinking":"  The parser drops it.\n","signature":"x"},
+            {"type":"thinking","thinking":"","signature":"y"},
+            {"type":"redacted_thinking","data":"z"}
+        ]}}"#;
+        let evts = parse_claude_line(line).unwrap();
+        assert_eq!(evts.len(), 1);
+        assert!(
+            matches!(&evts[0], AgentEvent::Progress { text } if text == "∴ The parser drops it.")
+        );
     }
 
     #[test]
