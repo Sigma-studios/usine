@@ -83,6 +83,93 @@ pub(crate) fn reveal(path: &Path) {
     }
 }
 
+/// Extensions the OS "open" handler would run rather than display.
+const LAUNCHABLE_EXTENSIONS: &[&str] = &[
+    "app",
+    "command",
+    "terminal",
+    "tool",
+    "desktop",
+    "sh",
+    "bash",
+    "zsh",
+    "csh",
+    "ksh",
+    "fish",
+    "workflow",
+    "action",
+    "scpt",
+    "scptd",
+    "applescript",
+    "pkg",
+    "mpkg",
+    "prefpane",
+    "jar",
+    "appimage",
+    "run",
+    "exe",
+    "bat",
+    "cmd",
+    "com",
+    "msi",
+    "ps1",
+    "vbs",
+];
+
+/// Whether handing `path` to `open`/`xdg-open` would execute it (an app
+/// bundle, a script, an executable) instead of showing it.
+pub(crate) fn is_launchable(path: &Path) -> bool {
+    let by_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| LAUNCHABLE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    if by_ext {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Open `path` in its default app (a PDF in Preview, …), off the UI thread.
+/// Anything that would be run rather than shown is only revealed, and so is
+/// a file nothing can open.
+pub(crate) fn open_file(path: &Path) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        if is_launchable(&path) {
+            reveal(&path);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("open").arg(&path).status();
+        #[cfg(not(target_os = "macos"))]
+        let status = std::process::Command::new("xdg-open").arg(&path).status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                tracing::warn!("could not open {}: {s}", path.display());
+                reveal(&path);
+            }
+            Err(e) => {
+                tracing::warn!("could not open {}: {e}", path.display());
+                reveal(&path);
+            }
+        }
+    });
+}
+
 /// Folders a new session is likely to want, most relevant first, without
 /// duplicates (by canonical path) and only ones that exist: recent session
 /// folders (newest activity first, top 8), then registered projects.
@@ -223,6 +310,28 @@ mod tests {
         );
         assert_eq!(cwd_of_line(r#"{"type":"summary"}"#), None);
         assert_eq!(cwd_of_line("not json"), None);
+    }
+
+    #[test]
+    fn launchable_attachments_are_not_opened() {
+        assert!(is_launchable(Path::new("/x/run.command")));
+        assert!(is_launchable(Path::new("/x/Evil.APP")));
+        assert!(is_launchable(Path::new("/x/a.desktop")));
+        assert!(!is_launchable(Path::new("/x/missing.pdf")));
+
+        let dir = tempfile_dir();
+        assert!(is_launchable(&dir), "directories (bundles) are revealed");
+        let doc = dir.join("doc.pdf");
+        std::fs::write(&doc, b"%PDF").unwrap();
+        assert!(!is_launchable(&doc));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bin = dir.join("tool");
+            std::fs::write(&bin, b"#!/bin/sh").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(is_launchable(&bin));
+        }
     }
 
     fn tempfile_dir() -> PathBuf {

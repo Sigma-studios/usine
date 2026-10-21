@@ -10,7 +10,7 @@ use usine_core::{
 };
 use uuid::Uuid;
 
-use super::{ago, home_dir, reveal, shorten_home};
+use super::{ago, home_dir, open_file, reveal, shorten_home};
 use crate::state::AppState;
 use crate::ui::detail::{
     attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
@@ -477,8 +477,9 @@ fn QueuedTurns(session_id: Uuid, turns: Vec<SessionTurn>, running: bool) -> Elem
     }
 }
 
-/// The files sent with one turn: images open a preview, any file can be
-/// revealed. Read-only — a sent file can't be taken back.
+/// The files sent with one turn: images open a preview, other files open in
+/// their default app, and any existing file can be revealed. Read-only — a
+/// sent file can't be taken back.
 #[component]
 fn TurnAttachments(paths: Vec<PathBuf>) -> Element {
     let mut preview = use_signal(|| None::<PathBuf>);
@@ -494,6 +495,7 @@ fn TurnAttachments(paths: Vec<PathBuf>) -> Element {
                     let is_image = exists && image_mime(&path).is_some();
                     let to_preview = path.clone();
                     let to_reveal = path.clone();
+                    let to_open = path.clone();
                     rsx! {
                         span { key: "{path.display()}", class: if exists { "chip" } else { "chip missing" },
                             if is_image {
@@ -501,6 +503,13 @@ fn TurnAttachments(paths: Vec<PathBuf>) -> Element {
                                     class: "chip-label clickable",
                                     title: "Preview",
                                     onclick: move |_| preview.set(Some(to_preview.clone())),
+                                    "{label}"
+                                }
+                            } else if exists {
+                                span {
+                                    class: "chip-label clickable",
+                                    title: "Open",
+                                    onclick: move |_| open_file(&to_open),
                                     "{label}"
                                 }
                             } else {
