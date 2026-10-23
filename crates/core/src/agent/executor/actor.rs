@@ -1220,6 +1220,8 @@ pub(super) fn handle_event(
         AgentEvent::Progress { text } => {
             transcript(store, evt_tx, card_id, text);
         }
+        // Card runs deny the background-agent tools.
+        AgentEvent::Task(_) => {}
         AgentEvent::PlanReady { plan } => {
             apply_transition(store, evt_tx, card_id, Transition::AgentPlanReady { plan })?;
         }

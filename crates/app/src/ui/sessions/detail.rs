@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
 use usine_core::{
-    ExecutorCommand, Provider, Session, SessionAccess, SessionStatus, SessionTurn, SessionTurnKind,
+    BgTask, BgTaskKind, BgTaskStatus, ExecutorCommand, Provider, Session, SessionAccess,
+    SessionStatus, SessionTurn, SessionTurnKind,
 };
 use uuid::Uuid;
 
@@ -312,17 +313,25 @@ fn Conversation(session: Session) -> Element {
                         }
                     };
                     match turn.kind {
-                        SessionTurnKind::User | SessionTurnKind::Answer => {
+                        SessionTurnKind::User | SessionTurnKind::Answer | SessionTurnKind::Notice => {
                             let work = bounds.iter().position(|b| b.after_turn == i);
+                            let (head, rest) = notice_parts(&turn.text);
                             rsx! {
-                                div { key: "{i}", class: "turn turn-user",
-                                    if turn.kind == SessionTurnKind::Answer {
-                                        div { class: "turn-label", "Your answer" }
+                                if turn.kind == SessionTurnKind::Notice {
+                                    details { key: "{i}", class: "turn turn-notice",
+                                        summary { title: "Usine sent this to the agent", "{head}" }
+                                        div { class: "turn-text", "{rest}" }
                                     }
-                                    if !turn.text.is_empty() {
-                                        div { class: "turn-text", "{turn.text}" }
+                                } else {
+                                    div { key: "{i}", class: "turn turn-user",
+                                        if turn.kind == SessionTurnKind::Answer {
+                                            div { class: "turn-label", "Your answer" }
+                                        }
+                                        if !turn.text.is_empty() {
+                                            div { class: "turn-text", "{turn.text}" }
+                                        }
+                                        TurnAttachments { paths: turn.attachments.clone() }
                                     }
-                                    TurnAttachments { paths: turn.attachments.clone() }
                                 }
                                 if let Some(w) = work {
                                     WorkSection {
@@ -369,7 +378,10 @@ fn Conversation(session: Session) -> Element {
                             span { "Working…" }
                         }
                     }
+                    BackgroundTasks { tasks: session.bg_tasks.clone(), running: true }
                 }
+            } else if !session.bg_tasks.is_empty() {
+                BackgroundTasks { tasks: session.bg_tasks.clone(), running: false }
             }
             if !session.queued.is_empty() {
                 // A pending question counts as in flight: the queue follows the
@@ -381,6 +393,144 @@ fn Conversation(session: Session) -> Element {
                 }
             }
             div { id: "session-end-{id}" }
+        }
+    }
+}
+
+/// A notice's first line (its row) and the rest (shown when unfolded).
+fn notice_parts(text: &str) -> (String, String) {
+    let mut lines = text.trim().splitn(2, '\n');
+    let head = lines
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(':')
+        .to_string();
+    let head = format!("{head} — auto-resumed");
+    (head, lines.next().unwrap_or("").trim().to_string())
+}
+
+/// `ms` as a short duration: "45 s", "12 min", "2 h 05".
+fn short_duration(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..=59 => format!("{secs} s"),
+        60..=3599 => format!("{} min", secs / 60),
+        _ => format!("{} h {:02}", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// "3 agents · 2 done · 1 cut off": the agents' count, then each status's.
+pub(crate) fn agents_summary(tasks: &[BgTask]) -> String {
+    let agents: Vec<&BgTask> = tasks.iter().filter(|t| t.kind == BgTaskKind::Agent).collect();
+    let n = agents.len();
+    let mut out = format!("{n} agent{}", if n == 1 { "" } else { "s" });
+    for status in [
+        BgTaskStatus::Running,
+        BgTaskStatus::Completed,
+        BgTaskStatus::CutOff,
+        BgTaskStatus::Relaunched,
+        BgTaskStatus::Failed,
+        BgTaskStatus::Stopped,
+    ] {
+        let k = agents.iter().filter(|t| t.status == status).count();
+        if k > 0 {
+            out.push_str(&format!(" · {k} {}", status.label()));
+        }
+    }
+    out
+}
+
+/// The agent's background tasks: one row per subagent with its commands
+/// under it, and the parent's own background commands. Open while the turn
+/// runs; afterwards folded to a one-line tally.
+#[component]
+fn BackgroundTasks(tasks: Vec<BgTask>, running: bool) -> Element {
+    let shown = |t: &&BgTask| t.parent.is_none();
+    let top: Vec<BgTask> = tasks.iter().filter(shown).cloned().collect();
+    if top.is_empty() {
+        return rsx! {};
+    }
+    let now = usine_core::now_millis();
+    let summary = agents_summary(&tasks);
+    let cut = tasks
+        .iter()
+        .any(|t| t.kind == BgTaskKind::Agent && t.status == BgTaskStatus::CutOff);
+    let rows = rsx! {
+        div { class: "bg-tasks-rows",
+            for t in top {
+                {
+                    let children: Vec<BgTask> = tasks
+                        .iter()
+                        .filter(|c| c.parent.as_deref() == Some(t.id.as_str()))
+                        .cloned()
+                        .collect();
+                    rsx! {
+                        BgTaskRow { key: "{t.id}", task: t.clone(), now, nested: false }
+                        for c in children {
+                            BgTaskRow { key: "{c.id}", task: c, now, nested: true }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    rsx! {
+        if running {
+            div { class: "bg-tasks", {rows} }
+        } else {
+            details { class: if cut { "bg-tasks folded cut" } else { "bg-tasks folded" },
+                summary { "{summary}" }
+                {rows}
+            }
+        }
+    }
+}
+
+#[component]
+fn BgTaskRow(task: BgTask, now: i64, nested: bool) -> Element {
+    let status = match task.status {
+        BgTaskStatus::Running => "running",
+        BgTaskStatus::Completed => "done",
+        BgTaskStatus::Failed | BgTaskStatus::Stopped => "stopped",
+        BgTaskStatus::CutOff => "cut",
+        BgTaskStatus::Relaunched => "relaunched",
+    };
+    let class = format!(
+        "bg-task {status}{}",
+        if nested { " nested" } else { "" }
+    );
+    let end = if task.status == BgTaskStatus::Running {
+        now
+    } else {
+        task.updated_at
+    };
+    let elapsed = short_duration(end - task.started_at);
+    let activity = task
+        .summary
+        .as_deref()
+        .or(task.last_tool.as_deref())
+        .map(|s| s.lines().next().unwrap_or("").trim().to_string())
+        .unwrap_or_default();
+    let icon = if task.kind == BgTaskKind::Agent { "⧉" } else { "›_" };
+    let label = task.status.label();
+    let tools = task.tool_uses;
+    let title = task.reason.clone().map(|r| format!("Stopped: {r}")).unwrap_or_default();
+    rsx! {
+        div { class: "{class}", title: "{title}",
+            span { class: "bg-task-dot" }
+            span { class: "bg-task-icon", "{icon}" }
+            span { class: "bg-task-desc", "{task.description}" }
+            if let Some(kind) = &task.subagent_type {
+                span { class: "badge", "{kind}" }
+            }
+            span { class: "bg-task-activity", "{activity}" }
+            span { class: "bg-task-meta",
+                "{label} · {elapsed}"
+                if tools > 0 {
+                    " · {tools} tools"
+                }
+            }
         }
     }
 }

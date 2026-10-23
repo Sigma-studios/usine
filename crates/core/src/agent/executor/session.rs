@@ -27,19 +27,24 @@ use crate::agent::provider::{RunConfig, RunMode, SESSION_STATUS_PROMPT};
 use crate::domain::config::SessionDefaults;
 use crate::domain::model::{now_millis, Cost, Intervention, ModelSpec, Provider};
 use crate::domain::session::{
-    last_status_line, strip_status_lines, truncate_chars, Session, SessionAccess, SessionStatus,
-    SessionTransition, SessionTurn, SessionTurnKind, StatusNote, STATUS_MAX,
+    last_status_line, strip_status_lines, truncate_chars, BgTask, BgTaskKind, BgTaskStatus,
+    Session, SessionAccess, SessionStatus, SessionTransition, SessionTurn, SessionTurnKind,
+    StatusNote, TaskEvent, STATUS_MAX,
 };
 use crate::error::{CoreError, Result};
 use crate::infra::persistence::Store;
 
 /// The session actor's idle watchdog. Longer than the board's
-/// `RUN_IDLE_TIMEOUT`: sessions may run background subagents, which stay
-/// silent after the parent's interim result until they report back (see
-/// `SESSION_HELD_RESULT_GRACE`). A hung session costs little — the user sees it
-/// Running and can Stop it.
+/// `RUN_IDLE_TIMEOUT`: sessions may run background subagents, which can work
+/// for hours after the parent's interim result (see
+/// `SESSION_HELD_RESULT_GRACE`; their task events reset this clock). A hung
+/// session costs little — the user sees it Running and can Stop it.
 const SESSION_IDLE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2 * 60 * 60 + 5 * 60);
+    std::time::Duration::from_secs(24 * 60 * 60 + 5 * 60);
+
+/// How often one background task's progress is saved; starts, ends and a
+/// switch to another tool always are.
+const TASK_PROGRESS_SAVE: std::time::Duration = std::time::Duration::from_secs(1);
 
 // The Claude pump releases a held session result after its own quiet period;
 // it must fire before this watchdog, which would fail the session instead.
@@ -187,8 +192,10 @@ impl Executor {
             return Err(CoreError::other("write a message or attach a file"));
         }
         let mut batch = Vec::new();
+        let mut cut = Vec::new();
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::StartTurn)?;
+            cut = s.begin_user_turn();
             batch = s.take_queued();
             if !blank || !attachments.is_empty() {
                 batch.push(
@@ -204,8 +211,8 @@ impl Executor {
         self.unstage(id, &staged)?;
         self.emit_session(session.clone());
         let resume = session.last_session.clone();
-        self.launch_session_turn(&session, queued_input(&batch), resume)
-            .await
+        let input = with_unresolved(queued_input(&batch), &cut);
+        self.launch_session_turn(&session, input, resume).await
     }
 
     /// Hand `text` to the running turn's agent. Whether it took it — it then
@@ -268,8 +275,10 @@ impl Executor {
         }
         let staged = self.store.get_attachments(id).unwrap_or_default();
         let attachments = existing(&staged);
+        let mut cut = Vec::new();
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::Answer)?;
+            cut = s.begin_user_turn();
             s.push_turn(
                 SessionTurn::new(SessionTurnKind::Answer, text.trim())
                     .with_attachments(attachments.clone()),
@@ -288,10 +297,13 @@ impl Executor {
             return Ok(());
         }
         // A one-shot CLI run is gone: resume with the answer as the next turn.
-        let input = TurnInput {
-            prompt: answer_prompt(&question, &text, &attachments),
-            attachments,
-        };
+        let input = with_unresolved(
+            TurnInput {
+                prompt: answer_prompt(&question, &text, &attachments),
+                attachments,
+            },
+            &cut,
+        );
         let resume = session.last_session.clone();
         self.launch_session_turn(&session, input, resume).await
     }
@@ -305,6 +317,7 @@ impl Executor {
         }
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::Cancelled)?;
+            s.stop_live_tasks();
             s.push_turn(SessionTurn::new(SessionTurnKind::Error, "Stopped by user"));
             Ok(())
         })?;
@@ -326,8 +339,10 @@ impl Executor {
         }
         let mut input = batch_input(&session.turns, batch);
         let mut queued = Vec::new();
+        let mut cut = Vec::new();
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::StartTurn)?;
+            cut = s.begin_user_turn();
             s.last_activity_at = now_millis();
             queued = s.take_queued();
             for t in &queued {
@@ -346,6 +361,7 @@ impl Executor {
             );
             input.attachments.extend(more.attachments);
         }
+        let input = with_unresolved(input, &cut);
         self.launch_session_turn(&session, input, resume).await
     }
 
@@ -615,7 +631,87 @@ fn queued_input(turns: &[SessionTurn]) -> TurnInput {
 }
 
 fn is_message(t: &SessionTurn) -> bool {
-    matches!(t.kind, SessionTurnKind::User | SessionTurnKind::Answer)
+    matches!(
+        t.kind,
+        SessionTurnKind::User | SessionTurnKind::Answer | SessionTurnKind::Notice
+    )
+}
+
+/// Why `agent` counts as cut off, for the agent reading the notice.
+fn cut_off_why(session: &Session, agent: &BgTask, cut: &[String]) -> String {
+    let own_command = session
+        .bg_tasks
+        .iter()
+        .find(|t| t.parent.as_deref() == Some(agent.id.as_str()) && cut.contains(&t.id));
+    if let Some(cmd) = own_command {
+        return format!(
+            "it ended its turn while its own background command (\"{}\") was still running, \
+             and that command was killed",
+            cmd.description
+        );
+    }
+    match agent.reason.as_deref() {
+        Some("deadline") => "the CLI stopped it at its background time limit".into(),
+        Some("memory_pressure") => "the CLI stopped it under memory pressure".into(),
+        Some(other) => format!("the CLI stopped it ({other})"),
+        None => "it was still working when the CLI exited".into(),
+    }
+}
+
+/// The message auto-resuming the agents a run's end cut off (`lost`), and
+/// listing the parent's own background commands stopped with it.
+fn cut_off_notice(session: &Session, lost: &[BgTask], cut: &[String]) -> String {
+    let n = lost.len();
+    let mut out = format!(
+        "↻ {n} background agent{} {} cut off when the CLI exited:\n",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "was" } else { "were" },
+    );
+    for a in lost {
+        let kind = a
+            .subagent_type
+            .as_deref()
+            .map(|t| format!(" ({t})"))
+            .unwrap_or_default();
+        out.push_str(&format!("\n- \"{}\"{kind}: {}", a.description, cut_off_why(session, a, cut)));
+        let last = a.summary.as_deref().or(a.last_tool.as_deref());
+        if let Some(last) = last {
+            out.push_str(&format!(". Last seen: {}", truncate_chars(last.trim(), 200)));
+        }
+    }
+    let commands: Vec<&str> = session
+        .bg_tasks
+        .iter()
+        .filter(|t| t.parent.is_none() && t.kind != BgTaskKind::Agent && cut.contains(&t.id))
+        .map(|t| t.description.as_str())
+        .collect();
+    if !commands.is_empty() {
+        out.push_str("\n\nYour own background commands were stopped too: ");
+        out.push_str(&commands.join("; "));
+        out.push('.');
+    }
+    out.push_str(
+        "\n\nResume or relaunch every one of these agents to finish its remaining work \
+         (check the folder first for what each already did). Tell each to run long builds \
+         and tests in the foreground and never to end its turn while a command it started \
+         in the background is still running.",
+    );
+    out
+}
+
+/// `input` reminding the agent of agents cut off earlier and never relaunched
+/// (after a restart, or once auto-resume paused).
+fn with_unresolved(mut input: TurnInput, cut: &[BgTask]) -> TurnInput {
+    if cut.is_empty() {
+        return input;
+    }
+    let names: Vec<String> = cut.iter().map(|t| format!("\"{}\"", t.description)).collect();
+    input.prompt.push_str(&format!(
+        "\n\n(Note from Usine: these background agents were cut off before finishing and \
+         were never relaunched: {}. Resume them if their work still matters.)",
+        names.join(", ")
+    ));
+    input
 }
 
 /// The turns the latest turn sent: the run of User/Answer turns ending at the
@@ -688,6 +784,7 @@ fn fresh_prompt(session: &Session, input: &TurnInput) -> String {
             SessionTurnKind::Question => "Assistant (question)",
             SessionTurnKind::Answer => "User (answer)",
             SessionTurnKind::Error => "Note",
+            SessionTurnKind::Notice => "Note (Usine)",
         };
         out.push_str(&format!(
             "\n{who}: {}",
@@ -761,6 +858,17 @@ async fn run_session_actor(run: SessionRun) {
     // Whether the agent reported a `usine-status:` line this turn; until it
     // does, its todo list's current item stands in.
     let mut reported = false;
+    // The tasks the run's end cut short (its `CutOff` event, sent just
+    // before the result).
+    let mut cut: Vec<String> = Vec::new();
+    // When each task's progress was last saved and with which tool, and its
+    // newer progress held back since (saved ahead of the next event that is).
+    let mut progress_saved: std::collections::HashMap<
+        String,
+        (std::time::Instant, Option<String>),
+    > = std::collections::HashMap::new();
+    let mut progress_held: std::collections::HashMap<String, TaskEvent> =
+        std::collections::HashMap::new();
     loop {
         let evt = if interactive {
             match events.next().await {
@@ -830,6 +938,76 @@ async fn run_session_actor(run: SessionRun) {
                 }
                 transcript(&store, &evt_tx, id, text);
             }
+            AgentEvent::Task(task) => {
+                saw_output = true;
+                if let TaskEvent::CutOff { ids } = &task {
+                    cut = ids.clone();
+                }
+                if let TaskEvent::Progress {
+                    id: task_id,
+                    last_tool,
+                    ..
+                } = &task
+                {
+                    let now = std::time::Instant::now();
+                    // A new tool is saved at once: the last one before a long
+                    // step (a 20-minute build) must not sit held behind it.
+                    match progress_saved.get(task_id) {
+                        Some((at, tool))
+                            if now.duration_since(*at) < TASK_PROGRESS_SAVE
+                                && (last_tool.is_none() || last_tool == tool) =>
+                        {
+                            progress_held.insert(task_id.clone(), task);
+                            continue;
+                        }
+                        prev => {
+                            let tool = last_tool
+                                .clone()
+                                .or_else(|| prev.and_then(|(_, t)| t.clone()));
+                            progress_saved.insert(task_id.clone(), (now, tool));
+                            progress_held.remove(task_id);
+                        }
+                    }
+                }
+                let held: Vec<TaskEvent> = match &task {
+                    TaskEvent::Status { id: task_id, .. } => {
+                        progress_held.remove(task_id).into_iter().collect()
+                    }
+                    TaskEvent::CutOff { .. } => progress_held.drain().map(|(_, e)| e).collect(),
+                    _ => Vec::new(),
+                };
+                let mut changed = false;
+                // A task's end is often reported twice (`task_updated`, then
+                // `task_notification`): the second only fills in details, so
+                // it is saved but not logged again.
+                let mut repeat = false;
+                let Ok(s) = store.mutate_session(id, |s| {
+                    for e in &held {
+                        changed |= s.apply_task(e);
+                    }
+                    let status_of = |s: &Session, tid: &str| {
+                        s.bg_tasks.iter().find(|t| t.id == tid).map(|t| t.status)
+                    };
+                    let before = match &task {
+                        TaskEvent::Status { id: tid, .. } => status_of(s, tid),
+                        _ => None,
+                    };
+                    changed |= s.apply_task(&task);
+                    if let TaskEvent::Status { id: tid, .. } = &task {
+                        repeat = before.is_some() && before == status_of(s, tid);
+                    }
+                    Ok(())
+                }) else {
+                    continue;
+                };
+                if !changed {
+                    continue;
+                }
+                if let Some(line) = task_line(&s, &task).filter(|_| !repeat) {
+                    transcript(&store, &evt_tx, id, line);
+                }
+                let _ = evt_tx.unbounded_send(ExecutorEvent::session_updated(s));
+            }
             AgentEvent::PlanReady { plan: p } => plan = Some(p),
             AgentEvent::NeedsInput {
                 request_id,
@@ -843,6 +1021,10 @@ async fn run_session_actor(run: SessionRun) {
                 };
                 let updated = store.mutate_session(id, |s| {
                     s.apply(SessionTransition::NeedsInput(iv))?;
+                    if !interactive {
+                        // Tearing the run down below ends its tasks too.
+                        s.cut_off_live_tasks();
+                    }
                     s.push_turn(SessionTurn::new(SessionTurnKind::Question, question.trim()));
                     s.unread = true;
                     Ok(())
@@ -868,19 +1050,51 @@ async fn run_session_actor(run: SessionRun) {
                 } else {
                     result
                 };
-                // Messages queued during the turn go out at once as the next
-                // turn, in the same write: the session never leaves Running,
-                // so nothing pings in between.
+                // Background agents the run's end cut off are resumed at
+                // once, and messages queued during the turn go out with them
+                // (or alone) as the next turn, in the same write: the session
+                // never leaves Running, so nothing pings in between.
                 let mut next: Option<Vec<SessionTurn>> = None;
+                let mut notice: Option<(usize, String)> = None;
+                let mut unresolved: Vec<BgTask> = Vec::new();
                 let updated = store.mutate_session(id, |s| {
                     s.apply(SessionTransition::TurnDone)?;
-                    s.push_turn(SessionTurn::new(SessionTurnKind::Agent, text.trim()));
+                    let lost: Vec<BgTask> = s.lost_agents(&cut).into_iter().cloned().collect();
+                    let stalled = !lost.is_empty() && s.cut_off_stalled(&lost.iter().collect::<Vec<_>>());
+                    let mut reply = text.trim().to_string();
+                    if stalled {
+                        let n = lost.len();
+                        reply.push_str(&format!(
+                            "\n\n---\n⚠ {n} background agent{} cut off again with no progress — \
+                             auto-resume paused. Send a message to have the agent pick {} up.",
+                            if n == 1 { "" } else { "s" },
+                            if n == 1 { "it" } else { "them" },
+                        ));
+                    }
+                    s.push_turn(SessionTurn::new(SessionTurnKind::Agent, reply.trim()));
                     s.cost += Cost::from_usd(cost_usd);
                     let queued = s.take_queued();
-                    if queued.is_empty() {
+                    let keep: Vec<&str> = lost.iter().map(|t| t.id.as_str()).collect();
+                    s.settle_cut_offs(&keep);
+                    if !lost.is_empty() && !stalled {
+                        let text = cut_off_notice(s, &lost, &cut);
+                        s.record_cutoff(&lost);
+                        s.apply(SessionTransition::StartTurn)?;
+                        for t in &queued {
+                            s.push_turn(t.clone());
+                        }
+                        // Last, so the resumed work shows under it.
+                        s.push_turn(SessionTurn::new(SessionTurnKind::Notice, text.clone()));
+                        notice = Some((lost.len(), text));
+                        next = Some(queued);
+                    } else if queued.is_empty() {
                         s.unread = true;
                     } else {
                         s.apply(SessionTransition::StartTurn)?;
+                        // The queued messages are the user's turn: the guard
+                        // starts over, and agents a paused round left cut off
+                        // go along, as for a typed message.
+                        unresolved = s.begin_user_turn();
                         for t in &queued {
                             s.push_turn(t.clone());
                         }
@@ -890,6 +1104,33 @@ async fn run_session_actor(run: SessionRun) {
                 });
                 if let Ok(s) = updated {
                     let _ = evt_tx.unbounded_send(ExecutorEvent::session_updated(s));
+                }
+                if let Some((n, text)) = notice {
+                    let queued = next.take().unwrap_or_default();
+                    transcript(
+                        &store,
+                        &evt_tx,
+                        id,
+                        format!("↻ {n} background agent(s) cut off — resuming them"),
+                    );
+                    let mut input = TurnInput {
+                        prompt: text,
+                        attachments: Vec::new(),
+                    };
+                    if !queued.is_empty() {
+                        let more = queued_input(&queued);
+                        input.prompt = format!(
+                            "{}\n\nThe user also sent, while you were working:\n\n{}",
+                            input.prompt, more.prompt
+                        );
+                        input.attachments = more.attachments;
+                    }
+                    // A direct call, never `cmd_tx` (see `SessionRun::executor`).
+                    release_run(&session_runs, id, run_id);
+                    if let Some(exec) = executor.upgrade() {
+                        exec.continue_session_queue(id, input).await;
+                    }
+                    return;
                 }
                 if let Some(queued) = next {
                     transcript(
@@ -905,7 +1146,8 @@ async fn run_session_actor(run: SessionRun) {
                     // never `cmd_tx` (see `SessionRun::executor`).
                     release_run(&session_runs, id, run_id);
                     if let Some(exec) = executor.upgrade() {
-                        exec.continue_session_queue(id, queued_input(&queued)).await;
+                        let input = with_unresolved(queued_input(&queued), &unresolved);
+                        exec.continue_session_queue(id, input).await;
                     }
                     return;
                 }
@@ -947,6 +1189,34 @@ async fn run_session_actor(run: SessionRun) {
     release_run(&session_runs, id, run_id);
 }
 
+/// The work-block line for a subagent starting or ending; commands stay out
+/// of the log (the agents strip shows them).
+fn task_line(session: &Session, event: &TaskEvent) -> Option<String> {
+    let (task_id, started) = match event {
+        TaskEvent::Started { id, .. } => (id, true),
+        TaskEvent::Status { id, .. } => (id, false),
+        TaskEvent::Progress { .. } | TaskEvent::CutOff { .. } => return None,
+    };
+    let task = session.bg_tasks.iter().find(|t| t.id == *task_id)?;
+    if task.kind != BgTaskKind::Agent {
+        return None;
+    }
+    if started {
+        return Some(format!("⧉ agent started: {}", task.description));
+    }
+    let summary = task
+        .summary
+        .as_deref()
+        .filter(|s| task.status != BgTaskStatus::Running && !s.trim().is_empty())
+        .map(|s| format!(" — {}", truncate_chars(s.lines().next().unwrap_or("").trim(), 120)))
+        .unwrap_or_default();
+    Some(format!(
+        "⧉ agent {}: {}{summary}",
+        task.status.label(),
+        task.description
+    ))
+}
+
 /// Fail the session's running turn, flagging it unread. A no-op if the
 /// session already left `Running` (stopped meanwhile).
 fn fail_session(store: &Store, evt_tx: &UnboundedSender<ExecutorEvent>, id: Uuid, message: String) {
@@ -954,6 +1224,7 @@ fn fail_session(store: &Store, evt_tx: &UnboundedSender<ExecutorEvent>, id: Uuid
         s.apply(SessionTransition::TurnFailed {
             message: message.clone(),
         })?;
+        s.cut_off_live_tasks();
         s.push_turn(SessionTurn::new(SessionTurnKind::Error, message.clone()));
         s.unread = true;
         Ok(())

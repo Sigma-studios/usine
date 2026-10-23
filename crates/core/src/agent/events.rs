@@ -17,7 +17,7 @@ use crate::domain::model::{
     Card, CardAnswers, DraftComment, FixVerdict, ModelSpec, PrInfo, PreviewStatus, PreviewUrl,
     Project, Provider, ReviewEvent, ReviewTask, Usage,
 };
-use crate::domain::session::{Session, SessionAccess};
+use crate::domain::session::{Session, SessionAccess, TaskEvent};
 use crate::infra::forge::OpenPr;
 
 /// Severity for a user-facing toast.
@@ -55,6 +55,9 @@ pub enum AgentEvent {
     },
     /// The run failed.
     Error { message: String },
+    /// A background task (subagent or command) started, progressed or ended.
+    /// Only sessions see these: card runs deny the `Agent`/`Task` tools.
+    Task(TaskEvent),
 }
 
 /// Control messages sent *into* an active run (UI → provider via executor).

@@ -1399,6 +1399,33 @@ button.change-path.link:hover { color: var(--accent); text-decoration: underline
   max-height: calc(2 * 1.45em); line-height: 1.45em;
   -webkit-mask-image: linear-gradient(to bottom, black 1.45em, transparent 2.9em);
 }
+/* Sessions: the agent's background tasks (subagents and their commands). */
+.bg-tasks { display: flex; flex-direction: column; gap: 4px; margin: 0 12px; font-size: 12px; color: var(--muted); }
+.bg-tasks.folded > summary { cursor: pointer; align-self: flex-start; }
+.bg-tasks.folded > summary:hover { color: var(--text); }
+.bg-tasks.folded.cut > summary { color: var(--amber); }
+.bg-tasks-rows { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
+.bg-task { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 3px 8px; border-radius: 6px; background: var(--panel-2); }
+.bg-task.nested { margin-left: 22px; background: transparent; padding-top: 0; padding-bottom: 0; }
+.bg-task.cut { background: var(--amber-wash); border: 1px solid var(--amber-border); }
+.bg-task.relaunched, .bg-task.stopped { opacity: .55; }
+.bg-task-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--border); }
+.bg-task.running .bg-task-dot {
+  box-sizing: border-box; background: transparent;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+.bg-task.done .bg-task-dot { background: var(--green); }
+.bg-task.cut .bg-task-dot { background: var(--amber); }
+.bg-task-icon { flex: none; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.bg-task-desc { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 60px; }
+.bg-task.nested .bg-task-desc { color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.bg-task-activity { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-style: italic; }
+.bg-task-meta { flex: none; white-space: nowrap; }
+/* Usine's own message to the agent (an auto-resume): a muted system row. */
+.turn-notice { align-self: stretch; margin: 0 12px; padding: 6px 10px; font-size: 12px; color: var(--muted); border: 1px dashed var(--border); }
+.turn-notice > summary { cursor: pointer; }
+.turn-notice .turn-text { margin-top: 6px; }
 .queued-turns { display: flex; flex-direction: column; gap: 6px; }
 .turn.queued { opacity: .6; }
 .queued-row { display: flex; align-items: flex-start; gap: 8px; }

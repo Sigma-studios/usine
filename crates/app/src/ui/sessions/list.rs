@@ -73,11 +73,37 @@ pub(crate) fn grouped(sessions: Vec<Session>) -> Vec<(Section, Vec<Session>)> {
         .collect()
 }
 
-/// One line previewing a session: what a running agent last said it is doing,
-/// else its latest turn.
+/// One line previewing a session: what a running agent last said it is doing
+/// (and how many subagents work for it), that it is resuming cut-off agents,
+/// that some were left cut off, else its latest turn.
 fn preview(s: &Session) -> (String, usize) {
-    if let (true, Some(note)) = (s.is_running(), &s.status_note) {
-        return (format!("⟳ {}", note.text), 0);
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if s.is_running() {
+        let agents = s.running_agents().len();
+        let resuming = s.last_cutoff.as_ref().map_or(0, |c| c.descriptions.len());
+        let last_notice = s
+            .turns
+            .last()
+            .is_some_and(|t| t.kind == SessionTurnKind::Notice);
+        if resuming > 0 && agents == 0 && last_notice {
+            return (format!("↻ resuming {resuming} agent{}", plural(resuming)), 0);
+        }
+        let with_agents = |line: String| match agents {
+            0 => line,
+            n => format!("{line} · {n} agent{}", plural(n)),
+        };
+        match &s.status_note {
+            Some(note) => return (with_agents(format!("⟳ {}", note.text)), 0),
+            None if agents > 0 => {
+                return (format!("⟳ {agents} agent{} working", plural(agents)), 0)
+            }
+            None => {}
+        }
+    } else {
+        let cut = s.cut_off_agents().len();
+        if cut > 0 && !matches!(s.status, SessionStatus::NeedsAnswer(_)) {
+            return (format!("⚠ {cut} agent{} cut off", plural(cut)), 0);
+        }
     }
     let Some(turn) = s.turns.last() else {
         return (String::new(), 0);
@@ -86,7 +112,7 @@ fn preview(s: &Session) -> (String, usize) {
         SessionTurnKind::User | SessionTurnKind::Answer => "You: ",
         SessionTurnKind::Question => "Asks: ",
         SessionTurnKind::Error => "⚠ ",
-        SessionTurnKind::Agent => "",
+        SessionTurnKind::Agent | SessionTurnKind::Notice => "",
     };
     let line = turn
         .text
@@ -407,6 +433,43 @@ mod tests {
         assert_eq!(preview(&s).0, "⟳ Running tests");
         s.status = SessionStatus::Finished;
         assert_eq!(preview(&s).0, "You: x");
+    }
+
+    fn agent(id: &str, desc: &str) -> usine_core::TaskEvent {
+        usine_core::TaskEvent::Started {
+            id: id.into(),
+            parent: None,
+            kind: usine_core::BgTaskKind::Agent,
+            description: desc.into(),
+            subagent_type: None,
+            backgrounded: true,
+        }
+    }
+
+    #[test]
+    fn previews_count_running_resuming_and_cut_off_agents() {
+        let mut s = session(SessionStatus::Running, false, false, 0);
+        s.apply_task(&agent("a", "Build"));
+        s.apply_task(&agent("b", "Test"));
+        assert_eq!(preview(&s).0, "⟳ 2 agents working");
+        s.status_note = Some(usine_core::StatusNote {
+            text: "Waiting on agents".into(),
+            ts: 0,
+        });
+        assert_eq!(preview(&s).0, "⟳ Waiting on agents · 2 agents");
+
+        // The run ended cutting both off, and the session resumes them.
+        s.apply_task(&usine_core::TaskEvent::CutOff {
+            ids: vec!["a".into(), "b".into()],
+        });
+        let lost: Vec<usine_core::BgTask> = s.cut_off_agents().into_iter().cloned().collect();
+        s.record_cutoff(&lost);
+        s.push_turn(usine_core::SessionTurn::new(SessionTurnKind::Notice, "↻ 2 cut off"));
+        assert_eq!(preview(&s).0, "↻ resuming 2 agents");
+
+        // Paused by the guard: the session settles with them cut off.
+        s.status = SessionStatus::Finished;
+        assert_eq!(preview(&s).0, "⚠ 2 agents cut off");
     }
 
     #[test]

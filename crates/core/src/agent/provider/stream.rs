@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::agent::events::AgentEvent;
 use crate::domain::model::Usage;
+use crate::domain::session::{BgTaskKind, BgTaskStatus, TaskEvent};
 use crate::error::Result;
 
 /// Parse one line of `claude --output-format stream-json`.
@@ -28,6 +29,11 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
                 out.push(AgentEvent::Started {
                     session_id: sid.to_string(),
                 });
+            }
+        }
+        Some("system") => {
+            if let Some(task) = parse_task(&v) {
+                out.push(AgentEvent::Task(task));
             }
         }
         Some("assistant") => {
@@ -143,6 +149,74 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
     }
 
     Ok(out)
+}
+
+/// A `system/task_*` line: the CLI's account of a background task (subagent
+/// or command). Shapes verified on CLI 2.1.307 (see the fixtures under
+/// `tests/fixtures/claude_task_*.ndjson`).
+fn parse_task(v: &Value) -> Option<TaskEvent> {
+    let str_of = |key: &str| {
+        v.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let id = str_of("task_id")?;
+    let tool_uses = v.pointer("/usage/tool_uses").and_then(Value::as_u64);
+    match v.get("subtype").and_then(Value::as_str)? {
+        "task_started" => Some(TaskEvent::Started {
+            id,
+            parent: str_of("parent_task_id"),
+            kind: match v.get("task_type").and_then(Value::as_str) {
+                Some("local_agent") | Some("remote_agent") => BgTaskKind::Agent,
+                Some("local_bash") => BgTaskKind::Command,
+                _ => BgTaskKind::Other,
+            },
+            description: str_of("description").unwrap_or_else(|| "background task".into()),
+            subagent_type: str_of("subagent_type"),
+            backgrounded: v
+                .get("is_backgrounded")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        }),
+        "task_progress" => Some(TaskEvent::Progress {
+            id,
+            last_tool: str_of("last_tool_name"),
+            // `description` is the running activity ("Running cargo test");
+            // `summary`, when present, the agent's own recap.
+            summary: str_of("summary").or_else(|| str_of("description")),
+            tool_uses,
+        }),
+        "task_updated" => Some(TaskEvent::Status {
+            id,
+            status: task_status(v.pointer("/patch/status").and_then(Value::as_str)?)?,
+            reason: v
+                .pointer("/patch/reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            summary: None,
+            tool_uses: None,
+        }),
+        "task_notification" => Some(TaskEvent::Status {
+            id,
+            status: task_status(v.get("status").and_then(Value::as_str)?)?,
+            reason: str_of("reason"),
+            summary: str_of("summary"),
+            tool_uses,
+        }),
+        _ => None,
+    }
+}
+
+/// A task status word as the CLI writes it; `None` for a still-live one.
+fn task_status(s: &str) -> Option<BgTaskStatus> {
+    match s {
+        "completed" => Some(BgTaskStatus::Completed),
+        "failed" | "error" => Some(BgTaskStatus::Failed),
+        "stopped" | "killed" | "cancelled" => Some(BgTaskStatus::Stopped),
+        _ => None,
+    }
 }
 
 /// The one input field that says what a tool call does — the command, the
@@ -463,6 +537,61 @@ mod tests {
         assert!(
             matches!(&evts[0], AgentEvent::Progress { text } if text == "∴ The parser drops it.")
         );
+    }
+
+    fn fixture(name: &str) -> Vec<TaskEvent> {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .flat_map(|l| parse_claude_line(l).unwrap())
+            .filter_map(|e| match e {
+                AgentEvent::Task(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claude_task_lines_yield_task_events() {
+        let evts = fixture("claude_task_events.ndjson");
+        assert!(matches!(
+            &evts[0],
+            TaskEvent::Started { id, kind: BgTaskKind::Agent, description, subagent_type, parent: None, backgrounded: true }
+                if id == "a0a0e9d731c800ce5" && description == "Run sleep and echo"
+                    && subagent_type.as_deref() == Some("general-purpose")
+        ));
+        assert!(matches!(
+            &evts[1],
+            TaskEvent::Progress { last_tool, tool_uses: Some(1), .. } if last_tool.as_deref() == Some("Bash")
+        ));
+        // The subagent's own (foreground) command names its owner.
+        assert!(matches!(
+            &evts[2],
+            TaskEvent::Started { kind: BgTaskKind::Command, parent, backgrounded: false, .. }
+                if parent.as_deref() == Some("a0a0e9d731c800ce5")
+        ));
+        assert!(matches!(
+            evts.last().unwrap(),
+            TaskEvent::Status { status: BgTaskStatus::Completed, summary, tool_uses: Some(1), .. }
+                if summary.as_deref() == Some("hi")
+        ));
+    }
+
+    #[test]
+    fn claude_killed_and_stopped_tasks_are_stopped() {
+        let evts = fixture("claude_task_cutoff.ndjson");
+        let stops: Vec<&TaskEvent> = evts
+            .iter()
+            .filter(|e| matches!(e, TaskEvent::Status { id, .. } if id == "b64qntfst"))
+            .collect();
+        assert_eq!(stops.len(), 2, "task_updated(killed) and task_notification(stopped)");
+        assert!(stops
+            .iter()
+            .all(|e| matches!(e, TaskEvent::Status { status: BgTaskStatus::Stopped, .. })));
+        // Other system lines stay silent.
+        let other = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+        assert!(parse_claude_line(other).unwrap().is_empty());
     }
 
     #[test]
