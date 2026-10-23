@@ -1613,8 +1613,9 @@ fn handle_review_event(
         }
         // Plan-ready is not applicable to a review run.
         AgentEvent::PlanReady { .. } => {}
-        // Done is handled by finalize_review.
-        AgentEvent::Done { .. } => {}
+        // Done is handled by finalize_review; review runs deny the
+        // background-agent tools, so no task events arrive.
+        AgentEvent::Done { .. } | AgentEvent::Task(_) => {}
         AgentEvent::Error { message } => {
             fail_review_task(store, evt_tx, review_id, message.clone())?;
             let _ =

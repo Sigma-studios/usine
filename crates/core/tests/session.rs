@@ -10,11 +10,12 @@ use std::time::Duration;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use usine_core::{
-    reconcile_interrupted_sessions, spawn_executor, AgentEvent, AgentProvider, AppSettings, Card,
+    reconcile_interrupted_sessions, spawn_executor, AgentEvent, AgentProvider, AppSettings,
+    BgTaskKind, BgTaskStatus, Card,
     CardConfig, CardState, CoreError, DesignSub, Effort, ExecutorCommand, ExecutorConfig,
     ExecutorEvent, ExecutorEventKind, ExecutorHandle, ModelSpec, Project, ProjectConfig, Provider,
     ProviderFactory, Result, RunConfig, RunHandle, RunMode, Session, SessionAccess, SessionStatus,
-    SessionTurnKind, SimFactory, SimForge, SimGit, Store,
+    SessionTurnKind, SimFactory, SimForge, SimGit, Store, TaskEvent,
 };
 use uuid::Uuid;
 
@@ -800,4 +801,195 @@ async fn a_stop_keeps_the_queue_for_the_next_message() {
     wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
     wait_status(&mut rx, id, finished).await;
     assert!(spy.last().full_prompt().starts_with("solo"));
+}
+
+/// Every `SessionUpdated` for `id` until it settles (`Finished`), the last
+/// one included.
+async fn updates_until_finished(
+    rx: &mut UnboundedReceiver<ExecutorEvent>,
+    id: Uuid,
+) -> Vec<Session> {
+    let mut seen = Vec::new();
+    loop {
+        let s = wait_for(rx, |e| match &e.kind {
+            ExecutorEventKind::SessionUpdated(s) if s.id == id => Some((**s).clone()),
+            _ => None,
+        })
+        .await;
+        let done = finished(&s.status);
+        seen.push(s);
+        if done {
+            return seen;
+        }
+    }
+}
+
+#[tokio::test]
+async fn background_agents_are_tracked_to_completion() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+
+    create(&handle, id, folder.path(), "Survey it [bg-agent]");
+    let seen = updates_until_finished(&mut rx, id).await;
+    assert!(
+        seen.iter()
+            .any(|s| s.is_running() && s.running_agents().len() == 1),
+        "the agent shows while it works"
+    );
+    let s = seen.last().unwrap();
+    let agents: Vec<_> = s
+        .bg_tasks
+        .iter()
+        .filter(|t| t.kind == BgTaskKind::Agent)
+        .collect();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].status, BgTaskStatus::Completed);
+    assert_eq!(agents[0].summary.as_deref(), Some("All 42 tests pass"));
+    assert_eq!(agents[0].tool_uses, 3);
+    assert_eq!(spy.count(), 1, "nothing to resume");
+    assert!(s.unread);
+    assert!(s.turns.iter().all(|t| t.kind != SessionTurnKind::Notice));
+}
+
+#[tokio::test]
+async fn a_cut_off_agent_is_resumed_without_the_session_ever_settling() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+
+    create(&handle, id, folder.path(), "Integrate [bg-cutoff]");
+    let seen = updates_until_finished(&mut rx, id).await;
+    let (last, before) = seen.split_last().unwrap();
+    assert!(
+        before.iter().all(|s| s.is_running() && !s.unread),
+        "no attention, no unread until the resumed turn ends"
+    );
+    assert_eq!(spy.count(), 2, "one auto-resume");
+    let resume = spy.last();
+    assert!(resume.resume_session.is_some(), "it resumes the conversation");
+    let prompt = resume.full_prompt();
+    assert!(prompt.contains("\"Integrate the walls\" (general-purpose)"));
+    assert!(prompt.contains("its own background command (\"cargo test --workspace\")"));
+    assert!(prompt.contains("Resume or relaunch every one"));
+
+    let notices: Vec<_> = last
+        .turns
+        .iter()
+        .filter(|t| t.kind == SessionTurnKind::Notice)
+        .collect();
+    assert_eq!(notices.len(), 1);
+    let agents: Vec<_> = last
+        .bg_tasks
+        .iter()
+        .filter(|t| t.kind == BgTaskKind::Agent)
+        .map(|t| t.status)
+        .collect();
+    assert_eq!(
+        agents,
+        [BgTaskStatus::Relaunched, BgTaskStatus::Completed],
+        "the cut-off entry is superseded by its relaunch"
+    );
+    assert!(last.unread);
+    assert!(last.cut_off_agents().is_empty());
+}
+
+#[tokio::test]
+async fn auto_resume_keeps_going_while_each_round_makes_progress() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+
+    create(&handle, id, folder.path(), "Go [bg-rounds]");
+    let seen = updates_until_finished(&mut rx, id).await;
+    assert_eq!(spy.count(), 3, "two cut-off rounds, then done");
+    let last = seen.last().unwrap();
+    assert_eq!(
+        last.turns
+            .iter()
+            .filter(|t| t.kind == SessionTurnKind::Notice)
+            .count(),
+        2
+    );
+    assert!(!last.turns.last().unwrap().text.contains("auto-resume paused"));
+    assert!(
+        last.cut_off_agents().is_empty(),
+        "the agents the resumed turns were told about are settled"
+    );
+}
+
+#[tokio::test]
+async fn a_stuck_cut_off_loop_pauses_after_one_resume_until_the_user_writes() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+
+    create(&handle, id, folder.path(), "Go [bg-cutoff-stuck]");
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(spy.count(), 2, "one auto-resume, then the guard holds");
+    assert!(s.unread);
+    assert!(s.needs_attention());
+    let reply = s.last_turn_of(SessionTurnKind::Agent).unwrap();
+    assert!(reply.text.contains("cut off again with no progress"));
+    assert_eq!(s.cut_off_agents().len(), 1);
+
+    // The user's message names the agent, and starts the guard over: the
+    // same stuck agent gets one more automatic round.
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "try again".into(),
+    });
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(spy.count(), 4);
+    let prompts: Vec<String> = spy
+        .runs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.full_prompt())
+        .collect();
+    assert!(prompts[2].starts_with("try again"));
+    assert!(prompts[2].contains("never relaunched: \"Stuck worker [bg-cutoff-stuck]\""));
+    assert!(s.last_turn_of(SessionTurnKind::Agent).unwrap().text.contains("auto-resume paused"));
+}
+
+#[tokio::test]
+async fn a_restart_cuts_off_live_agents_and_retry_names_them() {
+    let store = Store::open_in_memory().unwrap();
+    let mut s = Session::new(
+        Uuid::new_v4(),
+        std::env::temp_dir(),
+        Provider::Claude,
+        ModelSpec::new("opus", Effort::High),
+        SessionAccess::FullAccess,
+        "work",
+        vec![],
+    );
+    s.apply_task(&TaskEvent::Started {
+        id: "a1".into(),
+        parent: None,
+        kind: BgTaskKind::Agent,
+        description: "Long job".into(),
+        subagent_type: None,
+        backgrounded: true,
+    });
+    store.upsert_session(&s).unwrap();
+    reconcile_interrupted_sessions(&store, "Usine restarted").unwrap();
+    let s = store.get_session(s.id).unwrap();
+    assert_eq!(s.bg_tasks[0].status, BgTaskStatus::CutOff);
+
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    handle.send(ExecutorCommand::RetrySession { session_id: s.id });
+    let done = wait_status(&mut rx, s.id, finished).await;
+    assert!(spy.last().full_prompt().contains("never relaunched: \"Long job\""));
+    assert!(done.bg_tasks.is_empty(), "settled tasks are dropped on a new turn");
 }

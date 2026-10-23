@@ -22,6 +22,7 @@ use tokio::time::{sleep_until, timeout, Instant};
 
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider, Usage};
+use crate::domain::session::{BgTaskStatus, TaskEvent};
 use crate::error::{CoreError, Result};
 
 use super::stream::{
@@ -143,9 +144,10 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
 /// (default 10 minutes) after the last turn's `result` for background tasks,
 /// then stops them — a session's long `run_in_background` subagent was cut
 /// off mid-work at exactly that mark. Sessions raise it to
-/// [`SESSION_BG_WAIT_CEILING`], just under our own [`SESSION_HELD_RESULT_GRACE`],
-/// so the CLI stops the subagent cleanly (marked stopped, resumable on a later
-/// turn) before we would hard-kill the process. Card runs deny `Agent`/`Task`,
+/// [`SESSION_BG_WAIT_CEILING`] (a day less 5 minutes), just under our own
+/// [`SESSION_HELD_RESULT_GRACE`], so the CLI stops the subagent cleanly before
+/// we would hard-kill the process — and the session then sees it cut off and
+/// resumes it (see [`TaskTracker`]). Card runs deny `Agent`/`Task`,
 /// and their background `Bash`/`Monitor` have their own 10-minute cap.
 fn cli_env(cfg: &RunConfig) -> Vec<(&'static str, String)> {
     if cfg.mode.is_session() {
@@ -464,6 +466,9 @@ impl TurnGate {
                     self.resumed_announced = false;
                     self.held_kept = false;
                 }
+                // A subagent's progress isn't the agent resuming: it works
+                // while the parent waits.
+                AgentEvent::Task(_) => out.push(evt),
                 other => {
                     if self.held.is_some() && !self.resumed_announced && !self.held_kept {
                         self.resumed_announced = true;
@@ -481,6 +486,12 @@ impl TurnGate {
     /// Whether a turn's result is waiting for the run to end.
     fn is_holding(&self) -> bool {
         self.held.is_some()
+    }
+
+    /// Whether the agent sits between turns: its last turn ended and nothing
+    /// has woken it since. A task stopped now wasn't stopped by the agent.
+    fn is_idle(&self) -> bool {
+        self.held.is_some() && !self.resumed_announced && !self.held_kept
     }
 
     /// Keep the held result: a live message written before it was read
@@ -520,6 +531,98 @@ impl TurnGate {
     }
 }
 
+/// Follows a session run's background tasks to say, when the run ends, whose
+/// work it cut short (see [`BgTaskStatus::CutOff`]).
+///
+/// The CLI ends a `-p` run once the parent agent has nothing left to wait
+/// for, and stops whatever still runs then: a subagent past the wait
+/// ceiling, or — verified live on CLI 2.1.307 — a subagent's own
+/// `run_in_background` command once that subagent ended its turn (the CLI
+/// reports the subagent `completed`, "waiting on its own background work",
+/// and then kills the command at exit). Its status line can't tell that from
+/// a deliberate stop, so the timing does: a command stopped after its owner
+/// had already ended, or a top-level task stopped while the parent sat idle
+/// between turns, was stopped by the CLI.
+#[derive(Default)]
+struct TaskTracker {
+    tasks: Vec<TrackedTask>,
+}
+
+struct TrackedTask {
+    id: String,
+    parent: Option<String>,
+    status: BgTaskStatus,
+    /// Ended by the CLI rather than by the agent (see [`TaskTracker`]).
+    cut: bool,
+}
+
+/// Stop reasons that mean the CLI ended a task before its work was done.
+const CUT_OFF_REASONS: &[&str] = &["deadline", "memory_pressure"];
+
+impl TaskTracker {
+    /// Note the task events among `events`; `idle` is whether the parent
+    /// agent sat between turns when they arrived.
+    fn observe(&mut self, events: &[AgentEvent], idle: bool) {
+        for evt in events {
+            let AgentEvent::Task(task) = evt else {
+                continue;
+            };
+            match task {
+                TaskEvent::Started { id, parent, .. } => {
+                    self.tasks.retain(|t| t.id != *id);
+                    self.tasks.push(TrackedTask {
+                        id: id.clone(),
+                        parent: parent.clone(),
+                        status: BgTaskStatus::Running,
+                        cut: false,
+                    });
+                }
+                TaskEvent::Status {
+                    id, status, reason, ..
+                } => {
+                    let parent = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == *id)
+                        .map(|t| t.parent.as_deref());
+                    let owner_ended = parent
+                        .flatten()
+                        .and_then(|p| self.tasks.iter().find(|o| o.id == p))
+                        .is_some_and(|o| o.status.is_terminal());
+                    // Only the parent's own tasks: a subagent works while the
+                    // parent idles, so it stopping its own command then is
+                    // deliberate.
+                    let idle_own = idle && parent.is_some_and(|p| p.is_none());
+                    let Some(t) = self.tasks.iter_mut().find(|t| t.id == *id) else {
+                        continue;
+                    };
+                    if t.status.is_terminal() {
+                        continue;
+                    }
+                    t.status = *status;
+                    t.cut = *status == BgTaskStatus::Stopped
+                        && (idle_own
+                            || owner_ended
+                            || reason
+                                .as_deref()
+                                .is_some_and(|r| CUT_OFF_REASONS.contains(&r)));
+                }
+                TaskEvent::Progress { .. } | TaskEvent::CutOff { .. } => {}
+            }
+        }
+    }
+
+    /// The tasks the run's end cut short: those still running, and those the
+    /// CLI stopped. (Their owners follow in [`Session::apply_task`].)
+    fn cut_off(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|t| t.cut || !t.status.is_terminal())
+            .map(|t| t.id.clone())
+            .collect()
+    }
+}
+
 /// How long a run may stay silent with a turn's `result` held before that
 /// result is taken as final and the process is killed.
 ///
@@ -535,15 +638,18 @@ pub(crate) const HELD_RESULT_GRACE: Duration = Duration::from_secs(12 * 60);
 
 /// [`HELD_RESULT_GRACE`] for one-off sessions. Sessions allow `Agent`/`Task`,
 /// and a `run_in_background` subagent has no 10-minute cap: the parent's
-/// interim result ("waiting on the subagent") is followed by silence until the
+/// interim result ("waiting on the subagent") is followed by a wait until the
 /// subagent reports back. Releasing it early would mark the session Finished
 /// and kill the subagent mid-work — the exact failure sessions exist to avoid.
-/// The user can always Stop a session, so a long wait costs little. Must stay
-/// below the session actor's `SESSION_IDLE_TIMEOUT`, asserted there. Waiting is
-/// only useful if the CLI waits too: it stops background tasks
-/// `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` after the last `result` (10 minutes
-/// by default), which sessions raise to [`SESSION_BG_WAIT_CEILING`].
-pub(crate) const SESSION_HELD_RESULT_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
+/// A day, because real subagents routinely work 2–4 hours (a 2-hour window
+/// cut them off), and because the subagents' own task events reset this
+/// clock, so it only measures true silence. The user can always Stop a
+/// session, so a long wait costs little. Must stay below the session actor's
+/// `SESSION_IDLE_TIMEOUT`, asserted there. Waiting is only useful if the CLI
+/// waits too: it stops background tasks `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`
+/// after the last `result` (10 minutes by default, parsed with no upper
+/// clamp), which sessions raise to [`SESSION_BG_WAIT_CEILING`].
+pub(crate) const SESSION_HELD_RESULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The CLI background-wait ceiling for sessions ([`cli_env`]). Kept below
 /// [`SESSION_HELD_RESULT_GRACE`] so the CLI always stops a runaway subagent
@@ -597,6 +703,8 @@ async fn pump(
     // When the executor last received an event: its idle watchdog counts from
     // here, so the held-result grace does too.
     let mut last_sent = Instant::now();
+    // Which background tasks the run's end will have cut short.
+    let mut tasks = TaskTracker::default();
     let mut exit_status = None;
     let mut timed_out = false;
 
@@ -606,10 +714,12 @@ async fn pump(
     let forward = |line: &str,
                    gate: &mut PlanGate,
                    turns: &mut TurnGate,
+                   tasks: &mut TaskTracker,
                    live: &mut Option<LiveInput>,
                    last_sent: &mut Instant| {
         gate.observe(line);
         let events = parse_claude_line(line).unwrap_or_default();
+        tasks.observe(&events, turns.is_idle());
         if let Some(note) = live.as_mut().and_then(|l| l.observe(line, &events)) {
             *last_sent = Instant::now();
             let _ = evt_tx.unbounded_send(note);
@@ -637,7 +747,7 @@ async fn pump(
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     last_line = Instant::now();
-                    forward(&line, &mut gate, &mut turns, &mut live, &mut last_sent)
+                    forward(&line, &mut gate, &mut turns, &mut tasks, &mut live, &mut last_sent)
                 }
                 _ => break, // EOF or read error
             },
@@ -646,7 +756,7 @@ async fn pump(
                 // `claude` is gone; read what's left in the pipe, but don't wait
                 // on a grandchild (a background task) that still holds it open.
                 while let Ok(Ok(Some(line))) = timeout(EXIT_DRAIN, lines.next_line()).await {
-                    forward(&line, &mut gate, &mut turns, &mut live, &mut last_sent);
+                    forward(&line, &mut gate, &mut turns, &mut tasks, &mut live, &mut last_sent);
                 }
                 break;
             },
@@ -696,6 +806,12 @@ async fn pump(
     // un-rejected plan whose run produced no trailing `result` line). A
     // cancelled run forwards neither.
     if !cancelled {
+        // Before the result, so the session knows what was lost when it
+        // settles the turn. A user's Stop cuts nothing off: they meant it.
+        let cut = tasks.cut_off();
+        if !cut.is_empty() {
+            let _ = evt_tx.unbounded_send(AgentEvent::Task(TaskEvent::CutOff { ids: cut }));
+        }
         let tail = match turns.finish() {
             // `line` is only read for PlanReady tool ids; none arrive here.
             Some(evt) => gate.gate("", vec![evt]),
@@ -763,7 +879,7 @@ mod tests {
     fn session_runs_raise_the_cli_background_wait_ceiling() {
         let expected = vec![(
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
-            (115 * 60 * 1000).to_string(),
+            (24 * 60 * 60 * 1000 - 5 * 60 * 1000).to_string(),
         )];
         assert_eq!(cli_env(&cfg(RunMode::SessionFull)), expected);
         assert_eq!(cli_env(&cfg(RunMode::SessionReadOnly)), expected);
@@ -1367,5 +1483,137 @@ mod tests {
         let events =
             pump_script(&script, Duration::from_millis(100), Duration::from_secs(10)).await;
         assert!(final_done(&events), "{:?}", kinds(&events));
+    }
+
+    fn fixture_path(name: &str) -> String {
+        format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn cut_offs(events: &[AgentEvent]) -> Vec<Vec<String>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Task(TaskEvent::CutOff { ids }) => Some(ids.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // The live capture of a subagent that backgrounded its own command and
+    // ended its turn: the CLI killed the command after the parent's last
+    // result. The run reports it cut off, just before its result, and the
+    // subagents' task lines never pass for the parent resuming.
+    #[tokio::test]
+    async fn a_subagents_command_killed_at_exit_is_cut_off() {
+        let script = format!("cat '{}'", fixture_path("claude_task_cutoff.ndjson"));
+        let events = pump_script(&script, Duration::from_secs(5), Duration::from_secs(10)).await;
+        assert_eq!(cut_offs(&events), vec![vec!["b64qntfst".to_string()]]);
+        let n = events.len();
+        assert!(matches!(&events[n - 2], AgentEvent::Task(TaskEvent::CutOff { .. })));
+        assert!(matches!(&events[n - 1], AgentEvent::Done { .. }));
+        assert_eq!(resumed_notes(&events), 0);
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_tasks_all_finished_cuts_nothing_off() {
+        let script = format!("cat '{}'", fixture_path("claude_task_events.ndjson"));
+        let events = pump_script(&script, Duration::from_secs(5), Duration::from_secs(10)).await;
+        assert!(cut_offs(&events).is_empty());
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Task(_))));
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Done { result, .. }) if result.starts_with("DONE"))
+        );
+    }
+
+    fn task_started(id: &str, parent: Option<&str>) -> AgentEvent {
+        AgentEvent::Task(TaskEvent::Started {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+            kind: if parent.is_some() {
+                crate::domain::session::BgTaskKind::Command
+            } else {
+                crate::domain::session::BgTaskKind::Agent
+            },
+            description: id.into(),
+            subagent_type: None,
+            backgrounded: true,
+        })
+    }
+
+    fn task_status(id: &str, status: BgTaskStatus, reason: Option<&str>) -> AgentEvent {
+        AgentEvent::Task(TaskEvent::Status {
+            id: id.into(),
+            status,
+            reason: reason.map(str::to_string),
+            summary: None,
+            tool_uses: None,
+        })
+    }
+
+    #[test]
+    fn task_tracker_cut_off_rules() {
+        let mut t = TaskTracker::default();
+        // Mid-turn, while the parent works.
+        t.observe(
+            &[
+                task_started("live", None),
+                task_started("timed-out", None),
+                task_started("done", None),
+                task_started("own-cmd", Some("done")),
+                task_started("killed-on-purpose", None),
+                task_started("busy", None),
+                task_started("busy-cmd", Some("busy")),
+            ],
+            false,
+        );
+        t.observe(
+            &[
+                task_status("killed-on-purpose", BgTaskStatus::Stopped, None),
+                task_status("done", BgTaskStatus::Completed, None),
+                task_status("timed-out", BgTaskStatus::Stopped, Some("deadline")),
+                // Its owner still works: the subagent stopped it itself.
+                task_status("busy-cmd", BgTaskStatus::Stopped, None),
+                task_status("busy", BgTaskStatus::Completed, None),
+            ],
+            false,
+        );
+        // Its owner already ended: the CLI killed it.
+        t.observe(&[task_status("own-cmd", BgTaskStatus::Stopped, None)], false);
+        assert_eq!(t.cut_off(), vec!["live", "timed-out", "own-cmd"]);
+
+        // A top-level task stopped while the parent sits between turns was
+        // the CLI; a subagent stopping its own command then was deliberate.
+        let mut idle = TaskTracker::default();
+        idle.observe(
+            &[
+                task_started("a", None),
+                task_started("worker", None),
+                task_started("dev-server", Some("worker")),
+            ],
+            false,
+        );
+        idle.observe(
+            &[
+                task_status("a", BgTaskStatus::Stopped, None),
+                task_status("dev-server", BgTaskStatus::Stopped, None),
+                task_status("worker", BgTaskStatus::Completed, None),
+            ],
+            true,
+        );
+        assert_eq!(idle.cut_off(), vec!["a"]);
+    }
+
+    #[test]
+    fn turn_gate_task_events_are_not_a_resumption() {
+        let mut turns = TurnGate::default();
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"waiting on the agent","total_cost_usd":0.1}"#;
+        turns.hold(parse_claude_line(line).unwrap());
+        assert!(turns.is_idle());
+        let out = turns.hold(vec![task_started("a", None)]);
+        assert_eq!(out.len(), 1, "passed through, no note");
+        assert!(turns.is_idle(), "the parent still waits");
+        let out = turns.hold(vec![AgentEvent::Progress { text: "back".into() }]);
+        assert_eq!(out.len(), 2, "a real resumption is announced");
+        assert!(!turns.is_idle());
     }
 }

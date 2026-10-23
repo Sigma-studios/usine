@@ -47,7 +47,8 @@ pub(super) fn section_bounds(turns: &[SessionTurn]) -> Vec<Bound> {
         };
         latest = latest.max(after);
         match turn.kind {
-            SessionTurnKind::User | SessionTurnKind::Answer => {
+            // Usine's own notice (an auto-resume) starts a turn like a message.
+            SessionTurnKind::User | SessionTurnKind::Answer | SessionTurnKind::Notice => {
                 if let Some(prev) = out.last_mut() {
                     prev.end = Some(latest);
                 }
@@ -112,7 +113,7 @@ pub(super) fn classify(line: &str, prefix: &str) -> Option<(WorkKind, String)> {
         (WorkKind::Tool, tool)
     } else if let Some(thought) = line.strip_prefix(THINKING_PROGRESS_PREFIX) {
         (WorkKind::Thinking, thought.trim().to_string())
-    } else if ["↪", "⚠", "✔", "✖", "■"]
+    } else if ["↪", "⚠", "✔", "✖", "■", "⧉", "↻"]
         .iter()
         .any(|m| line.starts_with(m))
     {

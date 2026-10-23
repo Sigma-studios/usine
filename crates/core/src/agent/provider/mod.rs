@@ -74,9 +74,15 @@ impl RunMode {
 /// What a session's agent is told about reporting progress: Claude gets it as
 /// an appended system prompt on every turn, Codex after the user's message.
 /// The session actor shows the latest line and strips them from the reply.
+/// It also keeps subagents from backgrounding their own builds: once one ends
+/// its turn on such a command, the CLI counts it done and kills the command
+/// when the run exits.
 pub const SESSION_STATUS_PROMPT: &str = "While you work, at each meaningful step write one \
     line on its own: `usine-status: <what you are doing now, 80 chars max>`. Never include it \
-    in your final answer.";
+    in your final answer. When you launch subagents, tell each to run builds and tests in the \
+    foreground (with a long timeout) and never to end its turn while a command it started in \
+    the background is still running — the session ends when its agents do, killing that \
+    command.";
 
 /// Everything a provider needs to launch one run.
 #[derive(Debug, Clone)]

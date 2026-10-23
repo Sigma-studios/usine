@@ -67,6 +67,9 @@ pub enum SessionTurnKind {
     Question,
     Answer,
     Error,
+    /// A message Usine itself sent the agent — the auto-resume after
+    /// background agents were cut off. Re-sent by Retry like a user message.
+    Notice,
 }
 
 /// One entry of a session's conversation.
@@ -103,6 +106,116 @@ impl SessionTurn {
 pub struct StatusNote {
     pub text: String,
     pub ts: i64,
+}
+
+/// What a background task of the session's agent is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BgTaskKind {
+    /// A subagent (`Agent` tool).
+    Agent,
+    /// A shell command (`Bash`), the agent's own or a subagent's.
+    Command,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BgTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    /// Stopped on purpose (by the agent, or by the user via the agent).
+    Stopped,
+    /// Ended by the CLI before its work was done: still running when the
+    /// process exited, stopped at a time or memory limit, or a subagent that
+    /// "completed" while its own background command was still running.
+    CutOff,
+    /// A cut-off agent the parent launched again (a newer entry carries on).
+    Relaunched,
+}
+
+impl BgTaskStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            BgTaskStatus::Running => "running",
+            BgTaskStatus::Completed => "done",
+            BgTaskStatus::Failed => "failed",
+            BgTaskStatus::Stopped => "stopped",
+            BgTaskStatus::CutOff => "cut off",
+            BgTaskStatus::Relaunched => "relaunched",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, BgTaskStatus::Running)
+    }
+}
+
+/// One background task of the session's agent, as the CLI reports it
+/// (`system/task_*` stream lines).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BgTask {
+    pub id: String,
+    /// The task that launched it — a subagent's own commands name it; the
+    /// parent agent's tasks have none.
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub kind: BgTaskKind,
+    pub description: String,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    pub status: BgTaskStatus,
+    /// Why the CLI stopped it (`deadline`, `memory_pressure`…), when it says.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub last_tool: Option<String>,
+    /// What it is doing, or what it reported when it ended.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub tool_uses: u64,
+    pub started_at: i64,
+    pub updated_at: i64,
+}
+
+/// A change to the session's background tasks, parsed from the CLI stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEvent {
+    Started {
+        id: String,
+        parent: Option<String>,
+        kind: BgTaskKind,
+        description: String,
+        subagent_type: Option<String>,
+        /// Run in the background rather than awaited by its launcher.
+        backgrounded: bool,
+    },
+    Progress {
+        id: String,
+        last_tool: Option<String>,
+        summary: Option<String>,
+        tool_uses: Option<u64>,
+    },
+    Status {
+        id: String,
+        status: BgTaskStatus,
+        reason: Option<String>,
+        summary: Option<String>,
+        tool_uses: Option<u64>,
+    },
+    /// The run ended with these tasks' work unfinished (see
+    /// [`BgTaskStatus::CutOff`]); sent once, just before the run's end.
+    CutOff { ids: Vec<String> },
+}
+
+/// The last auto-resume's cut-off agents, kept to tell a stuck loop from one
+/// making progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CutOffRound {
+    /// The cut-off agents' descriptions, sorted.
+    pub descriptions: Vec<String>,
+    /// [`Session::bg_tool_uses`] when the round was sent.
+    pub tool_uses: u64,
 }
 
 /// A status change, applied by [`Session::apply`].
@@ -161,6 +274,14 @@ pub struct Session {
     /// out together as the next resumed turn.
     #[serde(default)]
     pub queued: Vec<SessionTurn>,
+    /// The agent's background tasks (subagents and their commands) since the
+    /// user's last message; settled ones are dropped when the next starts.
+    #[serde(default)]
+    pub bg_tasks: Vec<BgTask>,
+    /// Set while the session auto-resumes cut-off agents (see
+    /// [`Session::cut_off_stalled`]); cleared by the user's next message.
+    #[serde(default)]
+    pub last_cutoff: Option<CutOffRound>,
 }
 
 impl Session {
@@ -197,6 +318,8 @@ impl Session {
             cost: Cost::ZERO,
             status_note: None,
             queued: Vec::new(),
+            bg_tasks: Vec::new(),
+            last_cutoff: None,
         }
     }
 
@@ -304,6 +427,265 @@ impl Session {
         self.status = next;
         Ok(())
     }
+}
+
+impl Session {
+    /// Record a background-task event. Returns whether anything changed.
+    ///
+    /// A settled task never goes back to running from a late progress line,
+    /// except that the end of the run may still mark it cut off. A subagent
+    /// whose own command is cut off is cut off with it: it reported done
+    /// while that command was still at work. Commands the parent runs in the
+    /// foreground aren't tracked — they never outlive its turn.
+    pub fn apply_task(&mut self, event: &TaskEvent) -> bool {
+        let now = now_millis();
+        match event {
+            TaskEvent::Started {
+                id,
+                parent,
+                kind,
+                description,
+                subagent_type,
+                backgrounded,
+            } => {
+                if *kind != BgTaskKind::Agent && parent.is_none() && !backgrounded {
+                    return false;
+                }
+                // A cut-off agent launched again under the same description.
+                if *kind == BgTaskKind::Agent {
+                    for t in &mut self.bg_tasks {
+                        if t.kind == BgTaskKind::Agent
+                            && t.status == BgTaskStatus::CutOff
+                            && t.description == *description
+                            && t.id != *id
+                        {
+                            t.status = BgTaskStatus::Relaunched;
+                            t.updated_at = now;
+                        }
+                    }
+                }
+                let task = BgTask {
+                    id: id.clone(),
+                    parent: parent.clone(),
+                    kind: *kind,
+                    description: description.clone(),
+                    subagent_type: subagent_type.clone(),
+                    status: BgTaskStatus::Running,
+                    reason: None,
+                    last_tool: None,
+                    summary: None,
+                    tool_uses: 0,
+                    started_at: now,
+                    updated_at: now,
+                };
+                match self.bg_tasks.iter_mut().find(|t| t.id == *id) {
+                    // Resumed (`SendMessage` to a finished agent): it works again.
+                    Some(t) => {
+                        t.status = BgTaskStatus::Running;
+                        t.reason = None;
+                        t.updated_at = now;
+                    }
+                    None => self.bg_tasks.push(task),
+                }
+                true
+            }
+            TaskEvent::Progress {
+                id,
+                last_tool,
+                summary,
+                tool_uses,
+            } => {
+                let Some(t) = self.bg_tasks.iter_mut().find(|t| t.id == *id) else {
+                    return false;
+                };
+                if last_tool.is_some() {
+                    t.last_tool = last_tool.clone();
+                }
+                if summary.is_some() {
+                    t.summary = summary.clone();
+                }
+                if let Some(n) = tool_uses {
+                    t.tool_uses = t.tool_uses.max(*n);
+                }
+                t.updated_at = now;
+                true
+            }
+            TaskEvent::Status {
+                id,
+                status,
+                reason,
+                summary,
+                tool_uses,
+            } => {
+                let Some(t) = self.bg_tasks.iter_mut().find(|t| t.id == *id) else {
+                    return false;
+                };
+                if t.status.is_terminal() && *status != BgTaskStatus::CutOff {
+                    // A task's end is often reported twice (`task_updated`,
+                    // then `task_notification`): keep what the later one adds.
+                    if t.status != *status {
+                        return false;
+                    }
+                }
+                t.status = *status;
+                if reason.is_some() {
+                    t.reason = reason.clone();
+                }
+                if summary.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                    t.summary = summary.clone();
+                }
+                if let Some(n) = tool_uses {
+                    t.tool_uses = t.tool_uses.max(*n);
+                }
+                t.updated_at = now;
+                true
+            }
+            TaskEvent::CutOff { ids } => {
+                let owners: Vec<String> = self
+                    .bg_tasks
+                    .iter()
+                    .filter(|t| ids.contains(&t.id))
+                    .filter_map(|t| t.parent.clone())
+                    .collect();
+                let mut changed = false;
+                for t in &mut self.bg_tasks {
+                    if (ids.contains(&t.id) || owners.contains(&t.id))
+                        && t.status != BgTaskStatus::CutOff
+                    {
+                        t.status = BgTaskStatus::CutOff;
+                        t.updated_at = now;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+        }
+    }
+
+    /// The subagents whose work a run's end cut short: those among `ids`, and
+    /// those owning a command among `ids`. The parent's own commands (a dev
+    /// server it started) are not in it: they alone never warrant resuming.
+    pub fn lost_agents(&self, ids: &[String]) -> Vec<&BgTask> {
+        let owners: Vec<&str> = self
+            .bg_tasks
+            .iter()
+            .filter(|t| ids.contains(&t.id))
+            .filter_map(|t| t.parent.as_deref())
+            .collect();
+        self.bg_tasks
+            .iter()
+            .filter(|t| {
+                t.kind == BgTaskKind::Agent
+                    && t.status == BgTaskStatus::CutOff
+                    && (ids.contains(&t.id) || owners.contains(&t.id.as_str()))
+            })
+            .collect()
+    }
+
+    /// Cut-off subagents nobody launched again yet.
+    pub fn cut_off_agents(&self) -> Vec<&BgTask> {
+        self.bg_tasks
+            .iter()
+            .filter(|t| t.kind == BgTaskKind::Agent && t.status == BgTaskStatus::CutOff)
+            .collect()
+    }
+
+    /// Subagents at work right now.
+    pub fn running_agents(&self) -> Vec<&BgTask> {
+        self.bg_tasks
+            .iter()
+            .filter(|t| t.kind == BgTaskKind::Agent && t.status == BgTaskStatus::Running)
+            .collect()
+    }
+
+    /// Tool calls made by every background task so far — the measure of
+    /// progress between two auto-resumes.
+    pub fn bg_tool_uses(&self) -> u64 {
+        self.bg_tasks.iter().map(|t| t.tool_uses).sum()
+    }
+
+    /// Whether resuming `lost` again would just repeat the last auto-resume:
+    /// no fewer agents cut off, and the relaunches did no more than the one
+    /// call each that backgrounds their work again. Progress is judged by
+    /// counts, not descriptions, since a relaunch is often reworded. Any real
+    /// progress keeps the session resuming, however many rounds it takes.
+    pub fn cut_off_stalled(&self, lost: &[&BgTask]) -> bool {
+        let Some(last) = &self.last_cutoff else {
+            return false;
+        };
+        lost.len() >= last.descriptions.len()
+            && self.bg_tool_uses() <= last.tool_uses + lost.len() as u64
+    }
+
+    /// An auto-resumed turn ended: the parent was told about the agents cut
+    /// off before and dealt with them, whether it relaunched them under
+    /// another description or judged them done. Those cut off by this very
+    /// turn's end (`keep`) stay cut off.
+    pub fn settle_cut_offs(&mut self, keep: &[&str]) {
+        if self.last_cutoff.is_none() {
+            return;
+        }
+        let now = now_millis();
+        for t in &mut self.bg_tasks {
+            if t.kind == BgTaskKind::Agent
+                && t.status == BgTaskStatus::CutOff
+                && !keep.contains(&t.id.as_str())
+            {
+                t.status = BgTaskStatus::Relaunched;
+                t.updated_at = now;
+            }
+        }
+    }
+
+    /// Remember an auto-resume of `lost` for [`Session::cut_off_stalled`].
+    pub fn record_cutoff(&mut self, lost: &[BgTask]) {
+        let refs: Vec<&BgTask> = lost.iter().collect();
+        self.last_cutoff = Some(CutOffRound {
+            descriptions: sorted_descriptions(&refs),
+            tool_uses: self.bg_tool_uses(),
+        });
+    }
+
+    /// The user starts a turn: what is still cut off is handed back (for the
+    /// prompt to mention), settled tasks are dropped, and the auto-resume
+    /// guard starts over.
+    pub fn begin_user_turn(&mut self) -> Vec<BgTask> {
+        let cut: Vec<BgTask> = self.cut_off_agents().into_iter().cloned().collect();
+        self.bg_tasks.retain(|t| !t.status.is_terminal());
+        self.last_cutoff = None;
+        cut
+    }
+
+    /// The user stopped the session: whatever ran was stopped with it.
+    pub fn stop_live_tasks(&mut self) {
+        let now = now_millis();
+        for t in &mut self.bg_tasks {
+            if !t.status.is_terminal() {
+                t.status = BgTaskStatus::Stopped;
+                t.updated_at = now;
+            }
+        }
+    }
+
+    /// The run ended without the CLI accounting for its tasks (a restart, a
+    /// crash, a question tearing the run down): every live one was cut off.
+    pub fn cut_off_live_tasks(&mut self) {
+        let ids: Vec<String> = self
+            .bg_tasks
+            .iter()
+            .filter(|t| !t.status.is_terminal())
+            .map(|t| t.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            self.apply_task(&TaskEvent::CutOff { ids });
+        }
+    }
+}
+
+fn sorted_descriptions(tasks: &[&BgTask]) -> Vec<String> {
+    let mut out: Vec<String> = tasks.iter().map(|t| t.description.clone()).collect();
+    out.sort();
+    out
 }
 
 fn illegal(msg: &str) -> CoreError {
@@ -586,5 +968,193 @@ mod tests {
         s.push_turn(SessionTurn::new(SessionTurnKind::Answer, "Speed"));
         s.push_turn(SessionTurn::new(SessionTurnKind::Error, "Stopped by user"));
         assert_eq!(s.last_resendable_turn().unwrap().text, "Speed");
+    }
+
+    fn started(id: &str, parent: Option<&str>, kind: BgTaskKind, desc: &str) -> TaskEvent {
+        TaskEvent::Started {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+            kind,
+            description: desc.into(),
+            subagent_type: Some("general-purpose".into()),
+            backgrounded: true,
+        }
+    }
+
+    fn status(id: &str, status: BgTaskStatus) -> TaskEvent {
+        TaskEvent::Status {
+            id: id.into(),
+            status,
+            reason: None,
+            summary: Some(format!("{status:?}")),
+            tool_uses: Some(4),
+        }
+    }
+
+    #[test]
+    fn a_settled_task_is_not_downgraded_but_can_still_be_cut_off() {
+        let mut s = session();
+        s.apply_task(&started("a", None, BgTaskKind::Agent, "Build"));
+        assert!(s.apply_task(&status("a", BgTaskStatus::Completed)));
+        // A late progress line or another end leaves it be.
+        s.apply_task(&TaskEvent::Progress {
+            id: "a".into(),
+            last_tool: Some("Bash".into()),
+            summary: None,
+            tool_uses: Some(9),
+        });
+        assert_eq!(s.bg_tasks[0].status, BgTaskStatus::Completed);
+        assert!(!s.apply_task(&status("a", BgTaskStatus::Stopped)));
+        assert_eq!(s.bg_tasks[0].status, BgTaskStatus::Completed);
+        assert_eq!(s.bg_tool_uses(), 9, "tool counts only grow");
+
+        // Its own command cut off at the run's end cuts it off too.
+        s.apply_task(&started("c", Some("a"), BgTaskKind::Command, "cargo test"));
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["c".into()],
+        });
+        assert_eq!(s.bg_tasks[0].status, BgTaskStatus::CutOff);
+        let ids = vec!["c".to_string()];
+        assert_eq!(s.lost_agents(&ids).len(), 1);
+        assert_eq!(s.lost_agents(&ids)[0].id, "a");
+    }
+
+    #[test]
+    fn foreground_commands_of_the_parent_are_not_tracked() {
+        let mut s = session();
+        assert!(!s.apply_task(&TaskEvent::Started {
+            id: "c".into(),
+            parent: None,
+            kind: BgTaskKind::Command,
+            description: "ls".into(),
+            subagent_type: None,
+            backgrounded: false,
+        }));
+        assert!(s.bg_tasks.is_empty());
+        // The parent's own background command alone is no lost agent.
+        s.apply_task(&started("srv", None, BgTaskKind::Command, "dev server"));
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["srv".into()],
+        });
+        assert!(s.lost_agents(&["srv".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_relaunch_supersedes_the_cut_off_entry() {
+        let mut s = session();
+        s.apply_task(&started("a", None, BgTaskKind::Agent, "Build"));
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["a".into()],
+        });
+        assert_eq!(s.cut_off_agents().len(), 1);
+        s.apply_task(&started("b", None, BgTaskKind::Agent, "Build"));
+        assert_eq!(s.bg_tasks[0].status, BgTaskStatus::Relaunched);
+        assert!(s.cut_off_agents().is_empty());
+        assert_eq!(s.running_agents().len(), 1);
+    }
+
+    #[test]
+    fn the_guard_pauses_only_a_repeat_without_progress() {
+        let mut s = session();
+        s.apply_task(&started("a", None, BgTaskKind::Agent, "Build"));
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["a".into()],
+        });
+        let lost: Vec<BgTask> = s.cut_off_agents().into_iter().cloned().collect();
+        let refs: Vec<&BgTask> = lost.iter().collect();
+        assert!(!s.cut_off_stalled(&refs), "the first round always resumes");
+        s.record_cutoff(&lost);
+        assert!(s.cut_off_stalled(&refs));
+
+        // The relaunch re-backgrounds its work in one call: still stuck.
+        s.apply_task(&started("b", None, BgTaskKind::Agent, "Build"));
+        s.apply_task(&TaskEvent::Progress {
+            id: "b".into(),
+            last_tool: None,
+            summary: None,
+            tool_uses: Some(1),
+        });
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["b".into()],
+        });
+        let again: Vec<&BgTask> = s.lost_agents(&["b".to_string()]);
+        assert!(s.cut_off_stalled(&again));
+
+        // Real work is progress.
+        s.apply_task(&TaskEvent::Progress {
+            id: "b".into(),
+            last_tool: None,
+            summary: None,
+            tool_uses: Some(6),
+        });
+        let again: Vec<&BgTask> = s.lost_agents(&["b".to_string()]);
+        assert!(!s.cut_off_stalled(&again));
+
+        // A clean end of the auto-resumed turn settles what it was told about.
+        let mut settled = s.clone();
+        settled.settle_cut_offs(&[]);
+        assert!(settled.cut_off_agents().is_empty());
+
+        // A user's turn hands back what is still cut off and starts over.
+        let cut = s.begin_user_turn();
+        assert_eq!(cut.len(), 1);
+        assert!(s.bg_tasks.is_empty());
+        assert!(s.last_cutoff.is_none());
+    }
+
+    #[test]
+    fn the_guard_sees_through_a_reworded_relaunch() {
+        let mut s = session();
+        s.apply_task(&started("a", None, BgTaskKind::Agent, "Build the walls"));
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["a".into()],
+        });
+        let lost: Vec<BgTask> = s.cut_off_agents().into_iter().cloned().collect();
+        s.record_cutoff(&lost);
+
+        // Relaunched under another name, cut off again after one call.
+        s.apply_task(&started("b", None, BgTaskKind::Agent, "Finish the walls"));
+        assert_eq!(s.cut_off_agents().len(), 1, "no exact match yet");
+        s.apply_task(&TaskEvent::Progress {
+            id: "b".into(),
+            last_tool: None,
+            summary: None,
+            tool_uses: Some(1),
+        });
+        s.apply_task(&TaskEvent::CutOff {
+            ids: vec!["b".into()],
+        });
+        let again: Vec<&BgTask> = s.lost_agents(&["b".to_string()]);
+        assert_eq!(again.len(), 1);
+        assert!(s.cut_off_stalled(&again), "reworded, still no progress");
+
+        // The round's end settles the old entry, keeping only the new loss.
+        s.settle_cut_offs(&["b"]);
+        let cut: Vec<&str> = s.cut_off_agents().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(cut, vec!["b"]);
+    }
+
+    #[test]
+    fn stop_and_restart_settle_live_tasks() {
+        let mut s = session();
+        s.apply_task(&started("a", None, BgTaskKind::Agent, "Build"));
+        s.apply_task(&started("b", None, BgTaskKind::Agent, "Test"));
+        s.apply_task(&status("b", BgTaskStatus::Completed));
+        let mut stopped = s.clone();
+        stopped.stop_live_tasks();
+        assert_eq!(stopped.bg_tasks[0].status, BgTaskStatus::Stopped);
+        s.cut_off_live_tasks();
+        assert_eq!(s.bg_tasks[0].status, BgTaskStatus::CutOff);
+        assert_eq!(s.bg_tasks[1].status, BgTaskStatus::Completed);
+    }
+
+    #[test]
+    fn sessions_saved_before_background_tasks_still_load() {
+        let mut v = serde_json::to_value(session()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("bg_tasks");
+        obj.remove("last_cutoff");
+        let s: Session = serde_json::from_value(v).unwrap();
+        assert!(s.bg_tasks.is_empty());
     }
 }

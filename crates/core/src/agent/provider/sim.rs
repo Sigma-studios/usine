@@ -12,6 +12,7 @@ use futures::StreamExt;
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 use crate::domain::model::{Provider, Usage};
+use crate::domain::session::{BgTaskKind, BgTaskStatus, TaskEvent};
 use crate::error::Result;
 
 use super::{AgentProvider, ProviderFactory, RunConfig, RunHandle, RunMode, UsageSource};
@@ -377,6 +378,7 @@ async fn simulate(
                     }
                 }
             }
+            simulate_bg_tasks(&prompt, &evt_tx).await;
             let first_line = prompt
                 .lines()
                 .map(str::trim)
@@ -521,6 +523,113 @@ mod tests {
             for window in [codex.session.unwrap(), codex.weekly.unwrap()] {
                 assert!(window.resets_at.is_some_and(|at| at > now), "{window:?}");
             }
+        }
+    }
+}
+
+/// The background-agent scenarios of a simulated session turn, picked by a
+/// tag in its prompt (`[slow]` stretches them):
+///
+/// - `[bg-agent]`: a subagent runs a command and completes.
+/// - `[bg-cutoff]`: a subagent backgrounds its tests and "completes"; the run
+///   ends cutting it off. The auto-resume relaunches it, and it completes.
+/// - `[bg-cutoff-stuck]`: every run's subagent is cut off with no progress.
+/// - `[bg-rounds]`: cut off with progress twice, then done on round three.
+///
+/// The resumes find their tag again in the notice, which names the agents.
+async fn simulate_bg_tasks(prompt: &str, evt_tx: &mpsc::UnboundedSender<AgentEvent>) {
+    let step = Duration::from_millis(if prompt.contains("[slow]") { 1500 } else { 150 });
+    let emit = |t: TaskEvent| {
+        let _ = evt_tx.unbounded_send(AgentEvent::Task(t));
+    };
+    let new_id = || uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    let agent = |id: &str, description: &str| TaskEvent::Started {
+        id: id.into(),
+        parent: None,
+        kind: BgTaskKind::Agent,
+        description: description.into(),
+        subagent_type: Some("general-purpose".into()),
+        backgrounded: true,
+    };
+    let command = |id: &str, owner: &str, description: &str, backgrounded: bool| {
+        TaskEvent::Started {
+            id: id.into(),
+            parent: Some(owner.into()),
+            kind: BgTaskKind::Command,
+            description: description.into(),
+            subagent_type: None,
+            backgrounded,
+        }
+    };
+    let progress = |id: &str, tool: &str, summary: &str, uses: u64| TaskEvent::Progress {
+        id: id.into(),
+        last_tool: Some(tool.into()),
+        summary: Some(summary.into()),
+        tool_uses: Some(uses),
+    };
+    let status = |id: &str, status: BgTaskStatus, summary: &str| TaskEvent::Status {
+        id: id.into(),
+        status,
+        reason: None,
+        summary: Some(summary.into()),
+        tool_uses: None,
+    };
+    let resuming = prompt.contains("cut off when the CLI exited");
+
+    if prompt.contains("[bg-cutoff-stuck]") {
+        let a = new_id();
+        emit(agent(&a, "Stuck worker [bg-cutoff-stuck]"));
+        tokio::time::sleep(step).await;
+        emit(TaskEvent::CutOff { ids: vec![a] });
+    } else if prompt.contains("[bg-rounds]") {
+        let done = (1..=3)
+            .rev()
+            .find(|n| prompt.contains(&format!("finished round {n}")))
+            .unwrap_or(0);
+        let round = done + 1;
+        let a = new_id();
+        emit(agent(&a, "Round worker [bg-rounds]"));
+        tokio::time::sleep(step).await;
+        let summary = format!("finished round {round}");
+        emit(progress(&a, "Edit", &summary, 3));
+        tokio::time::sleep(step).await;
+        if round < 3 {
+            emit(TaskEvent::CutOff { ids: vec![a] });
+        } else {
+            emit(status(&a, BgTaskStatus::Completed, "All three rounds done"));
+        }
+    } else if prompt.contains("[bg-cutoff]") || prompt.contains("[bg-agent]") || resuming {
+        let cutoff = prompt.contains("[bg-cutoff]") && !resuming;
+        let description = if cutoff || resuming {
+            "Integrate the walls"
+        } else {
+            "Survey the codebase"
+        };
+        let a = new_id();
+        emit(agent(&a, description));
+        tokio::time::sleep(step).await;
+        emit(progress(&a, "Read", "Reading the module layout", 1));
+        tokio::time::sleep(step).await;
+        emit(progress(&a, "Edit", "Editing the integration", 2));
+        tokio::time::sleep(step).await;
+        let c = new_id();
+        emit(command(&c, &a, "cargo test --workspace", cutoff));
+        tokio::time::sleep(step).await;
+        if cutoff {
+            // Ends its turn on its own background command, which the run's
+            // exit then kills.
+            emit(status(
+                &a,
+                BgTaskStatus::Completed,
+                "Waiting for the test run to finish.",
+            ));
+            tokio::time::sleep(step).await;
+            emit(TaskEvent::CutOff { ids: vec![c] });
+        } else {
+            emit(progress(&a, "Bash", "Running cargo test --workspace", 3));
+            emit(status(&c, BgTaskStatus::Completed, "cargo test --workspace"));
+            tokio::time::sleep(step).await;
+            emit(status(&a, BgTaskStatus::Completed, "All 42 tests pass"));
         }
     }
 }

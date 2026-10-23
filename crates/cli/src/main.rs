@@ -839,6 +839,8 @@ async fn real_plan(dir: PathBuf, task: String) -> anyhow::Result<()> {
             AgentEvent::Started { session_id } => println!("● session {session_id}"),
             AgentEvent::Progress { text } => println!("   {text}"),
             AgentEvent::NeedsInput { question, .. } => println!("   ? {question}"),
+            // Card-mode runs deny the background-agent tools.
+            AgentEvent::Task(_) => {}
             AgentEvent::PlanReady { plan } => {
                 println!("\n=== PLAN ===\n{plan}\n============");
                 break;

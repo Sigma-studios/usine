@@ -127,7 +127,8 @@ pub fn reconcile_interrupted_reviews(store: &Store, message: &str) -> Result<usi
 }
 
 /// After a restart, a session persisted mid-turn has no agent behind it. Mark
-/// each `Failed` (Retry resumes it) and unread, carrying `message`. Returns how
+/// each `Failed` (Retry resumes it) and unread, carrying `message`, with its
+/// live background tasks cut off. Returns how
 /// many sessions were reconciled.
 pub fn reconcile_interrupted_sessions(store: &Store, message: &str) -> Result<usize> {
     let mut reconciled = 0;
@@ -136,6 +137,8 @@ pub fn reconcile_interrupted_sessions(store: &Store, message: &str) -> Result<us
             session.apply(SessionTransition::TurnFailed {
                 message: message.to_string(),
             })?;
+            // Its agents died with the process; Retry names them.
+            session.cut_off_live_tasks();
             session.push_turn(SessionTurn::new(SessionTurnKind::Error, message));
             session.unread = true;
             store.upsert_session(&session)?;
