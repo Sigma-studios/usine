@@ -646,14 +646,7 @@ impl Store {
         if let Some(rec) = rw.get().primary::<CardRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
-        let lines: Vec<TranscriptRecord> = rw
-            .scan()
-            .primary::<TranscriptRecord>()?
-            .all()?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for line in lines.into_iter().filter(|t| t.card_id == id.to_string()) {
-            rw.remove(line)?;
-        }
+        remove_transcript(&rw, id)?;
         if let Some(rec) = rw.get().primary::<CardPlanRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
@@ -1591,14 +1584,7 @@ impl Store {
             rw.remove(rec)?;
         }
         // Review-run activity is stored in the transcript table keyed by the task id.
-        let lines: Vec<TranscriptRecord> = rw
-            .scan()
-            .primary::<TranscriptRecord>()?
-            .all()?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for line in lines.into_iter().filter(|t| t.card_id == id.to_string()) {
-            rw.remove(line)?;
-        }
+        remove_transcript(&rw, id)?;
         rw.commit()?;
         Ok(())
     }
@@ -1669,14 +1655,7 @@ impl Store {
         if let Some(rec) = rw.get().primary::<SessionRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
-        let lines: Vec<TranscriptRecord> = rw
-            .scan()
-            .primary::<TranscriptRecord>()?
-            .all()?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for line in lines.into_iter().filter(|t| t.card_id == id.to_string()) {
-            rw.remove(line)?;
-        }
+        remove_transcript(&rw, id)?;
         if let Some(rec) = rw.get().primary::<CardAttachmentsRecord>(id.to_string())? {
             rw.remove(rec)?;
         }
@@ -1685,6 +1664,15 @@ impl Store {
     }
 
     // --- transcripts ----------------------------------------------------
+
+    /// Remove every transcript row of `card_id` (a card, review task or
+    /// session).
+    pub fn delete_transcript(&self, card_id: Uuid) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        remove_transcript(&rw, card_id)?;
+        rw.commit()?;
+        Ok(())
+    }
 
     pub fn append_transcript(&self, card_id: Uuid, ts: i64, line: &str) -> Result<()> {
         let rec = TranscriptRecord {
@@ -1785,6 +1773,20 @@ pub fn rebuild_database(old: &Path, new: &Path) -> Result<Vec<(&'static str, usi
 
     rw.commit()?;
     Ok(report)
+}
+
+/// Remove `card_id`'s transcript rows inside an open transaction.
+fn remove_transcript(rw: &transaction::RwTransaction, card_id: Uuid) -> Result<()> {
+    let wanted = card_id.to_string();
+    let lines: Vec<TranscriptRecord> = rw
+        .scan()
+        .primary::<TranscriptRecord>()?
+        .all()?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for line in lines.into_iter().filter(|t| t.card_id == wanted) {
+        rw.remove(line)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

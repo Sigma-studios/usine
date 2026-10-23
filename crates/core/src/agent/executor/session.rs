@@ -331,6 +331,32 @@ impl Executor {
         Ok(())
     }
 
+    /// Wipe an idle session's conversation (see [`Session::clear_context`]):
+    /// its turns, work log and the turns' attachment copies go, and the next
+    /// message starts a fresh agent. Files staged in the composer stay.
+    pub(super) fn clear_session(&self, id: Uuid) -> Result<()> {
+        let mut probe = self.store.get_session(id)?;
+        probe.clear_context()?;
+        // A pending question's run may still be parked waiting for the answer.
+        if let Some((_, control)) = lock(&self.session_runs).remove(&id) {
+            let _ = control.unbounded_send(RunControl::Cancel);
+        }
+        let mut files = Vec::new();
+        let session = self.store.mutate_session(id, |s| {
+            files = s.clear_context()?;
+            Ok(())
+        })?;
+        self.store.delete_transcript(id)?;
+        for file in files {
+            let _ = std::fs::remove_file(file);
+        }
+        let _ = self
+            .evt_tx
+            .unbounded_send(ExecutorEvent::transcript_cleared(id));
+        self.emit_session(session);
+        Ok(())
+    }
+
     pub(super) async fn retry_session(&self, id: Uuid) -> Result<()> {
         let session = self.store.get_session(id)?;
         if !matches!(session.status, SessionStatus::Failed { .. }) {

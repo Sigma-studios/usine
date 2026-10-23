@@ -528,6 +528,13 @@ impl AppState {
                 let mut loaded = self.transcripts_loaded;
                 loaded.write().insert(evt.card_id);
             }
+            ExecutorEventKind::TranscriptCleared => {
+                // Nothing is left on disk to load.
+                let mut transcripts = self.transcripts;
+                transcripts.write().insert(evt.card_id, Vec::new());
+                let mut loaded = self.transcripts_loaded;
+                loaded.write().insert(evt.card_id);
+            }
             ExecutorEventKind::Reviewers { project_id, logins } => {
                 let mut reviewers = self.reviewers;
                 reviewers.write().insert(project_id, logins);

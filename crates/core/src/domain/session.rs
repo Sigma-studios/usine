@@ -235,6 +235,8 @@ pub enum SessionTransition {
     },
     /// The user stopped the session.
     Cancelled,
+    /// The user wiped the conversation to start over with a fresh agent.
+    Cleared,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,6 +418,8 @@ impl Session {
             (S::Running, T::TurnDone) => S::Finished,
             (S::Running, T::TurnFailed { message }) => S::Failed { message },
             (S::Running | S::NeedsAnswer(_), T::Cancelled) => S::Finished,
+            (S::Running, T::Cleared) => return Err(illegal("stop the turn first")),
+            (_, T::Cleared) => S::Finished,
             (s, t) => {
                 return Err(illegal(&format!(
                     "{t:?} while {}",
@@ -429,6 +433,29 @@ impl Session {
         }
         self.status = next;
         Ok(())
+    }
+
+    /// Wipe the conversation, like the CLI's `/clear`: the turns, the agent's
+    /// resume id and everything tied to past turns go; the title, folder,
+    /// model, access and cost stay, and the next message starts a fresh
+    /// agent. A pending question is dropped. Refused while a turn runs or
+    /// when there's nothing to clear. Returns the turns' attachment copies,
+    /// for the caller to delete.
+    pub fn clear_context(&mut self) -> Result<Vec<PathBuf>> {
+        if self.turns.is_empty() {
+            return Err(illegal("nothing to clear"));
+        }
+        self.apply(SessionTransition::Cleared)?;
+        let files = std::mem::take(&mut self.turns)
+            .into_iter()
+            .flat_map(|t| t.attachments)
+            .collect();
+        self.last_session = None;
+        self.status_note = None;
+        self.last_cutoff = None;
+        self.bg_tasks.clear();
+        self.unread = false;
+        Ok(files)
     }
 }
 
@@ -852,6 +879,69 @@ mod tests {
         s.apply(SessionTransition::Cancelled).unwrap();
         assert_eq!(s.status, SessionStatus::Finished);
         assert!(s.apply(SessionTransition::Cancelled).is_err());
+    }
+
+    #[test]
+    fn clear_is_refused_while_running_and_lands_on_finished() {
+        let mut s = session();
+        assert!(s.apply(SessionTransition::Cleared).is_err());
+        s.apply(SessionTransition::TurnFailed {
+            message: "boom".into(),
+        })
+        .unwrap();
+        s.apply(SessionTransition::Cleared).unwrap();
+        assert_eq!(s.status, SessionStatus::Finished);
+        s.apply(SessionTransition::Cleared).unwrap();
+        s.apply(SessionTransition::StartTurn).unwrap();
+        s.apply(SessionTransition::NeedsInput(question())).unwrap();
+        s.apply(SessionTransition::Cleared).unwrap();
+        assert_eq!(s.status, SessionStatus::Finished);
+    }
+
+    #[test]
+    fn clear_context_wipes_the_conversation_and_keeps_the_session() {
+        let mut s = Session::new(
+            Uuid::new_v4(),
+            PathBuf::from("/tmp"),
+            Provider::Claude,
+            ModelSpec::new("opus", Effort::High),
+            SessionAccess::FullAccess,
+            "Look",
+            vec![PathBuf::from("/a.png")],
+        );
+        // Refused mid-turn: nothing changes.
+        assert!(s.clear_context().is_err());
+        assert_eq!(s.turns.len(), 1);
+        s.last_session = Some("cli-1".into());
+        s.status_note = Some(StatusNote {
+            text: "busy".into(),
+            ts: 1,
+        });
+        s.push_turn(SessionTurn::new(SessionTurnKind::Agent, "done"));
+        s.push_turn(
+            SessionTurn::new(SessionTurnKind::User, "more")
+                .with_attachments(vec![PathBuf::from("/b.txt")]),
+        );
+        s.apply(SessionTransition::TurnDone).unwrap();
+        s.unread = true;
+        s.blocked = true;
+        s.cost = Cost::from_cents(150);
+        let title = s.title.clone();
+
+        let files = s.clear_context().unwrap();
+        assert_eq!(files, vec![PathBuf::from("/a.png"), PathBuf::from("/b.txt")]);
+        assert!(s.turns.is_empty());
+        assert_eq!(s.last_session, None);
+        assert_eq!(s.status_note, None);
+        assert!(s.bg_tasks.is_empty());
+        assert!(!s.unread);
+        assert_eq!(s.status, SessionStatus::Finished);
+        // The session itself is kept.
+        assert_eq!(s.title, title);
+        assert!(s.blocked);
+        assert_eq!(s.cost, Cost::from_cents(150));
+        // Nothing left to clear.
+        assert!(s.clear_context().is_err());
     }
 
     #[test]

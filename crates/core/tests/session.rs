@@ -1,5 +1,5 @@
 //! One-off sessions over the simulated backend: create → turn → finish,
-//! resumed follow-ups, questions, stop, retry, attachments riding exactly one
+//! resumed follow-ups, questions, stop, clear, retry, attachments riding exactly one
 //! turn, and sessions never waiting on the run gate.
 
 use std::path::{Path, PathBuf};
@@ -310,6 +310,118 @@ async fn a_follow_up_resumes_the_stored_conversation() {
             SessionTurnKind::Agent
         ]
     );
+}
+
+#[tokio::test]
+async fn clearing_wipes_and_starts_fresh() {
+    let folder = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create(&handle, id, folder.path(), "first");
+    wait_status(&mut rx, id, finished).await;
+    let staged = stage(&store, id, files.path(), &["shot.png"]);
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "look".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    let before = wait_status(&mut rx, id, finished).await;
+    assert!(!store.load_transcript_entries(id).unwrap().is_empty());
+
+    handle.send(ExecutorCommand::ClearSession { session_id: id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::TranscriptCleared if e.card_id == id => Some(()),
+        _ => None,
+    })
+    .await;
+    let s = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::SessionUpdated(s) if s.id == id => Some((**s).clone()),
+        _ => None,
+    })
+    .await;
+    assert!(s.turns.is_empty());
+    assert_eq!(s.last_session, None);
+    assert!(finished(&s.status));
+    assert_eq!(s.title, before.title);
+    assert_eq!(s.cost, before.cost);
+    assert!(store.load_transcript_entries(id).unwrap().is_empty());
+    // The turns' attachment copies are deleted with them.
+    assert!(!staged[0].exists());
+
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "fresh".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    let s = wait_status(&mut rx, id, finished).await;
+    let cfg = spy.last();
+    assert_eq!(cfg.resume_session, None);
+    assert_eq!(cfg.full_prompt(), "fresh");
+    let kinds: Vec<_> = s.turns.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [SessionTurnKind::User, SessionTurnKind::Agent]);
+}
+
+#[tokio::test]
+async fn clearing_is_refused_while_a_turn_runs() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    spy.hang_next.store(true, Ordering::SeqCst);
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create(&handle, id, folder.path(), "long job");
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    // Wait for the create to release its claim, or the clear is dropped as a
+    // duplicate instead of refused.
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardBusy { busy: false } if e.card_id == id => Some(()),
+        _ => None,
+    })
+    .await;
+
+    handle.send(ExecutorCommand::ClearSession { session_id: id });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Toast { message, .. } if message.contains("stop the turn first") => {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    let s = store.get_session(id).unwrap();
+    assert!(s.is_running());
+    assert_eq!(s.turns.len(), 1);
+    handle.send(ExecutorCommand::CancelSession { session_id: id });
+    wait_status(&mut rx, id, finished).await;
+}
+
+#[tokio::test]
+async fn clearing_a_question_drops_it() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create(&handle, id, folder.path(), "change it [ask]");
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::NeedsAnswer(_))).await;
+
+    handle.send(ExecutorCommand::ClearSession { session_id: id });
+    let s = wait_status(&mut rx, id, finished).await;
+    assert!(s.turns.is_empty());
+    assert!(!s.needs_answer());
+    // The parked run is gone: an answer is refused, a message starts afresh.
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "new topic".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(spy.count(), 2);
+    assert_eq!(spy.last().resume_session, None);
+    let kinds: Vec<_> = s.turns.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [SessionTurnKind::User, SessionTurnKind::Agent]);
 }
 
 #[tokio::test]
