@@ -24,15 +24,13 @@ use super::output::{drain, spawn_capture_reader, OutputTail, SharedTail};
 use super::*;
 use crate::domain::config::{resolve_open_command, PreviewPort, ProjectConfig};
 use crate::domain::model::{PreviewStatus, PreviewUrl};
+use crate::infra::process::{kill_group, KILL_GRACE};
 
 /// Conventional setup/teardown script paths auto-detected in a worktree when the
 /// project config names no explicit command (matches what the daedalus skill
 /// generates and what `docker-compose.worktree.yml` expects).
 pub(super) const SETUP_CANDIDATES: &[&str] = &["setup-worktree.sh", "scripts/setup-worktree.sh"];
 const TEARDOWN_CANDIDATES: &[&str] = &["teardown-worktree.sh", "scripts/teardown-worktree.sh"];
-
-/// How long a `SIGTERM`ed preview tree gets to exit cleanly before `SIGKILL`.
-const KILL_GRACE: Duration = Duration::from_millis(800);
 
 /// How much of a preview process's output a failure quotes (toast, card
 /// tooltip, persisted transcript line). Enough to hold the error and a little
@@ -913,85 +911,6 @@ fn compute_preview_urls(worktree: &Path, ports: &[PreviewPort]) -> Vec<PreviewUr
         })
         .collect()
 }
-
-/// SIGTERM then (after a grace) SIGKILL a preview's entire process tree. `pid` is
-/// the `sh -lc <run>` we spawn as a process-group leader (`process_group(0)`).
-///
-/// Signalling that group reaps everything that stayed in it, but `pnpm`/`turbo`
-/// move their dev servers — and each `--watch` task — into *new* process groups
-/// of their own, which a group-only signal misses, leaving them alive to keep
-/// writing into the worktree (and racing its removal on merge). So we also snapshot
-/// the descendant tree by ppid *before* killing (once the root dies, reparented
-/// survivors become unreachable this way) and signal every descendant directly.
-#[cfg(unix)]
-pub(super) async fn kill_group(pid: u32) {
-    let mut targets = descendants(pid).await;
-    targets.push(pid);
-    signal_all("-TERM", pid, &targets).await;
-    tokio::time::sleep(KILL_GRACE).await;
-    signal_all("-KILL", pid, &targets).await;
-}
-
-/// Send `sig` to the process group led by `group` (negated pid) and, belt-and-
-/// suspenders, to each pid in `pids` individually — covering children that left
-/// the group. `kill` signals every valid target even if some are already gone.
-///
-/// The `--` before the operands is load-bearing: without it, procps-ng's
-/// `kill` (Linux) parses the negated group as an option and degenerates to
-/// `kill(-1, sig)` — a signal to every process the user owns, which on a CI
-/// runner takes down the runner itself.
-#[cfg(unix)]
-async fn signal_all(sig: &str, group: u32, pids: &[u32]) {
-    let mut args: Vec<String> = Vec::with_capacity(pids.len() + 3);
-    args.push(sig.to_string());
-    args.push("--".to_string());
-    args.push(format!("-{group}"));
-    args.extend(pids.iter().map(u32::to_string));
-    let _ = Command::new("kill")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-}
-
-/// Every descendant pid of `root` (children, grandchildren, …) from a single `ps`
-/// snapshot. Empty if `ps` can't be read — the group signal still covers the
-/// common case.
-#[cfg(unix)]
-async fn descendants(root: u32) -> Vec<u32> {
-    let Ok(out) = Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()
-        .await
-    else {
-        return Vec::new();
-    };
-    // ppid -> children.
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut it = line.split_whitespace();
-        if let (Some(pid), Some(ppid)) = (it.next(), it.next()) {
-            if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
-                children.entry(ppid).or_default().push(pid);
-            }
-        }
-    }
-    let mut found = Vec::new();
-    let mut stack = vec![root];
-    while let Some(p) = stack.pop() {
-        if let Some(kids) = children.get(&p) {
-            for &k in kids {
-                found.push(k);
-                stack.push(k);
-            }
-        }
-    }
-    found
-}
-
-#[cfg(not(unix))]
-pub(super) async fn kill_group(_pid: u32) {}
 
 /// Synchronously reap several preview process trees at once — the app's
 /// last-gasp cleanup on shutdown, where there is no async runtime to await on.

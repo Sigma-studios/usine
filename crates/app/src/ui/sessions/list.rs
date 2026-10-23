@@ -112,6 +112,7 @@ fn preview(s: &Session) -> (String, usize) {
         SessionTurnKind::User | SessionTurnKind::Answer => "You: ",
         SessionTurnKind::Question => "Asks: ",
         SessionTurnKind::Error => "⚠ ",
+        SessionTurnKind::Interrupted => "■ ",
         SessionTurnKind::Agent | SessionTurnKind::Notice => "",
     };
     let line = turn

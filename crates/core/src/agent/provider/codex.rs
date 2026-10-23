@@ -21,6 +21,7 @@ use tokio::process::{Child, Command};
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider};
 use crate::error::{CoreError, Result};
+use crate::infra::process::{kill_tree, track_agent};
 
 use super::stream::{codex_agent_message, parse_codex_line};
 use super::{AgentProvider, RunConfig, RunHandle, RunMode};
@@ -189,13 +190,18 @@ impl AgentProvider for CodexProvider {
         let mut args = build_args(&cfg);
         args.push(cfg.full_prompt());
 
-        let mut child = Command::new("codex")
+        let mut command = Command::new("codex");
+        command
             .args(&args)
             .current_dir(&cfg.project_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Own process group so a Stop reaps the tools it runs too.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .spawn()
             .map_err(|e| {
                 CoreError::provider(format!("failed to spawn `codex` (is it installed?): {e}"))
@@ -226,6 +232,8 @@ async fn pump(
     evt_tx: mpsc::UnboundedSender<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<RunControl>,
 ) {
+    // Reaped on app quit while it runs (see `ExecutorHandle::shutdown`).
+    let _tracked = track_agent(&child);
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
         if let Some(mut err) = stderr {
@@ -287,7 +295,7 @@ async fn pump(
             ctl = ctl_rx.next(), if ctl_open => match ctl {
                 Some(RunControl::Cancel) | Some(RunControl::Interrupt) => {
                     cancelled = true;
-                    let _ = child.start_kill();
+                    kill_tree(&mut child).await;
                     break;
                 }
                 Some(RunControl::Answer { .. }) => {}

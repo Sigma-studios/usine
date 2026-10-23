@@ -149,13 +149,6 @@ pub(crate) fn SessionDetail() -> Element {
                     }
                 }
                 div { class: "row session-actions",
-                    if running {
-                        button {
-                            class: "btn",
-                            onclick: move |_| state.send(ExecutorCommand::CancelSession { session_id: id }),
-                            "Stop"
-                        }
-                    }
                     if failed {
                         button {
                             class: "btn primary",
@@ -363,6 +356,9 @@ fn Conversation(session: Session) -> Element {
                         },
                         SessionTurnKind::Error => rsx! {
                             div { key: "{i}", class: "turn turn-error", "{turn.text}" }
+                        },
+                        SessionTurnKind::Interrupted => rsx! {
+                            div { key: "{i}", class: "turn turn-interrupted", "■ {turn.text}" }
                         },
                     }
                 }
@@ -719,6 +715,17 @@ fn Composer(session_id: Uuid, running: bool, steerable: bool, has_queue: bool) -
                     span { class: "hint", "Files can't reach a running agent — this will be queued." }
                 }
                 div { class: "spacer" }
+                // Like the CLI's interrupt: stops the turn at once, no confirm.
+                // The draft stays for the next message.
+                if running {
+                    button {
+                        class: "btn stop-btn",
+                        title: "Stop the agent now",
+                        onclick: move |_| state.send(ExecutorCommand::CancelSession { session_id }),
+                        crate::ui::icons::IconStop {}
+                        "Stop"
+                    }
+                }
                 button {
                     class: "btn primary",
                     "data-submit": "1",

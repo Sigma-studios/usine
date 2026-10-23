@@ -24,6 +24,7 @@ use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider, Usage};
 use crate::domain::session::{BgTaskStatus, TaskEvent};
 use crate::error::{CoreError, Result};
+use crate::infra::process::{kill_tree, track_agent};
 
 use super::stream::{
     errored_tool_result_ids, exit_plan_mode_tool_id, parse_claude_line, replayed_user_text,
@@ -175,7 +176,8 @@ impl AgentProvider for ClaudeProvider {
             args.push(cfg.full_prompt());
         }
 
-        let mut child = Command::new("claude")
+        let mut command = Command::new("claude");
+        command
             .args(&args)
             .envs(cli_env(&cfg))
             .current_dir(&cfg.project_dir)
@@ -186,7 +188,11 @@ impl AgentProvider for ClaudeProvider {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Own process group so a Stop reaps the tools it runs too.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .spawn()
             .map_err(|e| {
                 CoreError::provider(format!("failed to spawn `claude` (is it installed?): {e}"))
@@ -681,6 +687,8 @@ async fn pump(
     grace: Duration,
     mut live: Option<LiveInput>,
 ) {
+    // Reaped on app quit while it runs (see `ExecutorHandle::shutdown`).
+    let _tracked = track_agent(&child);
     // Drain stderr concurrently so a useful message survives a non-zero exit.
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
@@ -790,7 +798,7 @@ async fn pump(
     }
 
     if exit_status.is_none() && (cancelled || timed_out) {
-        let _ = child.start_kill();
+        kill_tree(&mut child).await;
     }
     if timed_out {
         let _ = evt_tx.unbounded_send(AgentEvent::Progress {

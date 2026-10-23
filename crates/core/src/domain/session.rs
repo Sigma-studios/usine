@@ -70,6 +70,9 @@ pub enum SessionTurnKind {
     /// A message Usine itself sent the agent — the auto-resume after
     /// background agents were cut off. Re-sent by Retry like a user message.
     Notice,
+    /// The user stopped the running turn. The conversation stays resumable;
+    /// the next message tells the agent it was cut off.
+    Interrupted,
 }
 
 /// One entry of a session's conversation.
@@ -966,7 +969,7 @@ mod tests {
 
         s.push_turn(SessionTurn::new(SessionTurnKind::Agent, "done"));
         s.push_turn(SessionTurn::new(SessionTurnKind::Answer, "Speed"));
-        s.push_turn(SessionTurn::new(SessionTurnKind::Error, "Stopped by user"));
+        s.push_turn(SessionTurn::new(SessionTurnKind::Interrupted, "Interrupted by user"));
         assert_eq!(s.last_resendable_turn().unwrap().text, "Speed");
     }
 
