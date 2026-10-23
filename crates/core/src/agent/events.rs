@@ -645,6 +645,11 @@ pub enum ExecutorCommand {
     CancelSession {
         session_id: Uuid,
     },
+    /// Wipe an idle session's conversation so the next message starts a fresh
+    /// agent (like the CLI's `/clear`). Drops a pending question.
+    ClearSession {
+        session_id: Uuid,
+    },
     /// Re-send the last message of a failed session.
     RetrySession {
         session_id: Uuid,
@@ -745,6 +750,7 @@ impl ExecutorCommand {
             ExecutorCommand::SendSessionMessage { session_id, .. }
             | ExecutorCommand::AnswerSession { session_id, .. }
             | ExecutorCommand::CancelSession { session_id }
+            | ExecutorCommand::ClearSession { session_id }
             | ExecutorCommand::RetrySession { session_id }
             | ExecutorCommand::UnqueueSessionMessage { session_id, .. }
             | ExecutorCommand::RenameSession { session_id, .. }
@@ -862,6 +868,8 @@ impl ExecutorCommand {
                 | ExecutorCommand::SendSessionMessage { .. }
                 | ExecutorCommand::AnswerSession { .. }
                 | ExecutorCommand::RetrySession { .. }
+                // Wipes the turns: must not race a send that appends one.
+                | ExecutorCommand::ClearSession { .. }
         )
     }
 
@@ -944,6 +952,9 @@ pub enum ExecutorEventKind {
     /// The card's transcript as persisted, in append order — the answer to
     /// `ExecutorCommand::LoadTranscript`. Empty when nothing was stored.
     TranscriptLoaded { lines: Vec<(i64, String)> },
+    /// The card's (session's) persisted transcript was deleted: drop the
+    /// live one too.
+    TranscriptCleared,
     /// The GitHub logins that can review a project's PRs (project-scoped).
     Reviewers {
         project_id: Uuid,
@@ -1100,6 +1111,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::TranscriptLoaded { lines },
+        }
+    }
+    pub fn transcript_cleared(card_id: Uuid) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::TranscriptCleared,
         }
     }
     pub fn reviewers(project_id: Uuid, logins: Vec<String>) -> Self {

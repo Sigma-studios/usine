@@ -14,7 +14,9 @@ use uuid::Uuid;
 use super::work::{section_bounds, WorkSection};
 use super::{ago, home_dir, open_file, request_block_session, reveal, shorten_home};
 use crate::state::AppState;
-use crate::ui::confirm::{request_confirm_with_note, ConfirmAction, ConfirmRequest};
+use crate::ui::confirm::{
+    request_confirm, request_confirm_with_note, ConfirmAction, ConfirmRequest,
+};
 use crate::ui::detail::{
     attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
     InterventionPanel,
@@ -68,6 +70,7 @@ pub(crate) fn SessionDetail() -> Element {
         "Add blocked message"
     };
     let block_title = session.title.clone();
+    let can_clear = !running && !session.turns.is_empty();
     let crowded = folder_in_use(&state, &session);
 
     rsx! {
@@ -197,6 +200,27 @@ pub(crate) fn SessionDetail() -> Element {
                                 }
                             },
                             "{note_label}"
+                        }
+                    }
+                    if can_clear {
+                        button {
+                            class: "btn subtle",
+                            title: "Start over with a fresh agent — wipes this conversation",
+                            onclick: {
+                                let block_title = block_title.clone();
+                                move |_| {
+                                    request_confirm(ConfirmRequest {
+                                        title: "Clear session".into(),
+                                        message: format!(
+                                            "Wipe “{block_title}” and start over with a fresh agent? The conversation and its work log are deleted and can't be recovered.",
+                                        ),
+                                        confirm_label: "Clear".into(),
+                                        danger: true,
+                                        action: ConfirmAction::Send(ExecutorCommand::ClearSession { session_id: id }),
+                                    });
+                                }
+                            },
+                            "Clear session"
                         }
                     }
                     if !running {
@@ -362,6 +386,9 @@ fn Conversation(session: Session) -> Element {
                         },
                     }
                 }
+            }
+            if session.turns.is_empty() && !running {
+                div { class: "session-empty", "Send a message to start a fresh conversation." }
             }
             if running {
                 div { class: "turn-live",
