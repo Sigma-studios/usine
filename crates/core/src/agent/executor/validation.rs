@@ -24,7 +24,7 @@ use tokio::process::Command;
 
 use super::actor::reap_idle_preview_direct;
 use super::output::{drain, spawn_capture_reader, OutputTail, SharedTail};
-use super::preview::kill_group;
+use crate::infra::process::kill_group;
 use super::*;
 use crate::domain::config::ProjectConfig;
 use crate::domain::state_machine::MAX_VALIDATION_ATTEMPTS;

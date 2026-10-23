@@ -3,7 +3,7 @@
 //! turn, and sessions never waiting on the run gate.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,12 +21,12 @@ use uuid::Uuid;
 
 type Runs = Arc<Mutex<Vec<RunConfig>>>;
 
-/// The simulator, recording every run's config. `error_next` makes the next
-/// run fail at once (no output); `hang_next` makes it work until cancelled.
+/// The simulator, recording every run's config. `error_next` makes that many
+/// next runs fail at once (no output); `hang_next` makes it work until cancelled.
 struct SpyProvider {
     inner: Arc<dyn AgentProvider>,
     runs: Runs,
-    error_next: Arc<AtomicBool>,
+    error_next: Arc<AtomicUsize>,
     hang_next: Arc<AtomicBool>,
 }
 
@@ -40,7 +40,10 @@ impl AgentProvider for SpyProvider {
     }
     async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
         self.runs.lock().unwrap().push(cfg.clone());
-        if self.error_next.swap(false, Ordering::SeqCst) {
+        if self.error_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
             let (evt_tx, evt_rx) = futures::channel::mpsc::unbounded();
             let (ctl_tx, _ctl_rx) = futures::channel::mpsc::unbounded();
             let _ = evt_tx.unbounded_send(AgentEvent::Error {
@@ -75,7 +78,7 @@ impl AgentProvider for SpyProvider {
 #[derive(Default, Clone)]
 struct SpyFactory {
     runs: Runs,
-    error_next: Arc<AtomicBool>,
+    error_next: Arc<AtomicUsize>,
     hang_next: Arc<AtomicBool>,
 }
 
@@ -378,11 +381,98 @@ async fn stopping_a_running_session_finishes_it() {
     handle.send(ExecutorCommand::CancelSession { session_id: id });
     let s = wait_status(&mut rx, id, finished).await;
     let last = s.turns.last().unwrap();
-    assert_eq!(last.kind, SessionTurnKind::Error);
-    assert_eq!(last.text, "Stopped by user");
+    assert_eq!(last.kind, SessionTurnKind::Interrupted);
+    assert_eq!(last.text, "Interrupted by user");
     // The cancelled run's own "run cancelled" error must not fail it after.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(finished(&store.get_session(id).unwrap().status));
+}
+
+#[tokio::test]
+async fn the_turn_after_a_stop_tells_the_agent_it_was_interrupted() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    spy.hang_next.store(true, Ordering::SeqCst);
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create(&handle, id, folder.path(), "long job");
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Transcript { line, .. }
+            if e.card_id == id && line.contains("sess-hang") =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    handle.send(ExecutorCommand::CancelSession { session_id: id });
+    wait_status(&mut rx, id, finished).await;
+
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "what were you doing?".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    wait_status(&mut rx, id, finished).await;
+    let cfg = spy.last();
+    assert_eq!(cfg.resume_session.as_deref(), Some("sess-hang"));
+    let prompt = cfg.full_prompt();
+    assert!(
+        prompt.starts_with("(Note from Usine: the user interrupted your previous turn"),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("what were you doing?"), "{prompt}");
+
+    // Only the turn right after the stop carries the note.
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "thanks".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    wait_status(&mut rx, id, finished).await;
+    assert_eq!(spy.count(), 3);
+    assert_eq!(spy.last().full_prompt(), "thanks");
+}
+
+#[tokio::test]
+async fn retrying_the_turn_after_a_stop_keeps_the_interrupt_note() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    spy.hang_next.store(true, Ordering::SeqCst);
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    create(&handle, id, folder.path(), "long job");
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::Transcript { line, .. }
+            if e.card_id == id && line.contains("sess-hang") =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    handle.send(ExecutorCommand::CancelSession { session_id: id });
+    wait_status(&mut rx, id, finished).await;
+
+    // The resumed turn and its fresh fallback both fail.
+    spy.error_next.store(2, Ordering::SeqCst);
+    handle.send(ExecutorCommand::SendSessionMessage {
+        session_id: id,
+        text: "what were you doing?".into(),
+    });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Failed { .. })).await;
+
+    handle.send(ExecutorCommand::RetrySession { session_id: id });
+    wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Running)).await;
+    wait_status(&mut rx, id, finished).await;
+    let prompt = spy.last().full_prompt();
+    assert!(
+        prompt.starts_with("(Note from Usine: the user interrupted your previous turn"),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("what were you doing?"), "{prompt}");
 }
 
 #[tokio::test]
@@ -498,7 +588,7 @@ async fn retry_resends_the_last_message_with_its_surviving_files() {
     let (handle, mut rx) = spawn(&store, &spy);
     let id = Uuid::new_v4();
     let staged = stage(&store, id, files.path(), &["a.png", "b.txt"]);
-    spy.error_next.store(true, Ordering::SeqCst);
+    spy.error_next.store(1, Ordering::SeqCst);
     create(&handle, id, folder.path(), "do it");
     let s = wait_status(&mut rx, id, |s| matches!(s, SessionStatus::Failed { .. })).await;
     assert!(s.unread);
@@ -528,7 +618,7 @@ async fn a_failed_resume_falls_back_to_a_fresh_run_with_history() {
     create(&handle, id, folder.path(), "remember the number 42");
     wait_status(&mut rx, id, finished).await;
 
-    spy.error_next.store(true, Ordering::SeqCst);
+    spy.error_next.store(1, Ordering::SeqCst);
     handle.send(ExecutorCommand::SendSessionMessage {
         session_id: id,
         text: "what was the number?".into(),

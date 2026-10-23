@@ -82,8 +82,8 @@ impl ExecutorHandle {
         self.commands.clone()
     }
 
-    /// Reap every running preview and validation check synchronously. Called
-    /// from the app's window-close / loop-destroyed handler: both run in their
+    /// Reap every running preview, validation check and agent CLI synchronously.
+    /// Called from the app's window-close / loop-destroyed handler: all run in their
     /// own process groups (so their whole trees can be killed), which also
     /// detaches them from the app's group — without this they keep running
     /// after the app exits, holding ports and docker infra. Draining the maps
@@ -96,6 +96,7 @@ impl ExecutorHandle {
             map.drain().filter_map(|(_, h)| h.pid).collect()
         };
         pids.extend(lock(&self.validations).drain().map(|(_, pid)| pid));
+        pids.extend(crate::infra::process::take_agents());
         preview::reap_all_blocking(&pids);
     }
 }

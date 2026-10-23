@@ -1335,6 +1335,9 @@ button.change-path.link:hover { color: var(--accent); text-decoration: underline
 .turn-agent { padding: 0; }
 .turn-question { background: var(--amber-wash); border: 1px solid var(--amber-border); }
 .turn-error { background: var(--red-wash); color: var(--red); font-size: 12px; }
+.turn-interrupted { align-self: stretch; margin: 0 12px; padding: 6px 10px; color: var(--muted); font-size: 12px; }
+.stop-btn { display: inline-flex; align-items: center; gap: 6px; }
+.stop-btn svg { width: 12px; height: 12px; }
 .turn-working { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .turn-attachments { margin: 8px 0 0; }
 .chip.missing { opacity: 0.5; text-decoration: line-through; }

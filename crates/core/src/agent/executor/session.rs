@@ -193,8 +193,13 @@ impl Executor {
         }
         let mut batch = Vec::new();
         let mut cut = Vec::new();
+        let mut interrupted = false;
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::StartTurn)?;
+            interrupted = s
+                .turns
+                .last()
+                .is_some_and(|t| t.kind == SessionTurnKind::Interrupted);
             cut = s.begin_user_turn();
             batch = s.take_queued();
             if !blank || !attachments.is_empty() {
@@ -211,7 +216,7 @@ impl Executor {
         self.unstage(id, &staged)?;
         self.emit_session(session.clone());
         let resume = session.last_session.clone();
-        let input = with_unresolved(queued_input(&batch), &cut);
+        let input = with_interrupted(with_unresolved(queued_input(&batch), &cut), interrupted);
         self.launch_session_turn(&session, input, resume).await
     }
 
@@ -318,11 +323,11 @@ impl Executor {
         let session = self.store.mutate_session(id, |s| {
             s.apply(SessionTransition::Cancelled)?;
             s.stop_live_tasks();
-            s.push_turn(SessionTurn::new(SessionTurnKind::Error, "Stopped by user"));
+            s.push_turn(SessionTurn::new(SessionTurnKind::Interrupted, "Interrupted by user"));
             Ok(())
         })?;
         self.emit_session(session);
-        transcript(&self.store, &self.evt_tx, id, "■ stopped by user".into());
+        transcript(&self.store, &self.evt_tx, id, "■ interrupted by user".into());
         Ok(())
     }
 
@@ -337,6 +342,11 @@ impl Executor {
         if batch.is_empty() {
             return Err(CoreError::other("there is no message to re-send"));
         }
+        // A failed first turn after a Stop: its message still owes the agent
+        // the interrupt note it was first sent with.
+        let interrupted = session.turns[..batch.start]
+            .last()
+            .is_some_and(|t| t.kind == SessionTurnKind::Interrupted);
         let mut input = batch_input(&session.turns, batch);
         let mut queued = Vec::new();
         let mut cut = Vec::new();
@@ -361,7 +371,7 @@ impl Executor {
             );
             input.attachments.extend(more.attachments);
         }
-        let input = with_unresolved(input, &cut);
+        let input = with_interrupted(with_unresolved(input, &cut), interrupted);
         self.launch_session_turn(&session, input, resume).await
     }
 
@@ -714,6 +724,19 @@ fn with_unresolved(mut input: TurnInput, cut: &[BgTask]) -> TurnInput {
     input
 }
 
+/// Tell the agent its previous turn was cut short by the user, as the CLI's
+/// "[Request interrupted by user]" does — a killed CLI never records it.
+fn with_interrupted(mut input: TurnInput, interrupted: bool) -> TurnInput {
+    if interrupted {
+        input.prompt = format!(
+            "(Note from Usine: the user interrupted your previous turn before it finished — \
+             act on this message; don't resume the interrupted work unless it asks you to.)\n\n{}",
+            input.prompt
+        );
+    }
+    input
+}
+
 /// The turns the latest turn sent: the run of User/Answer turns ending at the
 /// last one — several when queued messages went out together or a message was
 /// steered in mid-turn. Trailing turns after it (a failed turn's error) are not
@@ -783,7 +806,7 @@ fn fresh_prompt(session: &Session, input: &TurnInput) -> String {
             SessionTurnKind::Agent => "Assistant",
             SessionTurnKind::Question => "Assistant (question)",
             SessionTurnKind::Answer => "User (answer)",
-            SessionTurnKind::Error => "Note",
+            SessionTurnKind::Error | SessionTurnKind::Interrupted => "Note",
             SessionTurnKind::Notice => "Note (Usine)",
         };
         out.push_str(&format!(

@@ -64,10 +64,10 @@ pub fn session_notification(
         }
         SessionStatus::Finished => {
             // A user's Stop also lands on Finished; that one needs no ping.
-            if session
-                .turns
-                .last()
-                .is_some_and(|t| t.kind == SessionTurnKind::Error)
+            // (Error: sessions stopped before the Interrupted kind existed.)
+            if session.turns.last().is_some_and(|t| {
+                matches!(t.kind, SessionTurnKind::Interrupted | SessionTurnKind::Error)
+            })
             {
                 return None;
             }
@@ -161,7 +161,7 @@ mod tests {
         );
 
         s.status = SessionStatus::Finished;
-        s.push_turn(SessionTurn::new(SessionTurnKind::Error, "Stopped by user"));
+        s.push_turn(SessionTurn::new(SessionTurnKind::Interrupted, "Interrupted by user"));
         assert_eq!(
             session_notification(Some(&SessionStatus::Running), &s),
             None

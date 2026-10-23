@@ -64,7 +64,7 @@ pub(super) fn section_bounds(turns: &[SessionTurn]) -> Vec<Bound> {
                     prev.final_text = Some(turn.text.clone());
                 }
             }
-            SessionTurnKind::Question | SessionTurnKind::Error => {}
+            SessionTurnKind::Question | SessionTurnKind::Error | SessionTurnKind::Interrupted => {}
         }
     }
     out.retain(|b| b.end.is_none_or(|end| end > b.start));
