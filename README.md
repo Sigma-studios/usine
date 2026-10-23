@@ -124,9 +124,13 @@ itself.
 cargo build --workspace                # build everything
 cargo test  --workspace                # test everything
 
-cargo run -p usine-app                 # run the app (real backends)
-USINE_SIM=1 cargo run -p usine-app     # run in demo mode (simulated backends)
+cargo run                              # run the app (real backends)
+USINE_SIM=1 cargo run                  # run in demo mode (simulated backends)
 ```
+
+The workspace's `default-members` are the app and core, so a bare `cargo run`
+launches the `usine` app, while bare `cargo build`/`cargo test` skip
+`usine-cli` — pass `--workspace` to include it.
 
 The `usine-cli` crate is a headless harness that drives the same core through
 the executor, used for smoke tests and live integration tests:
@@ -197,7 +201,7 @@ Usine can manage its own repository as a project. Add the repo as a project, set
 a validate command (e.g. `cargo test --workspace`), and set the run command to:
 
 ```sh
-USINE_DATA_DIR="$PWD/.preview-data" cargo run -p usine-app
+USINE_DATA_DIR="$PWD/.preview-data" cargo run
 ```
 
 Each preview then launches a fully isolated instance whose state lives inside the

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/app", "crates/cli"]
+# What a bare `cargo run/build/test` at the root acts on. `usine-cli` is left
+# out so `cargo run` resolves to the only binary left — the `usine` app.
+# CI and anything that wants the harness pass `--workspace` / `-p usine-cli`.
+default-members = ["crates/app", "crates/core"]
 exclude = ["vendor"]
 
 # Local copy of dioxus-desktop 0.7.9 adding `WindowCloseBehaviour::WindowStays`,
