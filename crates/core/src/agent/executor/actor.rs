@@ -328,8 +328,10 @@ async fn finalize_run(
             let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
             if !questions.is_empty() {
                 let recap = crate::agent::fixes::strip_fixes_block(
-                    &crate::agent::handoff::strip_handoff_block(
-                        &crate::agent::commit::strip_commit_block(&clean),
+                    &crate::agent::handoff::strip_tests_block(
+                        &crate::agent::handoff::strip_handoff_block(
+                            &crate::agent::commit::strip_commit_block(&clean),
+                        ),
                     ),
                 );
                 // Kept on the update, not as the fixes recap: that one belongs
@@ -522,11 +524,12 @@ async fn finalize_run(
     // For display, drop the machine-facing blocks the agent appended — including
     // a questions block that got this far (a fix run that asked but whose merge
     // had already been completed, say), which must never render raw as a recap.
-    let summary = crate::agent::fixes::strip_fixes_block(
-        &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
-            &crate::agent::plan::parse_questions(&result_text).0,
-        )),
-    );
+    let summary =
+        crate::agent::fixes::strip_fixes_block(&crate::agent::handoff::strip_tests_block(
+            &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
+                &crate::agent::plan::parse_questions(&result_text).0,
+            )),
+        ));
 
     if !committed {
         if matches!(transition, Transition::AgentImplementDone) {
@@ -690,6 +693,23 @@ async fn finalize_run(
         };
         if let Ok(answers) = store.get_answers(card_id) {
             let _ = evt_tx.unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
+        }
+        // The one part of the hand-off a change may rewrite: its "Test it"
+        // checklist, when the run sent back a revised one. No block means the
+        // stored list still holds. A garbled block keeps it too, but says so:
+        // the agent meant to revise it, so it may now be stale.
+        if is_change_run {
+            let stored = store.get_handoff(card_id).ok().flatten();
+            if let Some(handoff) = crate::agent::handoff::revise_tests(stored, &result_text) {
+                let _ = store.set_handoff(card_id, &handoff);
+                let _ = evt_tx.unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
+            } else if crate::agent::handoff::tests_block_malformed(&result_text) {
+                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                    card_id,
+                    Severity::Warning,
+                    "The agent sent a malformed \"Test it\" revision; the previous checklist was kept and may be out of date.".to_string(),
+                ));
+            }
         }
     }
 

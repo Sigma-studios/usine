@@ -6,6 +6,10 @@
 //! Before this, a change run was a plain re-implement: it was asked for a new
 //! `usine-handoff` block and `finalize_run` stored it over the original, so
 //! the reviewer lost the recap of the work they had just read.
+//!
+//! The one exception is the hand-off's "Test it" checklist, which a change
+//! can falsify: the change run is shown it and may send back the complete
+//! revised list in a `usine-tests` block, which replaces only `tests`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -110,7 +114,8 @@ fn project(store: &Store, dir: &str) -> Project {
 }
 
 #[tokio::test]
-async fn a_requested_change_gets_its_own_recap_and_keeps_the_hand_off() {
+async fn a_requested_change_gets_its_own_recap_and_keeps_the_hand_off_unless_it_revises_the_tests()
+{
     let store = Store::open_in_memory().unwrap();
     let project = project(&store, "/tmp/change-recap-revise");
     let card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
@@ -160,8 +165,8 @@ async fn a_requested_change_gets_its_own_recap_and_keeps_the_hand_off() {
 
     assert_eq!(
         store.get_handoff(card_id).unwrap(),
-        Some(original),
-        "the change run must not replace the original hand-off"
+        Some(original.clone()),
+        "a change run that sends no revised checklist leaves the hand-off as it was"
     );
     assert_eq!(store.get_pending_change(card_id).unwrap(), None);
 
@@ -179,7 +184,17 @@ async fn a_requested_change_gets_its_own_recap_and_keeps_the_hand_off() {
         "a change run is not asked for a hand-off:\n{}",
         implement[1]
     );
-    assert!(implement[1].contains(usine_core::CHANGE_RECAP_INSTRUCTION));
+    assert!(implement[1].contains("usine-tests"));
+    let scenario = &original
+        .tests
+        .first()
+        .expect("the sim hands off tests")
+        .scenario;
+    assert!(
+        implement[1].contains(scenario.as_str()),
+        "the change run is shown the current checklist:\n{}",
+        implement[1]
+    );
     assert!(implement[1].contains(feedback));
 }
 
@@ -201,10 +216,15 @@ async fn a_change_on_an_open_pr_leaves_the_fixes_recap_alone() {
     let card_id = card.id;
     store.upsert_card(&card).unwrap();
     store.set_review_recap(card_id, "old recap").unwrap();
+    let original = handoff_with_tests();
+    store.set_handoff(card_id, &original).unwrap();
 
     let (handle, mut rx) = spawn_executor(ExecutorConfig {
         store: store.clone(),
-        providers: Arc::new(ScriptedFactory::default()),
+        providers: Arc::new(ScriptedFactory {
+            result: Some(REVISED_REPLY.into()),
+            ..Default::default()
+        }),
         forge: Arc::new(SimForge),
         git: Arc::new(SimGit),
     });
@@ -229,7 +249,86 @@ async fn a_change_on_an_open_pr_leaves_the_fixes_recap_alone() {
         Some("old recap"),
         "the merge gate's fixes recap is not the change's to overwrite"
     );
+    assert_eq!(
+        store.get_handoff(card_id).unwrap().unwrap().tests,
+        vec![usine_core::TestItem::from("Click Save")],
+        "the revised checklist replaces the old one"
+    );
     assert_eq!(store.get_pending_change(card_id).unwrap(), None);
+}
+
+/// A reply that revises the checklist alongside its recap.
+const REVISED_REPLY: &str =
+    "Reworded the paragraph.\n\n```usine-tests\n{\"tests\": [\"Click Save\"]}\n```";
+
+fn handoff_with_tests() -> usine_core::Handoff {
+    usine_core::Handoff {
+        summary: "TL;DR: added the form.".into(),
+        changes: vec![usine_core::Change {
+            path: "src/form.rs".into(),
+            what: "new form".into(),
+            kind: "feat".into(),
+        }],
+        tests: vec![usine_core::TestItem::from("Click Submit")],
+        risks: vec!["no migration".into()],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_change_that_revises_the_tests_replaces_only_the_checklist() {
+    let store = Store::open_in_memory().unwrap();
+    let project = project(&store, "/tmp/change-recap-tests");
+    let mut card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    card.state = CardState::AwaitingReview(ReviewSub::ReadyForReview);
+    card.branch = Some("usine/thing".into());
+    card.worktree_path = Some(PathBuf::from("/tmp/change-recap-tests-wt"));
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+    store.set_auto_review(card_id, false).unwrap();
+    let original = handoff_with_tests();
+    store.set_handoff(card_id, &original).unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(ScriptedFactory {
+            result: Some(REVISED_REPLY.into()),
+            ..Default::default()
+        }),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::ReviseImplementation {
+        card_id,
+        feedback: "Rename the button to Save.".into(),
+    });
+
+    let log = wait_for_change_entry(&mut rx, card_id).await;
+    assert_eq!(
+        log.exchanges.last().unwrap().answer,
+        "Reworded the paragraph.",
+        "the block is stripped from the Agent Chat recap"
+    );
+    let revised = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::HandoffUpdated { handoff } if e.card_id == card_id => {
+            Some(handoff.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        revised.tests,
+        vec![usine_core::TestItem::from("Click Save")]
+    );
+    assert_eq!(
+        usine_core::Handoff {
+            tests: original.tests.clone(),
+            ..revised.clone()
+        },
+        original,
+        "summary, changes and risks are the original hand-off's"
+    );
+    assert_eq!(store.get_handoff(card_id).unwrap(), Some(revised));
 }
 
 #[tokio::test]
@@ -348,16 +447,19 @@ async fn stopping_an_approved_plan_run_returns_to_the_plan() {
     assert_eq!(store.get_plan(card_id).unwrap(), None);
 }
 
-/// An agent that finishes with prose and no blocks at all — or, with `hang`,
+/// An agent that finishes with prose (or the scripted `result`) — or, with `hang`,
 /// starts and never finishes (its event sender is kept alive).
 #[derive(Default)]
 struct ScriptedFactory {
     hang: bool,
+    /// The final message; a plain prose recap when unset.
+    result: Option<String>,
     held: Arc<Mutex<Vec<UnboundedSender<AgentEvent>>>>,
 }
 
 struct ScriptedProvider {
     hang: bool,
+    result: Option<String>,
     held: Arc<Mutex<Vec<UnboundedSender<AgentEvent>>>>,
 }
 
@@ -386,7 +488,10 @@ impl AgentProvider for ScriptedProvider {
             });
         } else {
             let _ = evt_tx.unbounded_send(AgentEvent::Done {
-                result: "Reworded the paragraph.".into(),
+                result: self
+                    .result
+                    .clone()
+                    .unwrap_or_else(|| "Reworded the paragraph.".into()),
                 cost_usd: 0.0,
                 usage: usine_core::Usage::default(),
             });
@@ -402,6 +507,7 @@ impl ProviderFactory for ScriptedFactory {
     fn make(&self, _: Provider) -> Arc<dyn AgentProvider> {
         Arc::new(ScriptedProvider {
             hang: self.hang,
+            result: self.result.clone(),
             held: self.held.clone(),
         })
     }

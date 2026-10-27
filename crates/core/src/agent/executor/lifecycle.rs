@@ -388,7 +388,19 @@ impl Executor {
                 tail.push_str(crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION);
                 if is_change_run {
                     tail.push_str("\n\n");
-                    tail.push_str(crate::agent::handoff::CHANGE_RECAP_INSTRUCTION);
+                    // Shown the checklist it may have just falsified, so it
+                    // can send back the revised one (see `finalize_run`).
+                    let tests = self
+                        .store
+                        .get_handoff(card.id)
+                        .ok()
+                        .flatten()
+                        .map(|h| h.tests)
+                        .unwrap_or_default();
+                    tail.push_str(&crate::agent::handoff::change_recap_instruction(
+                        run.is_some(),
+                        &tests,
+                    ));
                 } else if mode == RunMode::Implement {
                     tail.push_str("\n\n");
                     tail.push_str(&crate::agent::handoff::handoff_instruction(run.is_some()));
