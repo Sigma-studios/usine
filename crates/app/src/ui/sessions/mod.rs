@@ -143,6 +143,14 @@ const LAUNCHABLE_EXTENSIONS: &[&str] = &[
     "msi",
     "ps1",
     "vbs",
+    // Location/shortcut files: `open` follows them to another target, which
+    // can itself be an app. Diffed PR files reach `open_file` too.
+    "fileloc",
+    "inetloc",
+    "webloc",
+    "url",
+    "lnk",
+    "scr",
 ];
 
 /// Whether handing `path` to `open`/`xdg-open` would execute it (an app

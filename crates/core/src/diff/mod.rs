@@ -17,7 +17,7 @@ mod highlight;
 mod lang;
 
 pub use anchor::{anchor_drafts, fold_unanchorable, DraftAnchors};
-pub use compute::{compute_branch_diff, compute_card_diff};
+pub use compute::{compute_branch_diff, compute_card_diff, snapshot_blob};
 
 /// A file's change kind (git2's `Delta`, collapsed to what the UI shows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +81,14 @@ pub struct DiffFile {
     pub added: u32,
     pub removed: u32,
     pub hunks: Vec<DiffHunk>,
+    /// The new side's full text, for a markdown file the UI can render as a
+    /// preview. `None` for any other file, a deletion, a binary blob, or a file
+    /// over the preview size cap.
+    pub preview: Option<String>,
+    /// Hex id of the blob this file "is" in the diff — the new side, or the old
+    /// side for a deletion. Lets the UI materialize it with [`snapshot_blob`]
+    /// when no worktree copy exists.
+    pub blob: Option<String>,
 }
 
 /// The whole diff: the card's committed contribution over its fork point.

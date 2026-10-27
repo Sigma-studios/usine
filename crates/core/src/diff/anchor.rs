@@ -166,6 +166,8 @@ mod tests {
             highlighted: true,
             added: 0,
             removed: 0,
+            preview: None,
+            blob: None,
             hunks: vec![DiffHunk {
                 header: "@@".into(),
                 old_start: 1,

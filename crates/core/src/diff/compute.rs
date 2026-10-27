@@ -5,18 +5,21 @@
 //! only committed objects from the shared ODB, so it works even if the card's
 //! worktree was cleaned up. Follows the repo's "git2 for inspection" rule.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::infra::git::{merge_base, remote_tracking_base};
 
 use super::highlight::Highlighter;
-use super::lang::lang_for_path;
+use super::lang::{is_markdown, lang_for_path};
 use super::{DiffData, DiffFile, DiffHunk, DiffLine, DiffLineKind, FileStatus, Token};
 
 /// Files larger than this (either side) are shown without syntax highlighting —
 /// the diff structure is still produced, but tokens are plain.
 const MAX_HIGHLIGHT_BYTES: u64 = 512 * 1024;
+
+/// Markdown files larger than this (new side) get no rendered preview.
+const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
 
 /// Compute a card's committed contribution over its fork point. `repo` is the
 /// project's main checkout (shares the object DB with the card's worktree);
@@ -77,12 +80,20 @@ fn diff_range(repo_path: &Path, base_hex: &str, branch: &str) -> Result<DiffData
             .or(old_path.as_deref())
             .and_then(|p| lang_for_path(Path::new(p)));
 
+        // The blob the file "is" here: the new side, or the old one for a
+        // deletion. Kept even for binary/content-less files — an image or PDF
+        // is exactly what the UI's "open in default app" is for.
+        let new_id = delta.new_file().id();
+        let old_id = delta.old_file().id();
+        let blob = [new_id, old_id]
+            .into_iter()
+            .find(|id| !id.is_zero())
+            .map(|id| id.to_string());
+
         // Detect binary from the blob content up front: for a tree-vs-tree diff
         // git2 doesn't reliably flag the delta, and it still emits a (hunk-less)
         // patch for a binary file, so we can't infer it from `Patch::from_diff`.
-        if is_blob_binary(&repo, delta.new_file().id())
-            || is_blob_binary(&repo, delta.old_file().id())
-        {
+        if is_blob_binary(&repo, new_id) || is_blob_binary(&repo, old_id) {
             files.push(meta(
                 old_path,
                 new_path,
@@ -92,9 +103,13 @@ fn diff_range(repo_path: &Path, base_hex: &str, branch: &str) -> Result<DiffData
                 0,
                 0,
                 Vec::new(),
+                None,
+                blob,
             ));
             continue;
         }
+
+        let preview = markdown_preview(&repo, new_path.as_deref(), new_id);
 
         // A content-less change (mode-only / pure rename) yields no patch.
         let Some(patch) = git2::Patch::from_diff(&diff, idx)? else {
@@ -107,6 +122,8 @@ fn diff_range(repo_path: &Path, base_hex: &str, branch: &str) -> Result<DiffData
                 0,
                 0,
                 Vec::new(),
+                preview,
+                blob,
             ));
             continue;
         };
@@ -163,6 +180,8 @@ fn diff_range(repo_path: &Path, base_hex: &str, branch: &str) -> Result<DiffData
             added as u32,
             removed as u32,
             hunks,
+            preview,
+            blob,
         ));
     }
 
@@ -179,6 +198,8 @@ fn meta(
     added: u32,
     removed: u32,
     hunks: Vec<DiffHunk>,
+    preview: Option<String>,
+    blob: Option<String>,
 ) -> DiffFile {
     DiffFile {
         old_path,
@@ -189,7 +210,75 @@ fn meta(
         added,
         removed,
         hunks,
+        preview,
+        blob,
     }
+}
+
+/// The new side's text for a markdown file within the preview cap. `None` for
+/// a non-markdown path, a deletion (zero id), or an oversized blob. Invalid
+/// UTF-8 is replaced rather than dropping the preview.
+fn markdown_preview(
+    repo: &git2::Repository,
+    new_path: Option<&str>,
+    new_id: git2::Oid,
+) -> Option<String> {
+    let path = new_path?;
+    if new_id.is_zero() || !is_markdown(Path::new(path)) {
+        return None;
+    }
+    // Size from the blob itself: a tree-to-tree delta reports 0 until the
+    // patch has loaded it.
+    let blob = repo.find_blob(new_id).ok()?;
+    if blob.size() as u64 > MAX_PREVIEW_BYTES {
+        return None;
+    }
+    Some(String::from_utf8_lossy(blob.content()).into_owned())
+}
+
+/// Write blob `oid_hex` of `repo` to a read-only temp file named `file_name`,
+/// for opening a diffed file in its default app when no worktree copy exists
+/// (a merged card, a deleted file, a PR that was never checked out).
+///
+/// The file lands at `$TMPDIR/usine-diff/<12 hex of the id>/<file_name>`: the
+/// directory is content-addressed, so reopening reuses the copy, and the
+/// original name keeps the OS's app choice right. `file_name` must be a bare
+/// name. The copy is `0o444` — never executable, never mistaken for the real
+/// file to edit.
+pub fn snapshot_blob(repo: &Path, oid_hex: &str, file_name: &str) -> Result<PathBuf> {
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\\'])
+    {
+        return Err(CoreError::other(format!(
+            "not a bare file name: {file_name:?}"
+        )));
+    }
+    let oid = git2::Oid::from_str(oid_hex)?;
+    let hex = oid.to_string();
+    let dir = std::env::temp_dir().join("usine-diff").join(&hex[..12]);
+    let path = dir.join(file_name);
+    if path.exists() {
+        return Ok(path);
+    }
+    let repo = git2::Repository::open(repo)?;
+    let blob = repo.find_blob(oid)?;
+    std::fs::create_dir_all(&dir)?;
+    // Written aside and renamed in, so a reused copy is never a half-write.
+    let tmp = dir.join(format!(".{file_name}.{}.part", std::process::id()));
+    std::fs::write(&tmp, blob.content())?;
+    let mut perms = std::fs::metadata(&tmp)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o444);
+    }
+    #[cfg(not(unix))]
+    perms.set_readonly(true);
+    std::fs::set_permissions(&tmp, perms)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
 }
 
 fn plain_token(content: &str) -> Token {
