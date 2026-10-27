@@ -35,6 +35,10 @@ use crate::agent::block;
 
 const TAG: &str = "usine-handoff";
 
+/// A "Request changes" run's revised "Test it" checklist — see
+/// [`change_recap_instruction`].
+const TESTS_TAG: &str = "usine-tests";
+
 /// The schema version this build emits and assumes when a payload omits `v`.
 const VERSION: u8 = 2;
 
@@ -49,12 +53,21 @@ const VERSION: u8 = 2;
 /// library, a project with no `run_script`), the generic bullet stands, because
 /// there is no environment to point the reviewer at.
 pub fn handoff_instruction(local_app: bool) -> String {
-    let tests = if local_app {
+    let tests = tests_guidance(local_app);
+    format!(
+        "{HANDOFF_HEADER}- `tests`: {tests} Use an empty array if the change has no observable \
+behaviour.\n{HANDOFF_TAIL}"
+    )
+}
+
+/// How to write the `tests` checklist, shared by the hand-off and the change
+/// recap's `usine-tests` block so the two never drift apart.
+fn tests_guidance(local_app: bool) -> &'static str {
+    if local_app {
         TESTS_SEEDED
     } else {
         TESTS_GENERIC
-    };
-    format!("{HANDOFF_HEADER}{tests}{HANDOFF_TAIL}")
+    }
 }
 
 const HANDOFF_HEADER: &str = "\
@@ -86,7 +99,7 @@ right, say so there.\n";
 /// own environment. The route and no-hard-coded-URL requirements hold
 /// unconditionally.
 const TESTS_SEEDED: &str = "\
-- `tests`: a hand-testing script for the reviewer, who will run this card's app locally — the same \
+a hand-testing script for the reviewer, who will run this card's app locally — the same \
 worktree preview you had, but restarted from scratch: the setup re-creates the environment, \
 re-seeding its data if the project seeds any, so anything you created by hand during your run is \
 gone. Every scenario must be executable in that local environment and nothing else — no production \
@@ -100,18 +113,16 @@ already contain the state a scenario needs, make creating it the first steps of 
 important first, and favour what your automated tests do not already cover: the risky paths, the \
 edge cases you touched, the flows a regression would hide in. Set `verified: true` only for a \
 scenario you actually ran yourself in the app, as written — it still deserves a human eye, but the \
-reviewer should know it has been run once. Use an empty array if the change has no observable \
-behaviour.\n";
+reviewer should know it has been run once.";
 
 /// The `tests` bullet for a project with no runnable app: same checklist, no
 /// environment to promise.
 const TESTS_GENERIC: &str = "\
-- `tests`: what is worth checking by hand in the running app, most important first. `scenario` is \
+what is worth checking by hand in the running app, most important first. `scenario` is \
 what to do, `expect` is what should happen. Favour what your automated tests do not already cover: \
 the risky paths, the edge cases you touched, the flows a regression would hide in. Set \
 `verified: true` only for a scenario you actually exercised yourself in the running app — it still \
-deserves a human eye, but the reviewer should know it has been run once. Use an empty array if \
-the change has no observable behaviour.\n";
+deserves a human eye, but the reviewer should know it has been run once.";
 
 const HANDOFF_TAIL: &str = "\
 - `risks`: what could bite the reviewer or a user — a migration, a behaviour change, something \
@@ -125,11 +136,48 @@ Be honest and specific — this is the note a careful engineer leaves a colleagu
 /// original hand-off keeps describing the work as a whole, and this run's
 /// final message becomes its own entry in the Agent Chat log, under the
 /// request it answers.
-pub const CHANGE_RECAP_INSTRUCTION: &str = "\
+///
+/// The one part of the hand-off a change can falsify is its "Test it"
+/// checklist, so the run is shown `current` and asked to send back the
+/// complete revised list in a `usine-tests` block whenever the change makes it
+/// wrong (see [`revise_tests`]). No block means "still accurate", so the list
+/// never silently describes behaviour the branch no longer has.
+pub fn change_recap_instruction(local_app: bool, current: &[TestItem]) -> String {
+    let listed = if current.is_empty() {
+        "(none yet)\n".to_string()
+    } else {
+        current
+            .iter()
+            .map(|t| {
+                if t.expect.is_empty() {
+                    format!("- {}\n", t.scenario)
+                } else {
+                    format!("- {} → {}\n", t.scenario, t.expect)
+                }
+            })
+            .collect()
+    };
+    let guidance = tests_guidance(local_app);
+    format!(
+        "{CHANGE_RECAP_HEADER}\n\nBelow is the current \"Test it\" checklist the reviewer will \
+follow. If this change makes any scenario wrong or adds behaviour worth checking by hand, emit a \
+fenced code block tagged `{TESTS_TAG}` containing a JSON object shaped like {{\"tests\": \
+[{{\"scenario\": \"<what to do>\", \"expect\": \"<what should happen>\", \"verified\": \
+false}}]}} with the COMPLETE updated list for the branch as it now stands: keep what still holds, \
+rewrite what this change altered, add new items, drop obsolete ones. Omit the block only if the \
+list below is still accurate — in particular, a change with no observable behaviour of its own \
+(a refactor, a rename in code) sends no block, never an empty list: an empty list wipes the \
+checklist.\n\
+Current checklist:\n{listed}\
+Each item follows the same rules as the original hand-off's checklist — {guidance}"
+    )
+}
+
+const CHANGE_RECAP_HEADER: &str = "\
 Your final message is shown to the user as the recap of this change request, beside their \
 request; the original hand-off for the task stays as it is, so do not restate it. Start with a \
-`TL;DR:` line followed by 1-3 bullet points (`- ` lines) covering only what this change did, then \
-optionally a short \"To test:\" list of what to check by hand. Do not emit a hand-off block.";
+`TL;DR:` line followed by 1-3 bullet points (`- ` lines) covering only what this change did. Do \
+not emit a hand-off block.";
 
 /// One file the run touched, as the agent describes it. The path is a claim,
 /// not a fact: the panel cross-checks it against the computed diff and marks
@@ -347,6 +395,46 @@ pub fn strip_handoff_block(text: &str) -> String {
     block::strip(text, TAG)
 }
 
+/// The payload of a `usine-tests` block. `tests` is required: an empty list
+/// wipes the checklist, so only an explicit `"tests": []` may say so — a
+/// missing or misspelled key makes the block malformed and the list stands.
+#[derive(Deserialize)]
+struct TestsBlock {
+    tests: Vec<TestItem>,
+}
+
+/// The revised checklist a change run sent in its `usine-tests` block. `None`
+/// when the block is missing or malformed — either way the stored list stands.
+/// `Some(vec![])` is a real answer: nothing is left to check by hand.
+pub fn parse_tests_block(text: &str) -> Option<Vec<TestItem>> {
+    let raw = block::parse::<TestsBlock>(text, TESTS_TAG).0.ok()?;
+    Some(raw.tests.into_iter().filter(|t| !t.is_empty()).collect())
+}
+
+/// True when the reply carries a `usine-tests` block that doesn't parse (bad
+/// JSON, a bare array, no `tests` key) — the agent tried to revise the "Test
+/// it" checklist and garbled it, so the stored list was kept and may be stale.
+pub fn tests_block_malformed(text: &str) -> bool {
+    block::parse::<TestsBlock>(text, TESTS_TAG).0.is_malformed()
+}
+
+/// The reply with the `usine-tests` block removed, for the Agent Chat recap.
+pub fn strip_tests_block(text: &str) -> String {
+    block::strip(text, TESTS_TAG)
+}
+
+/// The hand-off to store after a change run: `stored` with only its `tests`
+/// replaced by the reply's `usine-tests` list (a fresh hand-off when nothing
+/// was stored). `None` when the reply carries no usable block — nothing to
+/// write, the stored hand-off still holds.
+pub fn revise_tests(stored: Option<Handoff>, reply: &str) -> Option<Handoff> {
+    let tests = parse_tests_block(reply)?;
+    Some(Handoff {
+        tests,
+        ..stored.unwrap_or_default()
+    })
+}
+
 /// Trim each entry and drop the ones that were only whitespace.
 fn trimmed(items: Vec<String>) -> Vec<String> {
     items
@@ -483,15 +571,114 @@ mod tests {
 
     #[test]
     fn the_change_recap_instruction_never_asks_for_a_hand_off_block() {
-        assert!(!CHANGE_RECAP_INSTRUCTION.contains(TAG));
-        assert!(CHANGE_RECAP_INSTRUCTION.contains("TL;DR"));
+        for local_app in [true, false] {
+            let s = change_recap_instruction(local_app, &[]);
+            assert!(!s.contains(TAG), "local_app={local_app}");
+            assert!(s.contains("TL;DR"));
+            assert!(s.contains(TESTS_TAG));
+            assert!(s.contains("(none yet)"));
+        }
+    }
+
+    #[test]
+    fn the_change_recap_instruction_lists_the_current_checklist() {
+        let current = vec![
+            TestItem {
+                scenario: "Click Submit".into(),
+                expect: "the form saves".into(),
+                verified: true,
+            },
+            TestItem::from("Reload the board"),
+        ];
+        let s = change_recap_instruction(true, &current);
+        assert!(s.contains("- Click Submit → the form saves\n"));
+        assert!(s.contains("- Reload the board\n"));
+        assert!(!s.contains("(none yet)"));
+        assert!(s.contains("COMPLETE updated list"));
+        assert!(
+            !s.contains("Use an empty array"),
+            "an empty list wipes the checklist; a no-op change must send no block"
+        );
+        // The same writing rules as the hand-off's checklist.
+        assert!(s.contains("never a hard-coded URL"));
+        assert!(!change_recap_instruction(false, &current).contains("hard-coded URL"));
+    }
+
+    #[test]
+    fn parses_a_tests_block_in_either_item_shape() {
+        let text = "TL;DR: renamed.\n\n```usine-tests\n{\"tests\": [\
+            {\"scenario\":\"Click Save\",\"expect\":\"saved\"},\
+            \"[verified] Reload\", \" \"]}\n```";
+        let tests = parse_tests_block(text).unwrap();
+        assert_eq!(tests.len(), 2, "the blank entry is dropped");
+        assert_eq!(tests[0].scenario, "Click Save");
+        assert_eq!(tests[0].expect, "saved");
+        assert_eq!(tests[1].scenario, "Reload");
+        assert!(tests[1].verified);
+        assert_eq!(strip_tests_block(text), "TL;DR: renamed.");
+    }
+
+    #[test]
+    fn a_missing_or_garbled_tests_block_is_none_but_an_empty_list_is_an_answer() {
+        assert_eq!(parse_tests_block("no block"), None);
+        assert_eq!(parse_tests_block("```usine-tests\nnot json\n```"), None);
+        assert!(!tests_block_malformed("no block"));
+        for garbled in [
+            "not json",
+            "{}",
+            "{\"v\":2}",
+            "{\"items\": []}",
+            "[\"Click Save\"]",
+        ] {
+            let text = format!("```usine-tests\n{garbled}\n```");
+            assert_eq!(parse_tests_block(&text), None, "{garbled}");
+            assert!(tests_block_malformed(&text), "{garbled}");
+        }
+        assert_eq!(
+            parse_tests_block("```usine-tests\n{\"tests\": []}\n```"),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn revising_the_tests_replaces_only_the_checklist() {
+        let stored = parse_handoff(
+            "```usine-handoff\n{\"v\":2,\"summary\":\"TL;DR: form\",\
+             \"changes\":[{\"path\":\"a.rs\",\"what\":\"x\"}],\
+             \"tests\":[\"Click Submit\"],\"risks\":[\"r\"]}\n```",
+        )
+        .unwrap();
+        let reply = "```usine-tests\n{\"tests\": [\"Click Save\"]}\n```";
+
+        let revised = revise_tests(Some(stored.clone()), reply).unwrap();
+        assert_eq!(revised.tests, vec![TestItem::from("Click Save")]);
+        assert_eq!(
+            Handoff {
+                tests: stored.tests.clone(),
+                ..revised
+            },
+            stored,
+            "everything but the tests is kept"
+        );
+
+        let fresh = revise_tests(None, reply).unwrap();
+        assert_eq!(fresh.tests.len(), 1);
+        assert!(fresh.summary.is_empty());
+
+        assert_eq!(revise_tests(Some(stored), "TL;DR: refactor only."), None);
     }
 
     #[test]
     fn the_instruction_states_the_v2_contract() {
         for local_app in [true, false] {
             let s = handoff_instruction(local_app);
-            for field in ["\"v\": 2", "changes", "risks", "verified"] {
+            for field in [
+                "\"v\": 2",
+                "changes",
+                "risks",
+                "verified",
+                "Use an empty array",
+            ] {
                 assert!(s.contains(field), "missing {field} (local_app={local_app})");
             }
         }
