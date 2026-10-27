@@ -16,6 +16,7 @@
 //! manual recompute for after a revision.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use dioxus::prelude::*;
 use usine_core::{
@@ -25,9 +26,10 @@ use usine_core::{
 use uuid::Uuid;
 
 use super::reviewdraft;
+use super::sessions::open_file;
 use crate::state::AppState;
 use crate::ui::textfield::use_push_back;
-use crate::ui::widgets::SeverityPicker;
+use crate::ui::widgets::{ArtifactText, SeverityPicker};
 
 /// Which entity's diff the dialog is showing. Both are keyed by a plain id in
 /// the executor's per-entity diff map, so only the command used to (re)compute
@@ -226,6 +228,35 @@ pub fn DiffDialogHost() -> Element {
         DiffTarget::Card(_) => false,
     };
 
+    // Where the diffed files live on disk, for "open in default app".
+    let roots = {
+        let (project_id, worktree) = match target {
+            DiffTarget::Card(card_id) => state
+                .cards
+                .read()
+                .iter()
+                .find(|c| c.id == card_id)
+                .map(|c| (c.project_id, c.worktree_path.clone()))
+                .unzip(),
+            DiffTarget::Review(review_id) => state
+                .review_task(review_id)
+                .map(|t| (t.project_id, t.worktree_path))
+                .unzip(),
+        };
+        let repo = project_id.and_then(|pid| {
+            state
+                .projects
+                .read()
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| p.path.clone())
+        });
+        OpenRoots {
+            repo,
+            worktree: worktree.flatten(),
+        }
+    };
+
     rsx! {
         div { class: "modal-overlay", onclick: move |_| dismiss(),
             div {
@@ -296,6 +327,7 @@ pub fn DiffDialogHost() -> Element {
                                 drafts: drafts.clone(),
                                 scroll_to: req.scroll_to.clone(),
                                 scroll_to_path: req.scroll_to_path.clone(),
+                                roots: roots.clone(),
                             }
                         },
                     }
@@ -324,9 +356,13 @@ fn DiffView(
     drafts: Option<Vec<DraftComment>>,
     scroll_to: Option<String>,
     scroll_to_path: Option<String>,
+    roots: OpenRoots,
 ) -> Element {
     // Indices of files the user has collapsed (expanded by default).
     let mut collapsed = use_signal(HashSet::<usize>::new);
+    // Indices of markdown files showing the rendered preview instead of hunks
+    // (every file starts on the diff).
+    let mut previewing = use_signal(HashSet::<usize>::new);
     // Case-insensitive substring filter over the left file list.
     let mut query = use_signal(String::new);
     let mut pushback = use_push_back(query.read().clone());
@@ -464,6 +500,19 @@ fn DiffView(
                     for (fi, file) in files.files.iter().enumerate() {
                         {
                             let is_collapsed = collapsed.read().contains(&fi);
+                            let has_preview = file.preview.is_some();
+                            let is_previewing = has_preview && previewing.read().contains(&fi);
+                            // Resolved on click: render does no filesystem probing.
+                            let can_open = can_open(file, &roots);
+                            let open_roots = roots.clone();
+                            // Line comments can't sit on rendered prose: say how many
+                            // the preview is hiding.
+                            let line_comments = anchors
+                                .per_file
+                                .get(&fi)
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_sub(anchors.file_level.get(&fi).map_or(0, |v| v.len()));
                             rsx! {
                                 div { key: "{fi}", id: "difffile-{fi}", class: "diff-file",
                                     div {
@@ -476,8 +525,38 @@ fn DiffView(
                                         span { class: "diff-file-path", "{file_path(file)}" }
                                         span { class: "diff-file-stat add", "+{file.added}" }
                                         span { class: "diff-file-stat del", "−{file.removed}" }
-                                        if !file.highlighted && !file.binary {
+                                        if !file.highlighted && !file.binary && !is_previewing {
                                             span { class: "diff-file-note", "no highlight" }
+                                        }
+                                        if has_preview {
+                                            button {
+                                                class: if is_previewing { "btn small diff-file-toggle active" } else { "btn small diff-file-toggle" },
+                                                title: if is_previewing { "Show the diff" } else { "Render the new version as markdown" },
+                                                onclick: move |e| {
+                                                    // The header itself toggles collapse.
+                                                    e.stop_propagation();
+                                                    collapsed.write().remove(&fi);
+                                                    let mut p = previewing.write();
+                                                    if !p.insert(fi) { p.remove(&fi); }
+                                                },
+                                                if is_previewing { "Diff" } else { "Preview" }
+                                            }
+                                        }
+                                        if can_open {
+                                            button {
+                                                class: "btn subtle small diff-file-open",
+                                                title: OPEN_TITLE,
+                                                "aria-label": OPEN_TITLE,
+                                                onclick: move |e| {
+                                                    e.stop_propagation();
+                                                    let source = data.read().files.get(fi).and_then(|f| open_source(f, &open_roots));
+                                                    match source {
+                                                        Some(source) => open_diff_file(source),
+                                                        None => tracing::warn!("diff file {fi}: nothing to open"),
+                                                    }
+                                                },
+                                                "↗"
+                                            }
                                         }
                                         span { class: "diff-collapse", if is_collapsed { "▸" } else { "▾" } }
                                     }
@@ -487,7 +566,16 @@ fn DiffView(
                                         for ci in anchors.file_level.get(&fi).into_iter().flatten().copied() {
                                             InlineComment { key: "f{ci}", index: ci, comment: drafts_ref[ci].clone() }
                                         }
-                                        if file.binary {
+                                        if let (true, Some(text)) = (is_previewing, file.preview.clone()) {
+                                            if line_comments > 0 {
+                                                div { class: "hint diff-preview-hint",
+                                                    "{line_comments} line comment(s) — switch to Diff to see them."
+                                                }
+                                            }
+                                            div { class: "diff-preview",
+                                                ArtifactText { text, bare: true }
+                                            }
+                                        } else if file.binary {
                                             div { class: "diff-binary", "Binary file — not shown." }
                                         } else {
                                             for (hi, hunk) in file.hunks.iter().enumerate() {
@@ -540,6 +628,71 @@ fn DiffView(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Where a diff's files live on disk: the project checkout (for the object DB)
+/// and the card/review worktree when one exists.
+#[derive(Clone, PartialEq, Default)]
+struct OpenRoots {
+    repo: Option<PathBuf>,
+    worktree: Option<PathBuf>,
+}
+
+/// What the "open in default app" button hands to the OS.
+#[derive(Clone, PartialEq)]
+enum OpenSource {
+    /// The live file in the worktree — editable, may carry uncommitted edits.
+    Worktree(PathBuf),
+    /// The committed blob, materialized read-only under the temp dir on click.
+    Snapshot {
+        repo: PathBuf,
+        blob: String,
+        name: String,
+    },
+}
+
+const OPEN_TITLE: &str = "Open in the default app — the worktree file (with uncommitted edits) when present, else a read-only snapshot of the committed version";
+
+/// Whether [`open_source`] can plausibly resolve `file`, without touching the
+/// filesystem — cheap enough for every render.
+fn can_open(file: &DiffFile, roots: &OpenRoots) -> bool {
+    let worktree =
+        file.status != FileStatus::Deleted && roots.worktree.is_some() && file.new_path.is_some();
+    worktree || (roots.repo.is_some() && file.blob.is_some())
+}
+
+/// The best way to open `file`: its worktree copy when present (and not a
+/// deletion), else a snapshot of its blob. `None` when neither is possible.
+fn open_source(file: &DiffFile, roots: &OpenRoots) -> Option<OpenSource> {
+    if file.status != FileStatus::Deleted {
+        if let (Some(wt), Some(rel)) = (&roots.worktree, &file.new_path) {
+            let path = wt.join(rel);
+            if path.is_file() {
+                return Some(OpenSource::Worktree(path));
+            }
+        }
+    }
+    let repo = roots.repo.clone()?;
+    let blob = file.blob.clone()?;
+    let name = file_name(file);
+    Some(OpenSource::Snapshot { repo, blob, name })
+}
+
+/// Open a diffed file in its default app. A snapshot is written off the UI
+/// thread; failures are logged like [`open_file`]'s (no toast — that would mean
+/// writing a UI signal from the worker thread).
+fn open_diff_file(source: OpenSource) {
+    match source {
+        OpenSource::Worktree(path) => open_file(&path),
+        OpenSource::Snapshot { repo, blob, name } => {
+            std::thread::spawn(
+                move || match usine_core::snapshot_blob(&repo, &blob, &name) {
+                    Ok(path) => open_file(&path),
+                    Err(e) => tracing::warn!("could not snapshot {name} ({blob}): {e}"),
+                },
+            );
         }
     }
 }

@@ -49,6 +49,17 @@ pub fn lang_for_path(path: &Path) -> Option<Lang> {
     })
 }
 
+/// Whether `path` is a markdown document the diff viewer can render as a
+/// preview. Separate from [`lang_for_path`]: markdown is never highlighted.
+pub fn is_markdown(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "md" | "markdown" | "mdown" | "mkd" | "mkdn"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +88,17 @@ mod tests {
         assert_eq!(lang_for_path(Path::new("go.mod")), None);
         assert_eq!(lang_for_path(Path::new("data.json")), None);
         assert_eq!(lang_for_path(Path::new("Makefile")), None);
+    }
+
+    #[test]
+    fn markdown_extensions_are_recognized() {
+        assert!(is_markdown(Path::new("README.md")));
+        assert!(is_markdown(Path::new("docs/Plan.MARKDOWN")));
+        assert!(is_markdown(Path::new("a.mdown")));
+        assert!(is_markdown(Path::new("a.mkd")));
+        assert!(is_markdown(Path::new("a.mkdn")));
+        assert!(!is_markdown(Path::new("a.rs")));
+        assert!(!is_markdown(Path::new("md")));
+        assert!(!is_markdown(Path::new("a.mdx")));
     }
 }
