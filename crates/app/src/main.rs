@@ -232,6 +232,9 @@ pub(crate) fn quit_app(
     window: &dioxus::desktop::DesktopContext,
 ) {
     use dioxus::desktop::WindowCloseBehaviour;
+    // Queued ahead of the reaping below, which gives the executor time to
+    // write it — but nothing waits for it.
+    ui::drafts::save_now(exec);
     exec.shutdown();
     window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
     window.close();
@@ -484,6 +487,9 @@ fn App() -> Element {
             }
         });
     }
+
+    // Persist unsent drafts as typing pauses.
+    ui::drafts::use_autosave(state);
 
     // Debug-only keystroke-drop harness (inert unless `USINE_STRESS=1`).
     stress::use_stress(state);

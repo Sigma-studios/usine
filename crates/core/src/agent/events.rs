@@ -15,7 +15,7 @@ use crate::agent::usage::UsageSnapshot;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
     Card, CardAnswers, DraftComment, FixVerdict, ModelSpec, PrInfo, PreviewStatus, PreviewUrl,
-    Project, Provider, ReviewEvent, ReviewTask, Usage,
+    Project, Provider, ReviewEvent, ReviewTask, UiDrafts, Usage,
 };
 use crate::domain::session::{Session, SessionAccess, TaskEvent};
 use crate::infra::forge::OpenPr;
@@ -569,6 +569,10 @@ pub enum ExecutorCommand {
     SaveSettings {
         settings: Box<AppSettings>,
     },
+    /// Persist the UI's unsent drafts. No event back: the UI already holds them.
+    SaveUiDrafts {
+        drafts: Box<UiDrafts>,
+    },
     /// Set a card's "skip plan" option.
     SetSkipPlan {
         card_id: Uuid,
@@ -787,6 +791,7 @@ impl ExecutorCommand {
             | ExecutorCommand::SaveProject { .. }
             | ExecutorCommand::DeleteProject { .. }
             | ExecutorCommand::SaveSettings { .. }
+            | ExecutorCommand::SaveUiDrafts { .. }
             | ExecutorCommand::ScanReviews { .. }
             | ExecutorCommand::RefreshUsage => Uuid::nil(),
         }
@@ -881,6 +886,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::AddProject { .. }
                 | ExecutorCommand::SaveProject { .. }
                 | ExecutorCommand::SaveSettings { .. }
+                | ExecutorCommand::SaveUiDrafts { .. }
                 | ExecutorCommand::SetSkipPlan { .. }
                 | ExecutorCommand::SetAutoReview { .. }
                 | ExecutorCommand::SetBlocked { .. }

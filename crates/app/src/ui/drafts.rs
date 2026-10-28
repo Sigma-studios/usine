@@ -19,17 +19,50 @@
 //!   `origin` field.
 //!
 //! Entries die with their owner: `forget_owner` runs on `CardRemoved` and
-//! `ProjectRemoved`. In-memory only — drafts don't survive a restart.
+//! `ProjectRemoved`, and `AppState` drops a card's drafts once nothing on it
+//! can be sent any more (PR created, card done).
+//!
+//! The map — together with `reviewdraft`'s buffer — is persisted, so drafts
+//! survive a restart or a crash: every change bumps [`REVISION`], the root
+//! component's [`use_autosave`] loop saves a [`snapshot`] once typing pauses
+//! for about a second, and `quit_app` sends a last one. [`load`] fills the map
+//! once at startup. Both rules above still hold for restored entries.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use dioxus::prelude::*;
 use serde::{de::DeserializeOwned, Serialize};
+use usine_core::{ExecutorCommand, ExecutorHandle, StoredDraft, UiDrafts};
 use uuid::Uuid;
+
+/// Every field name a `use_draft`/`use_draft_of` call site uses. Loading maps a
+/// saved name back through this list (keys hold `&'static str`), so a field
+/// that's renamed or removed just drops its old draft.
+const FIELDS: &[&str] = &[
+    "chat",
+    "session-message",
+    "pr.title",
+    "pr.body",
+    "pr.reviewer",
+    "pr.branch",
+    "fixes.verdicts",
+    "fixes.task",
+    "fixes.note",
+    "update.note",
+    "plan.answers",
+    "investigate.answers",
+    "investigate.followup",
+    "intervention.answer",
+    "intervention.option",
+    "review.guidance",
+    "review.fixnote",
+];
 
 /// One draft slot: the card or review it belongs to, plus a per-panel field
 /// name (e.g. `"chat"`, `"pr.body"`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DraftKey {
     pub owner: Uuid,
     pub field: &'static str,
@@ -47,6 +80,7 @@ pub fn use_draft(
     field: &'static str,
     seed: impl FnOnce() -> String,
 ) -> Signal<String> {
+    debug_assert!(FIELDS.contains(&field), "draft field {field:?} missing from FIELDS");
     let key = DraftKey { owner, field };
     let seeded = seed();
     let init = seeded.clone();
@@ -61,7 +95,9 @@ pub fn use_draft(
         if mirror_held() {
             return;
         }
-        mirror_str(&mut DRAFTS.write(), key, v, &seeded);
+        if mirror_str(&mut DRAFTS.write(), key, v, &seeded) {
+            bump();
+        }
     });
     sig
 }
@@ -100,6 +136,7 @@ where
     O: Serialize,
     T: Serialize + DeserializeOwned + Clone + PartialEq + 'static,
 {
+    debug_assert!(FIELDS.contains(&field), "draft field {field:?} missing from FIELDS");
     let key = DraftKey { owner, field };
     let fp = serde_json::to_string(origin).unwrap_or_default();
     let seeded = seed();
@@ -112,7 +149,9 @@ where
         if mirror_held() {
             return;
         }
-        mirror_typed(&mut DRAFTS.write(), key, &fp, &v, &seeded);
+        if mirror_typed(&mut DRAFTS.write(), key, &fp, &v, &seeded) {
+            bump();
+        }
     });
     sig
 }
@@ -120,7 +159,9 @@ where
 /// Drop one field's draft — for sends that don't clear the signal back to its
 /// seed (the confirm dialog fires the command, or the seed is nonempty).
 pub fn forget(owner: Uuid, field: &'static str) {
-    DRAFTS.write().remove(&DraftKey { owner, field });
+    if DRAFTS.write().remove(&DraftKey { owner, field }).is_some() {
+        bump();
+    }
 }
 
 /// Clear a draft at send time: reset the signal *and* drop the store entry in
@@ -140,16 +181,92 @@ pub fn peek(owner: Uuid, field: &'static str) -> Option<String> {
     DRAFTS.peek().get(&DraftKey { owner, field }).cloned()
 }
 
-/// Whether any field holds typed-but-unsent text — the idle restart waits on
-/// it, since drafts don't survive a restart. Peeks: no subscription.
-pub fn any() -> bool {
-    !DRAFTS.peek().is_empty()
+/// Drop every draft belonging to `owner` — called when a card or review is
+/// removed, or a card is done.
+pub fn forget_owner(owner: Uuid) {
+    forget_where(|k| k.owner == owner);
 }
 
-/// Drop every draft belonging to `owner` — called when a card or review is
-/// removed.
-pub fn forget_owner(owner: Uuid) {
-    forget_owner_in(&mut DRAFTS.write(), owner);
+/// Drop `owner`'s drafts whose field starts with `prefix` (e.g. the `"pr."`
+/// form once the PR exists).
+pub fn forget_prefix(owner: Uuid, prefix: &str) {
+    forget_where(|k| k.owner == owner && k.field.starts_with(prefix));
+}
+
+/// Peek first so the common nothing-to-drop case (every `CardUpdated`) doesn't
+/// write the signal.
+fn forget_where(doomed: impl Fn(&DraftKey) -> bool) {
+    if !DRAFTS.peek().keys().any(&doomed) {
+        return;
+    }
+    forget_in(&mut DRAFTS.write(), doomed);
+    bump();
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/// Bumped on every change to the map or to `reviewdraft`'s buffer; the
+/// autosave loop compares it against what it last saved.
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn bump() {
+    REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Everything unsent, as the record the store keeps.
+pub fn snapshot() -> UiDrafts {
+    UiDrafts {
+        entries: entries_of(&DRAFTS.peek()),
+        review_edits: super::reviewdraft::snapshot(),
+    }
+}
+
+/// Fill the store from the saved record — once, at startup. Drafts whose card,
+/// review or session no longer exists are dropped.
+pub fn load(saved: UiDrafts, owner_exists: impl Fn(Uuid) -> bool) {
+    *DRAFTS.write() = map_of(saved.entries, &owner_exists);
+    super::reviewdraft::load(saved.review_edits.filter(|e| owner_exists(e.review_id)));
+}
+
+/// Send the current snapshot to the executor to save. Fire-and-forget: on quit
+/// the process may exit before it's written.
+pub fn save_now(exec: &ExecutorHandle) {
+    exec.send(ExecutorCommand::SaveUiDrafts {
+        drafts: Box::new(snapshot()),
+    });
+}
+
+/// Root-component loop that saves the drafts once they stop changing: each
+/// tick saves if something changed since the last save and nothing changed
+/// during the tick — or if a save has been pending for a while, so a long
+/// stretch of typing still lands.
+pub fn use_autosave(state: crate::state::AppState) {
+    use_future(move || async move {
+        const TICK: Duration = Duration::from_secs(1);
+        const MAX_PENDING_TICKS: u32 = 5;
+        let mut saved = REVISION.load(Ordering::Relaxed);
+        let mut seen = saved;
+        let mut pending = 0;
+        loop {
+            tokio::time::sleep(TICK).await;
+            let now = REVISION.load(Ordering::Relaxed);
+            if now == saved {
+                pending = 0;
+            } else {
+                pending += 1;
+                if now == seen || pending >= MAX_PENDING_TICKS {
+                    state.send(ExecutorCommand::SaveUiDrafts {
+                        drafts: Box::new(snapshot()),
+                    });
+                    saved = now;
+                    pending = 0;
+                }
+            }
+            seen = now;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -161,11 +278,17 @@ fn restore_str(map: &HashMap<DraftKey, String>, key: DraftKey) -> Option<String>
     map.get(&key).cloned()
 }
 
-fn mirror_str(map: &mut HashMap<DraftKey, String>, key: DraftKey, value: String, seed: &str) {
+/// Returns whether the map changed.
+fn mirror_str(
+    map: &mut HashMap<DraftKey, String>,
+    key: DraftKey,
+    value: String,
+    seed: &str,
+) -> bool {
     if value == seed {
-        map.remove(&key);
+        map.remove(&key).is_some()
     } else {
-        map.insert(key, value);
+        map.insert(key, value.clone()).as_ref() != Some(&value)
     }
 }
 
@@ -188,16 +311,54 @@ fn mirror_typed<T: Serialize + PartialEq>(
     origin_fp: &str,
     value: &T,
     seed: &T,
-) {
+) -> bool {
     if value == seed {
-        map.remove(&key);
+        map.remove(&key).is_some()
     } else if let Ok(raw) = serde_json::to_string(&(origin_fp, value)) {
-        map.insert(key, raw);
+        map.insert(key, raw.clone()).as_ref() != Some(&raw)
+    } else {
+        false
     }
 }
 
-fn forget_owner_in(map: &mut HashMap<DraftKey, String>, owner: Uuid) {
-    map.retain(|k, _| k.owner != owner);
+fn forget_in(map: &mut HashMap<DraftKey, String>, doomed: impl Fn(&DraftKey) -> bool) {
+    map.retain(|k, _| !doomed(k));
+}
+
+/// The map as stored entries, sorted so an unchanged map saves identical bytes.
+fn entries_of(map: &HashMap<DraftKey, String>) -> Vec<StoredDraft> {
+    let mut entries: Vec<StoredDraft> = map
+        .iter()
+        .map(|(k, v)| StoredDraft {
+            owner: k.owner,
+            field: k.field.to_string(),
+            value: v.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| (a.owner, &a.field).cmp(&(b.owner, &b.field)));
+    entries
+}
+
+/// Stored entries back into a map, dropping unknown field names and entries
+/// whose owner is gone.
+fn map_of(
+    entries: Vec<StoredDraft>,
+    owner_exists: impl Fn(Uuid) -> bool,
+) -> HashMap<DraftKey, String> {
+    entries
+        .into_iter()
+        .filter(|e| owner_exists(e.owner))
+        .filter_map(|e| {
+            let field = FIELDS.iter().copied().find(|f| *f == e.field)?;
+            Some((
+                DraftKey {
+                    owner: e.owner,
+                    field,
+                },
+                e.value,
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -285,6 +446,49 @@ mod tests {
     }
 
     #[test]
+    fn mirror_reports_whether_the_map_changed() {
+        let mut map = HashMap::new();
+        let k = key(Uuid::new_v4(), "chat");
+        assert!(mirror_str(&mut map, k, "a".into(), ""));
+        // A remount re-mirrors the same value: not a change worth saving.
+        assert!(!mirror_str(&mut map, k, "a".into(), ""));
+        assert!(mirror_str(&mut map, k, String::new(), ""));
+        assert!(!mirror_str(&mut map, k, String::new(), ""));
+    }
+
+    #[test]
+    fn stored_entries_round_trip_every_field() {
+        let mut map = HashMap::new();
+        let owner = Uuid::new_v4();
+        for (i, f) in FIELDS.iter().enumerate() {
+            map.insert(key(owner, f), format!("v{i}"));
+        }
+        let back = map_of(entries_of(&map), |_| true);
+        assert_eq!(back, map);
+    }
+
+    #[test]
+    fn loading_drops_unknown_fields_and_gone_owners() {
+        let alive = Uuid::new_v4();
+        let gone = Uuid::new_v4();
+        let entry = |owner, field: &str| StoredDraft {
+            owner,
+            field: field.into(),
+            value: "x".into(),
+        };
+        let map = map_of(
+            vec![
+                entry(alive, "chat"),
+                entry(alive, "renamed.field"),
+                entry(gone, "chat"),
+            ],
+            |id| id == alive,
+        );
+        assert_eq!(map.len(), 1);
+        assert_eq!(restore_str(&map, key(alive, "chat")), Some("x".into()));
+    }
+
+    #[test]
     fn forget_owner_clears_only_that_owner() {
         let mut map = HashMap::new();
         let mine = Uuid::new_v4();
@@ -292,8 +496,20 @@ mod tests {
         mirror_str(&mut map, key(mine, "chat"), "a".into(), "");
         mirror_str(&mut map, key(mine, "pr.body"), "b".into(), "");
         mirror_str(&mut map, key(theirs, "chat"), "c".into(), "");
-        forget_owner_in(&mut map, mine);
+        forget_in(&mut map, |k| k.owner == mine);
         assert_eq!(map.len(), 1);
         assert_eq!(restore_str(&map, key(theirs, "chat")), Some("c".into()));
+    }
+
+    #[test]
+    fn forget_by_prefix_keeps_the_owners_other_fields() {
+        let mut map = HashMap::new();
+        let mine = Uuid::new_v4();
+        mirror_str(&mut map, key(mine, "pr.title"), "t".into(), "");
+        mirror_str(&mut map, key(mine, "pr.branch"), "b".into(), "");
+        mirror_str(&mut map, key(mine, "chat"), "c".into(), "");
+        forget_in(&mut map, |k| k.owner == mine && k.field.starts_with("pr."));
+        assert_eq!(map.len(), 1);
+        assert_eq!(restore_str(&map, key(mine, "chat")), Some("c".into()));
     }
 }

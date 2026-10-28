@@ -168,6 +168,7 @@ pub fn spawn_with_forges(
                     scan_locks: Mutex::new(HashMap::new()),
                     gate: Mutex::new(gate::RunGate::new()),
                     arrivals: std::sync::atomic::AtomicU64::new(0),
+                    drafts_save_failing: std::sync::atomic::AtomicBool::new(false),
                     self_ref: self_ref.clone(),
                 });
                 // Background poll: every few minutes, discover new PRs to review
@@ -395,6 +396,10 @@ struct Executor {
     /// Hands out the monotonic arrival tickets that order the gate's queue (see
     /// [`gate::ARRIVAL`]).
     arrivals: std::sync::atomic::AtomicU64,
+    /// Set while draft autosaves keep failing, so a persistent failure (a full
+    /// disk) toasts once instead of on every autosave tick; cleared by the
+    /// next successful save.
+    drafts_save_failing: std::sync::atomic::AtomicBool,
     /// Back-reference for actor tasks that must call the executor directly:
     /// a command re-dispatched from an actor can race the in-flight claim of
     /// the very handler that spawned it and be silently dropped, stranding the
@@ -799,6 +804,26 @@ impl Executor {
                 // A raised (or lifted) concurrency cap frees slots — drain the
                 // run queue into them right away.
                 self.spawn_pump();
+                Ok(())
+            }
+            ExecutorCommand::SaveUiDrafts { drafts } => {
+                // A background autosave, not a click: report failures here
+                // rather than through the generic error toast, which would
+                // fire on every tick while the user types.
+                use std::sync::atomic::Ordering;
+                match self.store.save_ui_drafts(&drafts) {
+                    Ok(()) => self.drafts_save_failing.store(false, Ordering::Relaxed),
+                    Err(e) => {
+                        tracing::warn!("saving unsent drafts failed: {e}");
+                        if !self.drafts_save_failing.swap(true, Ordering::Relaxed) {
+                            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                                Uuid::nil(),
+                                Severity::Error,
+                                format!("Couldn't save unsent drafts: {e}"),
+                            ));
+                        }
+                    }
+                }
                 Ok(())
             }
             ExecutorCommand::SetSkipPlan { card_id, skip } => {
