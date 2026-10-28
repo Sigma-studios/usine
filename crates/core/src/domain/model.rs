@@ -1135,6 +1135,38 @@ pub struct DraftComment {
     pub selected: bool,
 }
 
+/// The UI's typed-but-unsent input, persisted so a restart (or a crash) doesn't
+/// lose it. The core treats it as an opaque blob: the app owns the meaning of
+/// every field, and loads it once at startup.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UiDrafts {
+    #[serde(default)]
+    pub entries: Vec<StoredDraft>,
+    /// The edit buffer for one PR review's drafted comments, if any.
+    #[serde(default)]
+    pub review_edits: Option<StoredReviewEdits>,
+}
+
+/// One draft slot: the card, review or session it belongs to, the UI's field
+/// name for it (e.g. `"chat"`), and its value as the UI stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredDraft {
+    pub owner: Uuid,
+    pub field: String,
+    pub value: String,
+}
+
+/// The user's working copy of a review's drafted comments, alongside the
+/// comments exactly as the agent drafted them (`origin`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReviewEdits {
+    pub review_id: Uuid,
+    pub origin: Vec<DraftComment>,
+    pub comments: Vec<DraftComment>,
+    pub summary: String,
+    pub verdict: ReviewEvent,
+}
+
 /// The rolled-up state of a PR's CI checks, collapsed from GitHub's
 /// `statusCheckRollup` to the four outcomes the board distinguishes. A failing
 /// or still-running build is worth knowing *before* spending a review pass on

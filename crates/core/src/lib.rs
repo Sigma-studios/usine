@@ -78,7 +78,8 @@ pub use domain::model::{
     DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, InvestigationRound,
     Mergeable, ModelSpec, PrInfo, PrReviewSub, PrState, PreviewStatus, PreviewUrl, Project,
     Provider, QaExchange, ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,
-    ReviewSummary, ReviewTask, ReviewThread, RunSub, Usage, CI_REGISTER_GRACE,
+    ReviewSummary, ReviewTask, ReviewThread, RunSub, StoredDraft, StoredReviewEdits, UiDrafts, Usage,
+    CI_REGISTER_GRACE,
     MERGEABILITY_RECOMPUTE_GRACE,
 };
 pub use domain::session::{

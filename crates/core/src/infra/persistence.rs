@@ -24,7 +24,7 @@ use crate::agent::fixes::{FixItem, FixReport};
 use crate::agent::handoff::Handoff;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
-    Card, CardAnswers, ExchangeKind, Project, QaExchange, ReviewComment, ReviewTask,
+    Card, CardAnswers, ExchangeKind, Project, QaExchange, ReviewComment, ReviewTask, UiDrafts,
 };
 use crate::domain::session::Session;
 use crate::error::{CoreError, Result};
@@ -331,7 +331,19 @@ impl CardAnswerRecord {
     }
 }
 
+/// The UI's unsent drafts (see [`UiDrafts`]). A single row, like settings:
+/// the app saves the whole map at once.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 16, version = 1, with = Json)]
+#[native_db]
+struct UiDraftsRecord {
+    #[primary_key]
+    id: u8,
+    drafts: UiDrafts,
+}
+
 const SETTINGS_ID: u8 = 1;
+const UI_DRAFTS_ID: u8 = 1;
 
 /// Model registry. Must be `'static` so the [`Database`] can be `'static` and
 /// thus stored in a `Clone + Send + Sync` handle.
@@ -385,6 +397,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<CardAnswerRecord>()
         .expect("define CardAnswerRecord");
+    models
+        .define::<UiDraftsRecord>()
+        .expect("define UiDraftsRecord");
     models
 });
 
@@ -448,6 +463,7 @@ impl Store {
         self.refresh_type::<CardReviewRecord>();
         self.refresh_type::<DismissedReviewsRecord>();
         self.refresh_type::<CardAnswerRecord>();
+        self.refresh_type::<UiDraftsRecord>();
     }
 
     /// Refresh one record type in its own transaction, best-effort: an undecodable
@@ -486,6 +502,29 @@ impl Store {
         };
         let rw = self.db.rw_transaction()?;
         let old: Option<SettingsRecord> = rw.get().primary(SETTINGS_ID)?;
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    // --- UI drafts ------------------------------------------------------
+
+    pub fn ui_drafts(&self) -> Result<UiDrafts> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<UiDraftsRecord> = r.get().primary(UI_DRAFTS_ID)?;
+        Ok(rec.map(|r| r.drafts).unwrap_or_default())
+    }
+
+    pub fn save_ui_drafts(&self, drafts: &UiDrafts) -> Result<()> {
+        let rec = UiDraftsRecord {
+            id: UI_DRAFTS_ID,
+            drafts: drafts.clone(),
+        };
+        let rw = self.db.rw_transaction()?;
+        let old: Option<UiDraftsRecord> = rw.get().primary(UI_DRAFTS_ID)?;
         match old {
             Some(old) => rw.update(old, rec)?,
             None => rw.insert(rec)?,
@@ -1770,6 +1809,7 @@ pub fn rebuild_database(old: &Path, new: &Path) -> Result<Vec<(&'static str, usi
     copy_table!(SessionRecord, "sessions");
     copy_table!(DismissedReviewsRecord, "dismissed_reviews");
     copy_table!(CardAnswerRecord, "answers");
+    copy_table!(UiDraftsRecord, "ui_drafts");
 
     rw.commit()?;
     Ok(report)
@@ -1853,6 +1893,42 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn ui_drafts_round_trip_and_overwrite() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.ui_drafts().unwrap(), UiDrafts::default());
+        let owner = Uuid::new_v4();
+        let comment = crate::DraftComment {
+            path: "a.rs".into(),
+            line: Some(3),
+            body: "nit".into(),
+            severity: "low".into(),
+            selected: true,
+        };
+        let drafts = UiDrafts {
+            entries: vec![crate::StoredDraft {
+                owner,
+                field: "chat".into(),
+                value: "half a thought".into(),
+            }],
+            review_edits: Some(crate::StoredReviewEdits {
+                review_id: owner,
+                origin: vec![comment.clone()],
+                comments: vec![crate::DraftComment {
+                    selected: false,
+                    ..comment
+                }],
+                summary: "lgtm".into(),
+                verdict: crate::ReviewEvent::Approve,
+            }),
+        };
+        store.save_ui_drafts(&drafts).unwrap();
+        assert_eq!(store.ui_drafts().unwrap(), drafts);
+        // A second save replaces the single row rather than adding one.
+        store.save_ui_drafts(&UiDrafts::default()).unwrap();
+        assert_eq!(store.ui_drafts().unwrap(), UiDrafts::default());
     }
 
     #[test]

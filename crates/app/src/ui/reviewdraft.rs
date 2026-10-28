@@ -10,13 +10,17 @@
 //! review is rendered and dropped when the review changes or is published, so
 //! one review's edits can never leak into the next.
 //!
+//! It's persisted alongside the draft store (`drafts::snapshot`/`load`): every
+//! change bumps the shared revision, and a restored buffer is kept only while
+//! its review exists and its `origin` still matches the drafted comments.
+//!
 //! This is the same origin-keyed pattern as `drafts::use_draft_of`, kept
 //! separate because two surfaces edit it through module-level setters rather
 //! than one component's signal; folding it onto the draft store is possible
 //! but low value.
 
 use dioxus::prelude::*;
-use usine_core::{DraftComment, ReviewEvent};
+use usine_core::{DraftComment, ReviewEvent, StoredReviewEdits};
 use uuid::Uuid;
 
 /// The user's working copy of a drafted review: which comments to send, their
@@ -65,6 +69,7 @@ pub(crate) fn ensure_seeded(
             summary: summary.to_string(),
             verdict,
         });
+        super::drafts::bump();
     }
 }
 
@@ -75,47 +80,77 @@ pub(crate) fn edits_for(review_id: Uuid) -> Option<DraftEdits> {
 
 /// Drop the buffer (after publishing or dismissing).
 pub(crate) fn clear() {
-    *DRAFTS.write() = None;
+    if DRAFTS.peek().is_some() {
+        *DRAFTS.write() = None;
+        super::drafts::bump();
+    }
+}
+
+/// The buffer as the record the store keeps.
+pub(crate) fn snapshot() -> Option<StoredReviewEdits> {
+    DRAFTS.peek().clone().map(|d| StoredReviewEdits {
+        review_id: d.review_id,
+        origin: d.origin,
+        comments: d.comments,
+        summary: d.summary,
+        verdict: d.verdict,
+    })
+}
+
+/// Restore the saved buffer at startup. `ensure_seeded` still reseeds it if
+/// the review's drafted comments have changed since.
+pub(crate) fn load(saved: Option<StoredReviewEdits>) {
+    *DRAFTS.write() = saved.map(|e| DraftEdits {
+        review_id: e.review_id,
+        origin: e.origin,
+        comments: e.comments,
+        summary: e.summary,
+        verdict: e.verdict,
+    });
+}
+
+/// Apply one edit to the buffer and mark the drafts changed.
+fn edit(f: impl FnOnce(&mut DraftEdits)) {
+    if let Some(d) = DRAFTS.write().as_mut() {
+        f(d);
+        super::drafts::bump();
+    }
 }
 
 /// Flip a comment's include/skip checkbox.
 pub(crate) fn toggle(index: usize) {
-    if let Some(d) = DRAFTS.write().as_mut() {
+    edit(|d| {
         if let Some(c) = d.comments.get_mut(index) {
             c.selected = !c.selected;
         }
-    }
+    });
 }
 
 /// Replace a comment's body with the user's edit.
 pub(crate) fn set_body(index: usize, body: String) {
-    if let Some(d) = DRAFTS.write().as_mut() {
+    edit(|d| {
         if let Some(c) = d.comments.get_mut(index) {
             c.body = body;
         }
-    }
+    });
 }
 
 /// Replace a comment's criticality with the maintainer's judgement. The empty
 /// string clears it — that comment then publishes untagged, verbatim.
 pub(crate) fn set_severity(index: usize, severity: String) {
-    if let Some(d) = DRAFTS.write().as_mut() {
+    edit(|d| {
         if let Some(c) = d.comments.get_mut(index) {
             c.severity = severity;
         }
-    }
+    });
 }
 
 pub(crate) fn set_summary(summary: String) {
-    if let Some(d) = DRAFTS.write().as_mut() {
-        d.summary = summary;
-    }
+    edit(|d| d.summary = summary);
 }
 
 pub(crate) fn set_verdict(verdict: ReviewEvent) {
-    if let Some(d) = DRAFTS.write().as_mut() {
-        d.verdict = verdict;
-    }
+    edit(|d| d.verdict = verdict);
 }
 
 /// The DOM id of a comment's inline thread in the diff viewer, so "jump to" can

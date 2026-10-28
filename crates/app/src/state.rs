@@ -250,6 +250,15 @@ impl AppState {
         for t in store.list_review_tasks().unwrap_or_default() {
             review_tasks.entry(t.project_id).or_default().push(t);
         }
+        // Unsent drafts from the last run, minus those whose card, review or
+        // session is gone.
+        if let Ok(saved) = store.ui_drafts() {
+            crate::ui::drafts::load(saved, |id| {
+                cards.iter().any(|c| c.id == id)
+                    || sessions.contains_key(&id)
+                    || review_tasks.values().flatten().any(|t| t.id == id)
+            });
+        }
 
         let (providers, forges, git) = backends();
         // The MCP server needs its own handle, taken before the store moves
@@ -399,6 +408,17 @@ impl AppState {
         match evt.kind {
             ExecutorEventKind::CardUpdated(card) => {
                 let card = *card;
+                // Drop drafts that can no longer be sent: the PR form once the
+                // PR exists, everything once the card is finished.
+                match card.state {
+                    CardState::Done | CardState::MergedWithoutReview { .. } => {
+                        crate::ui::drafts::forget_owner(card.id)
+                    }
+                    CardState::PrReview(_) | CardState::ReadyToMerge => {
+                        crate::ui::drafts::forget_prefix(card.id, "pr.")
+                    }
+                    _ => {}
+                }
                 let mut cards = self.cards;
                 let mut list = cards.write();
                 match list.iter_mut().find(|c| c.id == card.id) {

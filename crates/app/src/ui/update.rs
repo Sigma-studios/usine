@@ -2,8 +2,9 @@
 //! button that, once an update is found, grows an "Update when idle" toggle.
 //! Turning the toggle on builds the update straight away; only the restart
 //! waits, until no card, PR review or session has had work in flight for
-//! [`IDLE_GRACE`] — and the user isn't mid-edit: no unsent draft, no open
-//! dialog, no input for [`INPUT_QUIET`]. The bar is always mounted, so the control owns its state —
+//! [`IDLE_GRACE`] — and the user isn't mid-edit: no open dialog, no input for
+//! [`INPUT_QUIET`]. (Unsent drafts don't hold it: they're saved and come back
+//! after the restart.) The bar is always mounted, so the control owns its state —
 //! and the one automatic check per launch, [`LAUNCH_CHECK_DELAY`] in. The
 //! process work lives in `crate::update`.
 
@@ -22,7 +23,8 @@ const LAUNCH_CHECK_DELAY: Duration = Duration::from_secs(15);
 /// back-to-back runs (validation, then its fixes) doesn't count.
 const IDLE_GRACE: u32 = 10;
 /// The restart also waits until the user has gone this long without typing,
-/// clicking or scrolling — a restart throws away anything typed but unsent.
+/// clicking or scrolling — a restart throws away what's typed in a dialog, and
+/// the last second or so of typing the draft store hasn't saved yet.
 const INPUT_QUIET: Duration = Duration::from_secs(30);
 /// How long a launch check's "Update available" keeps its accent highlight.
 const HIGHLIGHT_FOR: Duration = Duration::from_secs(6);
@@ -45,7 +47,6 @@ enum Phase {
 /// What the user has open that holds the idle restart back.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum UserHold {
-    Draft,
     Dialog,
     /// Typed, clicked or scrolled within [`INPUT_QUIET`].
     Input,
@@ -67,7 +68,6 @@ fn label(phase: Phase, restart_on: bool, waiting: usize, hold: Option<UserHold>)
         Phase::Built if !restart_on => "Update installed — applies on next launch".into(),
         Phase::Built if waiting == 0 => match hold {
             None | Some(UserHold::Input) => "Restarting when idle…".into(),
-            Some(UserHold::Draft) => "Restarting when idle · waiting on an unsent draft".into(),
             Some(UserHold::Dialog) => "Restarting when idle · waiting on an open dialog".into(),
         },
         Phase::Built => {
@@ -280,14 +280,11 @@ pub fn UpdateControl() -> Element {
     }
 }
 
-/// What, if anything, the user has going that a restart would lose: a draft in
-/// the store, an open dialog (the New card / New session forms and confirm
-/// notes keep their text in plain signals), or input too recent to call them
-/// done. Unknown (the eval failed) counts as busy.
+/// What, if anything, the user has going that a restart would lose: an open
+/// dialog (the New card / New session forms and confirm notes keep their text
+/// in plain signals, outside the persisted draft store), or input too recent to
+/// call them done. Unknown (the eval failed) counts as busy.
 async fn user_hold() -> Option<UserHold> {
-    if super::drafts::any() {
-        return Some(UserHold::Draft);
-    }
     // Installs the input listener on first use (re-installed after a webview
     // reload); until then the clock starts at install, so INPUT_QUIET still
     // has to pass in full.
@@ -382,10 +379,6 @@ mod tests {
     #[test]
     fn a_built_update_says_when_the_user_holds_it() {
         assert_eq!(
-            label(Phase::Built, true, 0, Some(UserHold::Draft)),
-            "Restarting when idle · waiting on an unsent draft"
-        );
-        assert_eq!(
             label(Phase::Built, true, 0, Some(UserHold::Dialog)),
             "Restarting when idle · waiting on an open dialog"
         );
@@ -395,7 +388,7 @@ mod tests {
         );
         // Agent work outranks the user's hold.
         assert_eq!(
-            label(Phase::Built, true, 2, Some(UserHold::Draft)),
+            label(Phase::Built, true, 2, Some(UserHold::Dialog)),
             "Restarting when idle · waiting on 2 items"
         );
     }
