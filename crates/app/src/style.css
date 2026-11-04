@@ -1232,6 +1232,8 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 .md-h2 { font-size: 14px; }
 .md-h3, .md-h4, .md-h5, .md-h6 { font-size: 13px; color: var(--muted); }
 .md-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.md-list .md-list { margin-top: 4px; }
+.md-item-para { margin-top: 4px; }
 .md-code {
   margin: 0; padding: 8px 10px; border-radius: 6px; background: var(--panel-2);
   font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;

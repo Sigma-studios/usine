@@ -306,29 +306,8 @@ pub(crate) fn ArtifactText(
                     MdBlock::Code(code) => rsx! {
                         pre { key: "{i}", class: "md-code", "{code}" }
                     },
-                    MdBlock::Bullets(items) => rsx! {
-                        ul { key: "{i}", class: "md-list",
-                            for (j, item) in items.into_iter().enumerate() {
-                                match task_item(&item) {
-                                    Some((done, rest)) => rsx! {
-                                        li { key: "{j}", class: "md-task",
-                                            span { class: "md-check", if done { "☑" } else { "☐" } }
-                                            MdLine { line: rest.to_string(), on_path }
-                                        }
-                                    },
-                                    None => rsx! {
-                                        li { key: "{j}", MdLine { line: item.clone(), on_path } }
-                                    },
-                                }
-                            }
-                        }
-                    },
-                    MdBlock::Ordered(items) => rsx! {
-                        ol { key: "{i}", class: "md-list",
-                            for (j, item) in items.into_iter().enumerate() {
-                                li { key: "{j}", MdLine { line: item, on_path } }
-                            }
-                        }
+                    MdBlock::List(list) => rsx! {
+                        MdListView { key: "{i}", list, on_path }
                     },
                     MdBlock::Para(lines) => rsx! {
                         p { key: "{i}", class: "md-p",
@@ -385,6 +364,65 @@ pub(crate) fn ArtifactText(
     }
 }
 
+/// A bullet or numbered list, and its one level of sub-lists.
+#[component]
+fn MdListView(list: MdList, on_path: Option<EventHandler<String>>) -> Element {
+    let task = list.start.is_none();
+    let items = list.items.into_iter().enumerate().map(|(j, item)| {
+        rsx! {
+            MdListItem { key: "{j}", item, task, on_path }
+        }
+    });
+    match list.start {
+        // The first item's number is the list's: a section that picks up at
+        // `5.` must not read `1.`.
+        Some(n) => rsx! {
+            ol { class: "md-list", start: "{n}", {items} }
+        },
+        None => rsx! {
+            ul { class: "md-list", {items} }
+        },
+    }
+}
+
+/// One list item: its marker line (a checkbox when `task` and it is one), the
+/// paragraphs indented under it, its sub-list, then the paragraphs that follow
+/// the sub-list.
+#[component]
+fn MdListItem(item: MdItem, task: bool, on_path: Option<EventHandler<String>>) -> Element {
+    let mut lines = item.lines.into_iter();
+    let first = lines.next().unwrap_or_default();
+    let rest: Vec<String> = lines.collect();
+    let checkbox = if task {
+        task_item(&first).map(|(done, text)| (done, text.to_string()))
+    } else {
+        None
+    };
+    let class = if checkbox.is_some() { "md-task" } else { "" };
+    rsx! {
+        li { class,
+            match checkbox {
+                Some((done, text)) => rsx! {
+                    span { class: "md-check", if done { "☑" } else { "☐" } }
+                    MdLine { line: text, on_path }
+                },
+                None => rsx! {
+                    MdLine { line: first, on_path }
+                },
+            }
+            for (k, line) in rest.into_iter().enumerate() {
+                div { key: "{k}", class: "md-item-para", MdLine { line, on_path } }
+            }
+            if let Some(sub) = item.sub {
+                MdListView { list: sub, on_path }
+            }
+            for (k, line) in item.tail.into_iter().enumerate() {
+                div { key: "t{k}", class: "md-item-para", MdLine { line, on_path } }
+            }
+        }
+    }
+}
+
 /// One line's worth of inline spans.
 #[component]
 fn MdLine(line: String, on_path: Option<EventHandler<String>>) -> Element {
@@ -432,8 +470,7 @@ fn MdLine(line: String, on_path: Option<EventHandler<String>>) -> Element {
 enum MdBlock {
     Heading(u8, String),
     Para(Vec<String>),
-    Bullets(Vec<String>),
-    Ordered(Vec<String>),
+    List(MdList),
     Code(String),
     Quote(Vec<String>),
     Rule,
@@ -444,6 +481,56 @@ enum MdBlock {
         header: Vec<String>,
         rows: Vec<Vec<String>>,
     },
+}
+
+/// A bullet list (`start` is `None`) or a numbered one (`start` is the first
+/// item's number — later numbers are ignored, as in standard markdown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MdList {
+    start: Option<u32>,
+    items: Vec<MdItem>,
+}
+
+/// A list item: `lines[0]` is its marker line, later entries are paragraphs
+/// indented under it after a blank line. `sub` is the one level of nesting the
+/// parser understands — deeper indentation lands in the same sub-list, whose
+/// markers sit at `sub_indent`. `tail` holds the item's paragraphs that come
+/// after its sub-list (indented less than the sub-items' text), rendered below
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MdItem {
+    lines: Vec<String>,
+    sub: Option<MdList>,
+    sub_indent: usize,
+    tail: Vec<String>,
+}
+
+impl MdItem {
+    fn new(text: String) -> Self {
+        MdItem {
+            lines: vec![text],
+            sub: None,
+            sub_indent: 0,
+            tail: Vec::new(),
+        }
+    }
+
+    /// Where an indented, non-marker line under this item goes. Without a
+    /// sub-list that is the item itself. With one, a wrapped line (no blank
+    /// before it) continues whatever came last; after a blank line, text
+    /// indented to the sub-items' text column is a paragraph of the last
+    /// sub-item, and anything shallower is the item's own, after the sub-list.
+    fn text_target(&mut self, indent: usize, after_blank: bool) -> &mut Vec<String> {
+        if !self.tail.is_empty() {
+            return &mut self.tail;
+        }
+        let deep = !after_blank || indent >= self.sub_indent + 2;
+        match self.sub.as_mut().and_then(|s| s.items.last_mut()) {
+            Some(sub_item) if deep => &mut sub_item.lines,
+            Some(_) => &mut self.tail,
+            None => &mut self.lines,
+        }
+    }
 }
 
 /// A table column's alignment, from the colons of its separator cell.
@@ -471,8 +558,11 @@ impl Align {
 fn md_blocks(text: &str) -> Vec<MdBlock> {
     let mut out = Vec::new();
     let mut para: Vec<String> = Vec::new();
-    let mut bullets: Vec<String> = Vec::new();
-    let mut ordered: Vec<String> = Vec::new();
+    // The open list and the indent of its top-level markers.
+    let mut list: Option<(usize, MdList)> = None;
+    // A blank line went by inside the open list: indented text after it is a
+    // new paragraph of the item, not a wrap of its last line.
+    let mut after_blank = false;
     let mut quote: Vec<String> = Vec::new();
     let mut code: Option<Vec<String>> = None;
 
@@ -481,11 +571,8 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
             if !para.is_empty() {
                 out.push(MdBlock::Para(std::mem::take(&mut para)));
             }
-            if !bullets.is_empty() {
-                out.push(MdBlock::Bullets(std::mem::take(&mut bullets)));
-            }
-            if !ordered.is_empty() {
-                out.push(MdBlock::Ordered(std::mem::take(&mut ordered)));
+            if let Some((_, l)) = list.take() {
+                out.push(MdBlock::List(l));
             }
             if !quote.is_empty() {
                 out.push(MdBlock::Quote(std::mem::take(&mut quote)));
@@ -515,6 +602,14 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
             continue;
         }
         if trimmed.is_empty() {
+            // Agents leave blank lines between steps: the list carries on if
+            // what follows still belongs to it.
+            if let Some((base, l)) = &list {
+                if list_continues(&lines[idx..], *base, l.start.is_some()) {
+                    after_blank = true;
+                    continue;
+                }
+            }
             flush!();
             continue;
         }
@@ -568,30 +663,66 @@ fn md_blocks(text: &str) -> Vec<MdBlock> {
             quote.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
             continue;
         }
-        if let Some(item) = bullet_item(trimmed) {
-            if !para.is_empty() || !ordered.is_empty() || !quote.is_empty() {
+        if let Some((num, text)) = list_item(trimmed) {
+            if !para.is_empty() || !quote.is_empty() {
                 flush!();
             }
-            bullets.push(item);
-            continue;
-        }
-        if let Some(item) = ordered_item(trimmed) {
-            if !para.is_empty() || !bullets.is_empty() || !quote.is_empty() {
+            let indent = indent_of(raw);
+            let nests =
+                matches!(&list, Some((base, l)) if indent >= base + 2 && !l.items.is_empty());
+            let sibling = matches!(&list, Some((_, l)) if l.start.is_some() == num.is_some());
+            if nests {
+                // Indented under the last item: its sub-list, whose kind (and
+                // number) the first sub-item decides.
+                if let Some(parent) = list.as_mut().and_then(|(_, l)| l.items.last_mut()) {
+                    if parent.sub.is_none() {
+                        parent.sub_indent = indent;
+                    }
+                    parent
+                        .sub
+                        .get_or_insert_with(|| MdList {
+                            start: num,
+                            items: Vec::new(),
+                        })
+                        .items
+                        .push(MdItem::new(text));
+                }
+            } else if sibling {
+                if let Some((_, l)) = &mut list {
+                    l.items.push(MdItem::new(text));
+                }
+            } else {
                 flush!();
+                list = Some((
+                    indent,
+                    MdList {
+                        start: num,
+                        items: vec![MdItem::new(text)],
+                    },
+                ));
             }
-            ordered.push(item);
+            after_blank = false;
             continue;
         }
         // A continuation line under a list item belongs to it, not to a new
-        // paragraph — agents wrap long bullets.
-        if raw.starts_with("  ") {
-            if let Some(last) = bullets.last_mut().or_else(|| ordered.last_mut()) {
-                last.push(' ');
-                last.push_str(trimmed);
+        // paragraph — agents wrap long bullets. After a blank line it is a
+        // paragraph of its own inside the item.
+        let indent = indent_of(raw);
+        if indent >= 2 {
+            if let Some(item) = list.as_mut().and_then(|(_, l)| l.items.last_mut()) {
+                let target = item.text_target(indent, after_blank);
+                match target.last_mut() {
+                    Some(last) if !after_blank => {
+                        last.push(' ');
+                        last.push_str(trimmed);
+                    }
+                    _ => target.push(trimmed.to_string()),
+                }
+                after_blank = false;
                 continue;
             }
         }
-        if !bullets.is_empty() || !ordered.is_empty() || !quote.is_empty() {
+        if list.is_some() || !quote.is_empty() {
             flush!();
         }
         para.push(line.trim_start().to_string());
@@ -692,16 +823,44 @@ fn task_item(item: &str) -> Option<(bool, &str)> {
     (rest.1.is_empty() || rest.1.starts_with(' ')).then(|| (rest.0, rest.1.trim_start()))
 }
 
-/// The text of a `1. ` / `1) ` numbered item.
-fn ordered_item(line: &str) -> Option<String> {
+/// The number and text of a `1. ` / `1) ` numbered item. At most nine digits,
+/// as in CommonMark — so the number always fits.
+fn ordered_item(line: &str) -> Option<(u32, String)> {
     let digits = line.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
+    if !(1..=9).contains(&digits) {
         return None;
     }
-    line[digits..]
+    let text = line[digits..]
         .strip_prefix(". ")
-        .or_else(|| line[digits..].strip_prefix(") "))
-        .map(|s| s.trim().to_string())
+        .or_else(|| line[digits..].strip_prefix(") "))?;
+    Some((line[..digits].parse().ok()?, text.trim().to_string()))
+}
+
+/// A bullet (`None`) or numbered (`Some(n)`) item, and its text.
+fn list_item(line: &str) -> Option<(Option<u32>, String)> {
+    bullet_item(line)
+        .map(|text| (None, text))
+        .or_else(|| ordered_item(line).map(|(n, text)| (Some(n), text)))
+}
+
+/// Leading whitespace width, a tab counting as four spaces.
+fn indent_of(raw: &str) -> usize {
+    raw.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// After a blank line inside a list, whether the list goes on: the next
+/// non-blank line is indented under it, or is an item of the same kind. A
+/// paragraph, a heading, the other list kind or the end of the text ends it.
+fn list_continues(rest: &[&str], base: usize, ordered: bool) -> bool {
+    let Some(next) = rest.iter().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let t = next.trim();
+    indent_of(next) >= base + 2
+        || (!is_rule(t) && list_item(t).is_some_and(|(n, _)| n.is_some() == ordered))
 }
 
 /// One inline run.
@@ -944,6 +1103,131 @@ fn is_path_ref(word: &str) -> bool {
 mod md_tests {
     use super::*;
 
+    fn items(texts: &[&str]) -> Vec<MdItem> {
+        texts.iter().map(|t| MdItem::new(t.to_string())).collect()
+    }
+
+    pub(super) fn bullets(texts: &[&str]) -> MdBlock {
+        MdBlock::List(MdList {
+            start: None,
+            items: items(texts),
+        })
+    }
+
+    pub(super) fn ordered(start: u32, texts: &[&str]) -> MdBlock {
+        MdBlock::List(MdList {
+            start: Some(start),
+            items: items(texts),
+        })
+    }
+
+    fn list(block: &MdBlock) -> &MdList {
+        match block {
+            MdBlock::List(l) => l,
+            other => panic!("expected a list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numbered_lists_keep_numbers_and_structure() {
+        assert_eq!(md_blocks("5. x\n6. y"), vec![ordered(5, &["x", "y"])]);
+        assert_eq!(
+            md_blocks("1. a\n\n2. b\n\n3. c"),
+            vec![ordered(1, &["a", "b", "c"])],
+            "blank lines between steps must not restart the list"
+        );
+
+        let blocks = md_blocks("1. a\n   - s\n   - t\n2. b");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let l = list(&blocks[0]);
+        assert_eq!(l.start, Some(1));
+        assert_eq!(l.items.len(), 2);
+        assert_eq!(
+            l.items[0].sub,
+            Some(MdList {
+                start: None,
+                items: items(&["s", "t"])
+            })
+        );
+        assert_eq!(l.items[1], MdItem::new("b".into()));
+
+        let blocks = md_blocks("- a\n  - s\n- b");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let l = list(&blocks[0]);
+        assert_eq!(l.items.len(), 2, "a sub-bullet is not a sibling");
+        assert_eq!(l.items[0].sub.as_ref().map(|s| s.items.len()), Some(1));
+
+        let l = md_blocks("1. a\n   1. s");
+        assert_eq!(list(&l[0]).items[0].sub.as_ref().unwrap().start, Some(1));
+        let l = md_blocks("1. a\n   3. s");
+        assert_eq!(
+            list(&l[0]).items[0].sub.as_ref().unwrap().start,
+            Some(3),
+            "a numbered sub-list keeps its own start"
+        );
+
+        let blocks = md_blocks("1. a\n\n   more\n2. b");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let l = list(&blocks[0]);
+        assert_eq!(l.items[0].lines, vec!["a".to_string(), "more".to_string()]);
+        assert_eq!(l.items.len(), 2);
+
+        let blocks = md_blocks("1. a\n   - s\n     wrapped");
+        assert_eq!(
+            list(&blocks[0]).items[0].sub.as_ref().unwrap().items[0].lines,
+            vec!["s wrapped".to_string()]
+        );
+
+        // A paragraph after a step's sub-bullets, indented to the step and not
+        // to the sub-items' text, belongs to the step — below its sub-list.
+        let blocks = md_blocks("1. Step\n   - a\n   - b\n\n   Explanation\n   wrapped\n2. Next");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let l = list(&blocks[0]);
+        assert_eq!(l.items.len(), 2);
+        assert_eq!(l.items[0].lines, vec!["Step".to_string()]);
+        assert_eq!(l.items[0].tail, vec!["Explanation wrapped".to_string()]);
+        assert_eq!(
+            l.items[0].sub.as_ref().unwrap().items,
+            items(&["a", "b"]),
+            "the explanation is not a paragraph of `b`"
+        );
+        // Indented to the sub-item's text, it is the sub-item's paragraph.
+        let blocks = md_blocks("1. Step\n   - a\n\n     more");
+        let item = &list(&blocks[0]).items[0];
+        assert!(item.tail.is_empty());
+        assert_eq!(
+            item.sub.as_ref().unwrap().items[0].lines,
+            vec!["a".to_string(), "more".to_string()]
+        );
+
+        assert_eq!(
+            md_blocks("1. a\n\nPara"),
+            vec![ordered(1, &["a"]), MdBlock::Para(vec!["Para".into()])]
+        );
+        assert_eq!(
+            md_blocks("- one\n\n1. first"),
+            vec![bullets(&["one"]), ordered(1, &["first"])]
+        );
+        assert_eq!(
+            md_blocks("1. a\n\n---"),
+            vec![ordered(1, &["a"]), MdBlock::Rule]
+        );
+        assert_eq!(md_blocks("1. a\n\n"), vec![ordered(1, &["a"])]);
+
+        // The reporter's case: two sections, the second picking up at 5.
+        assert_eq!(
+            md_blocks("## A\n1. x\n\n2. y\n\n## B\n5. z"),
+            vec![
+                MdBlock::Heading(2, "A".into()),
+                ordered(1, &["x", "y"]),
+                MdBlock::Heading(2, "B".into()),
+                ordered(5, &["z"]),
+            ]
+        );
+        // Ten digits is not a list marker (CommonMark caps it at nine).
+        assert!(matches!(md_blocks("1234567890. x")[0], MdBlock::Para(_)));
+    }
+
     #[test]
     fn matches_agent_paths_against_diff_paths() {
         assert!(same_path("crates/app/src/lib.rs", "crates/app/src/lib.rs"));
@@ -972,14 +1256,8 @@ mod md_tests {
             blocks[1],
             MdBlock::Para(vec!["Do it.".into(), "And then some.".into()])
         );
-        assert_eq!(
-            blocks[2],
-            MdBlock::Bullets(vec!["one".into(), "two".into()])
-        );
-        assert_eq!(
-            blocks[3],
-            MdBlock::Ordered(vec!["first".into(), "second".into()])
-        );
+        assert_eq!(blocks[2], bullets(&["one", "two"]));
+        assert_eq!(blocks[3], ordered(1, &["first", "second"]));
         assert_eq!(blocks[4], MdBlock::Code("let x = 1;".into()));
     }
 
@@ -988,7 +1266,7 @@ mod md_tests {
         let blocks = md_blocks("- a long bullet\n  that wrapped\n- another");
         assert_eq!(
             blocks[0],
-            MdBlock::Bullets(vec!["a long bullet that wrapped".into(), "another".into()])
+            bullets(&["a long bullet that wrapped", "another"])
         );
     }
 
@@ -1123,7 +1401,7 @@ mod md_table_tests {
         }
         assert_eq!(
             md_blocks("- item\n* other"),
-            vec![MdBlock::Bullets(vec!["item".into(), "other".into()])]
+            vec![md_tests::bullets(&["item", "other"])]
         );
         assert_eq!(
             md_blocks("Para\n---\nmore"),
@@ -1140,8 +1418,8 @@ mod md_table_tests {
                 MdBlock::Para(vec!["after".into()]),
             ]
         );
-        assert_eq!(md_blocks("+ x"), vec![MdBlock::Bullets(vec!["x".into()])]);
-        assert_eq!(md_blocks("1) x"), vec![MdBlock::Ordered(vec!["x".into()])]);
+        assert_eq!(md_blocks("+ x"), vec![md_tests::bullets(&["x"])]);
+        assert_eq!(md_blocks("1) x"), vec![md_tests::ordered(1, &["x"])]);
         assert_eq!(task_item("[ ] a"), Some((false, "a")));
         assert_eq!(task_item("[x] b"), Some((true, "b")));
         assert_eq!(task_item("[X] c"), Some((true, "c")));
@@ -1274,13 +1552,20 @@ mod md_fuzz_tests {
                     MdBlock::Heading(_, l) | MdBlock::Code(l) => {
                         let _ = md_inline(l);
                     }
-                    MdBlock::Para(v)
-                    | MdBlock::Bullets(v)
-                    | MdBlock::Ordered(v)
-                    | MdBlock::Quote(v) => {
+                    MdBlock::Para(v) | MdBlock::Quote(v) => {
                         for l in v {
                             let _ = md_inline(l);
                             let _ = task_item(l);
+                        }
+                    }
+                    MdBlock::List(list) => {
+                        let subs = list.items.iter().filter_map(|i| i.sub.as_ref());
+                        for item in list.items.iter().chain(subs.flat_map(|s| &s.items)) {
+                            assert!(!item.lines.is_empty());
+                            for l in &item.lines {
+                                let _ = md_inline(l);
+                                let _ = task_item(l);
+                            }
                         }
                     }
                     MdBlock::Table {
