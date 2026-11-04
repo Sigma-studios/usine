@@ -138,20 +138,11 @@ fn clipboard_image_png() -> Option<Vec<u8>> {
 /// vision-capable Read tool, Codex receives them as `codex exec -i` flags. Non-
 /// image files ride as prompt-listed paths either way (Codex's `-i` filter only
 /// covers png/jpg/jpeg/gif/webp), which both CLIs read with their shell tools.
-///
-/// `can_attach: false` drops the picker but keeps the chips: in a terminal
-/// state nothing can ever read a new attachment, but what was attached earlier
-/// still has to be visible (and removable).
 #[component]
-pub(super) fn Attachments(card_id: Uuid, #[props(default = true)] can_attach: bool) -> Element {
+pub(super) fn Attachments(card_id: Uuid) -> Element {
     let atts_empty = use_context::<AppState>()
         .card_attachments(card_id)
         .is_empty();
-
-    // No picker and nothing to show: no section at all.
-    if atts_empty && !can_attach {
-        return rsx! {};
-    }
 
     rsx! {
         // Nothing attached: the section IS the button. A heading and a "No files
@@ -161,9 +152,7 @@ pub(super) fn Attachments(card_id: Uuid, #[props(default = true)] can_attach: bo
                 h3 { "Attachments" }
             }
             AttachmentChips { card_id }
-            if can_attach {
-                AttachButton { card_id }
-            }
+            AttachButton { card_id }
         }
     }
 }

@@ -517,3 +517,118 @@ async fn an_interrupted_question_retries_as_a_question() {
     );
     assert!(store.get_answer(card_id).unwrap().is_some());
 }
+
+/// A finished card keeps its Agent Chat: a question from `Done` wraps it,
+/// answers, and lands it back in `Done`, and every round stays in the log.
+/// With no worktree left (a merge removes it), the run must read the fresh
+/// `<base>` scratch tree, never the user's main checkout, and its prompt must
+/// say where the code is.
+#[tokio::test]
+async fn a_done_card_question_round_trips_and_keeps_history() {
+    use std::sync::Mutex;
+    use usine_core::{
+        AgentProvider, Provider, ProviderFactory, Result, RunConfig, RunHandle, RunMode,
+    };
+
+    type Runs = Arc<Mutex<Vec<(RunMode, PathBuf, String)>>>;
+    struct Spy {
+        inner: Arc<dyn AgentProvider>,
+        runs: Runs,
+    }
+    #[async_trait::async_trait]
+    impl AgentProvider for Spy {
+        fn provider(&self) -> Provider {
+            self.inner.provider()
+        }
+        fn interactive(&self) -> bool {
+            self.inner.interactive()
+        }
+        async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push((cfg.mode, cfg.project_dir.clone(), cfg.full_prompt()));
+            self.inner.start(cfg).await
+        }
+    }
+    struct SpyFactory(Runs);
+    impl ProviderFactory for SpyFactory {
+        fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
+            Arc::new(Spy {
+                inner: SimFactory.make(provider),
+                runs: self.0.clone(),
+            })
+        }
+    }
+
+    let store = Store::open_in_memory().unwrap();
+    let project_dir = "/tmp/question-done";
+    let card_id = seed_card(&store, project_dir);
+    store
+        .mutate_card(card_id, |c| {
+            c.state = CardState::Done;
+            Ok(())
+        })
+        .unwrap();
+    let runs: Runs = Arc::new(Mutex::new(Vec::new()));
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(SpyFactory(runs.clone())),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+
+    for q in ["what did this ship?", "and why that way?"] {
+        handle.send(ExecutorCommand::AskQuestion {
+            card_id,
+            question: q.into(),
+        });
+        wait_for(&mut rx, |e| match &e.kind {
+            ExecutorEventKind::CardUpdated(c) => match &c.state {
+                CardState::Answering { previous, .. } if **previous == CardState::Done => Some(()),
+                _ => None,
+            },
+            ExecutorEventKind::Toast { message, .. } if message.contains("parked") => {
+                panic!("a Done card must accept the question: {message}")
+            }
+            _ => None,
+        })
+        .await;
+        wait_for(&mut rx, |e| match &e.kind {
+            ExecutorEventKind::CardUpdated(c) => match &c.state {
+                CardState::Done => Some(()),
+                CardState::Failed { message, .. } => panic!("question run failed: {message}"),
+                _ => None,
+            },
+            _ => None,
+        })
+        .await;
+    }
+
+    let log = store.get_answers(card_id).unwrap();
+    let questions: Vec<_> = log.exchanges.iter().map(|x| x.question.as_str()).collect();
+    assert_eq!(
+        questions,
+        vec!["what did this ship?", "and why that way?"],
+        "the earlier round is kept"
+    );
+    assert!(log.exchanges.iter().all(|x| !x.answer.is_empty()));
+    assert_eq!(store.get_card(card_id).unwrap().state, CardState::Done);
+
+    let runs = runs.lock().unwrap();
+    assert_eq!(runs.len(), 2);
+    for (mode, dir, prompt) in runs.iter() {
+        assert_eq!(*mode, RunMode::Question);
+        assert_ne!(dir, &PathBuf::from(project_dir), "never the main checkout");
+        assert!(
+            dir.to_string_lossy()
+                .ends_with(&format!("{card_id}-design")),
+            "the fresh base scratch tree: {}",
+            dir.display()
+        );
+        assert!(
+            prompt.contains("This card is finished. This worktree is a fresh checkout of"),
+            "the prompt says where the code is: {prompt}"
+        );
+    }
+}

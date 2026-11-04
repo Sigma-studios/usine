@@ -36,7 +36,8 @@ pub fn CardView(card: Card) -> Element {
     let selected = *state.selected_card.read() == Some(id);
     // An Agent Chat answer landed while the card was closed. Opening the card
     // (see `AppState::select_card`) reads it. Only offered where the panel
-    // renders the chat log — a Done/merged card has none to scroll to.
+    // renders the chat log, so there is something to scroll to — finished
+    // (Done/merged) cards included, since they keep the chat.
     let unread_answer = super::detail::renders_chat(&card.state)
         && state.answers.read().get(&id).is_some_and(|l| l.unread);
 

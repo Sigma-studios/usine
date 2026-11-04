@@ -411,6 +411,10 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
                     )
                     | S::PrReview(PrReviewSub::Idle)
                     | S::ReadyToMerge
+                    // Finished cards too: the chat log survives the merge, so
+                    // the user can keep asking about the finished work.
+                    | S::Done
+                    | S::MergedWithoutReview { .. }
             ) =>
         {
             S::Answering {
@@ -1618,6 +1622,9 @@ mod tests {
             }),
             CardState::PrReview(PrReviewSub::Idle),
             CardState::ReadyToMerge,
+            CardState::Done,
+            CardState::MergedWithoutReview { merged: true },
+            CardState::MergedWithoutReview { merged: false },
         ]
     }
 
@@ -1645,7 +1652,7 @@ mod tests {
             assert_eq!(wrapped.column(), s.column());
         }
 
-        // Illegal everywhere else: unstarted, running, mid-question, terminal.
+        // Illegal everywhere else: unstarted, running, mid-question, concluded.
         for s in [
             CardState::StartingBlock,
             CardState::Designing(DesignSub::Running),
@@ -1663,7 +1670,6 @@ mod tests {
                 previous: Box::new(CardState::ReadyToMerge),
                 question: "q".into(),
             },
-            CardState::Done,
         ] {
             assert!(ask(&s).is_err(), "{s:?} must not accept AskQuestion");
         }

@@ -23,7 +23,8 @@ pub(super) const CHAT_HINT: &str = "Send this back to the agent, or just ask abo
 /// Props: `hint` overrides [`CHAT_HINT`] (only the plan panel needs to, since
 /// its request button also carries the answered questions);
 /// `on_request` dispatches the panel-specific change command with the typed
-/// text. `request_enabled_when_blank` lets the plan panel submit answered
+/// text; `None` (the finished `Done` / merged panels, whose PR is gone) drops
+/// the request button and leaves only "Ask questions". `request_enabled_when_blank` lets the plan panel submit answered
 /// questions with no free-form text (its request folds both), and
 /// `request_label` lets it retitle the button to what the send actually does
 /// (e.g. "Send answers") — with `request_label_nonblank` overriding it while
@@ -34,7 +35,7 @@ pub(super) const CHAT_HINT: &str = "Send this back to the agent, or just ask abo
 pub(super) fn AgentChatSection(
     card_id: Uuid,
     #[props(default = CHAT_HINT.to_string())] hint: String,
-    on_request: EventHandler<String>,
+    on_request: Option<EventHandler<String>>,
     #[props(default = false)] request_enabled_when_blank: bool,
     request_label: Option<String>,
     request_label_nonblank: Option<String>,
@@ -75,6 +76,11 @@ pub(super) fn AgentChatSection(
         (false, Some(l)) => l,
         _ => request_label.unwrap_or_else(|| "Request changes".to_string()),
     };
+    let placeholder = if on_request.is_some() {
+        "What should change — or what do you want to know?"
+    } else {
+        "What do you want to know about this work?"
+    };
 
     rsx! {
         div { class: "section",
@@ -95,7 +101,7 @@ pub(super) fn AgentChatSection(
                             key: "{g}",
                             // Stable hook for the debug keystroke-drop harness.
                             id: "chat-input",
-                            placeholder: "What should change — or what do you want to know?",
+                            placeholder,
                             initial_value: "{text.peek()}",
                             oninput: move |e| {
                                 let v = e.value();
@@ -108,7 +114,7 @@ pub(super) fn AgentChatSection(
                 } else {
                     textarea {
                         id: "chat-input",
-                        placeholder: "What should change — or what do you want to know?",
+                        placeholder,
                         value: "{text}",
                         oninput: move |e| {
                             let v = e.value();
@@ -121,19 +127,21 @@ pub(super) fn AgentChatSection(
                 AttachButton { card_id, icon: true }
             }
             div { class: "row",
-                button {
-                    class: "btn",
-                    disabled: blank && !request_enabled_when_blank,
-                    onclick: move |_| {
-                        let t = text.read().trim().to_string();
-                        if !t.is_empty() || request_enabled_when_blank {
-                            on_request.call(t);
-                            drafts::clear(card_id, "chat", text, String::new());
-                            generation += 1;
-                        }
-                    },
-                    title: "{request_title}",
-                    "{request_label}"
+                if let Some(on_request) = on_request {
+                    button {
+                        class: "btn",
+                        disabled: blank && !request_enabled_when_blank,
+                        onclick: move |_| {
+                            let t = text.read().trim().to_string();
+                            if !t.is_empty() || request_enabled_when_blank {
+                                on_request.call(t);
+                                drafts::clear(card_id, "chat", text, String::new());
+                                generation += 1;
+                            }
+                        },
+                        title: "{request_title}",
+                        "{request_label}"
+                    }
                 }
                 button {
                     class: "btn",
@@ -256,7 +264,7 @@ pub(super) fn summary_line(question: &str) -> String {
 /// The states whose panel renders an [`AgentChatSection`] — i.e. the ones that
 /// carry their own attach control, so the panel-top attachments section would
 /// duplicate it. Mirrors the call sites in `plan.rs`, `pr_create.rs`,
-/// `pr_review.rs` and the merge gate; computed from `effective()` so the
+/// `pr_review.rs`, the merge gate and the finished (`Done` / merged) panels; computed from `effective()` so the
 /// `Failed`/`Answering` wrappers resolve exactly as those panels do.
 ///
 /// Deliberately exhaustive — no `_` arm — so a new state or sub-state has to be
@@ -275,11 +283,15 @@ pub(in crate::ui) fn renders_chat(state: &CardState) -> bool {
             | ReviewSub::ReadyForPr,
         )
         | CardState::PrReview(PrReviewSub::Idle)
-        | CardState::ReadyToMerge => true,
+        | CardState::ReadyToMerge
+        // The finished panels render it too, ask-only: the chat log survives
+        // the merge and questions keep working there.
+        | CardState::MergedWithoutReview { .. }
+        | CardState::Done => true,
 
         // The running phases and the two panels with a send box of their own
-        // (the intervention answer, the conclusion's "dig deeper"), plus the
-        // terminal states: these keep the panel-top attachments section.
+        // (the intervention answer, the conclusion's "dig deeper"): these keep
+        // the panel-top attachments section.
         CardState::StartingBlock
         | CardState::Designing(DesignSub::Running | DesignSub::Intervention(_))
         | CardState::Investigating(_)
@@ -297,9 +309,7 @@ pub(in crate::ui) fn renders_chat(state: &CardState) -> bool {
             | PrReviewSub::ApplyingFixes
             | PrReviewSub::ApplyingChange
             | PrReviewSub::AwaitingAnswer(_),
-        )
-        | CardState::MergedWithoutReview { .. }
-        | CardState::Done => false,
+        ) => false,
 
         // Unreachable: `effective()` unwrapped both of these above.
         CardState::Failed { .. } | CardState::Answering { .. } | CardState::Updating { .. } => {

@@ -270,9 +270,20 @@ impl Executor {
             // they read that; before it exists (starting-block Agent Chat) they
             // get the same fresh design scratch tree as a plan run, rather than
             // whatever state the user's main checkout is in.
+            // A finished card's recorded worktree may be gone from disk (cleaned
+            // up by hand); its questions get the scratch tree too, matching
+            // the stage sentence `question_context` wrote for them.
             RunMode::Triage | RunMode::Question => match card.worktree_path.clone() {
-                Some(wt) => wt,
-                None => {
+                Some(wt)
+                    if wt.exists()
+                        || !matches!(
+                            card.state.effective(),
+                            CardState::Done | CardState::MergedWithoutReview { .. }
+                        ) =>
+                {
+                    wt
+                }
+                _ => {
                     self.design_dir_or_fault(&card, &project, resume_session.is_some())
                         .await?
                 }
@@ -1401,7 +1412,9 @@ impl Executor {
                 card = self.store.get_card(card_id)?;
             }
             let stored_plan = self.store.get_plan(card_id).unwrap_or(None);
-            let Some((stage, plan)) = question_context(&previous, stored_plan) else {
+            let project = self.store.get_project(card.project_id)?;
+            let base = project.config.effective_base_branch();
+            let Some((stage, plan)) = question_context(&card, &previous, base, stored_plan) else {
                 // No prompt can be rebuilt from this `previous` (it should
                 // always be a legal question entry point — see `ask_question`).
                 // Restore it rather than leaving the card parked in a running
@@ -1415,7 +1428,7 @@ impl Executor {
                 ));
                 return Ok(());
             };
-            let extra = question_extra(stage, plan.as_deref(), &question);
+            let extra = question_extra(&stage, plan.as_deref(), &question);
             return self
                 .launch(card, RunMode::Question, Some(extra), None)
                 .await;

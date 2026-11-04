@@ -12,6 +12,7 @@
 //! applies agent-driven transitions; the dispatcher handles user-driven
 //! transitions and routes answers to the right run via a shared control map.
 
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -33,8 +34,8 @@ use crate::agent::provider::{ProviderFactory, RunConfig, RunMode, UsageSource};
 use crate::domain::config::CardKind;
 use crate::domain::model::{
     now_millis, Card, CardAnswers, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict,
-    Intervention, InvestigationRound, Mergeable, PrReviewSub, Project, ReviewComment, ReviewEvent,
-    ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
+    Intervention, InvestigationRound, Mergeable, PrReviewSub, PrState, Project, ReviewComment,
+    ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
 };
 use crate::domain::state_machine::{note_entry, stop_transition, transition, Transition};
 use crate::error::{CoreError, Result};
@@ -166,6 +167,7 @@ pub fn spawn_with_forges(
                     previews: previews_for_exec,
                     validations: validations_for_exec,
                     scan_locks: Mutex::new(HashMap::new()),
+                    session_lanes: Mutex::new(HashMap::new()),
                     gate: Mutex::new(gate::RunGate::new()),
                     arrivals: std::sync::atomic::AtomicU64::new(0),
                     drafts_save_failing: std::sync::atomic::AtomicBool::new(false),
@@ -366,6 +368,12 @@ fn release_run(runs: &RunMap, card_id: Uuid, run_id: Uuid) {
 /// is nothing, and dropping one mid-scan would defeat the point.
 type ScanLocks = Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>;
 
+/// Per-session FIFO lanes of messages waiting for the session's claim (see
+/// [`Executor::enqueue_session_message`]). An entry exists exactly while a
+/// lane worker is alive for that session; it holds the messages not yet taken
+/// up, each with its arrival ticket.
+type SessionLanes = Mutex<HashMap<Uuid, std::collections::VecDeque<(u64, ExecutorCommand)>>>;
+
 struct Executor {
     store: Store,
     providers: Arc<dyn ProviderFactory>,
@@ -390,6 +398,8 @@ struct Executor {
     /// Serializes review scans per project, so two overlapping scans can't both
     /// decide a just-opened PR is untracked and create a task apiece for it.
     scan_locks: ScanLocks,
+    /// Session messages queued behind their session's in-flight command.
+    session_lanes: SessionLanes,
     /// The global concurrency gate: active slot owners + the FIFO queue of
     /// launches waiting for one (see [`gate::RunGate`]).
     gate: Mutex<gate::RunGate>,
@@ -430,6 +440,9 @@ impl Executor {
                         e.to_string(),
                     ));
                 }
+            } else if matches!(cmd, ExecutorCommand::SendSessionMessage { .. }) {
+                let ticket = self.next_arrival();
+                Arc::clone(&self).enqueue_session_message(ticket, cmd);
             } else {
                 // At most one lifecycle-advancing command per card at a time
                 // (see `InFlight`). A second one is a duplicate of work already
@@ -462,6 +475,60 @@ impl Executor {
                 }));
             }
         }
+    }
+
+    /// A session message is never a duplicate click — the composer clears on
+    /// send — so unlike the other exclusive commands it must not be dropped
+    /// while its session's claim is held (by the previous message's handler,
+    /// still finishing up after it queued or launched). Each session's
+    /// messages wait in a FIFO lane and take the claim one at a time, in the
+    /// order they were sent.
+    fn enqueue_session_message(self: Arc<Self>, ticket: u64, cmd: ExecutorCommand) {
+        let id = cmd.target_id();
+        {
+            let mut lanes = lock(&self.session_lanes);
+            if let Some(lane) = lanes.get_mut(&id) {
+                // Its worker is alive and drains it.
+                lane.push_back((ticket, cmd));
+                return;
+            }
+            lanes.insert(id, std::collections::VecDeque::from([(ticket, cmd)]));
+        }
+        tokio::spawn(async move {
+            loop {
+                // Popping and retiring the lane share the lock, so a message
+                // enqueued meanwhile is either seen here or starts a new worker.
+                let next = {
+                    let mut lanes = lock(&self.session_lanes);
+                    match lanes.get_mut(&id).and_then(|lane| lane.pop_front()) {
+                        Some(next) => next,
+                        None => {
+                            lanes.remove(&id);
+                            return;
+                        }
+                    }
+                };
+                let (ticket, cmd) = next;
+                let guard = loop {
+                    if let Some(g) = claim(&self.in_flight, &self.evt_tx, id) {
+                        break g;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                gate::ARRIVAL
+                    .scope(ticket, async {
+                        if let Err(e) = self.handle(cmd).await {
+                            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                                id,
+                                Severity::Error,
+                                e.to_string(),
+                            ));
+                        }
+                    })
+                    .await;
+                drop(guard);
+            }
+        });
     }
 
     async fn handle(&self, cmd: ExecutorCommand) -> Result<()> {
@@ -1479,27 +1546,108 @@ fn fixed_comment_qa(v: &FixVerdict) -> String {
 /// in the state itself and wins. `None` means the state is not a legal question
 /// entry point. Shared by `ask_question` and `relaunch` so a retried question
 /// rebuilds the exact same prompt.
+///
+/// `card` and `base` (the project's effective base branch) only matter for a
+/// finished card, whose sentence has to say where the code is: its own
+/// worktree when it survived, otherwise the fresh `<base>` scratch tree
+/// `launch` falls back to.
 fn question_context(
+    card: &Card,
     state: &CardState,
+    base: &str,
     stored_plan: Option<String>,
-) -> Option<(&'static str, Option<String>)> {
+) -> Option<(Cow<'static, str>, Option<String>)> {
     match state {
         CardState::Designing(DesignSub::AwaitingApproval { plan }) => Some((
-            "The proposed plan below is under review; nothing is implemented yet.",
+            "The proposed plan below is under review; nothing is implemented yet.".into(),
             Some(plan.clone()),
         )),
         CardState::AwaitingReview(
             ReviewSub::ReadyForReview | ReviewSub::ReadyForPr | ReviewSub::ValidationFailed { .. },
         ) => Some((
             "The implementation is complete and committed in this worktree, under review \
-             before a pull request is opened.",
+             before a pull request is opened."
+                .into(),
             stored_plan,
         )),
         CardState::PrReview(PrReviewSub::Idle) | CardState::ReadyToMerge => Some((
-            "This card's pull request is open; its branch is checked out in this worktree.",
+            "This card's pull request is open; its branch is checked out in this worktree.".into(),
             stored_plan,
         )),
+        CardState::Done | CardState::MergedWithoutReview { .. } => {
+            Some((finished_stage(card, state, base).into(), stored_plan))
+        }
         _ => None,
+    }
+}
+
+/// The stage sentence for a question about a finished (`Done` /
+/// `MergedWithoutReview`) card. Mirrors `launch`'s directory choice: a card
+/// worktree still on disk is used as-is, anything else runs in a fresh
+/// detached checkout of `<base>`.
+fn finished_stage(card: &Card, state: &CardState, base: &str) -> String {
+    let worktree_kept = card.worktree_path.as_deref().is_some_and(Path::exists);
+    let branch = card.branch.as_deref();
+    if worktree_kept {
+        return match branch {
+            Some(b) => format!(
+                "This card's work is finished; its branch `{b}` is checked out in this worktree."
+            ),
+            None => "This card's work is finished and checked out in this worktree.".to_string(),
+        };
+    }
+    let fresh = format!("This worktree is a fresh checkout of `{base}`");
+    let pr = card.pr.as_ref();
+    let merged_pr = pr.filter(|p| {
+        p.state == PrState::Merged
+            || matches!(state, CardState::MergedWithoutReview { merged: true })
+    });
+    let closed_pr =
+        pr.filter(|_| matches!(state, CardState::MergedWithoutReview { merged: false }));
+    let open_pr = pr.filter(|p| matches!(p.state, PrState::Open | PrState::Draft));
+    let inspect = |b: &str| {
+        format!(
+            " The card's branch `{b}` may still exist locally — inspect it read-only with \
+             `git log {base}..{b}` / `git diff {base}...{b}`."
+        )
+    };
+    if let Some(p) = merged_pr {
+        format!(
+            "This card's work is finished: its pull request #{} was merged into `{base}`. \
+             {fresh}, so the merged work is part of the code here (later commits may have \
+             changed it since).",
+            p.number
+        )
+    } else if let Some(p) = closed_pr {
+        let mut s = format!(
+            "This card is finished but its work was not merged: its pull request #{} was \
+             closed. {fresh}, so the card's changes are NOT in the code here.",
+            p.number
+        );
+        if let Some(b) = branch {
+            s.push_str(&inspect(b));
+        }
+        s
+    } else if let Some(p) = open_pr {
+        // Marked done while its PR was still open, worktree since removed.
+        let mut s = format!(
+            "This card is finished but its pull request #{} is still open, not merged. \
+             {fresh}, so the card's changes are NOT in the code here.",
+            p.number
+        );
+        if let Some(b) = branch {
+            s.push_str(&inspect(b));
+        }
+        s
+    } else if let Some(b) = branch {
+        // No PR and no worktree: merged locally (and kept its branch) or
+        // simply marked done — the record can't tell which.
+        format!(
+            "This card's work is finished. {fresh}, which may or may not include it.{}",
+            inspect(b)
+        )
+    } else {
+        format!("This card is finished. {fresh}.")
     }
 }
 
@@ -2053,6 +2201,96 @@ mod tests {
     fn question_extra_asks_for_a_tldr_on_long_answers() {
         let extra = question_extra("Stage.", None, "Why is the sky blue?");
         assert!(extra.contains("TL;DR"));
+    }
+
+    fn finished_card(state: CardState) -> Card {
+        use crate::domain::config::CardConfig;
+        let mut card = Card::new(Uuid::nil(), "c", "d", CardConfig::default());
+        card.state = state;
+        card.branch = Some("usine/feat-1".into());
+        card
+    }
+
+    fn pr(number: u64, state: PrState) -> crate::domain::model::PrInfo {
+        crate::domain::model::PrInfo {
+            number,
+            url: String::new(),
+            title: String::new(),
+            state,
+            reviewer: None,
+            reviewer_recorded: false,
+        }
+    }
+
+    fn stage_of(card: &Card) -> String {
+        let (stage, plan) =
+            question_context(card, &card.state, "main", Some("the plan".into())).unwrap();
+        assert_eq!(
+            plan.as_deref(),
+            Some("the plan"),
+            "the stored plan rides along"
+        );
+        stage.into_owned()
+    }
+
+    #[test]
+    fn finished_question_with_its_worktree_points_at_the_branch() {
+        let dir = std::env::temp_dir();
+        let mut card = finished_card(CardState::Done);
+        card.worktree_path = Some(dir);
+        let stage = stage_of(&card);
+        assert!(stage.contains("finished"), "{stage}");
+        assert!(stage.contains("`usine/feat-1` is checked out"), "{stage}");
+    }
+
+    #[test]
+    fn finished_question_after_a_merge_reads_the_fresh_base() {
+        let mut card = finished_card(CardState::Done);
+        card.pr = Some(pr(42, PrState::Merged));
+        let stage = stage_of(&card);
+        assert!(stage.contains("#42 was merged into `main`"), "{stage}");
+        assert!(stage.contains("fresh checkout of `main`"), "{stage}");
+
+        // Merged without review counts as merged even if the cached PR state lags.
+        let mut card = finished_card(CardState::MergedWithoutReview { merged: true });
+        card.pr = Some(pr(7, PrState::Open));
+        assert!(stage_of(&card).contains("#7 was merged"));
+    }
+
+    #[test]
+    fn finished_question_after_a_closed_pr_says_the_work_is_not_here() {
+        let mut card = finished_card(CardState::MergedWithoutReview { merged: false });
+        card.pr = Some(pr(9, PrState::Closed));
+        let stage = stage_of(&card);
+        assert!(stage.contains("not merged"), "{stage}");
+        assert!(stage.contains("NOT in the code here"), "{stage}");
+        assert!(stage.contains("git diff main...usine/feat-1"), "{stage}");
+    }
+
+    #[test]
+    fn finished_question_with_a_still_open_pr_says_the_work_is_not_here() {
+        let mut card = finished_card(CardState::Done);
+        card.pr = Some(pr(11, PrState::Open));
+        let stage = stage_of(&card);
+        assert!(stage.contains("#11 is still open"), "{stage}");
+        assert!(stage.contains("NOT in the code here"), "{stage}");
+        assert!(stage.contains("git diff main...usine/feat-1"), "{stage}");
+    }
+
+    #[test]
+    fn finished_question_without_pr_or_worktree_points_at_the_branch_read_only() {
+        let mut card = finished_card(CardState::Done);
+        // A recorded worktree that is gone from disk counts as no worktree.
+        card.worktree_path = Some(PathBuf::from("/nonexistent/usine-test-wt"));
+        let stage = stage_of(&card);
+        assert!(stage.contains("fresh checkout of `main`"), "{stage}");
+        assert!(stage.contains("`usine/feat-1` may still exist"), "{stage}");
+
+        card.branch = None;
+        assert_eq!(
+            stage_of(&card),
+            "This card is finished. This worktree is a fresh checkout of `main`."
+        );
     }
 
     #[test]

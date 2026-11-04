@@ -475,14 +475,10 @@ fn CardPanel(card: Card) -> Element {
         // want to hand a card you are already reviewing, and the chat and
         // revise paths send attachments along. Where the panel renders a chat
         // box, the control lives *in* that box instead (`chat::renders_chat`),
-        // next to the change it is evidence for. The terminal states keep the
-        // chips but lose the picker — nothing there can read a new attachment,
-        // yet what was attached earlier still has to be visible and removable.
+        // next to the change it is evidence for — the finished states included,
+        // since their questions read the card's attachments too.
         if !chat::renders_chat(&card.state) {
-            Attachments {
-                card_id: id,
-                can_attach: !matches!(st, CardState::Done | CardState::MergedWithoutReview { .. }),
-            }
+            Attachments { card_id: id }
         }
 
         // The main running phases used to render nothing actionable here; give
@@ -831,13 +827,37 @@ fn CardPanel(card: Card) -> Element {
             }
             // Terminal too, and just as bare — show what the run produced.
             OutcomeArtifacts { card_id: id }
+            FinishedChat { card_id: id, merged: *merged }
         }
 
         if matches!(st, CardState::Done) {
             DonePanel { card: card.clone() }
+            FinishedChat {
+                card_id: id,
+                merged: card.pr.as_ref().is_some_and(|p| p.state == usine_core::PrState::Merged),
+            }
         }
 
         TranscriptView { id }
+    }
+}
+
+/// The Agent Chat on a finished (`Done` / merged) card: the earlier rounds
+/// stay readable and questions keep working, but there is no "Request
+/// changes" — the PR is merged or closed, so a change would need a new branch.
+/// A merged card has no worktree, so the question reads a fresh checkout of
+/// the base branch, which holds the merged work. `merged` is false when
+/// nothing is known to have been merged (closed PR, marked done by hand), so
+/// the hint must not promise merged code.
+#[component]
+fn FinishedChat(card_id: Uuid, merged: bool) -> Element {
+    let hint = if merged {
+        "Ask the agent about the finished work — it reads the merged code."
+    } else {
+        "Ask the agent about the finished work — it reads the finished code."
+    };
+    rsx! {
+        AgentChatSection { card_id, hint: hint.to_string() }
     }
 }
 

@@ -708,7 +708,9 @@ impl Executor {
         let question = question.trim().to_string();
         let card = self.store.get_card(card_id)?;
         let stored_plan = self.store.get_plan(card_id).unwrap_or(None);
-        let Some((stage, plan)) = question_context(&card.state, stored_plan) else {
+        let project = self.store.get_project(card.project_id)?;
+        let base = project.config.effective_base_branch();
+        let Some((stage, plan)) = question_context(&card, &card.state, base, stored_plan) else {
             return Err(CoreError::IllegalTransition(
                 "questions can only be asked while the work is parked for your review".into(),
             ));
@@ -719,10 +721,12 @@ impl Executor {
         ) {
             // The question runs read-only, but make sure the branch is
             // checked out here so the agent looks at the PR's actual code
-            // (mirrors `request_post_pr_change`).
+            // (mirrors `request_post_pr_change`). Deliberately NOT done for a
+            // finished card: rebuilding its worktree would undo the merge's
+            // cleanup — `launch` reads a fresh `<base>` scratch tree instead.
             self.ensure_branch_worktree(card_id).await?;
         }
-        let extra = question_extra(stage, plan.as_deref(), &question);
+        let extra = question_extra(&stage, plan.as_deref(), &question);
         let card = self.apply(
             card_id,
             Transition::AskQuestion {
