@@ -1,9 +1,9 @@
-//! The MCP surface: protocol handshake, tool contract, and the two create
-//! tools' route onto the executor's command channel.
+//! The MCP surface: protocol handshake, tool contract, and the write tools'
+//! route onto the executor's command channel.
 //!
 //! The executor itself is not spawned — the tests stand in for its persistence
 //! handlers by draining the command channel and applying `AddProject` /
-//! `CreateCard` to the store. That is the point as much as a convenience: if a
+//! `CreateCard` / `UpdateCardText` / `DeleteCard` to the store. That is the point as much as a convenience: if a
 //! create tool ever wrote to the store directly, the drained channel would be
 //! empty and these tests would fail, which is exactly the regression to catch
 //! (a direct write would never reach the open board's reducer).
@@ -17,7 +17,9 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use usine_core::mcp::{handle_line, serve, socket_path, Ctx};
-use usine_core::{Card, CardState, DesignSub, ExecutorCommand, Project, ProjectConfig, Store};
+use usine_core::{
+    Card, CardOrigin, CardState, DesignSub, ExecutorCommand, Project, ProjectConfig, RunSub, Store,
+};
 
 /// A `Ctx` whose command channel is drained by a task that applies the
 /// persistence commands, standing in for the executor's own handlers.
@@ -32,6 +34,25 @@ fn ctx(store: Store) -> Ctx {
                 }
                 ExecutorCommand::AddProject { project } => {
                     sink.upsert_project(&project).unwrap();
+                }
+                ExecutorCommand::UpdateCardText {
+                    card_id,
+                    title,
+                    description,
+                } => {
+                    sink.mutate_card(card_id, |c| {
+                        if let Some(t) = title {
+                            c.title = t;
+                        }
+                        if let Some(d) = description {
+                            c.description = d;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                ExecutorCommand::DeleteCard { card_id, .. } => {
+                    sink.delete_card(card_id).unwrap();
                 }
                 other => panic!("MCP sent an unexpected command: {other:?}"),
             }
@@ -140,7 +161,7 @@ async fn initialize_echoes_a_supported_protocol_and_advertises_tools() {
 }
 
 #[tokio::test]
-async fn tools_list_is_the_six_tools_with_object_schemas() {
+async fn tools_list_is_the_eight_tools_with_object_schemas() {
     let ctx = ctx(Store::open_in_memory().unwrap());
     let resp = rpc(&ctx, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap().clone();
@@ -154,6 +175,8 @@ async fn tools_list_is_the_six_tools_with_object_schemas() {
             "get_plan",
             "create_project",
             "create_card",
+            "update_card",
+            "delete_card",
         ]
     );
     for t in &tools {
@@ -246,6 +269,8 @@ async fn create_card_goes_through_the_command_channel() {
     assert_eq!(card.state, CardState::StartingBlock, "created, not started");
     assert_eq!(card.description, "do it");
     assert_eq!(card.project_id, project.id);
+    assert_eq!(card.origin, CardOrigin::Mcp, "marked as the MCP's own");
+    assert_eq!(created["origin"], "mcp");
 
     let (msg, err) = call(
         &ctx,
@@ -255,6 +280,147 @@ async fn create_card_goes_through_the_command_channel() {
     .await;
     assert!(err, "a blank title is refused");
     assert!(msg.as_str().unwrap().contains("title"));
+}
+
+/// File a card over MCP and return its id.
+async fn mcp_card(ctx: &Ctx, project: &Project, title: &str) -> uuid::Uuid {
+    let (created, err) = call(
+        ctx,
+        "create_card",
+        json!({ "project": project.id.to_string(), "title": title, "description": "orig" }),
+    )
+    .await;
+    assert!(!err, "{created}");
+    created["id"].as_str().unwrap().parse().unwrap()
+}
+
+fn err_text(v: &Value) -> &str {
+    v.as_str().expect("error text")
+}
+
+#[tokio::test]
+async fn update_card_only_touches_the_mcps_own_cards() {
+    let store = Store::open_in_memory().unwrap();
+    let (project, board_card) = seed(&store);
+    let ctx = ctx(store.clone());
+
+    // A card the user filed is off limits.
+    let (msg, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": board_card.id.to_string(), "title": "Hijacked" }),
+    )
+    .await;
+    assert!(err, "{msg}");
+    assert!(err_text(&msg).contains("create_card"), "{msg}");
+    assert_eq!(
+        store.get_card(board_card.id).unwrap().title,
+        "Fix the widget"
+    );
+
+    // Title only: trimmed, description untouched.
+    let id = mcp_card(&ctx, &project, "Draft").await;
+    let (out, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": id.to_string(), "title": "  Better  " }),
+    )
+    .await;
+    assert!(!err, "{out}");
+    assert_eq!(out["title"], "Better");
+    let c = store.get_card(id).unwrap();
+    assert_eq!(c.title, "Better");
+    assert_eq!(c.description, "orig");
+
+    // Description only.
+    let (out, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": id.to_string(), "description": "new task" }),
+    )
+    .await;
+    assert!(!err, "{out}");
+    let c = store.get_card(id).unwrap();
+    assert_eq!(
+        (c.title.as_str(), c.description.as_str()),
+        ("Better", "new task")
+    );
+
+    // Nothing to do, or a blank title, is refused.
+    let (_, err) = call(&ctx, "update_card", json!({ "card": id.to_string() })).await;
+    assert!(err, "no fields is refused");
+    let (msg, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": id.to_string(), "title": "   " }),
+    )
+    .await;
+    assert!(err && err_text(&msg).contains("title"), "{msg}");
+    assert_eq!(store.get_card(id).unwrap().title, "Better");
+
+    // Once work has started the title still moves, the description doesn't —
+    // and a call that tries both changes nothing.
+    store
+        .mutate_card(id, |c| {
+            c.state = CardState::Implementing(RunSub::Running);
+            Ok(())
+        })
+        .unwrap();
+    let (out, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": id.to_string(), "title": "Renamed mid-run" }),
+    )
+    .await;
+    assert!(!err, "{out}");
+    assert_eq!(store.get_card(id).unwrap().title, "Renamed mid-run");
+    let (msg, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": id.to_string(), "title": "Both", "description": "late" }),
+    )
+    .await;
+    assert!(err, "{msg}");
+    assert!(err_text(&msg).contains("locked"), "{msg}");
+    let c = store.get_card(id).unwrap();
+    assert_eq!(c.title, "Renamed mid-run", "nothing applied");
+    assert_eq!(c.description, "new task");
+}
+
+#[tokio::test]
+async fn delete_card_only_removes_the_mcps_own_unstarted_cards() {
+    let store = Store::open_in_memory().unwrap();
+    let (project, board_card) = seed(&store);
+    let ctx = ctx(store.clone());
+
+    let (msg, err) = call(
+        &ctx,
+        "delete_card",
+        json!({ "card": board_card.id.to_string() }),
+    )
+    .await;
+    assert!(err && err_text(&msg).contains("create_card"), "{msg}");
+    assert!(store.get_card(board_card.id).is_ok());
+
+    let started = mcp_card(&ctx, &project, "Started").await;
+    store
+        .mutate_card(started, |c| {
+            c.state = CardState::Implementing(RunSub::Running);
+            Ok(())
+        })
+        .unwrap();
+    let (msg, err) = call(&ctx, "delete_card", json!({ "card": started.to_string() })).await;
+    assert!(err && err_text(&msg).contains("starting block"), "{msg}");
+    assert!(store.get_card(started).is_ok());
+
+    let fresh = mcp_card(&ctx, &project, "Duplicate").await;
+    let (out, err) = call(&ctx, "delete_card", json!({ "card": "Duplicate" })).await;
+    assert!(!err, "{out}");
+    assert_eq!(out["deleted"], true);
+    assert_eq!(out["title"], "Duplicate");
+    assert!(store.get_card(fresh).is_err());
+    let (_, err) = call(&ctx, "get_card", json!({ "card": fresh.to_string() })).await;
+    assert!(err, "gone from the MCP view too");
 }
 
 #[tokio::test]

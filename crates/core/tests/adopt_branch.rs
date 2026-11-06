@@ -537,7 +537,10 @@ async fn deleting_an_adopted_card_leaves_the_original_branch_alone() {
     })
     .await;
 
-    handle.send(ExecutorCommand::DeleteCard { card_id: card.id });
+    handle.send(ExecutorCommand::DeleteCard {
+        card_id: card.id,
+        starting_block_only: false,
+    });
     wait_for(&mut rx, |e| {
         matches!(&e.kind, ExecutorEventKind::CardRemoved if e.card_id == card.id).then_some(())
     })

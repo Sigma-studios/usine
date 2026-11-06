@@ -124,7 +124,10 @@ async fn deleting_a_card_reaps_its_worktree_and_branch() {
         forge: Arc::new(SimForge),
         git: Arc::new(RealGit),
     });
-    handle.send(ExecutorCommand::DeleteCard { card_id: card.id });
+    handle.send(ExecutorCommand::DeleteCard {
+        card_id: card.id,
+        starting_block_only: false,
+    });
 
     // CardRemoved is emitted only after teardown + the DB delete.
     wait_for(&mut rx, |e| {

@@ -532,7 +532,10 @@ async fn deleting_an_adopted_pr_card_leaves_the_remote_branch_alone() {
     let (store, project_id, handle, mut rx) = executor_for(&repo, PrForge::default());
     let card = adopt(&store, project_id, &handle, &mut rx).await;
 
-    handle.send(ExecutorCommand::DeleteCard { card_id: card.id });
+    handle.send(ExecutorCommand::DeleteCard {
+        card_id: card.id,
+        starting_block_only: false,
+    });
     wait_for(&mut rx, |e| {
         matches!(&e.kind, ExecutorEventKind::CardRemoved if e.card_id == card.id).then_some(())
     })

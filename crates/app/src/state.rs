@@ -1347,7 +1347,10 @@ impl AppState {
     /// Delete a card. Removal + selection clearing happen on the `CardRemoved`
     /// echo from the executor.
     pub fn delete_card(&self, id: Uuid) {
-        self.send(ExecutorCommand::DeleteCard { card_id: id });
+        self.send(ExecutorCommand::DeleteCard {
+            card_id: id,
+            starting_block_only: false,
+        });
     }
 
     // --- derived views ---------------------------------------------------

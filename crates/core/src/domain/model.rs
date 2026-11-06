@@ -1553,6 +1553,20 @@ pub const CI_REGISTER_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// is never distrusted, so this only has to outlast the recompute.
 pub const MERGEABILITY_RECOMPUTE_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Where a card was filed from. Gates the MCP surface's edit and delete tools:
+/// an external agent may only rename, re-describe or remove cards it created
+/// itself, never ones the user filed on the board.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardOrigin {
+    /// Filed by the user in the app (and every record written before this
+    /// field existed).
+    #[default]
+    Board,
+    /// Filed by the MCP `create_card` tool.
+    Mcp,
+}
+
 /// A unit of work moving across the board.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Card {
@@ -1706,6 +1720,10 @@ pub struct Card {
     /// `#[serde(default)]` keeps older records loadable.
     #[serde(default)]
     pub scenario_script: Option<String>,
+    /// Who filed the card — see [`CardOrigin`]. Set once at creation and never
+    /// rewritten. `#[serde(default)]` loads older records as `Board`.
+    #[serde(default)]
+    pub origin: CardOrigin,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1760,6 +1778,7 @@ impl Card {
             entered_from: None,
             investigation_rounds: Vec::new(),
             scenario_script: None,
+            origin: CardOrigin::Board,
             created_at: now,
             updated_at: now,
         }
@@ -2017,6 +2036,25 @@ pub(crate) fn normalize_blocked_note(blocked: bool, note: Option<String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_record_without_an_origin_loads_as_board() {
+        let card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        let mut v = serde_json::to_value(&card).unwrap();
+        assert_eq!(v["origin"], "board");
+        v.as_object_mut().unwrap().remove("origin");
+        let back: Card = serde_json::from_value(v).unwrap();
+        assert_eq!(back.origin, CardOrigin::Board);
+
+        let mut mcp = card.clone();
+        mcp.origin = CardOrigin::Mcp;
+        let v = serde_json::to_value(&mcp).unwrap();
+        assert_eq!(v["origin"], "mcp");
+        assert_eq!(
+            serde_json::from_value::<Card>(v).unwrap().origin,
+            CardOrigin::Mcp
+        );
+    }
 
     #[test]
     fn fable_5_1_takes_the_full_range_up_to_max_but_not_ultra() {

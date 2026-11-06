@@ -75,7 +75,7 @@ pub use domain::config::{
     AppSettings, CardConfig, CardKind, ForgeKind, PreviewPort, ProjectConfig, SessionDefaults,
 };
 pub use domain::model::{
-    now_millis, supported_efforts, Card, CardAnswers, CardState, CheckStatus, Column, Cost,
+    now_millis, supported_efforts, Card, CardAnswers, CardOrigin, CardState, CheckStatus, Column, Cost,
     DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, InvestigationRound,
     Mergeable, ModelSpec, PrInfo, PrReviewSub, PrState, PreviewStatus, PreviewUrl, Project,
     Provider, QaExchange, ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,

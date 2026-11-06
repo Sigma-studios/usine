@@ -351,19 +351,43 @@ fn CardDetail() -> Element {
 /// `EditableTask`'s commit pattern: a local mirror saved on blur/Enter
 /// (`onchange`), plus an unmount commit so deselecting mid-edit — which tears
 /// the panel down before blur can fire — doesn't drop the typed text.
-/// Comparing against the last value this input committed (seeded with the
-/// mount-time title) keeps an untouched input from overwriting an edit that
-/// arrived from elsewhere, while still saving a rename back to a previously
-/// committed value; a blur-then-unmount double save is idempotent.
+/// Comparing against the last value seen from the store (`committed`: the
+/// mount-time title, then each save and each outside rename) keeps an
+/// untouched input from overwriting an edit that arrived from elsewhere, while
+/// still saving a rename back to a previously committed value; a
+/// blur-then-unmount double save is idempotent.
+///
+/// A rename from elsewhere (the MCP `update_card` tool) is pushed into the open
+/// input when the user has nothing unsaved in it; mid-edit, their text is left
+/// alone and their blur-save wins.
 #[component]
 fn EditableTitle(card_id: Uuid, title: String) -> Element {
     let state = use_context::<AppState>();
     let mut buf = use_signal(|| title.clone());
     let mut committed = use_signal(|| title.clone());
     // Uncontrolled field (see `chat.rs`): only a remount can push a value back
-    // into it, so Escape's revert bumps this generation and the input is keyed
-    // with it. The remount costs focus, which `onmounted` puts back.
+    // into it, so Escape's revert — and an outside rename — bumps this
+    // generation and the input is keyed with it. The remount costs focus,
+    // which `onmounted` puts back after an Escape, and after an outside rename
+    // that lands while the field is focused (`focused`).
     let mut generation = use_signal(|| 0u32);
+    let mut refocus = use_signal(|| false);
+    let mut focused = use_signal(|| false);
+    let incoming = use_memo(use_reactive!(|title| title));
+    use_effect(move || {
+        let t = incoming();
+        if t == *committed.peek() {
+            return;
+        }
+        // No unsaved typing: show the new title. Otherwise only move the
+        // baseline, so Escape reverts to what is stored now.
+        if *buf.peek() == *committed.peek() {
+            buf.set(t.clone());
+            refocus.set(*focused.peek());
+            generation += 1;
+        }
+        committed.set(t);
+    });
     use_drop(move || {
         let t = buf.peek().clone();
         if t != *committed.peek() {
@@ -374,6 +398,7 @@ fn EditableTitle(card_id: Uuid, title: String) -> Element {
         for g in [generation()] {
             input {
                 key: "{g}",
+                id: "card-title",
                 class: "detail-title-input",
                 initial_value: "{buf.peek()}",
                 placeholder: "Untitled card",
@@ -387,15 +412,18 @@ fn EditableTitle(card_id: Uuid, title: String) -> Element {
                 onkeydown: move |e: KeyboardEvent| {
                     if e.key() == Key::Escape {
                         buf.set(committed.peek().clone());
+                        refocus.set(true);
                         generation += 1;
                     }
                 },
-                onmounted: move |e: MountedEvent| {
-                    // Only after a revert — the first mount must not steal focus.
-                    if g > 0 {
-                        spawn(async move {
-                            let _ = e.data().set_focus(true).await;
-                        });
+                onfocus: move |_| focused.set(true),
+                onblur: move |_| focused.set(false),
+                onmounted: move |_| {
+                    // Only after a revert, or an outside rename under the
+                    // user's caret — the first mount must not steal focus.
+                    if *refocus.peek() {
+                        refocus.set(false);
+                        edit::refocus_at_end("card-title");
                     }
                 },
             }

@@ -777,7 +777,61 @@ impl Executor {
                 let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
                 Ok(())
             }
-            ExecutorCommand::DeleteCard { card_id } => {
+            ExecutorCommand::UpdateCardText {
+                card_id,
+                title,
+                description,
+            } => {
+                // Only the fields the caller named; nothing read earlier is
+                // written back. The description lock is checked here, inside
+                // the same transaction as the write, so a `Start` that landed
+                // after the caller's read can't be followed by a rewrite of
+                // the task it is working from.
+                let busy = lock(&self.in_flight).contains(&card_id);
+                let updated = self.store.mutate_card(card_id, |c| {
+                    if description.is_some() && (busy || c.state != CardState::StartingBlock) {
+                        return Err(CoreError::other(format!(
+                            "card “{}” has started: its description is locked",
+                            c.title
+                        )));
+                    }
+                    if let Some(title) = &title {
+                        c.title = title.clone();
+                    }
+                    if let Some(description) = &description {
+                        c.description = description.clone();
+                    }
+                    c.updated_at = now_millis();
+                    Ok(())
+                })?;
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+                Ok(())
+            }
+            ExecutorCommand::DeleteCard {
+                card_id,
+                starting_block_only,
+            } => {
+                // The MCP's delete: hold the card's claim for the whole
+                // teardown so a `Start` arriving meanwhile is dropped as a
+                // duplicate instead of launching on a card being deleted, and
+                // re-check the state under it.
+                let _claim = if starting_block_only {
+                    let Some(claim) = claim(&self.in_flight, &self.evt_tx, card_id) else {
+                        return Err(CoreError::other(
+                            "card is busy: only cards still in the starting block can be deleted",
+                        ));
+                    };
+                    let card = self.store.get_card(card_id)?;
+                    if card.state != CardState::StartingBlock {
+                        return Err(CoreError::other(format!(
+                            "card “{}” has started: only cards still in the starting block can be deleted",
+                            card.title
+                        )));
+                    }
+                    Some(claim)
+                } else {
+                    None
+                };
                 // Reap the card's runtime + git artifacts before dropping the
                 // record: afterward there's no UI, and no stored worktree/branch
                 // path, left to stop a run, kill a preview, or remove a worktree —

@@ -23,15 +23,40 @@ pub(super) fn EditableTask(card: Card) -> Element {
     // Local copy of the description, saved on blur; it also drives the
     // auto-grow wrapper (`data-replicated-value`).
     let mut desc = use_signal(|| card.description.clone());
+    // The last description seen from the store: the mount-time value, then
+    // each echo of our own saves and each outside edit (the MCP `update_card`
+    // tool can rewrite it while the card sits in the starting block).
+    let mut seen = use_signal(|| card.description.clone());
+    // Uncontrolled textarea: only a remount pushes an outside edit into it.
+    let mut generation = use_signal(|| 0u32);
+    // Whether the field has focus, so a remount for an outside edit can hand
+    // it back (`refocus`) — never set on the first mount, which must not
+    // steal focus.
+    let mut focused = use_signal(|| false);
+    let mut refocus = use_signal(|| false);
+    let incoming = use_memo(use_reactive!(|card| card.description.clone()));
+    use_effect(move || {
+        let d = incoming();
+        if d == *seen.peek() {
+            return;
+        }
+        // No unsaved typing: show the new description. Mid-edit, leave the
+        // user's text alone — their blur-save wins (last write wins).
+        if *desc.peek() == *seen.peek() {
+            desc.set(d.clone());
+            refocus.set(*focused.peek());
+            generation += 1;
+        }
+        seen.set(d);
+    });
     // Deselecting (or a state change) unmounts this panel before blur can fire,
     // which would silently drop whatever was typed — commit on unmount too.
-    // Comparing against the mount-time value keeps an untouched field from
-    // overwriting an edit that arrived from elsewhere; a blur-then-unmount
-    // double save is idempotent.
-    let original_desc = card.description.clone();
+    // Comparing against the last stored value keeps an untouched field from
+    // writing back an older description; a blur-then-unmount double save is
+    // idempotent.
     use_drop(move || {
         let d = desc.peek().clone();
-        if d != original_desc {
+        if d != *seen.peek() {
             state.update_card(id, |c| c.description = d);
         }
     });
@@ -43,23 +68,36 @@ pub(super) fn EditableTask(card: Card) -> Element {
                 label { r#for: "task-desc", "Description" }
                 div { class: "grow-wrap", "data-replicated-value": "{desc}",
                     if crate::stress::fix_c() {
-                        textarea {
-                            id: "task-desc",
-                            // Uncontrolled (see `detail/chat.rs`): a controlled
-                            // `value` re-emits a DOM patch a frame after every
-                            // keystroke, and a keystroke macOS splits into two
-                            // mutations (dead key `^e`, smart quotes) makes the
-                            // first patch stale — WebKit then reparks the caret
-                            // at the end. Nothing but this field writes the
-                            // description while the card is in StartingBlock,
-                            // so `defaultValue` seeding is enough, with no
-                            // remount generation to carry.
-                            initial_value: "{desc.peek()}",
-                            placeholder: "What should the agent do? (paste a screenshot to attach it)",
-                            oninput: move |e| desc.set(e.value()),
-                            onchange: move |e| state.update_card(id, |c| c.description = e.value()),
-                            // Paste an image from the clipboard to attach it.
-                            onpaste: move |_| attach_from_clipboard(state, id),
+                        for g in [generation()] {
+                            textarea {
+                                key: "{g}",
+                                id: "task-desc",
+                                // Uncontrolled (see `detail/chat.rs`): a controlled
+                                // `value` re-emits a DOM patch a frame after every
+                                // keystroke, and a keystroke macOS splits into two
+                                // mutations (dead key `^e`, smart quotes) makes the
+                                // first patch stale — WebKit then reparks the caret
+                                // at the end. So the field is seeded through
+                                // `defaultValue`, and an outside edit (MCP
+                                // `update_card`) reaches it by bumping `generation`,
+                                // which keys — and so remounts — the textarea.
+                                initial_value: "{desc.peek()}",
+                                placeholder: "What should the agent do? (paste a screenshot to attach it)",
+                                oninput: move |e| desc.set(e.value()),
+                                onchange: move |e| state.update_card(id, |c| c.description = e.value()),
+                                // Paste an image from the clipboard to attach it.
+                                onpaste: move |_| attach_from_clipboard(state, id),
+                                onfocus: move |_| focused.set(true),
+                                onblur: move |_| focused.set(false),
+                                onmounted: move |_| {
+                                    // A remount under the user's caret (outside
+                                    // edit while focused) gives focus back.
+                                    if *refocus.peek() {
+                                        refocus.set(false);
+                                        refocus_at_end("task-desc");
+                                    }
+                                },
+                            }
                         }
                     } else {
                         // The pre-fix rendering, kept only so `USINE_STRESS_CARET`
@@ -77,6 +115,21 @@ pub(super) fn EditableTask(card: Card) -> Element {
             }
         }
     }
+}
+
+/// Focus field `id` with the caret at the end of its text: how a field
+/// remounted under the user's caret (to show an outside edit) gets focus back.
+/// The caret goes to the end since the text it sat in was just replaced.
+pub(super) fn refocus_at_end(id: &str) {
+    dioxus::document::eval(&format!(
+        "(function(){{\
+           var el = document.getElementById('{id}');\
+           if (!el) return;\
+           el.focus();\
+           var n = el.value.length;\
+           el.setSelectionRange(n, n);\
+         }})();"
+    ));
 }
 
 /// The `onpaste` handler every text field with an attach affordance uses: if

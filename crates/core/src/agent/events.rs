@@ -557,9 +557,27 @@ pub enum ExecutorCommand {
     SaveCard {
         card: Box<Card>,
     },
+    /// Set just the given text fields on a card, leaving everything else —
+    /// config included — as stored. The MCP `update_card` tool's write: unlike
+    /// [`Self::SaveCard`] it carries no snapshot, so it can't clobber a config
+    /// change the user made in the UI in the meantime. Not exclusive: a rename
+    /// is not a state change and applies even while a run holds the card. A
+    /// description, though, is refused unless the card is still in the starting
+    /// block with nothing in flight — checked when the command is applied, not
+    /// on the caller's earlier read.
+    UpdateCardText {
+        card_id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+    },
     /// Delete a card and its associated transcript/plan/options.
     DeleteCard {
         card_id: Uuid,
+        /// Refuse unless the card is in the starting block with nothing in
+        /// flight (the MCP `delete_card` tool's rule), checked under a claim
+        /// on the card so a `Start` can't slip in between check and delete.
+        /// The board's delete passes `false`: the user may delete any card.
+        starting_block_only: bool,
     },
     /// Persist a newly added project.
     AddProject {
@@ -757,7 +775,8 @@ impl ExecutorCommand {
             | ExecutorCommand::MarkDone { card_id }
             | ExecutorCommand::Retry { card_id }
             | ExecutorCommand::RetryFresh { card_id }
-            | ExecutorCommand::DeleteCard { card_id }
+            | ExecutorCommand::DeleteCard { card_id, .. }
+            | ExecutorCommand::UpdateCardText { card_id, .. }
             | ExecutorCommand::SetSkipPlan { card_id, .. }
             | ExecutorCommand::SetAutoReview { card_id, .. }
             | ExecutorCommand::SetBlocked { card_id, .. }
@@ -899,6 +918,7 @@ impl ExecutorCommand {
             self,
             ExecutorCommand::CreateCard { .. }
                 | ExecutorCommand::SaveCard { .. }
+                | ExecutorCommand::UpdateCardText { .. }
                 | ExecutorCommand::AddProject { .. }
                 | ExecutorCommand::SaveProject { .. }
                 | ExecutorCommand::SaveSettings { .. }

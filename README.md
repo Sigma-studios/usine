@@ -158,16 +158,19 @@ demo DB name applies under whichever directory is active).
 
 Usine serves a small [MCP](https://modelcontextprotocol.io) surface over the
 board, so an external agent — a terminal Claude Code session, say — can see
-what's in flight and file new work without you switching apps. Six tools:
+what's in flight and file new work without you switching apps. Eight tools:
 
 | Tool | |
 |---|---|
 | `list_projects`, `list_cards`, `get_card`, `get_plan` | read the board |
 | `create_project`, `create_card` | add a repo / file a card in the starting block |
+| `update_card`, `delete_card` | rename / re-describe / delete a card the MCP itself created (description and delete: starting block only) |
 
 Nothing here can start an agent run: a card created over MCP lands in the
 starting block and waits for you. It does appear on an open board immediately —
-the write goes through the same executor command the UI uses.
+the write goes through the same executor command the UI uses. Cards you file
+on the board are never editable or deletable over MCP; each card's `origin`
+(`board` / `mcp`) is reported in `list_cards` and `get_card`.
 
 Register it with a client:
 

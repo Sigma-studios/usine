@@ -1,10 +1,15 @@
-//! The six tools the MCP surface exposes, and their dispatch.
+//! The eight tools the MCP surface exposes, and their dispatch.
 //!
 //! Reads go straight to the [`Store`] (redb allows concurrent readers inside
 //! the process, and the handle is a cheap `Arc` clone). Writes go through
 //! [`ExecutorCommand`] exactly like the UI's own CRUD, so the executor persists
 //! them and echoes an event the open board applies — a card created here shows
 //! up without a restart.
+//!
+//! The write tools add projects and cards, and rename, re-describe or delete
+//! cards — but only cards the MCP itself filed ([`CardOrigin::Mcp`]), so an
+//! external agent can clean up its own mistakes without ever touching work the
+//! user put on the board.
 //!
 //! Deliberately absent: anything that starts an agent. The socket can add work
 //! to the board, not execute code.
@@ -17,7 +22,7 @@ use uuid::Uuid;
 
 use super::Ctx;
 use crate::domain::config::ProjectConfig;
-use crate::domain::model::{Card, Project};
+use crate::domain::model::{Card, CardOrigin, CardState, Project};
 use crate::infra::persistence::Store;
 use crate::ExecutorCommand;
 
@@ -101,6 +106,36 @@ pub fn list() -> Value {
                 "additionalProperties": false,
             },
         },
+        {
+            "name": "update_card",
+            "description": "Rename and/or re-describe a card. Only works on cards created with \
+                            `create_card` (origin `mcp`) — cards the user filed on the board are \
+                            off limits. The title can change at any time; the description only \
+                            while the card is still in the starting block.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "card": { "type": "string", "description": "Card id (or id prefix) or exact title." },
+                    "title": { "type": "string", "description": "New title." },
+                    "description": { "type": "string", "description": "New task prompt. An empty string clears it." },
+                },
+                "required": ["card"],
+                "additionalProperties": false,
+            },
+        },
+        {
+            "name": "delete_card",
+            "description": "Delete a card. Only works on cards created with `create_card` \
+                            (origin `mcp`), and only while they are still in the starting block.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "card": { "type": "string", "description": "Card id (or id prefix) or exact title." },
+                },
+                "required": ["card"],
+                "additionalProperties": false,
+            },
+        },
     ])
 }
 
@@ -125,6 +160,16 @@ pub async fn call(ctx: &Ctx, name: &str, args: &Value) -> std::result::Result<Va
             )
             .await
         }
+        "update_card" => {
+            update_card(
+                ctx,
+                req_str(args, "card")?,
+                opt_str(args, "title")?,
+                opt_str(args, "description")?,
+            )
+            .await
+        }
+        "delete_card" => delete_card(ctx, req_str(args, "card")?).await,
         other => Err(format!("unknown tool `{other}`")),
     }
 }
@@ -163,7 +208,13 @@ fn list_cards(ctx: &Ctx, project: Option<String>) -> std::result::Result<Value, 
 
 fn get_card(ctx: &Ctx, needle: String) -> std::result::Result<Value, String> {
     let card = resolve_card(&ctx.store, &needle)?;
-    let mut v = card_summary(&card);
+    card_detail(ctx, &card)
+}
+
+/// `get_card`'s full view of one card — also what `update_card` replies with,
+/// so the two tools can't drift apart.
+fn card_detail(ctx: &Ctx, card: &Card) -> std::result::Result<Value, String> {
+    let mut v = card_summary(card);
     let obj = v.as_object_mut().expect("card summary is an object");
     obj.insert("description".into(), json!(card.description));
     obj.insert("provider".into(), json!(card.config.provider.label()));
@@ -261,16 +312,14 @@ async fn create_card(
     description: String,
 ) -> std::result::Result<Value, String> {
     let project = resolve_project(&ctx.store, &project)?;
-    let title = title.trim().to_string();
-    if title.is_empty() {
-        return Err("`title` must not be blank".into());
-    }
+    let title = clean_title(&title)?;
     let config = ctx
         .store
         .settings()
         .map_err(|e| e.to_string())?
         .new_card_config();
-    let card = Card::new(project.id, title, description, config);
+    let mut card = Card::new(project.id, title, description, config);
+    card.origin = CardOrigin::Mcp;
     let id = card.id;
     ctx.send(ExecutorCommand::CreateCard {
         card: Box::new(card),
@@ -283,6 +332,122 @@ async fn create_card(
         out = card_summary(&c);
     }
     Ok(out)
+}
+
+/// Rename and/or re-describe one of the MCP's own cards. The whole call is
+/// checked before anything is sent: a refused description also drops the title.
+async fn update_card(
+    ctx: &Ctx,
+    needle: String,
+    title: Option<String>,
+    description: Option<String>,
+) -> std::result::Result<Value, String> {
+    if title.is_none() && description.is_none() {
+        return Err("nothing to update: pass `title`, `description`, or both".into());
+    }
+    let card = resolve_card(&ctx.store, &needle)?;
+    require_mcp_origin(&card, "updated")?;
+    let title = title.as_deref().map(clean_title).transpose()?;
+    if description.is_some() && card.state != CardState::StartingBlock {
+        return Err(format!(
+            "card `{}` is `{}`: its description is locked once work has started \
+             (only the title can still change)",
+            card.title,
+            card.status_label()
+        ));
+    }
+    let id = card.id;
+    ctx.send(ExecutorCommand::UpdateCardText {
+        card_id: id,
+        title: title.clone(),
+        description: description.clone(),
+    })?;
+
+    let landed = |c: &Card| {
+        title.as_ref().is_none_or(|t| &c.title == t)
+            && description.as_ref().is_none_or(|d| &c.description == d)
+    };
+    let confirmed = confirm(|| ctx.store.get_card(id).is_ok_and(|c| landed(&c))).await;
+    if !confirmed {
+        // The executor re-checks the lock when it applies the edit: a card
+        // started since our read refuses the whole command.
+        if description.is_some()
+            && ctx
+                .store
+                .get_card(id)
+                .is_ok_and(|c| c.state != CardState::StartingBlock)
+        {
+            return Err(locked_description(&card.title));
+        }
+        return Ok(json!({ "id": id, "confirmed": false }));
+    }
+    let c = ctx.store.get_card(id).map_err(|e| e.to_string())?;
+    card_detail(ctx, &c)
+}
+
+fn locked_description(title: &str) -> String {
+    format!(
+        "card `{title}` has started: its description is locked once work has started \
+         (only the title can still change)"
+    )
+}
+
+/// Delete one of the MCP's own cards, through the same command (and so the
+/// same cleanup) as deleting it from the board.
+async fn delete_card(ctx: &Ctx, needle: String) -> std::result::Result<Value, String> {
+    let card = resolve_card(&ctx.store, &needle)?;
+    require_mcp_origin(&card, "deleted")?;
+    if card.state != CardState::StartingBlock {
+        return Err(format!(
+            "card `{}` is `{}`: only cards still in the starting block can be deleted",
+            card.title,
+            card.status_label()
+        ));
+    }
+    let id = card.id;
+    // The executor re-checks the state (under a claim on the card) when it
+    // applies the delete: this read only gives the common case a clear error.
+    ctx.send(ExecutorCommand::DeleteCard {
+        card_id: id,
+        starting_block_only: true,
+    })?;
+    // Settled once the card is gone — or started, which the executor refuses.
+    confirm(|| {
+        ctx.store
+            .get_card(id)
+            .map_or(true, |c| c.state != CardState::StartingBlock)
+    })
+    .await;
+    match ctx.store.get_card(id) {
+        Err(_) => Ok(json!({ "id": id, "title": card.title, "deleted": true })),
+        Ok(c) if c.state != CardState::StartingBlock => Err(format!(
+            "card `{}` was started before it could be deleted (now `{}`); it was left in place",
+            c.title,
+            c.status_label()
+        )),
+        Ok(_) => Ok(json!({ "id": id, "title": card.title, "deleted": false })),
+    }
+}
+
+/// The edit/delete tools' guard: only cards the MCP filed itself.
+fn require_mcp_origin(card: &Card, verb: &str) -> std::result::Result<(), String> {
+    match card.origin {
+        CardOrigin::Mcp => Ok(()),
+        CardOrigin::Board => Err(format!(
+            "card `{}` was filed on the board by the user; only cards created with \
+             `create_card` can be {verb}",
+            card.title
+        )),
+    }
+}
+
+/// Trim a title and refuse a blank one.
+fn clean_title(title: &str) -> std::result::Result<String, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("`title` must not be blank".into());
+    }
+    Ok(title.to_string())
 }
 
 /// Poll until the executor has persisted what we just sent, so a follow-up
@@ -326,6 +491,7 @@ fn card_summary(c: &Card) -> Value {
         "column": c.state.column().title(),
         "blocked": c.blocked,
         "needs_attention": c.needs_attention(),
+        "origin": c.origin,
         "updated_at": c.updated_at,
     })
 }
