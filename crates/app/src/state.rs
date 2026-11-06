@@ -697,6 +697,27 @@ impl AppState {
                     }),
                 });
             }
+            // A no-PR merge conflicted with the base. The card stays in
+            // `ReadyForPr` (flagged, so the board keeps pointing at the way
+            // out); "Resolve conflicts" needs a PR, so the offer is an update
+            // from the base, which handles the conflicting merge.
+            ExecutorEventKind::LocalMergeConflict { branch, base } => {
+                let card_id = evt.card_id;
+                crate::ui::request_confirm(crate::ui::ConfirmRequest {
+                    title: "Merge conflicts".into(),
+                    message: format!(
+                        "`{branch}` can't be merged — it conflicts with `{base}`.\n\n\
+                         Have the agent merge `{base}` into the branch, resolve the conflicts and \
+                         adapt the work? The card comes back here so you can merge again."
+                    ),
+                    confirm_label: "Update from base".into(),
+                    danger: false,
+                    action: crate::ui::ConfirmAction::Send(ExecutorCommand::UpdateFromBase {
+                        card_id,
+                        note: None,
+                    }),
+                });
+            }
             // The merge was refused because the PR's CI checks are failing. Same
             // shape as the conflict offer: the card is still `ReadyToMerge`, and
             // declining leaves the detail pane's "Merge anyway" available.

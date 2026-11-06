@@ -1252,6 +1252,7 @@ impl Executor {
             c.ci_awaited_since = None;
             c.mergeable = Mergeable::Unknown;
             c.mergeable_stale_since = None;
+            c.local_merge_conflict = false;
             c.cost = crate::Cost::ZERO;
             // Only forget the worktree/branch once they're actually gone, so a
             // worktree that resisted removal isn't leaked out of the card's memory.

@@ -1030,6 +1030,11 @@ pub enum ExecutorEventKind {
     /// (`card_id` on the event). The card is left in `ReadyToMerge`; the UI asks
     /// whether an agent should resolve the conflicts (`ResolveConflicts`).
     MergeConflict { pr_number: u64, base: String },
+    /// A no-PR merge ("Merge into <base>") was refused because `branch`
+    /// conflicts with `base` (`origin/<base>` or the local base; `card_id` on
+    /// the event). The card is left in `ReadyForPr` with
+    /// `local_merge_conflict` set; the UI offers an `UpdateFromBase` run.
+    LocalMergeConflict { branch: String, base: String },
     /// The card's merge was refused because its PR's CI checks are failing
     /// (`card_id` on the event). `failed` names the failing checks. The card is
     /// left in `ReadyToMerge`; the UI asks whether an agent should fix the
@@ -1252,6 +1257,19 @@ impl ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::MergeConflict {
                 pr_number,
+                base: base.into(),
+            },
+        }
+    }
+    pub fn local_merge_conflict(
+        card_id: Uuid,
+        branch: impl Into<String>,
+        base: impl Into<String>,
+    ) -> Self {
+        ExecutorEvent {
+            card_id,
+            kind: ExecutorEventKind::LocalMergeConflict {
+                branch: branch.into(),
                 base: base.into(),
             },
         }

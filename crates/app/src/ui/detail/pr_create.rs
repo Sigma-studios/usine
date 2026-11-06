@@ -280,6 +280,25 @@ pub(super) fn PrCreateForm(card: Card) -> Element {
 
         // 2) Ready to open the pull request.
         if is_ready_for_pr {
+            // "Merge into <base>" conflicted: lead with the way out. Opening a
+            // PR is still possible (it would just open conflicting), so the
+            // form stays below.
+            if card.local_merge_conflict {
+                div { class: "section",
+                    h3 { "Merge conflicts" }
+                    div { class: "hint warn",
+                        "Merging into {merge_target} conflicted — bring {base} in first, then merge again."
+                    }
+                    div { class: "option-row",
+                        button {
+                            class: "btn primary",
+                            title: "The agent merges {base} into this branch in the card's worktree, resolves the conflicts and adapts the work. The card comes back here afterwards.",
+                            onclick: move |_| state.send(ExecutorCommand::UpdateFromBase { card_id: id, note: None }),
+                            "Update from {base}"
+                        }
+                    }
+                }
+            }
             div { class: "section", "data-submit-scope": "1",
                 h3 { "Create pull request" }
                 // The self-review / validation fix checklist. It is written on

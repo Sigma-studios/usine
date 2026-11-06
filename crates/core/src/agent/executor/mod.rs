@@ -1052,6 +1052,12 @@ fn persist_transition(store: &Store, card_id: Uuid, t: Transition) -> Result<Car
     store.mutate_card(card_id, |c| {
         let next = transition(&c.state, t)?;
         note_entry(&c.state, &next, &mut c.entered_from);
+        // A local-merge conflict only describes the `ReadyForPr` gate it was
+        // hit at; whatever leaves the gate (the update run it prompts, a PR,
+        // a revision) makes it stale.
+        if !matches!(next, CardState::AwaitingReview(ReviewSub::ReadyForPr)) {
+            c.local_merge_conflict = false;
+        }
         c.state = next;
         c.updated_at = now_millis();
         Ok(())

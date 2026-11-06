@@ -112,6 +112,11 @@ pub fn CardView(card: Card) -> Element {
         CardState::AwaitingReview(ReviewSub::ValidationFailed { .. }) => {
             Some(("Validation failed", "pr-create"))
         }
+        // A no-PR merge just conflicted: the way forward is bringing the base
+        // in first (Create PR is still in the panel, below).
+        CardState::AwaitingReview(ReviewSub::ReadyForPr) if card.local_merge_conflict => {
+            Some(("Update from base", "pr-create"))
+        }
         CardState::AwaitingReview(ReviewSub::ReadyForPr) => Some(("Create PR", "pr-create")),
         _ => None,
     };

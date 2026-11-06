@@ -276,6 +276,30 @@ async fn toast(
     }
 }
 
+/// The card's `LocalMergeConflict` event as `(branch, base)` — a conflicted
+/// merge ends in it rather than a toast. Any toast for the card first fails.
+async fn local_conflict(
+    rx: &mut UnboundedReceiver<ExecutorEvent>,
+    card_id: uuid::Uuid,
+) -> (String, String) {
+    loop {
+        let evt = tokio::time::timeout(Duration::from_secs(15), rx.next())
+            .await
+            .expect("timed out waiting for the conflict event")
+            .expect("event stream closed unexpectedly");
+        if evt.card_id != card_id {
+            continue;
+        }
+        match evt.kind {
+            ExecutorEventKind::LocalMergeConflict { branch, base } => return (branch, base),
+            ExecutorEventKind::Toast { severity, message } if severity != Severity::Info => {
+                panic!("expected a conflict event, got a {severity:?} toast: {message}")
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The squash commit on `tip`: one commit whose parent is `parent`, with the
 /// form's title + description as its message and the branch's tree.
 fn assert_squashed(dir: &Path, tip: &str, parent: &str) {
@@ -323,11 +347,13 @@ async fn a_conflict_with_origin_changes_nothing() {
     let (store, card, handle, mut rx) = spawn(&fx, ready_for_pr());
     merge(&handle, card.id, true);
 
-    let (severity, msg) = toast(&mut rx, card.id).await;
-    assert_eq!(severity, Severity::Warning, "got: {msg}");
-    assert!(msg.contains("Update from base"), "got: {msg}");
+    let (branch, base) = local_conflict(&mut rx, card.id).await;
+    assert_eq!(branch, BRANCH);
+    assert_eq!(base, "origin/main");
     assert_eq!(fx.origin_main(), before);
-    assert_eq!(store.get_card(card.id).unwrap().state, ready_for_pr());
+    let stored = store.get_card(card.id).unwrap();
+    assert_eq!(stored.state, ready_for_pr());
+    assert!(stored.local_merge_conflict, "the conflict is remembered");
     assert!(fx.branch_exists());
     assert!(!fx.scratch_left());
 }
@@ -426,15 +452,67 @@ async fn a_local_conflict_changes_nothing() {
     let (store, card, handle, mut rx) = spawn(&fx, ready_for_pr());
     merge(&handle, card.id, true);
 
-    let (severity, msg) = toast(&mut rx, card.id).await;
-    assert_eq!(severity, Severity::Warning, "got: {msg}");
+    let (_, base) = local_conflict(&mut rx, card.id).await;
+    assert_eq!(base, "main");
     assert_eq!(fx.local_main(), before);
     assert_eq!(git_out(&fx.repo, &["status", "--porcelain"]), "");
-    assert_eq!(store.get_card(card.id).unwrap().state, ready_for_pr());
+    let stored = store.get_card(card.id).unwrap();
+    assert_eq!(stored.state, ready_for_pr());
+    assert!(stored.local_merge_conflict);
     assert!(!fx.scratch_left());
 }
 
-/// Without an origin, "Update from base" — the conflict toast's way out —
+/// The conflict prompt's way out: "Update from base" leaves `ReadyForPr`, which
+/// clears the remembered conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_from_base_clears_the_local_conflict() {
+    let fx = Fixture::local();
+    fx.commit_on_local_main(true);
+    let (store, card, handle, mut rx) = spawn(&fx, ready_for_pr());
+    merge(&handle, card.id, true);
+    local_conflict(&mut rx, card.id).await;
+    assert!(store.get_card(card.id).unwrap().local_merge_conflict);
+    // The merge reports only once its scratch tree is gone, but it still
+    // holds the card's claim for that last instant; wait for the release so
+    // the command isn't dropped as a busy-card one.
+    loop {
+        let evt = tokio::time::timeout(Duration::from_secs(15), rx.next())
+            .await
+            .expect("timed out waiting for the merge to release the card")
+            .expect("event stream closed unexpectedly");
+        if matches!(evt.kind, ExecutorEventKind::CardBusy { busy: false }) && evt.card_id == card.id
+        {
+            break;
+        }
+    }
+
+    handle.send(ExecutorCommand::UpdateFromBase {
+        card_id: card.id,
+        note: None,
+    });
+    loop {
+        let evt = tokio::time::timeout(Duration::from_secs(30), rx.next())
+            .await
+            .expect("timed out waiting for the update")
+            .expect("event stream closed unexpectedly");
+        match evt.kind {
+            ExecutorEventKind::Toast {
+                severity: Severity::Error,
+                message,
+            } if evt.card_id == card.id => panic!("update failed: {message}"),
+            ExecutorEventKind::CardUpdated(c)
+                if c.id == card.id && matches!(c.state, CardState::Updating { .. }) =>
+            {
+                assert!(!c.local_merge_conflict, "leaving ReadyForPr clears it");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(!store.get_card(card.id).unwrap().local_merge_conflict);
+}
+
+/// Without an origin, "Update from base" — the conflict prompt's way out —
 /// merges the local base instead of fetching.
 #[tokio::test(flavor = "multi_thread")]
 async fn update_from_base_merges_the_local_base_without_an_origin() {

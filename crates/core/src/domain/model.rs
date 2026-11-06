@@ -1657,6 +1657,14 @@ pub struct Card {
     /// loadable.
     #[serde(default)]
     pub mergeable_stale_since: Option<i64>,
+    /// Set when a no-PR merge ("Merge into <base>") was refused because the
+    /// branch conflicts with the base. Only meaningful in `ReadyForPr`: the
+    /// board and panel then lead with "Update from base" instead of Create PR.
+    /// Cleared whenever the card leaves `ReadyForPr` (an update run, a PR, a
+    /// revision…) and on `BackToStart`. `#[serde(default)]` keeps older records
+    /// loadable.
+    #[serde(default)]
+    pub local_merge_conflict: bool,
     /// A user-set "waiting on something outside Usine" marker. Purely cosmetic:
     /// the board tints the card and shows a "blocked" chip, and the card stops
     /// counting toward the attention badges — no run, poll, or transition looks
@@ -1737,6 +1745,7 @@ impl Card {
             ci_awaited_since: None,
             mergeable: Mergeable::Unknown,
             mergeable_stale_since: None,
+            local_merge_conflict: false,
             blocked: false,
             blocked_note: None,
             entered_from: None,
@@ -2345,6 +2354,19 @@ mod tests {
         json.as_object_mut().unwrap().remove("investigation_rounds");
         let legacy: Card = serde_json::from_value(json).unwrap();
         assert!(legacy.investigation_rounds.is_empty());
+    }
+
+    #[test]
+    fn local_merge_conflict_round_trips_and_defaults_off() {
+        let mut card = Card::new(Uuid::new_v4(), "t", "d", CardConfig::default());
+        card.local_merge_conflict = true;
+        let mut json = serde_json::to_value(&card).unwrap();
+        let back: Card = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.local_merge_conflict);
+
+        json.as_object_mut().unwrap().remove("local_merge_conflict");
+        let legacy: Card = serde_json::from_value(json).unwrap();
+        assert!(!legacy.local_merge_conflict);
     }
 
     #[test]

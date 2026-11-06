@@ -1234,6 +1234,8 @@ impl Executor {
     /// The squash happens in a throwaway detached worktree cut at the target,
     /// so a conflict (or any failure before publishing) changes nothing: the
     /// card stays in `ReadyForPr` and neither origin nor the local base moves.
+    /// A conflict additionally sets the card's `local_merge_conflict` and emits
+    /// `LocalMergeConflict`, so the UI offers an `UpdateFromBase` run.
     /// Publishing never overwrites a base that moved meanwhile — the push isn't
     /// forced, the checked-out base is only fast-forwarded (git also refuses to
     /// clobber the checkout's uncommitted changes), and a base checked out
@@ -1333,25 +1335,21 @@ impl Executor {
             "" => title,
             b => format!("{title}\n\n{b}"),
         };
-        // `Ok(true)` = published; `Ok(false)` = a no-op already reported.
-        let published: Result<bool> = async {
+        enum Squash {
+            Published,
+            /// A no-op, already reported.
+            Nothing,
+            Conflicted,
+        }
+        let outcome: Result<Squash> = async {
             match self.git.squash_ref(&scratch, &branch).await? {
                 MergeOutcome::Clean => {}
-                MergeOutcome::Conflicted(_) => {
-                    let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
-                        card_id,
-                        Severity::Warning,
-                        format!(
-                            "{branch} conflicts with {base} — use Update from base to bring \
-                             {base} in, then merge again"
-                        ),
-                    ));
-                    return Ok(false);
-                }
+                // Reported once the scratch tree is gone (below).
+                MergeOutcome::Conflicted(_) => return Ok(Squash::Conflicted),
             }
             if !self.git.commit_all(&scratch, &message).await? {
                 nothing_to_merge();
-                return Ok(false);
+                return Ok(Squash::Nothing);
             }
             let new = self.git.head_sha(&scratch).await?;
             if has_origin {
@@ -1380,15 +1378,34 @@ impl Executor {
                 git::advance_branch(&project.path, &base, &old, &new)
                     .map_err(|e| CoreError::other(format!("{base} moved — merge again ({e})")))?;
             }
-            Ok(true)
+            Ok(Squash::Published)
         }
         .await;
         // The squash commit lives in the shared object store, so the scratch
         // tree can go whatever happened.
         let _ = self.git.remove_worktree(&project.path, &scratch).await;
         let _ = std::fs::remove_dir_all(&scratch);
-        if !published? {
-            return Ok(());
+        match outcome? {
+            Squash::Published => {}
+            Squash::Nothing => return Ok(()),
+            Squash::Conflicted => {
+                // Remember the conflict on the card (the board and panel lead
+                // with "Update from base" while it's set), then prompt to run
+                // that update. Sent only after the scratch cleanup, so the
+                // card's lock is released almost at once and the dialog's
+                // `UpdateFromBase` isn't dropped as a busy-card command.
+                let card = self.store.mutate_card(card_id, |c| {
+                    c.local_merge_conflict = true;
+                    Ok(())
+                })?;
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(card));
+                let _ = self
+                    .evt_tx
+                    .unbounded_send(ExecutorEvent::local_merge_conflict(
+                        card_id, branch, shown_base,
+                    ));
+                return Ok(());
+            }
         }
 
         self.apply(card_id, Transition::MergeLocally)?;
