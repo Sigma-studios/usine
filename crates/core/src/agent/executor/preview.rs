@@ -353,10 +353,34 @@ impl Executor {
         self.open_dir(review_id, &dir, target).await
     }
 
+    /// Open a session's folder in the configured terminal or editor.
+    ///
+    /// The folder can be deleted after the session was created; opening a
+    /// missing path would silently land the terminal/editor somewhere else, so
+    /// that case is reported instead.
+    pub(super) async fn open_session_folder(
+        &self,
+        session_id: Uuid,
+        target: OpenTarget,
+    ) -> Result<()> {
+        let session = self.store.get_session(session_id)?;
+        if !session.folder.is_dir() {
+            let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+                session_id,
+                Severity::Warning,
+                format!(
+                    "The session's folder {} no longer exists.",
+                    session.folder.display()
+                ),
+            ));
+            return Ok(());
+        }
+        self.open_dir(session_id, &session.folder, target).await
+    }
+
     /// Launch the configured terminal/editor on `dir`, reporting failures as
     /// toasts against `id`.
     async fn open_dir(&self, id: Uuid, dir: &Path, target: OpenTarget) -> Result<()> {
-        let card_id = id;
         let settings = self.store.settings().unwrap_or_default();
         let (template, what) = match target {
             OpenTarget::Terminal => (settings.terminal_command, "terminal"),
@@ -368,7 +392,7 @@ impl Executor {
             .and_then(|t| resolve_open_command(t, dir))
         else {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
-                card_id,
+                id,
                 Severity::Warning,
                 format!("No {what} command is set — add one in Settings (e.g. `zed {{path}}`)."),
             ));
@@ -386,7 +410,7 @@ impl Executor {
             .spawn();
         if let Err(e) = spawned {
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
-                card_id,
+                id,
                 Severity::Error,
                 format!("Couldn't run the {what} command `{program}`: {e}"),
             ));

@@ -982,6 +982,9 @@ impl Executor {
                 session_id,
                 archived,
             } => self.archive_session(session_id, archived),
+            ExecutorCommand::OpenSessionFolder { session_id, target } => {
+                self.open_session_folder(session_id, target).await
+            }
             ExecutorCommand::SetSessionBlocked {
                 session_id,
                 blocked,

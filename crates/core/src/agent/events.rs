@@ -116,7 +116,9 @@ pub struct AdoptProbe {
     pub open_pr: Option<PrInfo>,
 }
 
-/// Which app to launch for [`ExecutorCommand::OpenWorktree`].
+/// Which app to launch for [`ExecutorCommand::OpenWorktree`],
+/// [`ExecutorCommand::OpenReviewWorktree`] and
+/// [`ExecutorCommand::OpenSessionFolder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenTarget {
     /// A terminal, opened at the directory.
@@ -671,6 +673,12 @@ pub enum ExecutorCommand {
         session_id: Uuid,
         archived: bool,
     },
+    /// Open the session's folder in the configured terminal or editor.
+    /// Doesn't change the session's state.
+    OpenSessionFolder {
+        session_id: Uuid,
+        target: OpenTarget,
+    },
     /// Mark the session blocked (or not): a blocked session stays out of the
     /// attention counts. Only this command changes it. `note` is the optional
     /// message the user typed when marking; it is ignored (and any stored note
@@ -759,6 +767,7 @@ impl ExecutorCommand {
             | ExecutorCommand::UnqueueSessionMessage { session_id, .. }
             | ExecutorCommand::RenameSession { session_id, .. }
             | ExecutorCommand::ArchiveSession { session_id, .. }
+            | ExecutorCommand::OpenSessionFolder { session_id, .. }
             | ExecutorCommand::SetSessionBlocked { session_id, .. }
             | ExecutorCommand::MarkSessionRead { session_id }
             | ExecutorCommand::DeleteSession { session_id } => *session_id,

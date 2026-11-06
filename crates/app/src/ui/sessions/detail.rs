@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
 use usine_core::{
-    BgTask, BgTaskKind, BgTaskStatus, ExecutorCommand, Provider, Session, SessionAccess,
+    BgTask, BgTaskKind, BgTaskStatus, ExecutorCommand, OpenTarget, Provider, Session, SessionAccess,
     SessionStatus, SessionTurn, SessionTurnKind,
 };
 use uuid::Uuid;
@@ -111,6 +111,18 @@ pub(crate) fn SessionDetail() -> Element {
                             move |_| reveal(&folder)
                         },
                         "Reveal"
+                    }
+                    button {
+                        class: "btn subtle small",
+                        title: "Open this folder in your terminal (set the command in Settings)",
+                        onclick: move |_| state.send(ExecutorCommand::OpenSessionFolder { session_id: id, target: OpenTarget::Terminal }),
+                        "Terminal"
+                    }
+                    button {
+                        class: "btn subtle small",
+                        title: "Open this folder in your editor (set the command in Settings)",
+                        onclick: move |_| state.send(ExecutorCommand::OpenSessionFolder { session_id: id, target: OpenTarget::Editor }),
+                        "Editor"
                     }
                     button {
                         class: "btn subtle small",

@@ -395,14 +395,17 @@ pub struct AppSettings {
     /// it through [`Self::review_spec`], never directly.
     #[serde(default)]
     pub default_review: Option<ModelSpec>,
-    /// Command run for a card's "Open in terminal" action. `{path}` is replaced
-    /// by the card's worktree (or the project checkout); if absent it's appended.
+    /// Command run for the "Open in terminal" action on cards, PR reviews and
+    /// sessions. `{path}` is replaced by the card's worktree (or the project
+    /// checkout), the review's checkout, or the session's folder; if absent
+    /// it's appended.
     /// Cross-platform by construction — e.g. `open -a Terminal {path}` (macOS),
     /// `gnome-terminal --working-directory={path}` (Linux), `wt -d {path}`
     /// (Windows). `None`/blank disables the action. See [`resolve_open_command`].
     #[serde(default)]
     pub terminal_command: Option<String>,
-    /// Command run for a card's "Open in editor" action, same `{path}` rule as
+    /// Command run for the "Open in editor" action on cards, PR reviews and
+    /// sessions, same `{path}` rule as
     /// [`Self::terminal_command`] — e.g. `zed {path}`, `code {path}`, or just
     /// `code`. `None`/blank disables the action.
     #[serde(default)]
