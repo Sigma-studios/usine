@@ -4,7 +4,8 @@
 //! waits, until no card, PR review or session has had work in flight for
 //! [`IDLE_GRACE`] — and the user isn't mid-edit: no open dialog, no input for
 //! [`INPUT_QUIET`]. (Unsent drafts don't hold it: they're saved and come back
-//! after the restart.) The bar is always mounted, so the control owns its state —
+//! after the restart.) Until the toggle is on, the "Update available" label
+//! stays clickable, to check again for a fresh commit count. The bar is always mounted, so the control owns its state —
 //! and the one automatic check per launch, [`LAUNCH_CHECK_DELAY`] in. The
 //! process work lives in `crate::update`.
 
@@ -107,6 +108,9 @@ pub fn UpdateControl() -> Element {
         let mode = check_mode.clone();
         spawn(async move {
             phase.set(Phase::Checking);
+            // A re-check during the launch check's highlight ends it now; the
+            // launch task's later reset is then a no-op.
+            highlight.set(false);
             match update::check(&mode).await {
                 Ok(outcome) => {
                     last.set(LastCheck::At(now_millis()));
@@ -227,12 +231,15 @@ pub fn UpdateControl() -> Element {
         current,
         Phase::Checking | Phase::Building | Phase::Restarting
     );
-    let clickable = matches!(current, Phase::Unchecked | Phase::UpToDate);
+    let clickable = matches!(
+        current,
+        Phase::Unchecked | Phase::UpToDate | Phase::Available { .. }
+    );
     let show_toggle = matches!(
         current,
         Phase::Available { .. } | Phase::Building | Phase::Built
     );
-    let tip = tooltip(&last(), blocker);
+    let tip = tooltip(&last(), matches!(current, Phase::Available { .. }), blocker);
     let class = if highlight() {
         "update-control has-tip is-new"
     } else {
@@ -309,9 +316,10 @@ async fn user_hold() -> Option<UserHold> {
     }
 }
 
-/// The control's own tooltip: the running commit, the last check, and why the
+/// The control's own tooltip: the running commit, the last check, a hint that
+/// the label re-checks (`recheck`, while an update is shown), and why the
 /// toggle is off-limits when it is.
-fn tooltip(last: &LastCheck, blocker: Option<&str>) -> String {
+fn tooltip(last: &LastCheck, recheck: bool, blocker: Option<&str>) -> String {
     let sha = update::build_sha_short();
     let mut lines = vec![if sha.is_empty() {
         "Running an unknown commit".to_string()
@@ -327,6 +335,9 @@ fn tooltip(last: &LastCheck, blocker: Option<&str>) -> String {
             lines.push(format!("Last checked at {time}"));
         }
         LastCheck::Failed(e) => lines.push(format!("Last check failed: {e}")),
+    }
+    if recheck {
+        lines.push("Click to check again".to_string());
     }
     if let Some(why) = blocker {
         lines.push(why.to_string());
@@ -395,9 +406,17 @@ mod tests {
 
     #[test]
     fn the_tooltip_carries_a_failed_check_and_the_blocker() {
-        let tip = tooltip(&LastCheck::Failed("offline".into()), Some("nope"));
+        let tip = tooltip(&LastCheck::Failed("offline".into()), false, Some("nope"));
         assert!(tip.contains("Last check failed: offline"), "{tip}");
         assert!(tip.ends_with("nope"), "{tip}");
-        assert!(!tooltip(&LastCheck::Never, None).contains("Last"));
+        assert!(!tooltip(&LastCheck::Never, false, None).contains("Last"));
+    }
+
+    #[test]
+    fn the_tooltip_offers_a_recheck_when_an_update_is_shown() {
+        let tip = tooltip(&LastCheck::At(0), true, Some("nope"));
+        assert!(tip.contains("Click to check again"), "{tip}");
+        assert!(tip.ends_with("nope"), "{tip}");
+        assert!(!tooltip(&LastCheck::At(0), false, None).contains("Click to check again"));
     }
 }
