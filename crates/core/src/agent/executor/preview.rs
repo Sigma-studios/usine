@@ -44,12 +44,14 @@ const PREVIEW_REQUEST_POLL: Duration = Duration::from_secs(3);
 
 /// Every usine runtime artifact a worktree can carry that must never land on
 /// the card's branch: the preview info file, the agent's preview-request
-/// sentinel, and the setup script's port-offset file. Registered in the repo's
+/// sentinel, the card's scenario script (stored on the card instead), and the
+/// setup script's port-offset file. Registered in the repo's
 /// shared `info/exclude` so a `git add -A` — finalize's auto-commit, or one
 /// the agent runs itself — can't sweep them onto the branch.
 pub(super) const PREVIEW_EXCLUDES: &[&str] = &[
     crate::agent::testing::PREVIEW_INFO_FILE,
     crate::agent::testing::PREVIEW_REQUEST_FILE,
+    crate::agent::testing::SCENARIO_FILE,
     ".wt-offset",
 ];
 
@@ -134,7 +136,16 @@ impl Executor {
             .worktree_path
             .clone()
             .ok_or_else(|| CoreError::other("this card has no worktree to run the app in"))?;
-        self.launch_preview(card_id, &project.config, &worktree, generation)
+        // A parked card's worktree may have been rebuilt, or its scenario
+        // script hand-edited: bring file and card copy in step before the
+        // launch replays it. Not while a run is live: a write run synced at
+        // its start and captures at its end, so a file missing now means the
+        // agent just deleted it — restoring the card's copy would silently
+        // undo that removal at the run's capture.
+        if !card.state.is_running() {
+            super::scenario::sync_scenario(&self.store, &self.evt_tx, card_id, &worktree);
+        }
+        self.launch_preview(card_id, &project.config, &worktree, generation, true)
             .await
     }
 
@@ -165,7 +176,9 @@ impl Executor {
         };
         let result = async {
             let worktree = self.prepare_review_worktree(review_id, false).await?;
-            self.launch_preview(review_id, &project.config, &worktree, generation)
+            // Never a scenario script: it belongs to a card of ours, and a
+            // contributor's checkout carries none (the file is git-excluded).
+            self.launch_preview(review_id, &project.config, &worktree, generation, false)
                 .await
         }
         .await;
@@ -199,8 +212,9 @@ impl Executor {
     /// reused, and a project with no run script — or a card with no worktree —
     /// simply has no app to run (the agent's prompt omits the testing instruction
     /// on the same condition). A failure to start surfaces as a warning toast but
-    /// never fails the run: the agent just finds no app and says so in its
-    /// hand-off.
+    /// never fails the run: the agent finds a `failed` preview-info file with the
+    /// reason instead of the URLs, and can fix its scenario script and ask for a
+    /// restart, or say so in its hand-off.
     pub(super) async fn ensure_preview_for_run(&self, card_id: Uuid) -> Result<()> {
         let Some(generation) = self.claim_preview(card_id) else {
             return Ok(());
@@ -231,10 +245,18 @@ impl Executor {
             return Ok(());
         };
         if let Err(e) = self
-            .launch_preview(card_id, &config, &worktree, generation)
+            .launch_preview(card_id, &config, &worktree, generation, true)
             .await
         {
             self.abandon_claim(card_id, generation, &e);
+            // Tell the agent waiting on the info file that it isn't coming,
+            // and why — otherwise a failed setup or scenario script reads as
+            // "still setting up" for the rest of the run. A later start (the
+            // agent's restart request) clears it before running again.
+            let _ = std::fs::write(
+                worktree.join(crate::agent::testing::PREVIEW_INFO_FILE),
+                crate::agent::testing::preview_failed_json(&e.to_string()),
+            );
             let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
                 card_id,
                 Severity::Warning,
@@ -250,12 +272,16 @@ impl Executor {
     /// UI's per-id preview map handles the same way. `generation` is the caller's
     /// claim on that slot; every error return leaves cleanup (release + Failed
     /// status) to the claiming entry point.
+    ///
+    /// `scenario` lets the card's scenario script (see [`super::scenario`]) run
+    /// between setup and app launch; review-task previews pass `false`.
     async fn launch_preview(
         &self,
         id: Uuid,
         config: &ProjectConfig,
         worktree: &Path,
         generation: Uuid,
+        scenario: bool,
     ) -> Result<()> {
         if run_command(config).is_none() {
             return Err(CoreError::other(
@@ -265,6 +291,9 @@ impl Executor {
         }
 
         self.emit_preview(id, PreviewStatus::SettingUp, Vec::new());
+        // A `failed` info file from an earlier attempt describes a launch that
+        // is being retried right now.
+        clear_preview_info(worktree);
 
         // 1. Setup (deps, isolated DB, per-worktree ports). Its output streams
         //    live to the UI (not persisted — it can be voluminous). The setup
@@ -274,7 +303,10 @@ impl Executor {
         if let Some(cmd) = resolve_script(&config.worktree_setup_script, worktree, SETUP_CANDIDATES)
         {
             self.progress(id, "Setting up the worktree for preview…");
-            match self.run_setup_script(id, worktree, &cmd, generation).await {
+            match self
+                .run_setup_script(id, worktree, &cmd, generation, "Preview setup")
+                .await
+            {
                 Ok(SetupOutcome::Completed) => {}
                 // The user stopped the preview mid-setup: `kill_preview` already
                 // reaped the process and emitted nothing, so settle on Stopped.
@@ -284,6 +316,51 @@ impl Executor {
                 }
                 Err(e) => return Err(e),
             }
+
+            // 1b. The card's scenario data, on top of the freshly seeded
+            //     environment. Same stop/stream/stale-run handling as setup;
+            //     a failure fails the launch — an app missing the data its
+            //     "Test it" checklist names would only mislead.
+            let scenario_file = crate::agent::testing::SCENARIO_FILE;
+            if scenario && worktree.join(scenario_file).is_file() {
+                self.progress(
+                    id,
+                    &format!("Preparing this card's scenario data ({scenario_file})…"),
+                );
+                let cmd = format!("bash {scenario_file}");
+                match self
+                    .run_setup_script(id, worktree, &cmd, generation, "The card's scenario script")
+                    .await
+                {
+                    Ok(SetupOutcome::Completed) => {}
+                    Ok(SetupOutcome::Stopped) => {
+                        self.emit_preview(id, PreviewStatus::Stopped, Vec::new());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Setup already built the isolated environment (e.g.
+                        // the docker DB) and the abandoned claim leaves the
+                        // park-time reap nothing to find — tear it down here,
+                        // or it outlives the card's park.
+                        self.teardown_preview(id, config, Some(worktree)).await;
+                        return Err(CoreError::other(format!(
+                            "{e}\nFix or remove the card's scenario script (Test it tab), then \
+                             restart the preview."
+                        )));
+                    }
+                }
+            }
+        } else if scenario
+            && worktree
+                .join(crate::agent::testing::SCENARIO_FILE)
+                .is_file()
+        {
+            // Without a setup script there is no isolated environment: the
+            // script would write into whatever database the app shares.
+            self.progress(
+                id,
+                "⚠ scenario script skipped — no setup script, so no isolated environment to seed",
+            );
         }
 
         // 2. Launch the app as a persistent process and publish its URLs.
@@ -693,6 +770,7 @@ impl Executor {
         worktree: &Path,
         cmd: &str,
         generation: Uuid,
+        what: &str,
     ) -> Result<SetupOutcome> {
         let mut command = Command::new("sh");
         command
@@ -732,14 +810,9 @@ impl Executor {
             Ok(s) => {
                 drain(readers).await;
                 let tail = lock(&tail).render();
-                Err(CoreError::other(script_failure(
-                    "Preview setup",
-                    cmd,
-                    s,
-                    &tail,
-                )))
+                Err(CoreError::other(script_failure(what, cmd, s, &tail)))
             }
-            Err(e) => Err(CoreError::other(format!("setup script failed to run: {e}"))),
+            Err(e) => Err(CoreError::other(format!("{what} failed to run: {e}"))),
         }
     }
 
@@ -808,9 +881,14 @@ impl Executor {
     /// on the card once this run parks, even if no preview ran this time.
     /// No-op while a preview is claimed — it owns the status. The lock is held
     /// across the send so a racing claim's `SettingUp` can't be overtaken.
-    pub(super) fn clear_stale_preview_status(&self, card_id: Uuid) {
+    ///
+    /// The same goes for a `failed` preview-info file an earlier run's in-run
+    /// start left in `worktree`: its claim was already released, so the park's
+    /// reap never cleared it, and this run's agent would read a stale failure.
+    pub(super) fn clear_stale_preview_status(&self, card_id: Uuid, worktree: &Path) {
         let map = lock(&self.previews);
         if !map.contains_key(&card_id) {
+            clear_preview_info(worktree);
             self.emit_preview(card_id, PreviewStatus::Stopped, Vec::new());
         }
     }
@@ -825,8 +903,9 @@ impl Executor {
 /// Watch a write run's worktree for the agent's preview-request sentinel
 /// ([`crate::agent::testing::PREVIEW_REQUEST_FILE`]) and, on hit, delete it
 /// and dispatch `EnsurePreview` — the on-request half of the `auto_preview`
-/// toggle. Spawned from `lifecycle::launch` only when the toggle is off and
-/// the project has a run script (no other way a preview could start).
+/// toggle, and the restart path for an agent that fixed the scenario script
+/// behind a failed start. Spawned from `lifecycle::launch` for every write run
+/// on a project with a run script, whatever the toggle.
 ///
 /// Bound to the run's lifetime: the loop exits as soon as the runs map no
 /// longer holds this exact run (end-of-run cleanup, the NeedsInput teardown,

@@ -25,6 +25,7 @@ use usine_core::{
 };
 
 const SENTINEL: &str = ".usine-preview-request";
+const SCENARIO: &str = ".usine-scenario.sh";
 
 async fn wait_for<F, T>(rx: &mut UnboundedReceiver<ExecutorEvent>, mut f: F) -> T
 where
@@ -289,6 +290,8 @@ async fn sentinel_never_reaches_the_branch() {
     .await;
     std::fs::write(wt.join(SENTINEL), "").unwrap();
     std::fs::write(wt.join("change.txt"), "the run's work").unwrap();
+    // …and a scenario script, which finalize saves onto the card instead.
+    std::fs::write(wt.join(SCENARIO), "echo seed more\n").unwrap();
 
     let card = wait_for(&mut rx, |e| match &e.kind {
         ExecutorEventKind::CardUpdated(c)
@@ -312,6 +315,15 @@ async fn sentinel_never_reaches_the_branch() {
         !tree.contains(SENTINEL),
         "the sentinel must never land on the branch, got tree:\n{tree}"
     );
+    assert!(
+        !tree.contains(SCENARIO),
+        "the scenario script lives on the card, not the branch, got tree:\n{tree}"
+    );
+    assert_eq!(
+        card.scenario_script.as_deref(),
+        Some("echo seed more\n"),
+        "finalize saves the run's scenario script onto the card"
+    );
     // The repo-shared exclude carries all three preview artifacts.
     let exclude = git_stdout(
         &repo,
@@ -323,7 +335,7 @@ async fn sentinel_never_reaches_the_branch() {
         ],
     );
     let exclude = std::fs::read_to_string(exclude.trim()).unwrap_or_default();
-    for pattern in [".usine-preview.json", SENTINEL, ".wt-offset"] {
+    for pattern in [".usine-preview.json", SENTINEL, SCENARIO, ".wt-offset"] {
         assert!(
             exclude.lines().any(|l| l.trim() == pattern),
             "info/exclude should list {pattern}, got:\n{exclude}"

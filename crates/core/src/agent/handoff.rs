@@ -52,8 +52,12 @@ const VERSION: u8 = 2;
 /// concrete routes, real seeded accounts, seeded records. When it can't (a
 /// library, a project with no `run_script`), the generic bullet stands, because
 /// there is no environment to point the reviewer at.
-pub fn handoff_instruction(local_app: bool) -> String {
-    let tests = tests_guidance(local_app);
+///
+/// `scenario` says whether the card may carry a scenario script (see
+/// [`crate::agent::testing::ScenarioSupport`]): when it can, checklist records
+/// may come from it as well as from the seed.
+pub fn handoff_instruction(local_app: bool, scenario: bool) -> String {
+    let tests = tests_guidance(local_app, scenario);
     format!(
         "{HANDOFF_HEADER}- `tests`: {tests} Use an empty array if the change has no observable \
 behaviour.\n{HANDOFF_TAIL}"
@@ -62,11 +66,11 @@ behaviour.\n{HANDOFF_TAIL}"
 
 /// How to write the `tests` checklist, shared by the hand-off and the change
 /// recap's `usine-tests` block so the two never drift apart.
-fn tests_guidance(local_app: bool) -> &'static str {
-    if local_app {
-        TESTS_SEEDED
-    } else {
-        TESTS_GENERIC
+fn tests_guidance(local_app: bool, scenario: bool) -> &'static str {
+    match (local_app, scenario) {
+        (true, true) => TESTS_SCENARIO,
+        (true, false) => TESTS_SEEDED,
+        (false, _) => TESTS_GENERIC,
     }
 }
 
@@ -115,6 +119,30 @@ edge cases you touched, the flows a regression would hide in. Set `verified: tru
 scenario you actually ran yourself in the app, as written — it still deserves a human eye, but the \
 reviewer should know it has been run once.";
 
+/// [`TESTS_SEEDED`] for a card that may carry a scenario script
+/// (`.usine-scenario.sh`, replayed after setup on every fresh preview start):
+/// the checklist may lean on the records it creates as well as on the seed,
+/// and adding missing state to the script beats making the reviewer build it
+/// by hand. Same rules otherwise.
+const TESTS_SCENARIO: &str = "\
+a hand-testing script for the reviewer, who will run this card's app locally — the same \
+worktree preview you had, but restarted from scratch: the setup re-creates the environment, \
+re-seeding its data if the project seeds any, then replays this card's `.usine-scenario.sh` if it \
+has one, so anything you created by hand during your run is gone. Every scenario must be \
+executable in that local environment and nothing else — no production or staging data, no \
+hand-edited database rows, and, where the project seeds data, no account or record that exists \
+neither in the seed nor in this card's `.usine-scenario.sh`. Be concrete: name the path to open (a \
+route like `/settings/billing`, never a hard-coded URL — the port is per-worktree), the account to \
+sign in as with the exact credentials the repo's own seed/fixture data (or the scenario script) \
+gives it (never \"log in as an admin\"), and the records to act on by the names they carry in the \
+seed or the scenario script — say which records the script created where a scenario uses them. If \
+neither already contains the state a scenario needs, add it to the scenario script; failing that, \
+make creating it the first steps of the scenario. `scenario` is what to do (sign in → route → \
+actions), `expect` is what should happen. Most important first, and favour what your automated \
+tests do not already cover: the risky paths, the edge cases you touched, the flows a regression \
+would hide in. Set `verified: true` only for a scenario you actually ran yourself in the app, as \
+written — it still deserves a human eye, but the reviewer should know it has been run once.";
+
 /// The `tests` bullet for a project with no runnable app: same checklist, no
 /// environment to promise.
 const TESTS_GENERIC: &str = "\
@@ -142,7 +170,7 @@ Be honest and specific — this is the note a careful engineer leaves a colleagu
 /// complete revised list in a `usine-tests` block whenever the change makes it
 /// wrong (see [`revise_tests`]). No block means "still accurate", so the list
 /// never silently describes behaviour the branch no longer has.
-pub fn change_recap_instruction(local_app: bool, current: &[TestItem]) -> String {
+pub fn change_recap_instruction(local_app: bool, scenario: bool, current: &[TestItem]) -> String {
     let listed = if current.is_empty() {
         "(none yet)\n".to_string()
     } else {
@@ -157,7 +185,7 @@ pub fn change_recap_instruction(local_app: bool, current: &[TestItem]) -> String
             })
             .collect()
     };
-    let guidance = tests_guidance(local_app);
+    let guidance = tests_guidance(local_app, scenario);
     format!(
         "{CHANGE_RECAP_HEADER}\n\nBelow is the current \"Test it\" checklist the reviewer will \
 follow. If this change makes any scenario wrong or adds behaviour worth checking by hand, emit a \
@@ -572,7 +600,7 @@ mod tests {
     #[test]
     fn the_change_recap_instruction_never_asks_for_a_hand_off_block() {
         for local_app in [true, false] {
-            let s = change_recap_instruction(local_app, &[]);
+            let s = change_recap_instruction(local_app, false, &[]);
             assert!(!s.contains(TAG), "local_app={local_app}");
             assert!(s.contains("TL;DR"));
             assert!(s.contains(TESTS_TAG));
@@ -590,7 +618,7 @@ mod tests {
             },
             TestItem::from("Reload the board"),
         ];
-        let s = change_recap_instruction(true, &current);
+        let s = change_recap_instruction(true, false, &current);
         assert!(s.contains("- Click Submit → the form saves\n"));
         assert!(s.contains("- Reload the board\n"));
         assert!(!s.contains("(none yet)"));
@@ -601,7 +629,7 @@ mod tests {
         );
         // The same writing rules as the hand-off's checklist.
         assert!(s.contains("never a hard-coded URL"));
-        assert!(!change_recap_instruction(false, &current).contains("hard-coded URL"));
+        assert!(!change_recap_instruction(false, false, &current).contains("hard-coded URL"));
     }
 
     #[test]
@@ -671,7 +699,7 @@ mod tests {
     #[test]
     fn the_instruction_states_the_v2_contract() {
         for local_app in [true, false] {
-            let s = handoff_instruction(local_app);
+            let s = handoff_instruction(local_app, false);
             for field in [
                 "\"v\": 2",
                 "changes",
@@ -688,7 +716,7 @@ mod tests {
     /// promised where the reviewer actually has the card's preview to run.
     #[test]
     fn only_the_local_app_variant_demands_the_seeded_environment() {
-        let seeded = handoff_instruction(true);
+        let seeded = handoff_instruction(true, false);
         for phrase in [
             "executable in that local environment",
             "if the project seeds any",
@@ -700,7 +728,7 @@ mod tests {
             assert!(seeded.contains(phrase), "missing {phrase}");
         }
 
-        let generic = handoff_instruction(false);
+        let generic = handoff_instruction(false, false);
         for phrase in ["seed", "credentials", "hard-coded URL"] {
             assert!(
                 !generic.contains(phrase),
@@ -710,5 +738,21 @@ mod tests {
         // …but it still asks for the same checklist.
         assert!(generic.contains("worth checking by hand in the running app"));
         assert!(generic.contains("most important first"));
+    }
+
+    /// The scenario variant lets checklist records come from the card's
+    /// script, and only it mentions the script at all.
+    #[test]
+    fn only_the_scenario_variant_mentions_the_script() {
+        let scen = handoff_instruction(true, true);
+        assert!(scen.contains(".usine-scenario.sh"));
+        assert!(scen.contains("add it to the scenario script"));
+        assert!(scen.contains("no hand-edited database rows"));
+        assert!(scen.contains("never a hard-coded URL"));
+        assert!(!handoff_instruction(true, false).contains(".usine-scenario.sh"));
+        // No runnable app → no environment, script or not.
+        assert!(!handoff_instruction(false, true).contains(".usine-scenario.sh"));
+        assert!(change_recap_instruction(true, true, &[]).contains(".usine-scenario.sh"));
+        assert!(!change_recap_instruction(true, false, &[]).contains(".usine-scenario.sh"));
     }
 }

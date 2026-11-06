@@ -438,6 +438,10 @@ async fn finalize_run(
                 };
                 let message = crate::agent::commit::parse_commit_message(&result_text)
                     .unwrap_or_else(|| format!("{kind}: {}", card.title));
+                // Save the scenario script the run left (or drop the one it
+                // deleted) onto the card. The file is git-excluded, so the
+                // commit below never carries it.
+                super::scenario::capture_scenario(store, evt_tx, card_id, &dir);
                 match git.commit_all(&dir, &message).await {
                     Ok(true) => {
                         if card.pr.is_some() {

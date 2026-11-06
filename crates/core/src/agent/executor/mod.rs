@@ -53,6 +53,7 @@ mod pr;
 mod pr_images;
 mod pr_review;
 mod preview;
+mod scenario;
 mod self_review;
 mod session;
 mod usage;
@@ -739,6 +740,7 @@ impl Executor {
                 self.open_worktree(card_id, target).await
             }
             ExecutorCommand::OpenPath { card_id, path } => self.open_path(card_id, &path).await,
+            ExecutorCommand::ClearScenario { card_id } => self.clear_scenario(card_id).await,
             ExecutorCommand::ComputeDiff { card_id } => self.compute_diff(card_id).await,
             ExecutorCommand::LoadTranscript { card_id } => self.load_transcript(card_id).await,
             ExecutorCommand::Cancel { card_id } => self.cancel(card_id).await,

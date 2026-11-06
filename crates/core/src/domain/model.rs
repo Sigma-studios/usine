@@ -1697,6 +1697,15 @@ pub struct Card {
     /// records loadable.
     #[serde(default)]
     pub investigation_rounds: Vec<InvestigationRound>,
+    /// The card's scenario script: a bash script the agent wrote to add the
+    /// test data the repo's seed lacks, replayed on every fresh preview start
+    /// right after the setup script (see `executor::scenario`). Kept here
+    /// rather than only in the worktree — where it lives as the git-excluded
+    /// [`crate::agent::testing::SCENARIO_FILE`] — so it survives a rebuilt
+    /// worktree. Cleared by `BackToStart` and the panel's "Remove".
+    /// `#[serde(default)]` keeps older records loadable.
+    #[serde(default)]
+    pub scenario_script: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1750,6 +1759,7 @@ impl Card {
             blocked_note: None,
             entered_from: None,
             investigation_rounds: Vec::new(),
+            scenario_script: None,
             created_at: now,
             updated_at: now,
         }

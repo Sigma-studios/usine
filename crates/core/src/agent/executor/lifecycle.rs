@@ -3,6 +3,7 @@
 
 use super::actor::run_actor;
 use super::*;
+use crate::agent::testing::ScenarioSupport;
 
 impl Executor {
     /// Start a card. An investigation card runs its read-only investigate phase;
@@ -319,10 +320,31 @@ impl Executor {
         // This is the one choke point every write run passes through — new,
         // rebuilt, and adopted worktrees alike, including ones created before
         // these files existed, which creation-site-only registration misses.
-        if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
+        //
+        // The card's scenario script is synced at the same point (restored into
+        // a rebuilt worktree, or a hand edit saved), before the in-run preview
+        // below can replay it. Whether the agent may write one at all depends
+        // on there being a setup script — no isolated environment, nothing to
+        // seed.
+        let scenario = if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
             crate::infra::git::ensure_excluded(&project_dir, super::preview::PREVIEW_EXCLUDES)
                 .await;
-        }
+            let existing =
+                super::scenario::sync_scenario(&self.store, &self.evt_tx, card.id, &project_dir);
+            let has_setup = super::preview::resolve_script(
+                &project.config.worktree_setup_script,
+                &project_dir,
+                super::preview::SETUP_CANDIDATES,
+            )
+            .is_some();
+            match (has_setup, existing) {
+                (false, _) => ScenarioSupport::Unavailable,
+                (true, Some(_)) => ScenarioSupport::Existing,
+                (true, None) => ScenarioSupport::Available,
+            }
+        } else {
+            ScenarioSupport::Unavailable
+        };
         // Always send the full task description. `--resume` adds conversation
         // continuity when the session has saved state, but claude only persists
         // at turn boundaries — a run killed mid-turn resumes with an empty
@@ -389,9 +411,11 @@ impl Executor {
                     let has_ports = !project.config.preview_ports.is_empty();
                     let shot = project.config.screenshot_command();
                     let instruction = if project.config.auto_preview {
-                        crate::agent::testing::testing_instruction(run, has_ports, shot)
+                        crate::agent::testing::testing_instruction(run, has_ports, shot, scenario)
                     } else {
-                        crate::agent::testing::testing_instruction_on_request(run, has_ports, shot)
+                        crate::agent::testing::testing_instruction_on_request(
+                            run, has_ports, shot, scenario,
+                        )
                     };
                     tail.push_str(&instruction);
                     tail.push_str("\n\n");
@@ -410,11 +434,15 @@ impl Executor {
                         .unwrap_or_default();
                     tail.push_str(&crate::agent::handoff::change_recap_instruction(
                         run.is_some(),
+                        scenario.is_available(),
                         &tests,
                     ));
                 } else if mode == RunMode::Implement {
                     tail.push_str("\n\n");
-                    tail.push_str(&crate::agent::handoff::handoff_instruction(run.is_some()));
+                    tail.push_str(&crate::agent::handoff::handoff_instruction(
+                        run.is_some(),
+                        scenario.is_available(),
+                    ));
                 } else {
                     tail.push_str("\n\n");
                     tail.push_str(crate::agent::fixes::FIX_RECAP_INSTRUCTION);
@@ -496,16 +524,20 @@ impl Executor {
         //
         // With the project's `auto_preview` off, nothing starts eagerly;
         // instead a watcher lets the agent request the app mid-run via the
-        // sentinel file. No run script means no watcher either — a preview
-        // could never start, and the prompt above omits the testing
-        // instruction on that same condition.
+        // sentinel file. The watcher runs with the toggle on too: it is how an
+        // agent restarts an eager start that failed (say, on its own scenario
+        // script) once it has fixed the cause — while the app is up a request
+        // finds the slot claimed and no-ops. No run script means no watcher
+        // either — a preview could never start, and the prompt above omits the
+        // testing instruction on that same condition.
         if matches!(mode, RunMode::Implement | RunMode::ApplyFixes) {
-            self.clear_stale_preview_status(card.id);
+            self.clear_stale_preview_status(card.id, &run_dir);
             if project.config.auto_preview {
                 let _ = self
                     .cmd_tx
                     .unbounded_send(ExecutorCommand::EnsurePreview { card_id: card.id });
-            } else if super::preview::run_command(&project.config).is_some() {
+            }
+            if super::preview::run_command(&project.config).is_some() {
                 super::preview::spawn_preview_request_watcher(
                     run_dir,
                     card.id,
@@ -1224,6 +1256,11 @@ impl Executor {
                 card_id,
                 crate::agent::fixes::FixReport::default(),
             ));
+        // A worktree that resisted removal keeps its scenario file; drop it so
+        // the next start's sync can't resurrect the discarded attempt's data.
+        if let Some(wt) = card.worktree_path.as_deref() {
+            let _ = std::fs::remove_file(wt.join(crate::agent::testing::SCENARIO_FILE));
+        }
         let _ = self.store.set_handoff(card_id, &Handoff::default());
         let _ = self
             .evt_tx
@@ -1234,6 +1271,9 @@ impl Executor {
                 c.qa_log.clear();
             }
             c.investigation_rounds.clear();
+            // The scenario data was written for the implementation being
+            // discarded (the worktree file goes with the worktree).
+            c.scenario_script = None;
             c.state = transition(&c.state, Transition::ResetToStart)?;
             // A genuine do-over: drop the run artifacts so the next Start is fresh.
             c.last_session = None;

@@ -486,6 +486,12 @@ pub enum ExecutorCommand {
         card_id: Uuid,
         path: String,
     },
+    /// Drop the card's scenario script (`Card::scenario_script` and the
+    /// worktree's `.usine-scenario.sh`), so fresh previews run on the seed
+    /// alone. No effect on the card's lifecycle state.
+    ClearScenario {
+        card_id: Uuid,
+    },
     /// Compute the card's committed diff over its fork point (for the in-app diff
     /// viewer). Read-only; no effect on the card's lifecycle state. The result
     /// comes back as a `DiffUpdated` event.
@@ -743,6 +749,7 @@ impl ExecutorCommand {
             | ExecutorCommand::EnsurePreview { card_id }
             | ExecutorCommand::OpenWorktree { card_id, .. }
             | ExecutorCommand::OpenPath { card_id, .. }
+            | ExecutorCommand::ClearScenario { card_id }
             | ExecutorCommand::ComputeDiff { card_id }
             | ExecutorCommand::LoadTranscript { card_id }
             | ExecutorCommand::Cancel { card_id }
@@ -900,6 +907,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::SetAutoReview { .. }
                 | ExecutorCommand::SetBlocked { .. }
                 | ExecutorCommand::MarkAnswersRead { .. }
+                | ExecutorCommand::ClearScenario { .. }
                 | ExecutorCommand::AttachImage { .. }
                 | ExecutorCommand::AttachImageBytes { .. }
                 | ExecutorCommand::DetachImage { .. }

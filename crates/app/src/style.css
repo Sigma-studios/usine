@@ -613,6 +613,16 @@ select option { background: var(--panel-2); color: var(--text); }
 /* The implement run's hand-off: open questions + what to test. */
 .handoff-list { margin: 0; padding-left: 18px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
 .handoff-list li { line-height: 1.45; }
+/* The card's scenario script, atop the Test it list. */
+.scenario-data { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
+.scenario-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.scenario-head .spacer { flex: 1; }
+.scenario-title { font-size: 12px; font-weight: 600; }
+.scenario-script > summary { color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; list-style: none; margin-top: 4px; }
+.scenario-script > summary::before { content: "▸ "; }
+.scenario-script[open] > summary::before { content: "▾ "; }
+.scenario-script > summary:hover { color: var(--text); }
+.scenario-body { margin: 4px 0 0; padding: 6px 8px; font-size: 11px; font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; max-height: 280px; overflow: auto; background: var(--bg); border-radius: 4px; }
 
 /* --- Diff viewer -------------------------------------------------------- */
 .diff-header { display: flex; align-items: center; justify-content: space-between; }

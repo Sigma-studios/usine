@@ -39,6 +39,7 @@ pub use agent::handoff::{
     TestItem,
 };
 pub use agent::investigate::parse_findings;
+pub use agent::testing::SCENARIO_FILE;
 pub use agent::investigate::{
     conclusion_prose, findings_malformed, investigate_instruction, Evidence, Finding, Findings,
     INVESTIGATE_INSTRUCTION,

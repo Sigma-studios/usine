@@ -981,9 +981,21 @@ pub(crate) fn InterventionPanel(
 /// open question, use the Agent Chat.
 #[component]
 pub(super) fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
+    let state = use_context::<AppState>();
+    // The card's scenario script lives on the card, not the hand-off; it is
+    // part of "how to test this", so it shows under the Test it tab — which
+    // it brings up on its own when the hand-off listed no tests.
+    let scenario = state
+        .cards
+        .read()
+        .iter()
+        .find(|c| c.id == card_id)
+        .and_then(|c| c.scenario_script.clone());
     let sections: Vec<HandoffTab> = HandoffTab::ALL
         .into_iter()
-        .filter(|tab| tab.has_content(&handoff))
+        .filter(|tab| {
+            tab.has_content(&handoff) || (*tab == HandoffTab::Tests && scenario.is_some())
+        })
         .collect();
     // Summary first when there is one — it is the orienting view — otherwise
     // whatever the agent did fill in.
@@ -1025,6 +1037,9 @@ pub(super) fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
                     HandoffChanges { card_id, changes: handoff.changes.clone() }
                 },
                 Some(HandoffTab::Tests) => rsx! {
+                    if let Some(script) = scenario.clone() {
+                        ScenarioData { card_id, script }
+                    }
                     ul { class: "handoff-list",
                         for (i, t) in handoff.tests.iter().enumerate() {
                             li { key: "{i}",
@@ -1057,6 +1072,48 @@ pub(super) fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
                     }
                 },
                 None => rsx! {},
+            }
+        }
+    }
+}
+
+/// The card's scenario script (`.usine-scenario.sh`): the extra test data the
+/// agent wrote for this card, replayed after setup on every fresh preview
+/// start. Shown collapsed — the reviewer mostly needs to know it exists and
+/// which records it makes — with an editor shortcut and a way to drop it.
+#[component]
+fn ScenarioData(card_id: Uuid, script: String) -> Element {
+    let state = use_context::<AppState>();
+    let lines = script.lines().count();
+    rsx! {
+        div { class: "scenario-data",
+            div { class: "scenario-head",
+                span { class: "scenario-title", "Scenario data" }
+                span { class: "hint",
+                    "Replayed by "
+                    code { "{usine_core::SCENARIO_FILE}" }
+                    " on every fresh preview start"
+                }
+                span { class: "spacer" }
+                button {
+                    class: "btn small",
+                    title: "Open the script in your editor",
+                    onclick: move |_| state.send(ExecutorCommand::OpenPath {
+                        card_id,
+                        path: usine_core::SCENARIO_FILE.to_string(),
+                    }),
+                    "Open"
+                }
+                button {
+                    class: "btn small",
+                    title: "Drop the script: fresh previews run on the repo's seed alone",
+                    onclick: move |_| state.send(ExecutorCommand::ClearScenario { card_id }),
+                    "Remove"
+                }
+            }
+            details { class: "scenario-script",
+                summary { "script ({lines} lines)" }
+                pre { class: "scenario-body", "{script}" }
             }
         }
     }

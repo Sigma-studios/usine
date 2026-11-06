@@ -11,7 +11,14 @@
 //! starts eagerly; instead the agent gets [`testing_instruction_on_request`]
 //! and can ask for the app mid-run by creating [`PREVIEW_REQUEST_FILE`] in the
 //! worktree root — a watcher bound to the run's lifetime picks it up and
-//! starts the same preview. Both files are git-excluded (shared
+//! starts the same preview (the watcher runs with `auto_preview` on too, so
+//! an agent can restart a failed eager start once it fixed the cause; a failed
+//! in-run start writes `{"status":"failed","error":…}` into the info file).
+//!
+//! When the worktree has a setup script, the agent may also write a
+//! [`SCENARIO_FILE`] to add test data the seed lacks; the executor stores it
+//! on the card and replays it after setup on every fresh start (see
+//! `executor::scenario`). All these files are git-excluded (shared
 //! `info/exclude`, registered before the run starts), so neither the finalize
 //! commit's `git add -A` nor a commit the agent makes itself can sweep them
 //! onto the branch.
@@ -36,6 +43,35 @@ pub const PREVIEW_INFO_FILE: &str = ".usine-preview.json";
 /// it and starts the preview.
 pub const PREVIEW_REQUEST_FILE: &str = ".usine-preview-request";
 
+/// The card's optional scenario script, in the worktree root: a bash script
+/// the agent writes to add the test data the repo's seed lacks. Git-excluded
+/// like the other runtime files, mirrored into the card's store record
+/// (`Card::scenario_script`) so it survives a rebuilt worktree, and replayed
+/// after the setup script on every fresh preview start (see
+/// `executor::scenario`).
+pub const SCENARIO_FILE: &str = ".usine-scenario.sh";
+
+/// Whether the agent may write a [`SCENARIO_FILE`] for this run, and whether
+/// the card already has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioSupport {
+    /// No setup script resolves in the worktree, so there is no isolated
+    /// environment to seed: a scenario script would write into whatever
+    /// database the app shares, and the preview skips it anyway.
+    Unavailable,
+    /// The agent may write one.
+    Available,
+    /// The card already has one, restored into the worktree for this run.
+    Existing,
+}
+
+impl ScenarioSupport {
+    /// Whether the agent may use a scenario script at all.
+    pub fn is_available(self) -> bool {
+        self != ScenarioSupport::Unavailable
+    }
+}
+
 /// Appended to write runs when the project has a `run_script` and starts the
 /// app eagerly (`auto_preview` on). Kept provider-agnostic and self-contained,
 /// like its siblings in [`crate::agent::commit`] and [`crate::agent::handoff`].
@@ -43,17 +79,23 @@ pub const PREVIEW_REQUEST_FILE: &str = ".usine-preview-request";
 /// agent exercises URLs; none means a windowed app it should screenshot, using
 /// the project's `screenshot` command when it has one — which a ported project
 /// is offered too, for the windowed app that fronts its own dev server.
-pub fn testing_instruction(run_script: &str, has_ports: bool, screenshot: Option<&str>) -> String {
+pub fn testing_instruction(
+    run_script: &str,
+    has_ports: bool,
+    screenshot: Option<&str>,
+    scenario: ScenarioSupport,
+) -> String {
     format!(
         "The project's app is being started for you in this worktree (its command: `{run_script}`), \
          owned by the tool that launched you. Do NOT start your own instance and do NOT stop or \
          restart it — it watch-reloads your edits. Once the app is up, `{PREVIEW_INFO_FILE}` in the \
          worktree root lists its local URLs. Setup (dependency install, an isolated database, port \
          allocation) can take a few minutes and the file only appears when the app process is \
-         launched, so if it is missing, keep working and check again later.\n{}\n{SEED_DATA}\n\
+         launched, so if it is missing, keep working and check again later.\n{}\n{}\n\
          Leave the app running when you finish — the tool that launched you stops it once the work \
          parks.",
-        observation_route(has_ports, screenshot)
+        observation_route(has_ports, screenshot),
+        seed_data(scenario)
     )
 }
 
@@ -64,6 +106,7 @@ pub fn testing_instruction_on_request(
     run_script: &str,
     has_ports: bool,
     screenshot: Option<&str>,
+    scenario: ScenarioSupport,
 ) -> String {
     format!(
         "The project's app (its command: `{run_script}`) is NOT started automatically for this \
@@ -73,10 +116,11 @@ pub fn testing_instruction_on_request(
          while it comes up and watch for `{PREVIEW_INFO_FILE}` in the worktree root, which lists \
          its local URLs once the app process is launched. The tool that launched you owns that \
          process: do NOT start your own instance and do NOT stop or restart it — it watch-reloads \
-         your edits.\n{}\n{SEED_DATA}\n\
+         your edits.\n{}\n{}\n\
          Leave the app running when you finish — the tool that launched you stops it once the work \
          parks.",
-        observation_route(has_ports, screenshot)
+        observation_route(has_ports, screenshot),
+        seed_data(scenario)
     )
 }
 
@@ -99,6 +143,39 @@ const SEED_DATA: &str = "The worktree's environment is created fresh for this ru
      and use those exact credentials and records rather than inventing an account or editing the \
      database by hand. Note in your report which account and records you used, so the reviewer can \
      repeat what you did.";
+
+/// The scenario-script half of the environment text, offered when the
+/// worktree has a setup script (so an isolated environment to seed). The seed
+/// stays the first choice and hand-editing the database stays off-limits: the
+/// script is the one *repeatable* way to add data, because the executor replays
+/// it on every fresh start (`executor::scenario`). Phrased mode-neutrally like
+/// [`SEED_DATA`] — fix runs get it too.
+const SCENARIO_DATA: &str = "If the seed lacks a state worth testing (a record in a particular \
+     status, data that normally arrives through an import or an external system), you MAY write \
+     `.usine-scenario.sh` in the worktree root: a bash script that adds just that data on top of \
+     the seed, using the project's own tooling (its ORM or database client, and the env files the \
+     setup script writes). It is saved with this card and replayed on every fresh start of the app, \
+     after setup and before the app launches — it is never committed. Make it safe to run twice, \
+     rely only on what setup provides, give the records it creates recognisable names, and run it \
+     once yourself to check it works. If it fails, the app does not start. Only write one if the \
+     tests genuinely need it; editing the database by hand outside it is still off-limits. If \
+     `.usine-preview.json` shows `\"status\": \"failed\"`, read its `error`: a failing scenario \
+     script is yours to fix — fix it, then create an empty `.usine-preview-request` file in the \
+     worktree root to restart the app.";
+
+/// Added on top of [`SCENARIO_DATA`] when the card already has a script.
+const SCENARIO_EXISTING: &str = "This card already has a `.usine-scenario.sh`; it runs on every \
+     fresh start of the app. If your change breaks it or the tests need more data, update it and run it again.";
+
+/// The environment text for this run: [`SEED_DATA`], plus the scenario-script
+/// offer when the worktree has an isolated environment to seed.
+fn seed_data(scenario: ScenarioSupport) -> String {
+    match scenario {
+        ScenarioSupport::Unavailable => SEED_DATA.to_string(),
+        ScenarioSupport::Available => format!("{SEED_DATA} {SCENARIO_DATA}"),
+        ScenarioSupport::Existing => format!("{SEED_DATA} {SCENARIO_DATA} {SCENARIO_EXISTING}"),
+    }
+}
 
 /// The default way to capture a single window on the platform Usine is running
 /// on, used when the project names no screenshot command of its own.
@@ -199,13 +276,20 @@ pub fn preview_info_json(urls: &[PreviewUrl]) -> String {
     serde_json::json!({ "status": "running", "urls": urls }).to_string()
 }
 
+/// The contents of [`PREVIEW_INFO_FILE`] when an in-run preview failed to
+/// start (setup or scenario script error): an agent waiting for the file
+/// learns it is not coming, and why.
+pub fn preview_failed_json(error: &str) -> String {
+    serde_json::json!({ "status": "failed", "error": error }).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn instruction_names_the_run_script_and_info_file() {
-        let s = testing_instruction("pnpm dev", true, None);
+        let s = testing_instruction("pnpm dev", true, None, ScenarioSupport::Unavailable);
         assert!(s.contains("`pnpm dev`"));
         assert!(s.contains(PREVIEW_INFO_FILE));
         // Eager mode: the app is started for the agent, no sentinel involved.
@@ -217,7 +301,7 @@ mod tests {
 
     #[test]
     fn portless_instruction_takes_the_screenshot_route() {
-        let s = testing_instruction("cargo run", false, None);
+        let s = testing_instruction("cargo run", false, None, ScenarioSupport::Unavailable);
         assert!(s.contains("screenshot"));
         assert!(!s.contains("curl"));
         // Window-scoped capture only — a full-display grab would feed the
@@ -231,7 +315,12 @@ mod tests {
 
     #[test]
     fn a_configured_screenshot_command_replaces_the_platform_guess() {
-        let s = testing_instruction("cargo run", false, Some("./shot.sh {path}"));
+        let s = testing_instruction(
+            "cargo run",
+            false,
+            Some("./shot.sh {path}"),
+            ScenarioSupport::Unavailable,
+        );
         assert!(s.contains("`./shot.sh {path}`"));
         assert!(s.contains(OPEN_PATH_PLACEHOLDER));
         // The platform fallback is exactly what it supersedes.
@@ -245,7 +334,12 @@ mod tests {
     /// configured is still offered: a windowed app can front a dev server.
     #[test]
     fn declared_ports_keep_an_offered_screenshot_command() {
-        let s = testing_instruction("pnpm dev", true, Some("./shot.sh {path}"));
+        let s = testing_instruction(
+            "pnpm dev",
+            true,
+            Some("./shot.sh {path}"),
+            ScenarioSupport::Unavailable,
+        );
         assert!(s.contains("curl"));
         assert!(s.contains("`./shot.sh {path}`"));
         assert!(s.contains("NEVER capture the full display"));
@@ -257,8 +351,18 @@ mod tests {
     #[test]
     fn capture_keeps_the_image_out_of_the_worktree() {
         for s in [
-            testing_instruction("cargo run", false, Some("./shot.sh")),
-            testing_instruction("pnpm dev", true, Some("./shot.sh")),
+            testing_instruction(
+                "cargo run",
+                false,
+                Some("./shot.sh"),
+                ScenarioSupport::Unavailable,
+            ),
+            testing_instruction(
+                "pnpm dev",
+                true,
+                Some("./shot.sh"),
+                ScenarioSupport::Unavailable,
+            ),
         ] {
             assert!(s.contains("outside the worktree"));
             assert!(s.contains("$TMPDIR"));
@@ -268,7 +372,8 @@ mod tests {
 
     #[test]
     fn on_request_instruction_names_the_sentinel() {
-        let s = testing_instruction_on_request("pnpm dev", true, None);
+        let s =
+            testing_instruction_on_request("pnpm dev", true, None, ScenarioSupport::Unavailable);
         assert!(s.contains("`pnpm dev`"));
         assert!(s.contains(PREVIEW_REQUEST_FILE));
         assert!(s.contains(PREVIEW_INFO_FILE));
@@ -280,7 +385,8 @@ mod tests {
 
     #[test]
     fn on_request_portless_takes_the_screenshot_route() {
-        let s = testing_instruction_on_request("cargo run", false, None);
+        let s =
+            testing_instruction_on_request("cargo run", false, None, ScenarioSupport::Unavailable);
         assert!(s.contains(PREVIEW_REQUEST_FILE));
         assert!(s.contains("screenshot"));
         assert!(!s.contains("curl"));
@@ -292,10 +398,15 @@ mod tests {
     #[test]
     fn every_variant_points_at_the_repos_seed_data() {
         for s in [
-            testing_instruction("pnpm dev", true, None),
-            testing_instruction("cargo run", false, None),
-            testing_instruction_on_request("pnpm dev", true, None),
-            testing_instruction_on_request("cargo run", false, Some("./shot.sh")),
+            testing_instruction("pnpm dev", true, None, ScenarioSupport::Unavailable),
+            testing_instruction("cargo run", false, None, ScenarioSupport::Unavailable),
+            testing_instruction_on_request("pnpm dev", true, None, ScenarioSupport::Unavailable),
+            testing_instruction_on_request(
+                "cargo run",
+                false,
+                Some("./shot.sh"),
+                ScenarioSupport::Unavailable,
+            ),
         ] {
             assert!(s.contains("seed/fixture data"));
             assert!(s.contains("exact credentials"));
@@ -309,8 +420,80 @@ mod tests {
     /// own instruction).
     #[test]
     fn the_seed_ask_is_mode_neutral() {
-        assert!(!SEED_DATA.contains("hand-off"));
-        assert!(!SEED_DATA.contains("`tests`"));
+        for support in [
+            ScenarioSupport::Unavailable,
+            ScenarioSupport::Available,
+            ScenarioSupport::Existing,
+        ] {
+            let s = seed_data(support);
+            assert!(!s.contains("hand-off"), "{support:?}");
+            assert!(!s.contains("`tests`"), "{support:?}");
+        }
+    }
+
+    /// Without an isolated environment to seed, the scenario script is never
+    /// offered — the text is today's seed-only ask, unchanged.
+    #[test]
+    fn no_setup_script_means_no_scenario_offer() {
+        let s = testing_instruction("pnpm dev", true, None, ScenarioSupport::Unavailable);
+        assert!(!s.contains(SCENARIO_FILE));
+        assert!(s.contains(SEED_DATA));
+        let s =
+            testing_instruction_on_request("pnpm dev", true, None, ScenarioSupport::Unavailable);
+        assert!(!s.contains(SCENARIO_FILE));
+    }
+
+    /// The offer: optional, seed first, replayed, never committed, safe to
+    /// re-run, and recoverable from a failed start via the request sentinel —
+    /// in both instruction variants (the eager one never mentions the
+    /// sentinel otherwise).
+    #[test]
+    fn the_scenario_offer_explains_replay_and_recovery() {
+        for s in [
+            testing_instruction("pnpm dev", true, None, ScenarioSupport::Available),
+            testing_instruction_on_request("pnpm dev", true, None, ScenarioSupport::Available),
+        ] {
+            assert!(s.contains(SCENARIO_FILE));
+            assert!(s.contains("MAY write"));
+            assert!(s.contains("seed/fixture data"), "the seed stays first");
+            assert!(s.contains("replayed on every fresh start"));
+            assert!(s.contains("never committed"));
+            assert!(s.contains("safe to run twice"));
+            assert!(s.contains("editing the database by hand outside it is still off-limits"));
+            assert!(s.contains(PREVIEW_INFO_FILE));
+            assert!(
+                s.contains(PREVIEW_REQUEST_FILE),
+                "how to restart after a fix"
+            );
+            assert!(s.contains("\"status\": \"failed\""));
+            assert!(!s.contains("already has a"));
+        }
+    }
+
+    #[test]
+    fn an_existing_script_is_announced() {
+        let s = testing_instruction("pnpm dev", true, None, ScenarioSupport::Existing);
+        assert!(s.contains("already has a `.usine-scenario.sh`"));
+        assert!(s.contains("update it and run it again"));
+        assert!(s.contains("MAY write"));
+    }
+
+    /// The prose spells the file names out literally; keep them in step with
+    /// the constants the executor uses.
+    #[test]
+    fn the_scenario_prose_uses_the_real_file_names() {
+        assert!(SCENARIO_DATA.contains(&format!("`{SCENARIO_FILE}`")));
+        assert!(SCENARIO_DATA.contains(&format!("`{PREVIEW_INFO_FILE}`")));
+        assert!(SCENARIO_DATA.contains(&format!("`{PREVIEW_REQUEST_FILE}`")));
+        assert!(SCENARIO_EXISTING.contains(&format!("`{SCENARIO_FILE}`")));
+    }
+
+    #[test]
+    fn failed_json_round_trips() {
+        let v: serde_json::Value =
+            serde_json::from_str(&preview_failed_json("setup `x` failed:\n\"boom\"")).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "setup `x` failed:\n\"boom\"");
     }
 
     #[test]
