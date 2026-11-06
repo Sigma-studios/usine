@@ -318,9 +318,17 @@ pub fn untracked_files_args() -> Vec<String> {
 }
 
 /// Merge `gitref` into the checked-out branch. `--no-edit` keeps git from
-/// opening an editor for the merge commit message.
+/// opening an editor for the merge commit message; `--no-verify` skips the
+/// repo's `pre-merge-commit` / `commit-msg` hooks, like [`GitOps::commit_all`]'s
+/// commits — this merge commit is machine-made, and a hook (commitlint, a
+/// tool missing from the app's PATH) must not fail a merge that succeeded.
 pub fn merge_args(gitref: &str) -> Vec<String> {
-    vec!["merge".into(), "--no-edit".into(), gitref.into()]
+    vec![
+        "merge".into(),
+        "--no-edit".into(),
+        "--no-verify".into(),
+        gitref.into(),
+    ]
 }
 
 /// Squash `gitref` into the checked-out tree and index without committing —
@@ -900,6 +908,7 @@ impl GitOps for SimGit {
 /// a genuine failure — shared by [`GitOps::merge_ref`] and
 /// [`GitOps::squash_ref`].
 async fn run_merge(dir: &Path, args: &[String]) -> Result<MergeOutcome> {
+    let had_merge = merge_in_progress(dir).await;
     let Err(e) = run_git(dir, args).await else {
         return Ok(MergeOutcome::Clean);
     };
@@ -918,6 +927,16 @@ async fn run_merge(dir: &Path, args: &[String]) -> Result<MergeOutcome> {
         .map(|e| path_from_bytes(e).to_string_lossy().into_owned())
         .collect();
     if files.is_empty() {
+        // A third case: the merge itself went through but its commit step
+        // failed (a hook `--no-verify` doesn't skip, like
+        // `prepare-commit-msg`; gpg signing). Git then leaves `MERGE_HEAD`
+        // and the incoming changes staged, which every later step reads as
+        // uncommitted work. Roll back a merge *this call* started; one that
+        // was already in progress (an agent's unfinished conflict
+        // resolution) is the caller's to deal with.
+        if !had_merge && merge_in_progress(dir).await {
+            let _ = run_git(dir, &["merge".into(), "--abort".into()]).await;
+        }
         return Err(e);
     }
     Ok(MergeOutcome::Conflicted(files))
@@ -933,7 +952,14 @@ async fn run_git(cwd: &Path, args: &[String]) -> Result<String> {
 async fn run_git_bytes(cwd: &Path, args: &[String]) -> Result<Vec<u8>> {
     let out = timeout(
         GIT_TIMEOUT,
-        Command::new("git").current_dir(cwd).args(args).output(),
+        // `kill_on_drop`: on a timeout the future is dropped, and the git
+        // process must die with it — a merge left running would race the
+        // `merge --abort` cleanup in `run_merge`.
+        Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .map_err(|_| {
@@ -1268,6 +1294,17 @@ pub fn commitish_exists(repo: &Path, name: &str) -> bool {
 pub async fn is_dirty(repo: &Path) -> Result<bool> {
     let out = run_git(repo, &["status".into(), "--porcelain".into()]).await?;
     Ok(!out.trim().is_empty())
+}
+
+/// Whether a `git merge` is in progress in `dir` (`MERGE_HEAD` exists).
+/// Asks git rather than probing `.git/MERGE_HEAD`, which in a linked worktree
+/// lives under the main repo's `worktrees/<name>/`.
+pub async fn merge_in_progress(dir: &Path) -> bool {
+    let args: Vec<String> = ["rev-parse", "-q", "--verify", "MERGE_HEAD"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    run_git(dir, &args).await.is_ok()
 }
 
 /// Make git ignore `patterns` in every checkout of the repo `worktree` belongs
@@ -1663,10 +1700,10 @@ mod tests {
     /// `--no-edit`: a merge that opens `$EDITOR` in a headless worktree hangs
     /// until the git timeout kills it.
     #[test]
-    fn merge_never_opens_an_editor() {
+    fn merge_never_opens_an_editor_or_runs_hooks() {
         assert_eq!(
             merge_args("origin/dev"),
-            vec!["merge", "--no-edit", "origin/dev"]
+            vec!["merge", "--no-edit", "--no-verify", "origin/dev"]
         );
     }
 

@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
+use usine_core::infra::git;
 use usine_core::{
     spawn_executor, AgentProvider, Card, CardConfig, CardState, CheckStatus, CoreError,
     DraftComment, ExecutorCommand, ExecutorConfig, ExecutorEvent, ExecutorEventKind, Forge, GitOps,
@@ -911,6 +912,12 @@ fn git(dir: &Path, args: &[&str]) {
 /// A repo on `dev` whose `feature` worktree and `dev` both edited `a.txt` — the
 /// shape of every PR that stops merging because its base moved.
 fn diverged_repo(tmp: &Path) -> (PathBuf, PathBuf) {
+    diverged_repo_where_dev_edits(tmp, "a.txt")
+}
+
+/// Like [`diverged_repo`], but `dev` edits `dev_file` — another file than
+/// `a.txt` gives a branch that merges cleanly.
+fn diverged_repo_where_dev_edits(tmp: &Path, dev_file: &str) -> (PathBuf, PathBuf) {
     let repo = tmp.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
@@ -939,8 +946,8 @@ fn diverged_repo(tmp: &Path) -> (PathBuf, PathBuf) {
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "feat"]);
 
-    // `dev` moves underneath the branch, touching the same line.
-    std::fs::write(repo.join("a.txt"), "dev\n").unwrap();
+    // `dev` moves underneath the branch (on `a.txt`, touching the same line).
+    std::fs::write(repo.join(dev_file), "dev\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "dev moves"]);
     (repo, wt)
@@ -1133,4 +1140,116 @@ async fn unresolved_conflicts_sees_markers_through_odd_names_and_a_self_committe
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "really resolve"]);
     assert!(gitops.unresolved_conflicts(&wt).await.unwrap().is_empty());
+}
+
+// --- real git: a merge usine starts never outlives a failed commit ----------
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Install a `name` hook that always fails. Through a repo-local
+/// `core.hooksPath`, so a global one on the dev machine can't shadow it;
+/// linked worktrees share the config.
+fn failing_hook(repo: &Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let hooks = repo.join("test-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join(name);
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+}
+
+/// A repo's commit-msg hook (commitlint, say) gates human commits, not the
+/// merge commit usine makes — failing it must not fail an otherwise clean
+/// Update from base.
+#[tokio::test]
+async fn merge_ref_ignores_a_failing_commit_msg_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, wt) = diverged_repo_where_dev_edits(tmp.path(), "b.txt");
+    failing_hook(&repo, "commit-msg");
+    failing_hook(&repo, "pre-merge-commit");
+
+    let outcome = RealGit.merge_ref(&wt, "dev").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Clean);
+    assert_eq!(
+        git_out(&wt, &["rev-list", "--parents", "-n1", "HEAD"])
+            .split(' ')
+            .count(),
+        3,
+        "HEAD must be the merge commit (itself + 2 parents)"
+    );
+    assert!(!git::merge_in_progress(&wt).await);
+}
+
+/// A merge that went through but couldn't be committed (a hook `--no-verify`
+/// doesn't skip, gpg signing) would leave `MERGE_HEAD` and the incoming
+/// changes staged — read later as uncommitted work that blocks Merge locally.
+/// It is rolled back instead, and the failure still reported.
+#[tokio::test]
+async fn merge_ref_rolls_back_a_merge_whose_commit_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, wt) = diverged_repo_where_dev_edits(tmp.path(), "b.txt");
+    failing_hook(&repo, "prepare-commit-msg");
+    let before = git_out(&wt, &["rev-parse", "HEAD"]);
+
+    RealGit
+        .merge_ref(&wt, "dev")
+        .await
+        .expect_err("a merge whose commit failed must be an error");
+    assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), before);
+    assert!(!git::merge_in_progress(&wt).await);
+    assert_eq!(git_out(&wt, &["status", "--porcelain"]), "");
+}
+
+/// The rollback is only for a merge this call started: a conflicted merge
+/// already in progress is an agent's unfinished resolution, which the
+/// Resolve-conflicts and retry paths rely on finding intact.
+#[tokio::test]
+async fn merge_ref_leaves_a_preexisting_merge_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_repo, wt) = diverged_repo(tmp.path());
+    let out = Command::new("git")
+        .current_dir(&wt)
+        .args(["merge", "--no-edit", "dev"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the hand-made merge must conflict");
+    assert!(git::merge_in_progress(&wt).await);
+
+    let outcome = RealGit.merge_ref(&wt, "dev").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Conflicted(vec!["a.txt".to_string()]));
+    assert!(git::merge_in_progress(&wt).await);
+}
+
+/// The case the had-a-merge-already check exists for: an agent resolved and
+/// staged every conflict but never committed. Nothing is unmerged any more,
+/// so `git merge` fails like a commit-step failure would — but aborting here
+/// would throw the resolution away. It must be reported and left in place.
+#[tokio::test]
+async fn merge_ref_keeps_a_staged_but_uncommitted_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_repo, wt) = diverged_repo(tmp.path());
+    let out = Command::new("git")
+        .current_dir(&wt)
+        .args(["merge", "--no-edit", "dev"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the hand-made merge must conflict");
+    std::fs::write(wt.join("a.txt"), "resolved\n").unwrap();
+    git(&wt, &["add", "a.txt"]);
+    assert_eq!(git_out(&wt, &["diff", "--name-only", "--diff-filter=U"]), "");
+
+    RealGit
+        .merge_ref(&wt, "dev")
+        .await
+        .expect_err("merging over an uncommitted merge must be an error");
+    assert!(git::merge_in_progress(&wt).await, "MERGE_HEAD must survive");
+    assert_eq!(git_out(&wt, &["show", ":a.txt"]), "resolved");
 }

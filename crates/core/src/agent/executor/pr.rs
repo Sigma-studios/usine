@@ -1270,6 +1270,13 @@ impl Executor {
             .get_card(card_id)?
             .worktree_path
             .ok_or_else(|| CoreError::other("card has no worktree to merge"))?;
+        // A stopped merge stages its incoming changes, which reads as dirty —
+        // name it, rather than ask the user to commit work that isn't theirs.
+        if git::merge_in_progress(&dir).await {
+            return Err(CoreError::other(
+                "a merge is in progress in the card's worktree — finish it (`git commit`) or abort it (`git merge --abort`) first",
+            ));
+        }
         if is_dirty(&dir).await? {
             return Err(CoreError::other(
                 "the card's worktree has uncommitted changes — commit or discard them first",
@@ -1638,8 +1645,9 @@ impl Executor {
         transition(&card.state, Transition::UpdateFromBase)?;
 
         // Everything up to the transition is recoverable: a failure here leaves
-        // the card where it stands (a merge that failed outright, such as on a
-        // dirty tree, leaves no merge in progress behind).
+        // the card where it stands: a merge that failed outright (a dirty
+        // tree) never started, and one that merged but couldn't commit is
+        // rolled back by `run_merge` — neither leaves a merge in progress.
         self.ensure_branch_worktree(card_id).await?;
         let dir = self
             .store
