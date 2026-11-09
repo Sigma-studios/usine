@@ -213,8 +213,13 @@ async fn only_implement_runs_are_asked_for_a_hand_off() {
 
     let fixes = prompt_for(&prompts, RunMode::ApplyFixes).expect("a fix run");
     assert!(
-        !fixes.contains("usine-handoff"),
+        !fixes.contains("`usine-handoff`"),
         "a fix run must not be asked for a hand-off:\n{fixes}"
+    );
+    // …only, the card having one, for a revision of its tests/risks/questions.
+    assert!(
+        fixes.contains("`usine-handoff-revision`"),
+        "a fix run may revise the hand-off it could have falsified:\n{fixes}"
     );
     // …but it is asked to open its recap with a TL;DR.
     assert!(

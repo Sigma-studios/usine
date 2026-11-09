@@ -1040,6 +1040,13 @@ pub(super) fn HandoffPanel(card_id: Uuid, handoff: Handoff) -> Element {
                      Its notes are in the transcript."
                 }
             }
+            if handoff.revision_malformed {
+                div { class: "hint",
+                    "A later run tried to update this note and sent a garbled revision — the \
+                     tests, risks or open questions may be out of date. Its notes are in the \
+                     Agent Chat."
+                }
+            }
             if sections.len() > 1 {
                 ArtifactTabs {
                     labels: sections.iter().map(|t| t.label().to_string()).collect::<Vec<_>>(),

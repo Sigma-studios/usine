@@ -7,9 +7,11 @@
 //! `usine-handoff` block and `finalize_run` stored it over the original, so
 //! the reviewer lost the recap of the work they had just read.
 //!
-//! The one exception is the hand-off's "Test it" checklist, which a change
-//! can falsify: the change run is shown it and may send back the complete
-//! revised list in a `usine-tests` block, which replaces only `tests`.
+//! The exceptions are the hand-off's "Test it" checklist, risks and open
+//! questions, which a change can falsify: the change run is shown them and may
+//! send back any of them in a `usine-handoff-revision` block, which replaces
+//! only the lists it carries. Fix runs (self-review fixes here) get the same
+//! chance.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -180,11 +182,12 @@ async fn a_requested_change_gets_its_own_recap_and_keeps_the_hand_off_unless_it_
     assert_eq!(implement.len(), 2, "the first run, then the change run");
     assert!(implement[0].contains("usine-handoff"));
     assert!(
-        !implement[1].contains("usine-handoff"),
+        !implement[1].contains("`usine-handoff`"),
         "a change run is not asked for a hand-off:\n{}",
         implement[1]
     );
-    assert!(implement[1].contains("usine-tests"));
+    assert!(implement[1].contains("usine-handoff-revision"));
+    assert!(implement[1].contains("Current risks:"));
     let scenario = &original
         .tests
         .first()
@@ -254,12 +257,25 @@ async fn a_change_on_an_open_pr_leaves_the_fixes_recap_alone() {
         vec![usine_core::TestItem::from("Click Save")],
         "the revised checklist replaces the old one"
     );
+    assert_eq!(
+        store.get_handoff(card_id).unwrap().unwrap().risks,
+        vec!["The button label changed".to_string()],
+        "the revised risks replace the old ones"
+    );
     assert_eq!(store.get_pending_change(card_id).unwrap(), None);
 }
 
-/// A reply that revises the checklist alongside its recap.
-const REVISED_REPLY: &str =
-    "Reworded the paragraph.\n\n```usine-tests\n{\"tests\": [\"Click Save\"]}\n```";
+/// A reply that revises the checklist, risks and questions alongside its recap.
+const REVISED_REPLY: &str = "Reworded the paragraph.\n\n```usine-handoff-revision\n\
+{\"tests\": [\"Click Save\"], \"risks\": [\"The button label changed\"], \"questions\": []}\n```";
+
+/// A reply that revises only the risks.
+const RISKS_ONLY_REPLY: &str = "Reworded the paragraph.\n\n```usine-handoff-revision\n\
+{\"risks\": [\"Needs a migration\"]}\n```";
+
+/// A reply whose revision block is garbled (a misspelled key).
+const GARBLED_REPLY: &str =
+    "Reworded the paragraph.\n\n```usine-handoff-revision\n{\"risk\": [\"x\"]}\n```";
 
 fn handoff_with_tests() -> usine_core::Handoff {
     usine_core::Handoff {
@@ -269,8 +285,12 @@ fn handoff_with_tests() -> usine_core::Handoff {
             what: "new form".into(),
             kind: "feat".into(),
         }],
-        tests: vec![usine_core::TestItem::from("Click Submit")],
+        tests: vec![
+            usine_core::TestItem::from("Click Submit"),
+            usine_core::TestItem::from("[verified] Reload the form"),
+        ],
         risks: vec!["no migration".into()],
+        questions: vec!["Keep the old label?".into()],
         ..Default::default()
     }
 }
@@ -320,15 +340,257 @@ async fn a_change_that_revises_the_tests_replaces_only_the_checklist() {
         revised.tests,
         vec![usine_core::TestItem::from("Click Save")]
     );
+    assert_eq!(revised.risks, vec!["The button label changed"]);
+    assert!(revised.questions.is_empty(), "`[]` wipes the questions");
     assert_eq!(
         usine_core::Handoff {
             tests: original.tests.clone(),
+            risks: original.risks.clone(),
+            questions: original.questions.clone(),
             ..revised.clone()
         },
         original,
-        "summary, changes and risks are the original hand-off's"
+        "summary and changes are the original hand-off's"
     );
     assert_eq!(store.get_handoff(card_id).unwrap(), Some(revised));
+}
+
+/// Park a card at the pre-PR gate with `handoff`, run one change on it whose
+/// reply is `reply`, and return the hand-off it emitted.
+async fn revise_once(dir: &str, handoff: &usine_core::Handoff, reply: &str) -> usine_core::Handoff {
+    let store = Store::open_in_memory().unwrap();
+    let project = project(&store, dir);
+    let mut card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    card.state = CardState::AwaitingReview(ReviewSub::ReadyForReview);
+    card.branch = Some("usine/thing".into());
+    card.worktree_path = Some(PathBuf::from(format!("{dir}-wt")));
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+    store.set_auto_review(card_id, false).unwrap();
+    store.set_handoff(card_id, handoff).unwrap();
+
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(ScriptedFactory {
+            result: Some(reply.into()),
+            ..Default::default()
+        }),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::ReviseImplementation {
+        card_id,
+        feedback: "Change it.".into(),
+    });
+    let revised = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::HandoffUpdated { handoff } if e.card_id == card_id => {
+            Some(handoff.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(store.get_handoff(card_id).unwrap(), Some(revised.clone()));
+    revised
+}
+
+#[tokio::test]
+async fn a_risks_only_revision_keeps_the_checklist_and_its_verified_marks() {
+    let original = handoff_with_tests();
+    let revised = revise_once("/tmp/change-recap-risks", &original, RISKS_ONLY_REPLY).await;
+    assert_eq!(revised.risks, vec!["Needs a migration"]);
+    assert_eq!(revised.tests, original.tests, "tests not re-sent stay as they were");
+    assert!(revised.tests[1].verified, "…verified mark included");
+    assert_eq!(revised.questions, original.questions);
+}
+
+#[tokio::test]
+async fn a_garbled_revision_flags_the_note_and_a_good_one_clears_the_flag() {
+    let original = handoff_with_tests();
+    let flagged = revise_once("/tmp/change-recap-garbled", &original, GARBLED_REPLY).await;
+    assert!(flagged.revision_malformed);
+    assert_eq!(
+        usine_core::Handoff {
+            revision_malformed: false,
+            ..flagged.clone()
+        },
+        original,
+        "the stored lists are kept as they were"
+    );
+
+    let cleared = revise_once("/tmp/change-recap-garbled-2", &flagged, RISKS_ONLY_REPLY).await;
+    assert!(!cleared.revision_malformed);
+    assert_eq!(cleared.risks, vec!["Needs a migration"]);
+}
+
+/// Delegates to the sim for every run except a fix run, which ends with
+/// `fix_reply` — and records every prompt.
+struct FixScriptFactory {
+    fix_reply: String,
+    prompts: Prompts,
+}
+
+struct FixScriptProvider {
+    inner: Arc<dyn AgentProvider>,
+    fix_reply: String,
+    prompts: Prompts,
+}
+
+#[async_trait::async_trait]
+impl AgentProvider for FixScriptProvider {
+    fn provider(&self) -> Provider {
+        self.inner.provider()
+    }
+    fn interactive(&self) -> bool {
+        self.inner.interactive()
+    }
+    async fn start(&self, cfg: RunConfig) -> Result<RunHandle> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((cfg.mode, cfg.full_prompt()));
+        if cfg.mode != RunMode::ApplyFixes {
+            return self.inner.start(cfg).await;
+        }
+        let (evt_tx, evt_rx) = futures::channel::mpsc::unbounded();
+        let (ctl_tx, _ctl_rx) = futures::channel::mpsc::unbounded();
+        let _ = evt_tx.unbounded_send(AgentEvent::Started {
+            session_id: "sess-fix".into(),
+        });
+        let _ = evt_tx.unbounded_send(AgentEvent::Done {
+            result: self.fix_reply.clone(),
+            cost_usd: 0.0,
+            usage: usine_core::Usage::default(),
+        });
+        Ok(RunHandle {
+            events: evt_rx.boxed(),
+            control: ctl_tx,
+        })
+    }
+}
+
+impl ProviderFactory for FixScriptFactory {
+    fn make(&self, provider: Provider) -> Arc<dyn AgentProvider> {
+        Arc::new(FixScriptProvider {
+            inner: SimFactory.make(provider),
+            fix_reply: self.fix_reply.clone(),
+            prompts: self.prompts.clone(),
+        })
+    }
+}
+
+/// Drive a card to the self-review picker over the sim, with `handoff`
+/// standing in for whatever the implement run handed off, then apply every
+/// finding. Returns the store, event stream and recorded prompts.
+async fn run_self_fixes(
+    dir: &str,
+    handoff: Option<usine_core::Handoff>,
+    fix_reply: &str,
+) -> (Store, uuid::Uuid, UnboundedReceiver<ExecutorEvent>, Prompts) {
+    let store = Store::open_in_memory().unwrap();
+    let project = project(&store, dir);
+    let card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    let card_id = card.id;
+    store.upsert_card(&card).unwrap();
+    store.set_skip_plan(card_id, true).unwrap();
+
+    let prompts: Prompts = Arc::new(Mutex::new(Vec::new()));
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(FixScriptFactory {
+            fix_reply: fix_reply.into(),
+            prompts: prompts.clone(),
+        }),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::Start { card_id });
+    let verdicts = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::CardUpdated(c) if c.id == card_id => match &c.state {
+            CardState::AwaitingReview(ReviewSub::SelectingFixes { verdicts }) => {
+                Some(verdicts.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    match handoff {
+        Some(h) => store.set_handoff(card_id, &h).unwrap(),
+        None => store.set_handoff(card_id, &usine_core::Handoff::default()).unwrap(),
+    }
+    let picked = verdicts
+        .into_iter()
+        .map(|mut v| {
+            v.selected = true;
+            v
+        })
+        .collect();
+    handle.send(ExecutorCommand::ApplySelfFixes {
+        card_id,
+        verdicts: picked,
+        note: String::new(),
+        prompt: None,
+    });
+    (store, card_id, rx, prompts)
+}
+
+fn fix_prompt(prompts: &Prompts) -> String {
+    prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _)| *m == RunMode::ApplyFixes)
+        .map(|(_, p)| p.clone())
+        .expect("a fix run was launched")
+}
+
+#[tokio::test]
+async fn a_self_review_fix_run_can_revise_the_hand_off_and_refreshes_the_diff() {
+    let original = handoff_with_tests();
+    let reply = "TL;DR: fixed it.\n\n```usine-fixes\n{\"outcomes\": []}\n```\n\n\
+```usine-handoff-revision\n{\"risks\": [\"Needs a migration\"]}\n```";
+    let (store, card_id, mut rx, prompts) =
+        run_self_fixes("/tmp/change-recap-self-fix", Some(original.clone()), reply).await;
+
+    let mut revised = None;
+    let mut diff_refreshed = false;
+    wait_for(&mut rx, |e| {
+        if e.card_id == card_id {
+            match &e.kind {
+                ExecutorEventKind::HandoffUpdated { handoff } => revised = Some(handoff.clone()),
+                ExecutorEventKind::DiffUpdated { .. } => diff_refreshed = true,
+                _ => {}
+            }
+        }
+        (revised.is_some() && diff_refreshed).then_some(())
+    })
+    .await;
+    let revised = revised.unwrap();
+    assert_eq!(revised.risks, vec!["Needs a migration"]);
+    assert_eq!(revised.tests, original.tests);
+    assert_eq!(revised.summary, original.summary);
+    assert_eq!(store.get_handoff(card_id).unwrap(), Some(revised));
+
+    let prompt = fix_prompt(&prompts);
+    assert!(prompt.contains("usine-handoff-revision"), "{prompt}");
+    assert!(prompt.contains("- no migration\n"), "the fix run sees the risks");
+    assert!(prompt.contains("- Keep the old label?\n"));
+    assert!(prompt.contains("\"scenario\":\"Reload the form\""));
+    assert!(prompt.contains("\"verified\":true}"));
+}
+
+#[tokio::test]
+async fn a_fix_run_on_a_card_without_a_hand_off_is_not_asked_to_revise_one() {
+    let reply = "TL;DR: fixed it.\n\n```usine-fixes\n{\"outcomes\": []}\n```";
+    let (_store, card_id, mut rx, prompts) =
+        run_self_fixes("/tmp/change-recap-self-fix-none", None, reply).await;
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::FixReportUpdated { .. } if e.card_id == card_id => Some(()),
+        _ => None,
+    })
+    .await;
+    let prompt = fix_prompt(&prompts);
+    assert!(!prompt.contains("usine-handoff-revision"), "{prompt}");
 }
 
 #[tokio::test]

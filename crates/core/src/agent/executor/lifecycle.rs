@@ -421,21 +421,21 @@ impl Executor {
                     tail.push_str("\n\n");
                 }
                 tail.push_str(crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION);
+                // The hand-off as it stands: a later run that changes code is
+                // shown its tests, risks and questions so it can revise what
+                // it falsified (see `finalize_run`).
+                let handoff = self
+                    .store
+                    .get_handoff(card.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 if is_change_run {
                     tail.push_str("\n\n");
-                    // Shown the checklist it may have just falsified, so it
-                    // can send back the revised one (see `finalize_run`).
-                    let tests = self
-                        .store
-                        .get_handoff(card.id)
-                        .ok()
-                        .flatten()
-                        .map(|h| h.tests)
-                        .unwrap_or_default();
                     tail.push_str(&crate::agent::handoff::change_recap_instruction(
                         run.is_some(),
                         scenario.is_available(),
-                        &tests,
+                        &handoff,
                     ));
                 } else if mode == RunMode::Implement {
                     tail.push_str("\n\n");
@@ -444,8 +444,20 @@ impl Executor {
                         scenario.is_available(),
                     ));
                 } else {
+                    // Every fix path (self-review, validation, PR comments,
+                    // update / conflict resolution) runs as `ApplyFixes`. A
+                    // card with no hand-off (adopted branch, older card) has
+                    // nothing to revise.
                     tail.push_str("\n\n");
                     tail.push_str(crate::agent::fixes::FIX_RECAP_INSTRUCTION);
+                    if !handoff.is_empty() {
+                        tail.push_str("\n\n");
+                        tail.push_str(&crate::agent::handoff::fix_revision_instruction(
+                            run.is_some(),
+                            scenario.is_available(),
+                            &handoff,
+                        ));
+                    }
                 }
                 Some(match extra {
                     Some(e) => format!("{e}\n\n{tail}"),

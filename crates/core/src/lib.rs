@@ -34,9 +34,10 @@ pub use agent::fixes::{
     REVIEW_BODY_PATH,
 };
 pub use agent::handoff::{
-    change_recap_instruction, handoff_block_malformed, handoff_instruction, parse_handoff,
-    parse_tests_block, revise_tests, strip_handoff_block, strip_tests_block, Change, Handoff,
-    TestItem,
+    change_recap_instruction, fix_revision_instruction, handoff_block_malformed,
+    handoff_instruction, parse_handoff, parse_revision_block, revise_handoff,
+    revision_block_malformed, strip_handoff_block, strip_revision_block, Change, Handoff,
+    HandoffRevision, TestItem,
 };
 pub use agent::investigate::parse_findings;
 pub use agent::testing::SCENARIO_FILE;

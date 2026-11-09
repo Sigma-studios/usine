@@ -328,7 +328,7 @@ async fn finalize_run(
             let (clean, questions) = crate::agent::plan::parse_questions(&result_text);
             if !questions.is_empty() {
                 let recap = crate::agent::fixes::strip_fixes_block(
-                    &crate::agent::handoff::strip_tests_block(
+                    &crate::agent::handoff::strip_revision_block(
                         &crate::agent::handoff::strip_handoff_block(
                             &crate::agent::commit::strip_commit_block(&clean),
                         ),
@@ -529,7 +529,7 @@ async fn finalize_run(
     // a questions block that got this far (a fix run that asked but whose merge
     // had already been completed, say), which must never render raw as a recap.
     let summary =
-        crate::agent::fixes::strip_fixes_block(&crate::agent::handoff::strip_tests_block(
+        crate::agent::fixes::strip_fixes_block(&crate::agent::handoff::strip_revision_block(
             &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
                 &crate::agent::plan::parse_questions(&result_text).0,
             )),
@@ -698,23 +698,52 @@ async fn finalize_run(
         if let Ok(answers) = store.get_answers(card_id) {
             let _ = evt_tx.unbounded_send(ExecutorEvent::answers_updated(card_id, answers));
         }
-        // The one part of the hand-off a change may rewrite: its "Test it"
-        // checklist, when the run sent back a revised one. No block means the
-        // stored list still holds. A garbled block keeps it too, but says so:
-        // the agent meant to revise it, so it may now be stale.
-        if is_change_run {
-            let stored = store.get_handoff(card_id).ok().flatten();
-            if let Some(handoff) = crate::agent::handoff::revise_tests(stored, &result_text) {
+    }
+
+    // Every run that changes code after the first implement run may have
+    // falsified the hand-off's tests, risks or questions, so it was shown them
+    // and may send back a revision. No block means they still hold. A garbled
+    // block keeps them too, but flags the note so the panel says it may be
+    // stale. Applied even when the run committed nothing: the agent may have
+    // answered a question in prose alone.
+    let stored_handoff = store.get_handoff(card_id).ok().flatten();
+    let revises_handoff = is_change_run
+        || (matches!(
+            transition,
+            Transition::SelfFixesDone
+                | Transition::ValidationFixDone
+                | Transition::AgentFixesDone
+                | Transition::UpdateDone
+        ) && stored_handoff.as_ref().is_some_and(|h| !h.is_empty()));
+    if revises_handoff {
+        if let Some(handoff) =
+            crate::agent::handoff::revise_handoff(stored_handoff.clone(), &result_text)
+        {
+            let _ = store.set_handoff(card_id, &handoff);
+            let _ = evt_tx.unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
+        } else if crate::agent::handoff::revision_block_malformed(&result_text) {
+            if let Some(mut handoff) = stored_handoff.filter(|h| !h.is_empty()) {
+                handoff.revision_malformed = true;
                 let _ = store.set_handoff(card_id, &handoff);
                 let _ = evt_tx.unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
-            } else if crate::agent::handoff::tests_block_malformed(&result_text) {
-                let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
-                    card_id,
-                    Severity::Warning,
-                    "The agent sent a malformed \"Test it\" revision; the previous checklist was kept and may be out of date.".to_string(),
-                ));
             }
+            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                "The agent sent a malformed revision of the hand-off (tests/risks/questions); \
+                 the previous note was kept and may be out of date."
+                    .to_string(),
+            ));
         }
+    }
+
+    // A commit changed the branch, so the card's cached diff (the Changes
+    // tab's diffstats and "not in the diff" check) is stale — recompute it.
+    // An update moved the tip and fork point with its own merge commit before
+    // the run started, so `commit_all` may report nothing new (the agent
+    // changed nothing, or committed itself) — refresh after it regardless.
+    if committed || is_update {
+        refresh_diff_direct(executor, card_id);
     }
 
     // An implement run hands off to whoever reviews it next. Store it (and emit it)
@@ -893,6 +922,17 @@ async fn finalize_self_review(
 pub(super) fn reap_idle_preview_direct(executor: &Weak<Executor>, card_id: Uuid) {
     if let Some(exec) = executor.upgrade() {
         tokio::spawn(async move { exec.reap_idle_preview(card_id).await });
+    }
+}
+
+/// Recompute a card's diff from an actor task that only holds a
+/// `Weak<Executor>` (mirrors [`reap_idle_preview_direct`]), so the app's
+/// cached diff follows the commit a run just made. Best-effort.
+pub(super) fn refresh_diff_direct(executor: &Weak<Executor>, card_id: Uuid) {
+    if let Some(exec) = executor.upgrade() {
+        tokio::spawn(async move {
+            let _ = exec.compute_diff(card_id).await;
+        });
     }
 }
 
