@@ -1553,9 +1553,7 @@ pub const CI_REGISTER_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// is never distrusted, so this only has to outlast the recompute.
 pub const MERGEABILITY_RECOMPUTE_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Where a card was filed from. Gates the MCP surface's edit and delete tools:
-/// an external agent may only rename, re-describe or remove cards it created
-/// itself, never ones the user filed on the board.
+/// Where a card was filed from. Informational: reported by the MCP read tools.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardOrigin {

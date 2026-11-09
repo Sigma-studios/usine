@@ -7,9 +7,9 @@
 //! up without a restart.
 //!
 //! The write tools add projects and cards, and rename, re-describe or delete
-//! cards — but only cards the MCP itself filed ([`CardOrigin::Mcp`]), so an
-//! external agent can clean up its own mistakes without ever touching work the
-//! user put on the board.
+//! any card — whoever filed it. A description change or a delete is only
+//! allowed while the card is still in the starting block, so nothing here can
+//! disturb work already in flight.
 //!
 //! Deliberately absent: anything that starts an agent. The socket can add work
 //! to the board, not execute code.
@@ -108,10 +108,8 @@ pub fn list() -> Value {
         },
         {
             "name": "update_card",
-            "description": "Rename and/or re-describe a card. Only works on cards created with \
-                            `create_card` (origin `mcp`) — cards the user filed on the board are \
-                            off limits. The title can change at any time; the description only \
-                            while the card is still in the starting block.",
+            "description": "Rename and/or re-describe a card. The title can change at any time; \
+                            the description only while the card is still in the starting block.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -125,8 +123,8 @@ pub fn list() -> Value {
         },
         {
             "name": "delete_card",
-            "description": "Delete a card. Only works on cards created with `create_card` \
-                            (origin `mcp`), and only while they are still in the starting block.",
+            "description": "Delete a card. Only while it is still in the starting block (not \
+                            started, nothing in flight).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -334,7 +332,7 @@ async fn create_card(
     Ok(out)
 }
 
-/// Rename and/or re-describe one of the MCP's own cards. The whole call is
+/// Rename and/or re-describe a card. The whole call is
 /// checked before anything is sent: a refused description also drops the title.
 async fn update_card(
     ctx: &Ctx,
@@ -346,7 +344,6 @@ async fn update_card(
         return Err("nothing to update: pass `title`, `description`, or both".into());
     }
     let card = resolve_card(&ctx.store, &needle)?;
-    require_mcp_origin(&card, "updated")?;
     let title = title.as_deref().map(clean_title).transpose()?;
     if description.is_some() && card.state != CardState::StartingBlock {
         return Err(format!(
@@ -392,11 +389,10 @@ fn locked_description(title: &str) -> String {
     )
 }
 
-/// Delete one of the MCP's own cards, through the same command (and so the
+/// Delete a card, through the same command (and so the
 /// same cleanup) as deleting it from the board.
 async fn delete_card(ctx: &Ctx, needle: String) -> std::result::Result<Value, String> {
     let card = resolve_card(&ctx.store, &needle)?;
-    require_mcp_origin(&card, "deleted")?;
     if card.state != CardState::StartingBlock {
         return Err(format!(
             "card `{}` is `{}`: only cards still in the starting block can be deleted",
@@ -426,18 +422,6 @@ async fn delete_card(ctx: &Ctx, needle: String) -> std::result::Result<Value, St
             c.status_label()
         )),
         Ok(_) => Ok(json!({ "id": id, "title": card.title, "deleted": false })),
-    }
-}
-
-/// The edit/delete tools' guard: only cards the MCP filed itself.
-fn require_mcp_origin(card: &Card, verb: &str) -> std::result::Result<(), String> {
-    match card.origin {
-        CardOrigin::Mcp => Ok(()),
-        CardOrigin::Board => Err(format!(
-            "card `{}` was filed on the board by the user; only cards created with \
-             `create_card` can be {verb}",
-            card.title
-        )),
     }
 }
 

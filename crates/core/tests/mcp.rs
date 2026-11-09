@@ -299,23 +299,36 @@ fn err_text(v: &Value) -> &str {
 }
 
 #[tokio::test]
-async fn update_card_only_touches_the_mcps_own_cards() {
+async fn update_card_edits_any_card() {
     let store = Store::open_in_memory().unwrap();
     let (project, board_card) = seed(&store);
     let ctx = ctx(store.clone());
 
-    // A card the user filed is off limits.
+    // A card the user filed on the board can be renamed too.
+    assert_eq!(board_card.origin, CardOrigin::Board);
+    let (out, err) = call(
+        &ctx,
+        "update_card",
+        json!({ "card": board_card.id.to_string(), "title": "Renamed board card" }),
+    )
+    .await;
+    assert!(!err, "{out}");
+    assert_eq!(
+        store.get_card(board_card.id).unwrap().title,
+        "Renamed board card"
+    );
+    // …but the starting-block rule still holds: it is awaiting plan approval,
+    // so its description is locked.
     let (msg, err) = call(
         &ctx,
         "update_card",
-        json!({ "card": board_card.id.to_string(), "title": "Hijacked" }),
+        json!({ "card": board_card.id.to_string(), "description": "rewritten" }),
     )
     .await;
-    assert!(err, "{msg}");
-    assert!(err_text(&msg).contains("create_card"), "{msg}");
+    assert!(err && err_text(&msg).contains("locked"), "{msg}");
     assert_eq!(
-        store.get_card(board_card.id).unwrap().title,
-        "Fix the widget"
+        store.get_card(board_card.id).unwrap().description,
+        "make it work"
     );
 
     // Title only: trimmed, description untouched.
@@ -388,19 +401,41 @@ async fn update_card_only_touches_the_mcps_own_cards() {
 }
 
 #[tokio::test]
-async fn delete_card_only_removes_the_mcps_own_unstarted_cards() {
+async fn delete_card_removes_only_unstarted_cards() {
     let store = Store::open_in_memory().unwrap();
     let (project, board_card) = seed(&store);
     let ctx = ctx(store.clone());
 
+    // A started board card is refused for its state, not its origin.
     let (msg, err) = call(
         &ctx,
         "delete_card",
         json!({ "card": board_card.id.to_string() }),
     )
     .await;
-    assert!(err && err_text(&msg).contains("create_card"), "{msg}");
+    assert!(err && err_text(&msg).contains("starting block"), "{msg}");
     assert!(store.get_card(board_card.id).is_ok());
+
+    // An unstarted board card can be deleted.
+    let settings = store.settings().unwrap();
+    let mut unstarted = Card::new(
+        project.id,
+        "Filed on the board",
+        "not started yet",
+        settings.new_card_config(),
+    );
+    unstarted.state = CardState::StartingBlock;
+    assert_eq!(unstarted.origin, CardOrigin::Board);
+    store.upsert_card(&unstarted).unwrap();
+    let (out, err) = call(
+        &ctx,
+        "delete_card",
+        json!({ "card": unstarted.id.to_string() }),
+    )
+    .await;
+    assert!(!err, "{out}");
+    assert_eq!(out["deleted"], true);
+    assert!(store.get_card(unstarted.id).is_err());
 
     let started = mcp_card(&ctx, &project, "Started").await;
     store

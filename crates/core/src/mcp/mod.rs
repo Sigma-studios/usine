@@ -7,8 +7,8 @@
 //! running (the same constraint behind [`crate::CoreError::is_db_locked`]).
 //!
 //! The surface is deliberately small — read projects, cards, and plans; create
-//! projects and cards; rename, re-describe or delete the cards it created
-//! itself (never ones the user filed). Nothing here can start an agent run, so
+//! projects and cards; rename, re-describe or delete cards (description and
+//! delete only before a card starts). Nothing here can start an agent run, so
 //! reaching the socket does not buy arbitrary code execution.
 //!
 //! Transport is newline-delimited JSON-RPC (MCP's stdio framing) over a Unix
