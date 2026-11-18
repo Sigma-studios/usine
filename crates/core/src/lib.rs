@@ -87,7 +87,7 @@ pub use domain::model::{
 pub use domain::session::{
     derive_title as derive_session_title, strip_status_lines, truncate_chars, BgTask, BgTaskKind,
     BgTaskStatus, CutOffRound, Session, SessionAccess, SessionStatus, SessionTransition,
-    SessionTurn, SessionTurnKind, StatusNote, TaskEvent, STATUS_PREFIX,
+    SessionTurn, SessionTurnKind, StatusNote, TaskEvent, STATUS_PREFIX, TURN_REPLY_SEPARATOR,
 };
 pub use domain::state_machine::{
     stop_can_return_to, stop_target, stop_transition, transition, Transition,

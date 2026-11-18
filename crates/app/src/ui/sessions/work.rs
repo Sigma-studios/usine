@@ -147,10 +147,31 @@ pub(super) fn work_items(
             })
         })
         .collect();
-    if let Some(reply) = final_text.map(|t| usine_core::strip_status_lines(t).trim().to_string()) {
-        if let Some(pos) = out.iter().rposition(|it| it.kind == WorkKind::Text) {
-            if out[pos].text == reply {
+    // The closing prose repeats the reply. A single answer may itself hold a
+    // `---` rule, so match the whole reply first.
+    if let Some(reply) = final_text.map(usine_core::strip_status_lines) {
+        let whole = reply.trim();
+        if let Some(pos) = out
+            .iter()
+            .rposition(|it| it.kind == WorkKind::Text && it.text == whole)
+        {
+            out.remove(pos);
+            return out;
+        }
+        // A session reply may join several turns' answers; each was logged as
+        // its own prose line. Drop one matching line per part, latest first.
+        let mut before = out.len();
+        for part in reply.rsplit(usine_core::TURN_REPLY_SEPARATOR) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(pos) = out[..before]
+                .iter()
+                .rposition(|it| it.kind == WorkKind::Text && it.text == part)
+            {
                 out.remove(pos);
+                before = pos;
             }
         }
     }
@@ -514,6 +535,36 @@ mod tests {
         // A reply that differs from the last prose leaves it alone.
         let kept = work_items(&all, 0, Path::new("/w"), Some("Something else"));
         assert_eq!(kept.len(), 4);
+    }
+
+    #[test]
+    fn a_joined_reply_drops_each_turns_closing_prose() {
+        let all = lines(&[
+            "Looking around.",
+            "Here is the first answer.",
+            "→ Bash ls",
+            "The subagent reports success.",
+        ]);
+        let reply = format!(
+            "Here is the first answer.{}The subagent reports success.",
+            usine_core::TURN_REPLY_SEPARATOR
+        );
+        let items = work_items(&all, 0, Path::new("/w"), Some(&reply));
+        assert_eq!(
+            texts(&items),
+            vec![
+                (WorkKind::Text, "Looking around."),
+                (WorkKind::Tool, "Bash ls")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_reply_with_a_rule_drops_its_closing_prose() {
+        let answer = "Part one.\n\n---\n\nPart two.";
+        let all = lines(&["Looking around.", answer]);
+        let items = work_items(&all, 0, Path::new("/w"), Some(answer));
+        assert_eq!(texts(&items), vec![(WorkKind::Text, "Looking around.")]);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use tokio::time::{sleep_until, timeout, Instant};
 
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider, Usage};
-use crate::domain::session::{BgTaskStatus, TaskEvent};
+use crate::domain::session::{strip_status_lines, BgTaskStatus, TaskEvent, TURN_REPLY_SEPARATOR};
 use crate::error::{CoreError, Result};
 use crate::infra::process::{kill_tree, track_agent};
 
@@ -419,6 +419,12 @@ impl PlanGate {
     }
 }
 
+/// Whether a turn's result says nothing once its `usine-status:` lines are
+/// gone — such a turn is not worth joining into the session reply.
+fn is_blank_reply(result: &str) -> bool {
+    strip_status_lines(result).trim().is_empty()
+}
+
 /// Holds the run's terminal event until the `claude` process exits.
 ///
 /// A `result` line ends a *turn*, not the run: when the agent ended its turn
@@ -430,8 +436,16 @@ impl PlanGate {
 /// each later one replaces it, and [`TurnGate::finish`] releases the last at EOF.
 /// The exception is a result kept by [`TurnGate::keep_held`] (it answered the
 /// turn before a live message): it is joined ahead of the final one.
+///
+/// Session runs set `join_turns`: there a turn's answer is often the real reply
+/// (the agent answers, then a background subagent wakes it and it answers
+/// again), so every non-empty result is kept and joined with
+/// [`TURN_REPLY_SEPARATOR`]. Card runs keep "last wins": their parsers read the
+/// commit/handoff blocks from the final reply.
 #[derive(Default)]
 struct TurnGate {
+    /// Keep every turn's non-empty result rather than only the last (sessions).
+    join_turns: bool,
     /// The latest terminal event (`Done`/`Error`) seen, not yet forwarded.
     held: Option<AgentEvent>,
     /// Results of earlier turns that must reach the final answer.
@@ -458,6 +472,15 @@ impl TurnGate {
                     usage,
                 } => {
                     self.usage += usage;
+                    // Sessions keep the replaced turn's answer. A kept held
+                    // result is already the last of `kept`.
+                    if self.join_turns && !self.held_kept {
+                        if let Some(AgentEvent::Done { result: prev, .. }) = &self.held {
+                            if !is_blank_reply(prev) && prev.trim() != result.trim() {
+                                self.kept.push(prev.clone());
+                            }
+                        }
+                    }
                     // `total_cost_usd` is cumulative for the process: the last wins.
                     self.held = Some(AgentEvent::Done {
                         result,
@@ -504,7 +527,7 @@ impl TurnGate {
     /// makes the CLI run another turn, whose result must not replace it.
     fn keep_held(&mut self) {
         if let Some(AgentEvent::Done { result, .. }) = &self.held {
-            if !result.trim().is_empty() {
+            if !is_blank_reply(result) {
                 self.kept.push(result.clone());
             }
             self.held_kept = true;
@@ -523,11 +546,14 @@ impl TurnGate {
             } if !kept.is_empty() => {
                 // A still-kept held result is already the last of `kept`.
                 let mut parts = kept;
-                if !self.held_kept && !result.trim().is_empty() {
+                let duplicate = parts
+                    .last()
+                    .is_some_and(|last| last.trim() == result.trim());
+                if !self.held_kept && !is_blank_reply(&result) && !duplicate {
                     parts.push(result);
                 }
                 Some(AgentEvent::Done {
-                    result: parts.join("\n\n"),
+                    result: parts.join(TURN_REPLY_SEPARATOR),
                     cost_usd,
                     usage,
                 })
@@ -706,8 +732,12 @@ async fn pump(
     let mut ctl_open = true;
     // Holds an ExitPlanMode plan until its approve/reject verdict is known.
     let mut gate = PlanGate::default();
-    // Holds each turn's result until the run ends; the last one wins.
-    let mut turns = TurnGate::default();
+    // Holds each turn's result until the run ends: sessions (the only runs
+    // with live input) join every turn's answer, other runs keep the last.
+    let mut turns = TurnGate {
+        join_turns: live.is_some(),
+        ..Default::default()
+    };
     // When the executor last received an event: its idle watchdog counts from
     // here, so the held-result grace does too.
     let mut last_sent = Instant::now();
@@ -1292,7 +1322,10 @@ mod tests {
         assert!(turns.hold(parse_claude_line(second).unwrap()).is_empty());
         match turns.finish() {
             Some(AgentEvent::Done { result, .. }) => {
-                assert_eq!(result, "main answer\n\nsteer reply")
+                assert_eq!(
+                    result,
+                    format!("main answer{TURN_REPLY_SEPARATOR}steer reply")
+                )
             }
             other => panic!("expected Done, got {other:?}"),
         }
@@ -1305,6 +1338,143 @@ mod tests {
             Some(AgentEvent::Done { result, .. }) => assert_eq!(result, "main answer"),
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    fn result_line(text: &str, cost: f64) -> String {
+        serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": text, "total_cost_usd": cost,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        })
+        .to_string()
+    }
+
+    fn session_gate() -> TurnGate {
+        TurnGate {
+            join_turns: true,
+            ..Default::default()
+        }
+    }
+
+    fn finished_text(turns: &mut TurnGate) -> String {
+        match turns.finish() {
+            Some(AgentEvent::Done { result, .. }) => result,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    // A session agent answered, then a background subagent woke it and it
+    // answered again: both answers reach the reply, in order.
+    #[test]
+    fn turn_gate_joins_each_turn_result_in_sessions() {
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("first answer", 0.1)).unwrap());
+        turns.hold(vec![AgentEvent::Progress {
+            text: "back".into(),
+        }]);
+        turns.hold(parse_claude_line(&result_line("follow-up", 0.2)).unwrap());
+        match turns.finish() {
+            Some(AgentEvent::Done {
+                result,
+                usage,
+                cost_usd,
+            }) => {
+                assert_eq!(
+                    result,
+                    format!("first answer{TURN_REPLY_SEPARATOR}follow-up")
+                );
+                assert_eq!(usage.input_tokens, 20, "usage summed over both turns");
+                assert_eq!(cost_usd, 0.2, "cumulative cost: the last wins");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    // Card runs parse commit/handoff blocks from the final reply: last wins.
+    #[test]
+    fn turn_gate_last_result_wins_outside_sessions() {
+        let mut turns = TurnGate::default();
+        turns.hold(parse_claude_line(&result_line("first answer", 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("follow-up", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "follow-up");
+    }
+
+    #[test]
+    fn turn_gate_skips_empty_and_repeated_turn_results() {
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("  ", 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("answer", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "answer");
+
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("answer", 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("answer\n", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "answer\n");
+
+        // An empty last turn adds no trailing separator.
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("answer", 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "answer");
+    }
+
+    // A turn that only posted a status line isn't an answer worth joining.
+    #[test]
+    fn turn_gate_skips_status_only_turn_results() {
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("usine-status: waiting", 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("real answer", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "real answer");
+
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("usine-status: waiting", 0.1)).unwrap());
+        turns.keep_held();
+        turns.hold(parse_claude_line(&result_line("steer reply", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "steer reply");
+    }
+
+    // A late live message and a background wake in one session run: each
+    // answer appears once, in order.
+    #[test]
+    fn turn_gate_joins_steer_and_background_turns_once_each() {
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("main answer", 0.1)).unwrap());
+        turns.keep_held();
+        turns.hold(parse_claude_line(&result_line("steer reply", 0.2)).unwrap());
+        turns.hold(vec![AgentEvent::Progress {
+            text: "back".into(),
+        }]);
+        turns.hold(parse_claude_line(&result_line("subagent report", 0.3)).unwrap());
+        assert_eq!(
+            finished_text(&mut turns),
+            ["main answer", "steer reply", "subagent report"].join(TURN_REPLY_SEPARATOR)
+        );
+
+        // The late message's result arrives after a background wake's.
+        let mut turns = session_gate();
+        turns.hold(parse_claude_line(&result_line("interim", 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("main answer", 0.2)).unwrap());
+        turns.keep_held();
+        turns.hold(parse_claude_line(&result_line("steer reply", 0.3)).unwrap());
+        assert_eq!(
+            finished_text(&mut turns),
+            ["interim", "main answer", "steer reply"].join(TURN_REPLY_SEPARATOR)
+        );
+    }
+
+    // The recorded two-result run: a session keeps the interim turn ahead of
+    // the real answer.
+    #[test]
+    fn turn_gate_joins_the_fixture_turns_in_sessions() {
+        let text = std::fs::read_to_string(fixture_path("claude_task_events.ndjson")).unwrap();
+        let mut turns = session_gate();
+        for line in text.lines() {
+            turns.hold(parse_claude_line(line).unwrap_or_default());
+        }
+        let result = finished_text(&mut turns);
+        let parts: Vec<&str> = result.split(TURN_REPLY_SEPARATOR).collect();
+        assert_eq!(parts.len(), 2, "{result}");
+        assert!(parts[1].starts_with("DONE"), "{result}");
     }
 
     const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"final answer","total_cost_usd":0.1}"#;
@@ -1517,7 +1687,10 @@ mod tests {
         let events = pump_script(&script, Duration::from_secs(5), Duration::from_secs(10)).await;
         assert_eq!(cut_offs(&events), vec![vec!["b64qntfst".to_string()]]);
         let n = events.len();
-        assert!(matches!(&events[n - 2], AgentEvent::Task(TaskEvent::CutOff { .. })));
+        assert!(matches!(
+            &events[n - 2],
+            AgentEvent::Task(TaskEvent::CutOff { .. })
+        ));
         assert!(matches!(&events[n - 1], AgentEvent::Done { .. }));
         assert_eq!(resumed_notes(&events), 0);
     }
@@ -1586,7 +1759,10 @@ mod tests {
             false,
         );
         // Its owner already ended: the CLI killed it.
-        t.observe(&[task_status("own-cmd", BgTaskStatus::Stopped, None)], false);
+        t.observe(
+            &[task_status("own-cmd", BgTaskStatus::Stopped, None)],
+            false,
+        );
         assert_eq!(t.cut_off(), vec!["live", "timed-out", "own-cmd"]);
 
         // A top-level task stopped while the parent sits between turns was
@@ -1620,7 +1796,9 @@ mod tests {
         let out = turns.hold(vec![task_started("a", None)]);
         assert_eq!(out.len(), 1, "passed through, no note");
         assert!(turns.is_idle(), "the parent still waits");
-        let out = turns.hold(vec![AgentEvent::Progress { text: "back".into() }]);
+        let out = turns.hold(vec![AgentEvent::Progress {
+            text: "back".into(),
+        }]);
         assert_eq!(out.len(), 2, "a real resumption is announced");
         assert!(!turns.is_idle());
     }

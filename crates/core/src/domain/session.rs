@@ -773,6 +773,11 @@ pub fn last_status_line(text: &str) -> Option<String> {
         .map(|s| truncate_chars(s, STATUS_MAX))
 }
 
+/// Joins the answers of a session run's successive turns into one reply (the
+/// agent answered, then background work woke it and it answered again).
+/// Renders as a horizontal rule between the answers.
+pub const TURN_REPLY_SEPARATOR: &str = "\n\n---\n\n";
+
 /// `text` without its `usine-status:` lines — they are progress, not part of
 /// the agent's reply.
 pub fn strip_status_lines(text: &str) -> String {
