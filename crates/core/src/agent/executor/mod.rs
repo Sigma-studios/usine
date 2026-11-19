@@ -1216,9 +1216,11 @@ fn fold_qa(description: &str, qa_log: &[String]) -> String {
     out
 }
 
-/// The Q&A-log entry for answers given to an investigation's questions at
-/// conversion time — `None` when every answer is blank, so an untouched
-/// question list adds nothing. Paired by index like the panel's follow-up
+/// The section listing an investigation's final questions at conversion time:
+/// every question is listed — answered ones paired with their answer, blank
+/// ones marked so the agent decides — since an unanswered question is still a
+/// decision the implementation must make. `None` only when there are neither
+/// questions nor stray answers. Paired by index like the panel's follow-up
 /// send-back, but phrased for an implementation rather than a re-plan. Answers
 /// past the end of `questions` (a draft outliving its question list) are kept
 /// as unpaired lines rather than dropped.
@@ -1231,7 +1233,7 @@ fn conversion_answers(
         .map(answer)
         .filter(|a| !a.is_empty())
         .collect();
-    if extra.is_empty() && (0..questions.len()).all(|i| answer(i).is_empty()) {
+    if questions.is_empty() && extra.is_empty() {
         return None;
     }
     let mut s = String::from("Answers to the investigation's questions:\n");
@@ -1248,16 +1250,107 @@ fn conversion_answers(
     Some(s)
 }
 
-/// Fold an investigation's conclusion into the task description when the card
-/// converts into an implementation, under a clearly-marked findings section.
-/// Plain description text afterward — the user can trim it in the editor before
-/// starting the implementation.
-fn fold_findings(description: &str, conclusion: &str) -> String {
-    format!(
-        "{}\n\n---\n## Findings (from investigation)\n\n{}\n",
-        description.trim_end(),
-        conclusion.trim()
-    )
+/// The Q&A-log entries a conversion carries besides the rounds themselves:
+/// everything except the `Follow-up: ` entries already held, verbatim, by an
+/// [`InvestigationRound::follow_up`] (they are recorded together), so mid-run
+/// clarifying `Q:/A:` entries come along; then the unsent note, if any. Each
+/// round accounts for one matching entry only: a follow-up with no round —
+/// logged before rounds were stored, or while the card wasn't `Concluded` — is
+/// kept here rather than lost.
+fn conversion_extra_qa(
+    qa_log: &[String],
+    rounds: &[InvestigationRound],
+    note: &str,
+) -> Vec<String> {
+    let mut held: Vec<String> = rounds
+        .iter()
+        .map(|r| format!("Follow-up: {}", r.follow_up.trim()))
+        .collect();
+    let mut extra: Vec<String> = qa_log
+        .iter()
+        .filter(|e| match held.iter().position(|h| h == e.trim_end()) {
+            Some(i) => {
+                held.swap_remove(i);
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    if !note.trim().is_empty() {
+        extra.push(format!("Note: {}", note.trim()));
+    }
+    extra
+}
+
+/// Fold a whole investigation into the task description when the card converts
+/// into an implementation: every earlier round's conclusion (prose only) and
+/// the user's follow-up to it, oldest first, then the final conclusion, its
+/// questions (always listed, answered or not), and `extra_qa` (mid-run Q&A, the
+/// unsent note). Later rounds answer only the newest follow-up and abbreviate
+/// the rest as "still stands", so copying just the last conclusion would lose
+/// the earlier findings; the design phase merges this history into one plan.
+/// Plain description text afterward — the user can trim it in the editor.
+fn fold_investigation(
+    description: &str,
+    rounds: &[InvestigationRound],
+    final_conclusion: &str,
+    final_questions: &[crate::agent::plan::PlanQuestion],
+    answers: &[String],
+    extra_qa: &[String],
+) -> String {
+    use crate::agent::investigate::conclusion_prose;
+    let n = rounds.len() + 1;
+    let mut out = description.trim_end().to_string();
+    out.push_str(&format!(
+        "\n\n---\n## Investigation history ({n} round{}, oldest first)\n\n",
+        if n == 1 { "" } else { "s" }
+    ));
+    out.push_str(
+        "This task comes out of a multi-round investigation. Each round answered the user's \
+         latest follow-up, so later rounds often abbreviate earlier findings as \"still stands\". \
+         Treat ALL rounds below together as the source: carry forward every finding, its \
+         evidence and every decision the user made; where rounds disagree, the later round \
+         and the user's later answers win.\n\n",
+    );
+    for (i, r) in rounds.iter().enumerate() {
+        let k = i + 1;
+        out.push_str(&format!(
+            "### Round {k} — conclusion\n\n{}\n\n",
+            conclusion_prose(&r.conclusion).trim()
+        ));
+        if !r.follow_up.trim().is_empty() {
+            out.push_str(&format!(
+                "### Round {k} — user's follow-up\n\n{}\n\n",
+                r.follow_up.trim()
+            ));
+        }
+    }
+    let prose = conclusion_prose(final_conclusion);
+    if rounds.is_empty() {
+        out.push_str(prose.trim());
+    } else {
+        out.push_str(&format!(
+            "### Round {n} (final) — conclusion\n\n{}",
+            prose.trim()
+        ));
+    }
+    out.push('\n');
+    if let Some(a) = conversion_answers(final_questions, answers) {
+        out.push('\n');
+        out.push_str(&a);
+    }
+    if !extra_qa.is_empty() {
+        out.push_str(
+            "\nOther context from the investigation (the user's notes and requests, clarifying Q&A):\n",
+        );
+        for e in extra_qa {
+            out.push('\n');
+            out.push_str(e.trim());
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Build the extra context for a follow-up investigation round: the prior
@@ -3043,35 +3136,188 @@ mod tests {
         assert!(s.contains("Dig into the auth flow."));
     }
 
-    #[test]
-    fn fold_findings_appends_a_marked_section() {
-        let d = fold_findings("Audit the cache.\n", "It is unbounded (src/cache.rs:42).");
-        assert!(d.starts_with("Audit the cache."));
-        assert!(d.contains("## Findings (from investigation)"));
-        assert!(d.contains("src/cache.rs:42"));
+    fn round(conclusion: &str, follow_up: &str) -> InvestigationRound {
+        InvestigationRound {
+            conclusion: conclusion.into(),
+            follow_up: follow_up.into(),
+            at: 0,
+        }
+    }
+
+    /// A verbatim conclusion carrying both panel blocks around `marker` prose.
+    fn blocked_conclusion(marker: &str) -> String {
+        format!(
+            "{marker}: the cache is unbounded.\n\n\
+             ```usine-findings\n{{\"v\":1,\"verdict\":\"x\",\"findings\":[]}}\n```\n\n\
+             ```usine-questions\n[{{\"question\":\"Q for {marker}?\",\"options\":[]}}]\n```"
+        )
+    }
+
+    fn q(text: &str) -> crate::agent::plan::PlanQuestion {
+        crate::agent::plan::PlanQuestion {
+            question: text.into(),
+            options: vec![],
+        }
     }
 
     #[test]
-    fn conversion_answers_pairs_questions_and_skips_all_blank() {
-        use crate::agent::plan::PlanQuestion;
-        let qs = [
-            PlanQuestion {
-                question: "Bound by size or TTL?".into(),
-                options: vec![],
-            },
-            PlanQuestion {
-                question: "Expose a metric?".into(),
-                options: vec![],
-            },
+    fn fold_investigation_lists_rounds_oldest_first() {
+        let rounds = [
+            round(&blocked_conclusion("R1-FINDING"), "R1-FOLLOWUP"),
+            round(&blocked_conclusion("R2-FINDING"), "R2-FOLLOWUP"),
         ];
-        assert_eq!(conversion_answers(&qs, &[]), None);
-        assert_eq!(conversion_answers(&qs, &[" ".into(), String::new()]), None);
+        let d = fold_investigation(
+            "Audit the cache.\n",
+            &rounds,
+            &blocked_conclusion("FINAL-FINDING"),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(d.starts_with("Audit the cache.\n\n---\n"));
+        assert!(d.contains("## Investigation history (3 rounds, oldest first)"));
+        let at = |needle: &str| d.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        let order = [
+            at("### Round 1 — conclusion"),
+            at("R1-FINDING"),
+            at("### Round 1 — user's follow-up"),
+            at("R1-FOLLOWUP"),
+            at("### Round 2 — conclusion"),
+            at("R2-FINDING"),
+            at("R2-FOLLOWUP"),
+            at("### Round 3 (final) — conclusion"),
+            at("FINAL-FINDING"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{d}");
+    }
+
+    #[test]
+    fn fold_investigation_strips_panel_blocks_from_every_round() {
+        let rounds = [round(&blocked_conclusion("R1-FINDING"), "more")];
+        let d = fold_investigation(
+            "Audit.",
+            &rounds,
+            &blocked_conclusion("FINAL-FINDING"),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!d.contains("```usine-findings"), "{d}");
+        assert!(!d.contains("```usine-questions"), "{d}");
+        assert!(d.contains("R1-FINDING") && d.contains("FINAL-FINDING"));
+    }
+
+    #[test]
+    fn fold_investigation_lists_unanswered_final_questions() {
+        let qs = [q("Bound by size or TTL?"), q("Expose a metric?")];
+        let d = fold_investigation("Audit.", &[], "Unbounded.", &qs, &[], &[]);
+        assert!(d.contains("1. Bound by size or TTL? → (no answer — use your judgement)"));
+        assert!(d.contains("2. Expose a metric? → (no answer — use your judgement)"));
+        let d = fold_investigation(
+            "Audit.",
+            &[],
+            "Unbounded.",
+            &qs,
+            &["LRU".into(), " ".into()],
+            &[],
+        );
+        assert!(d.contains("1. Bound by size or TTL? → LRU\n"));
+        assert!(d.contains("2. Expose a metric? → (no answer — use your judgement)"));
+        // Answers and extra context follow the final conclusion.
+        assert!(d.find("Unbounded.").unwrap() < d.find("1. Bound").unwrap());
+    }
+
+    #[test]
+    fn fold_investigation_single_round_is_short() {
+        let d = fold_investigation(
+            "Audit.",
+            &[],
+            &blocked_conclusion("ONLY-FINDING"),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(d.contains("## Investigation history (1 round, oldest first)"));
+        assert!(!d.contains("Round 1 — conclusion"));
+        assert!(!d.contains("Round 1 — user's follow-up"));
+        assert!(!d.contains("(final)"));
+        assert!(d.contains("ONLY-FINDING"));
+        assert!(!d.contains("Other context"));
+    }
+
+    #[test]
+    fn convert_extra_qa_filter() {
+        let log = [
+            "Follow-up: dig into eviction".to_string(),
+            "Q: Which cache?\nA: the request cache".to_string(),
+            "Follow-up: and the streaming path".to_string(),
+        ];
+        let rounds = [
+            round("R1.", "dig into eviction"),
+            round("R2.", "and the streaming path"),
+        ];
+        assert_eq!(
+            conversion_extra_qa(&log, &rounds, "  "),
+            vec!["Q: Which cache?\nA: the request cache".to_string()]
+        );
+        assert_eq!(
+            conversion_extra_qa(&log, &rounds, " ship it "),
+            vec![
+                "Q: Which cache?\nA: the request cache".to_string(),
+                "Note: ship it".to_string()
+            ]
+        );
+        // A follow-up with no stored round (logged before rounds existed, or
+        // outside `Concluded`) is kept, not lost.
+        assert_eq!(
+            conversion_extra_qa(&log, &rounds[..1], ""),
+            vec![
+                "Q: Which cache?\nA: the request cache".to_string(),
+                "Follow-up: and the streaming path".to_string()
+            ]
+        );
+        assert_eq!(conversion_extra_qa(&log[..1], &[], "").len(), 1);
+        // A repeated follow-up text: each round accounts for one entry only.
+        let twice = [
+            "Follow-up: again".to_string(),
+            "Follow-up: again".to_string(),
+        ];
+        assert_eq!(
+            conversion_extra_qa(&twice, &[round("R1.", "again")], ""),
+            vec!["Follow-up: again".to_string()]
+        );
+        // Through the fold: the mid-run Q&A and note land after the conclusion,
+        // and the follow-ups appear only once (from the rounds).
+        let rounds = [round("R1.", "dig into eviction")];
+        let d = fold_investigation(
+            "Audit.",
+            &rounds,
+            "Final.",
+            &[],
+            &[],
+            &conversion_extra_qa(&log[..2], &rounds, "ship it"),
+        );
+        assert_eq!(d.matches("dig into eviction").count(), 1);
+        assert!(!d.contains("your unsent note"));
+        assert!(d.find("Final.").unwrap() < d.find("Q: Which cache?").unwrap());
+        assert!(d.find("Q: Which cache?").unwrap() < d.find("Note: ship it").unwrap());
+    }
+
+    #[test]
+    fn conversion_answers_always_lists_questions() {
+        let qs = [q("Bound by size or TTL?"), q("Expose a metric?")];
+        for blank in [vec![], vec![" ".to_string(), String::new()]] {
+            let s = conversion_answers(&qs, &blank).unwrap();
+            assert!(s.contains("1. Bound by size or TTL? → (no answer — use your judgement)\n"));
+            assert!(s.contains("2. Expose a metric? → (no answer — use your judgement)\n"));
+        }
         let s = conversion_answers(&qs, &["  LRU, 10k entries ".into(), String::new()]).unwrap();
         assert!(s.contains("1. Bound by size or TTL? → LRU, 10k entries\n"));
         assert!(s.contains("2. Expose a metric? → (no answer — use your judgement)"));
         assert!(s.find("1. ").unwrap() < s.find("2. ").unwrap());
 
         // Answers past the question list are kept, never a bare heading.
+        assert_eq!(conversion_answers(&[], &[]), None);
         assert_eq!(conversion_answers(&[], &[" ".into()]), None);
         let s = conversion_answers(&[], &["keep it simple".into()]).unwrap();
         assert_eq!(

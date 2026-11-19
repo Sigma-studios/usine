@@ -212,7 +212,9 @@ pub enum ExecutorCommand {
         feedback: String,
     },
     /// From `Concluded`: convert the card, in place, into an implementation —
-    /// fold the conclusion into the description under a findings section, flip
+    /// fold every round's conclusion and follow-up (oldest first, not just the
+    /// latest conclusion) into the description under an investigation-history
+    /// section, for the design phase to merge into one plan; flip
     /// the kind to Task, and reset to the starting block so the user shapes the
     /// implementation prompt from there. Cost is kept (the investigation was
     /// real spend on this card); the session is cleared so the next run is fresh.

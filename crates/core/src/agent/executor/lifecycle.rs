@@ -98,10 +98,11 @@ impl Executor {
     /// promotion, not a discard — unlike `back_to_start` there is no worktree,
     /// branch, PR, plan, or hand-off to tear down (investigations own none), the
     /// cost is kept (the investigation was real spend on this card's life), and
-    /// the conclusion is folded into the description under a marked findings
-    /// section (plain text afterward, so the user can trim it in the editor).
-    /// Answers typed against the conclusion's questions and an unsent note ride
-    /// along in the folded Q&A context, after the earlier follow-up rounds.
+    /// the whole investigation is folded into the description under a marked
+    /// investigation-history section: every round's conclusion and follow-up
+    /// (oldest first), the final round's questions with any answers, mid-run
+    /// Q&A and the unsent note. Plain text afterward, so the user can trim it in
+    /// the editor; the design phase then merges the rounds into one plan.
     pub(super) async fn convert_to_implementation(
         &self,
         card_id: Uuid,
@@ -114,19 +115,16 @@ impl Executor {
             let CardState::Concluded { conclusion } = c.state.clone() else {
                 return Ok(());
             };
-            c.description = fold_findings(
-                &c.description,
-                &crate::agent::investigate::conclusion_prose(&conclusion),
-            );
-            let mut qa = c.qa_log.clone();
             let (_, questions) = crate::agent::plan::parse_questions(&conclusion);
-            qa.extend(conversion_answers(&questions, &answers));
-            if !note.trim().is_empty() {
-                qa.push(format!("Note: {}", note.trim()));
-            }
-            if !qa.is_empty() {
-                c.description = fold_qa(&c.description, &qa);
-            }
+            let extra_qa = conversion_extra_qa(&c.qa_log, &c.investigation_rounds, &note);
+            c.description = fold_investigation(
+                &c.description,
+                &c.investigation_rounds,
+                &conclusion,
+                &questions,
+                &answers,
+                &extra_qa,
+            );
             c.qa_log.clear();
             c.investigation_rounds.clear();
             c.config.kind = CardKind::Task;

@@ -118,7 +118,7 @@ pub(super) fn ConclusionPanel(
             h3 { "Turn into implementation" }
             button {
                 class: "btn primary",
-                title: "Continues this card as an implementation: the findings, your answers to its questions and any unsent dig-deeper note are folded into the task description, and the card returns to the starting block, where you shape the prompt before starting",
+                title: "Continues this card as an implementation: every round's conclusion, your follow-ups, answers and any unsent note are folded into the task description; press Start and the design agent merges them into one plan.",
                 onclick: move |_| {
                     // Whatever is typed on the panel goes along — the core pairs
                     // the answers with the conclusion's questions.

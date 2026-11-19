@@ -242,22 +242,41 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     });
     let card = wait_for_state(&mut rx, |s| matches!(s, CardState::StartingBlock)).await;
     assert_eq!(card.config.kind, CardKind::Task);
-    assert!(card
-        .description
-        .contains("## Findings (from investigation)"));
     let d = &card.description;
-    let followup = d
-        .find("How big does it get under real traffic?")
-        .expect("follow-up folded");
-    let answer = d
-        .find("1. How should the cache be bounded? → LRU capped at 10k entries")
-        .expect("answer folded, paired with its question");
-    let note = d
-        .find("Note: Keep the public API unchanged.")
-        .expect("note folded");
     assert!(
-        followup < answer && answer < note,
-        "earlier rounds first, then the conversion's answers and note"
+        d.contains("## Investigation history (2 rounds, oldest first)"),
+        "{d}"
+    );
+    // The simulator concludes the same every round, so mere presence proves
+    // nothing: round 1's conclusion must be kept alongside the final one.
+    let prose = usine_core::conclusion_prose(&first_conclusion);
+    let p = prose.trim();
+    assert_eq!(
+        d.matches(p).count(),
+        2,
+        "round 1's conclusion is kept, not just the final one"
+    );
+    let at = |needle: &str| {
+        d.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}"))
+    };
+    let order = [
+        d.find(p).unwrap(),
+        at("### Round 1 — user's follow-up"),
+        at("How big does it get under real traffic?"),
+        at("### Round 2 (final) — conclusion"),
+        d.rfind(p).unwrap(),
+        at("1. How should the cache be bounded? → LRU capped at 10k entries"),
+        at("Note: Keep the public API unchanged."),
+    ];
+    assert!(
+        order.windows(2).all(|w| w[0] < w[1]),
+        "rounds oldest first, then the conversion's answers and note: {d}"
+    );
+    assert_eq!(
+        d.matches("How big does it get under real traffic?").count(),
+        1,
+        "the follow-up is folded once, not again from the Q&A log"
     );
     assert!(card.qa_log.is_empty(), "the folded Q&A log is cleared");
     assert!(
@@ -295,9 +314,9 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
     // The Designing(Running) echo is emitted BEFORE the provider launches, so
     // poll for the spy's record instead of asserting on it immediately.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let mode = loop {
-        if let Some((mode, _, _)) = runs.lock().unwrap().get(2) {
-            break *mode;
+    let (mode, plan_prompt) = loop {
+        if let Some((mode, _, prompt)) = runs.lock().unwrap().get(2) {
+            break (*mode, prompt.clone());
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -306,6 +325,9 @@ async fn investigation_concludes_follows_up_and_converts_in_place() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_eq!(mode, RunMode::Plan);
+    // The planning agent receives the whole investigation history.
+    assert!(plan_prompt.contains("Investigation history (2 rounds"));
+    assert!(plan_prompt.contains(p));
 }
 
 #[tokio::test(flavor = "multi_thread")]
