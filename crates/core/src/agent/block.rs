@@ -3,7 +3,7 @@
 //!
 //! Each protocol names its own tag — `usine-questions` (plan), `usine-review`
 //! (review/triage), `usine-commit`, `usine-handoff`, `usine-fixes`,
-//! `usine-plan`, `usine-findings` — and the agent emits it as
+//! `usine-plan`, `usine-findings`, `usine-no-work` — and the agent emits it as
 //! ```` ```<tag> ```` … ```` ``` ````. [`find`] pulls the payload out for parsing;
 //! [`strip`] removes the whole block for display, since it's addressed to the
 //! executor, not to the user. [`parse`] does both at once and reports a block

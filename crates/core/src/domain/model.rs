@@ -499,6 +499,32 @@ pub enum ReviewSub {
     ReadyForPr,
 }
 
+/// Which phase concluded a card needed no work (see [`CardState::NothingToDo`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoWorkPhase {
+    Plan,
+    Implement,
+}
+
+/// Why the agent judged a card needs no code change: the ask is already
+/// implemented on the base branch, or it doesn't apply to this codebase at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoWorkKind {
+    AlreadyDone,
+    NotActionable,
+}
+
+impl NoWorkKind {
+    /// Short human label, e.g. for the transcript line and the badge.
+    pub fn label(self) -> &'static str {
+        match self {
+            NoWorkKind::AlreadyDone => "already done",
+            NoWorkKind::NotActionable => "nothing to do",
+        }
+    }
+}
+
 /// The full lifecycle state of a card. The board column is derived from this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CardState {
@@ -550,6 +576,14 @@ pub enum CardState {
         previous: Box<CardState>,
         sub: RunSub,
     },
+    /// A plan or implement run concluded the card needs no code change (it's
+    /// already done, or the ask isn't actionable) and said why. Parked for the
+    /// user: Mark done, proceed anyway with a note, or Back to start.
+    NothingToDo {
+        phase: NoWorkPhase,
+        kind: NoWorkKind,
+        explanation: String,
+    },
 }
 
 impl CardState {
@@ -577,6 +611,16 @@ impl CardState {
             CardState::Failed { previous, .. } => previous.column(),
             CardState::Answering { previous, .. } => previous.column(),
             CardState::Updating { previous, .. } => previous.column(),
+            // A plan-phase verdict parks next to the parked plans; an
+            // implement-phase one where finished work waits for the user.
+            CardState::NothingToDo {
+                phase: NoWorkPhase::Plan,
+                ..
+            } => Column::Designing,
+            CardState::NothingToDo {
+                phase: NoWorkPhase::Implement,
+                ..
+            } => Column::SelfReview,
         }
     }
 
@@ -631,6 +675,7 @@ impl CardState {
                         | ReviewSub::ReadyForPr
                         | ReviewSub::ValidationFailed { .. }
                 ) | CardState::Concluded { .. }
+                    | CardState::NothingToDo { .. }
                     | CardState::ReadyToMerge
                     | CardState::MergedWithoutReview { .. }
                     | CardState::Failed { .. }
@@ -747,6 +792,7 @@ impl CardState {
                 sub: RunSub::Intervention(_),
                 ..
             } => "needs answer",
+            CardState::NothingToDo { kind, .. } => kind.label(),
         }
     }
 }

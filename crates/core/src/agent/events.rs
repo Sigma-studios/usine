@@ -152,6 +152,12 @@ pub enum ExecutorCommand {
         card_id: Uuid,
         feedback: String,
     },
+    /// Overrule a `NothingToDo` verdict: re-run the phase that concluded there
+    /// was nothing to do, with the user's (possibly empty) note.
+    ProceedAnyway {
+        card_id: Uuid,
+        note: String,
+    },
     /// Fetch and triage PR review comments.
     FetchComments {
         card_id: Uuid,
@@ -739,6 +745,7 @@ impl ExecutorCommand {
             | ExecutorCommand::Answer { card_id, .. }
             | ExecutorCommand::ApprovePlan { card_id }
             | ExecutorCommand::RejectPlan { card_id, .. }
+            | ExecutorCommand::ProceedAnyway { card_id, .. }
             | ExecutorCommand::FetchComments { card_id }
             | ExecutorCommand::MarkReviewBodiesRead { card_id }
             | ExecutorCommand::ApplyFixes { card_id, .. }
@@ -873,6 +880,7 @@ impl ExecutorCommand {
                 | ExecutorCommand::Answer { .. }
                 | ExecutorCommand::ApprovePlan { .. }
                 | ExecutorCommand::RejectPlan { .. }
+                | ExecutorCommand::ProceedAnyway { .. }
                 | ExecutorCommand::FetchComments { .. }
                 | ExecutorCommand::ApplyFixes { .. }
                 | ExecutorCommand::CreatePr { .. }

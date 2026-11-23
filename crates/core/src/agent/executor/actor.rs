@@ -528,12 +528,13 @@ async fn finalize_run(
     // For display, drop the machine-facing blocks the agent appended — including
     // a questions block that got this far (a fix run that asked but whose merge
     // had already been completed, say), which must never render raw as a recap.
-    let summary =
-        crate::agent::fixes::strip_fixes_block(&crate::agent::handoff::strip_revision_block(
+    let summary = crate::agent::no_work::strip_no_work_block(
+        &crate::agent::fixes::strip_fixes_block(&crate::agent::handoff::strip_revision_block(
             &crate::agent::handoff::strip_handoff_block(&crate::agent::commit::strip_commit_block(
                 &crate::agent::plan::parse_questions(&result_text).0,
             )),
-        ));
+        )),
+    );
 
     if !committed {
         if matches!(transition, Transition::AgentImplementDone) {
@@ -549,9 +550,30 @@ async fn finalize_run(
                     None => false,
                 };
             if !prior_work {
-                let message = "The run finished without changing any files, so nothing was \
-                               committed to the branch. Retry to run it again."
-                    .to_string();
+                // The agent said so itself: this card needs no code change.
+                // Park on its verdict instead of failing — the (empty)
+                // worktree stays for a possible "Implement anyway".
+                if let Some(verdict) = crate::agent::no_work::parse_no_work(&result_text) {
+                    park_no_work(store, evt_tx, card_id, verdict)?;
+                    reap_idle_preview_direct(executor, card_id);
+                    return Ok(());
+                }
+                // No verdict: still a fault, but quote what the agent said so
+                // the user isn't left guessing why nothing changed.
+                let message = match first_sentence(
+                    &crate::domain::session::strip_status_lines(&summary),
+                    300,
+                ) {
+                    said if said.is_empty() => "The run finished without changing any files, \
+                                                so nothing was committed to the branch. Retry \
+                                                to run it again."
+                        .to_string(),
+                    said => format!(
+                        "The run finished without changing any files, so nothing was \
+                         committed to the branch. The agent said: \"{said}\" Retry to run it \
+                         again, or Mark done if nothing was needed."
+                    ),
+                };
                 apply_transition(
                     store,
                     evt_tx,
@@ -980,6 +1002,45 @@ fn first_sentence(text: &str, max: usize) -> String {
     }
 }
 
+/// Park a plan/implement run on the agent's "no work needed" verdict, with a
+/// transcript line and an info toast carrying the gist of its explanation.
+/// Tolerates losing a race to a cancel (the card already left the run).
+fn park_no_work(
+    store: &Store,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+    verdict: crate::agent::no_work::NoWork,
+) -> Result<()> {
+    let kind = verdict.kind;
+    let gist = first_sentence(&verdict.explanation, 200);
+    match apply_transition(
+        store,
+        evt_tx,
+        card_id,
+        Transition::AgentNoWork {
+            kind,
+            explanation: verdict.explanation,
+        },
+    ) {
+        Ok(_) => {}
+        Err(CoreError::IllegalTransition(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    transcript(
+        store,
+        evt_tx,
+        card_id,
+        format!("✔ nothing to do — {}", kind.label()),
+    );
+    let toast = if gist.is_empty() {
+        format!("Nothing to do: {}.", kind.label())
+    } else {
+        format!("Nothing to do: {gist}")
+    };
+    let _ = evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Info, toast));
+    Ok(())
+}
+
 /// Continue the validation gate from an actor task with a direct executor call
 /// (never a re-dispatched command — see `finalize_run`). An error here can
 /// leave the card in a running state with nothing behind it, so it demotes to
@@ -1287,7 +1348,15 @@ pub(super) fn handle_event(
         // Card runs deny the background-agent tools.
         AgentEvent::Task(_) => {}
         AgentEvent::PlanReady { plan } => {
-            apply_transition(store, evt_tx, card_id, Transition::AgentPlanReady { plan })?;
+            // A plan run whose ExitPlanMode draft is a no-work verdict parks on
+            // the verdict, not on an approvable "plan".
+            let designing = matches!(store.get_card(card_id)?.state, CardState::Designing(_));
+            match crate::agent::no_work::parse_no_work(&plan).filter(|_| designing) {
+                Some(verdict) => park_no_work(store, evt_tx, card_id, verdict)?,
+                None => {
+                    apply_transition(store, evt_tx, card_id, Transition::AgentPlanReady { plan })?;
+                }
+            }
         }
         AgentEvent::Done {
             result, cost_usd, ..
@@ -1312,6 +1381,13 @@ pub(super) fn handle_event(
             const MIN_PLAN_CHARS: usize = 200;
             let fresh = store.get_card(card_id)?;
             if matches!(fresh.state, CardState::Designing(DesignSub::Running)) {
+                // The agent concluded there's nothing to plan: park on its
+                // verdict — checked before the floor below, since a "this is
+                // already implemented" reply is legitimately short.
+                if let Some(verdict) = crate::agent::no_work::parse_no_work(&result) {
+                    park_no_work(store, evt_tx, card_id, verdict)?;
+                    return Ok(());
+                }
                 // Measure the plan *prose*: the machine-facing outline block is
                 // stripped by `parse_plan`, so a bailed turn can't clear the
                 // floor on block payload alone.

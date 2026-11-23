@@ -7,7 +7,8 @@
 //! responsibility, keyed off the *resulting* state.
 
 use crate::domain::model::{
-    Card, CardState, DesignSub, FixVerdict, Intervention, PrReviewSub, ReviewSub, RunSub,
+    Card, CardState, DesignSub, FixVerdict, Intervention, NoWorkKind, NoWorkPhase, PrReviewSub,
+    ReviewSub, RunSub,
 };
 use crate::error::{CoreError, Result};
 
@@ -90,6 +91,9 @@ pub enum Transition {
     /// the card's work to what landed. Wraps the parked gate it was started
     /// from in `Updating`, so the run returns there once done (or cancelled).
     UpdateFromBase,
+    /// From a `NothingToDo` verdict, overrule the agent: re-run the phase that
+    /// concluded there was nothing to do (with the user's note).
+    ProceedAnyway,
     // --- agent-driven ---
     AgentNeedsInput(Intervention),
     AgentPlanReady {
@@ -100,6 +104,11 @@ pub enum Transition {
         conclusion: String,
     },
     AgentImplementDone,
+    /// A plan or implement run concluded the card needs no code change.
+    AgentNoWork {
+        kind: NoWorkKind,
+        explanation: String,
+    },
     /// The self-review agent produced its verdicts on the committed diff.
     SelfReviewReady {
         verdicts: Vec<FixVerdict>,
@@ -212,6 +221,30 @@ pub fn transition(state: &CardState, t: Transition) -> Result<CardState> {
         (S::Implementing(RunSub::Intervention(_)), T::AgentImplementDone) => {
             S::AwaitingReview(ReviewSub::ReadyForReview)
         }
+
+        // No work needed: a plan or implement run (live, or racing a parked
+        // question) concluded there's nothing to change. Parks for the user,
+        // who can overrule it and re-run the same phase.
+        (
+            S::Designing(DesignSub::Running | DesignSub::Intervention(_)),
+            T::AgentNoWork { kind, explanation },
+        ) => S::NothingToDo {
+            phase: NoWorkPhase::Plan,
+            kind,
+            explanation,
+        },
+        (
+            S::Implementing(RunSub::Running | RunSub::Intervention(_)),
+            T::AgentNoWork { kind, explanation },
+        ) => S::NothingToDo {
+            phase: NoWorkPhase::Implement,
+            kind,
+            explanation,
+        },
+        (S::NothingToDo { phase, .. }, T::ProceedAnyway) => match phase {
+            NoWorkPhase::Plan => S::Designing(DesignSub::Running),
+            NoWorkPhase::Implement => S::Implementing(RunSub::Running),
+        },
 
         // Awaiting review: the finished work sits committed in the card's own
         // worktree. The user reviews it there (editor / preview app), then runs a
@@ -554,15 +587,27 @@ fn in_phase_run(s: &CardState) -> bool {
 
 /// Whether Stop on `running` may step back to `origin`: re-planning returns to
 /// the plan it rejected, an approved plan's implementation to that plan, a
-/// change request to the review-gate state it was asked from, and a follow-up
-/// investigation to its conclusion.
+/// change request to the review-gate state it was asked from, a follow-up
+/// investigation to its conclusion, and a "proceed anyway" run to the
+/// no-work verdict it overruled.
 pub fn stop_can_return_to(running: &CardState, origin: &CardState) -> bool {
     use CardState as S;
     match running {
-        S::Designing(_) => matches!(origin, S::Designing(DesignSub::AwaitingApproval { .. })),
+        S::Designing(_) => matches!(
+            origin,
+            S::Designing(DesignSub::AwaitingApproval { .. })
+                | S::NothingToDo {
+                    phase: NoWorkPhase::Plan,
+                    ..
+                }
+        ),
         S::Implementing(_) => matches!(
             origin,
             S::Designing(DesignSub::AwaitingApproval { .. })
+                | S::NothingToDo {
+                    phase: NoWorkPhase::Implement,
+                    ..
+                }
                 | S::AwaitingReview(
                     ReviewSub::ReadyForReview
                         | ReviewSub::SelectingFixes { .. }
@@ -1861,5 +1906,101 @@ mod tests {
         .is_err());
         let plan = CardState::Designing(DesignSub::AwaitingApproval { plan: "p".into() });
         assert!(transition(&plan, Transition::CancelTo(Box::new(plan.clone()))).is_err());
+    }
+
+    fn verdict(phase: NoWorkPhase) -> CardState {
+        CardState::NothingToDo {
+            phase,
+            kind: NoWorkKind::AlreadyDone,
+            explanation: "already there".into(),
+        }
+    }
+
+    fn no_work() -> Transition {
+        Transition::AgentNoWork {
+            kind: NoWorkKind::AlreadyDone,
+            explanation: "already there".into(),
+        }
+    }
+
+    #[test]
+    fn no_work_parks_plan_and_implement_runs() {
+        let q = Intervention {
+            request_id: "q".into(),
+            question: "?".into(),
+            options: vec![],
+        };
+        for (from, phase) in [
+            (CardState::Designing(DesignSub::Running), NoWorkPhase::Plan),
+            (
+                CardState::Designing(DesignSub::Intervention(q.clone())),
+                NoWorkPhase::Plan,
+            ),
+            (
+                CardState::Implementing(RunSub::Running),
+                NoWorkPhase::Implement,
+            ),
+            (
+                CardState::Implementing(RunSub::Intervention(q.clone())),
+                NoWorkPhase::Implement,
+            ),
+        ] {
+            assert_eq!(transition(&from, no_work()).unwrap(), verdict(phase));
+        }
+        // Not from anywhere else.
+        for from in [
+            CardState::StartingBlock,
+            CardState::Investigating(RunSub::Running),
+            CardState::AwaitingReview(ReviewSub::ApplyingFixes),
+        ] {
+            assert!(transition(&from, no_work()).is_err(), "{from:?}");
+        }
+        let v = verdict(NoWorkPhase::Plan);
+        assert!(v.needs_attention());
+        assert!(!v.needs_urgent_attention());
+        assert!(!v.is_running());
+    }
+
+    #[test]
+    fn proceed_anyway_reruns_the_phase() {
+        assert_eq!(
+            transition(&verdict(NoWorkPhase::Plan), Transition::ProceedAnyway).unwrap(),
+            CardState::Designing(DesignSub::Running)
+        );
+        assert_eq!(
+            transition(&verdict(NoWorkPhase::Implement), Transition::ProceedAnyway).unwrap(),
+            CardState::Implementing(RunSub::Running)
+        );
+        assert!(transition(&CardState::ReadyToMerge, Transition::ProceedAnyway).is_err());
+        assert!(transition(&CardState::StartingBlock, Transition::ProceedAnyway).is_err());
+        // Mark done / Back to start work from the verdict too.
+        assert_eq!(
+            transition(&verdict(NoWorkPhase::Implement), Transition::MarkDone).unwrap(),
+            CardState::Done
+        );
+        assert_eq!(
+            transition(&verdict(NoWorkPhase::Plan), Transition::ResetToStart).unwrap(),
+            CardState::StartingBlock
+        );
+    }
+
+    #[test]
+    fn stop_on_proceed_anyway_returns_to_the_verdict() {
+        for phase in [NoWorkPhase::Plan, NoWorkPhase::Implement] {
+            let origin = verdict(phase);
+            let running = transition(&origin, Transition::ProceedAnyway).unwrap();
+            let mut from = None;
+            note_entry(&origin, &running, &mut from);
+            assert_eq!(from.as_ref(), Some(&origin));
+            assert_eq!(
+                transition(&running, Transition::CancelTo(Box::new(origin.clone()))).unwrap(),
+                origin
+            );
+        }
+        // A plan verdict isn't a legal Stop target for an implement run.
+        assert!(!stop_can_return_to(
+            &CardState::Implementing(RunSub::Running),
+            &verdict(NoWorkPhase::Plan)
+        ));
     }
 }

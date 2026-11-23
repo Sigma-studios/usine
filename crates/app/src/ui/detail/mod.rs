@@ -22,6 +22,7 @@ mod conclusion;
 mod done;
 mod edit;
 mod fixes;
+mod nothing;
 pub(super) mod plan;
 mod pr_create;
 mod pr_review;
@@ -40,6 +41,7 @@ pub(crate) use edit::{
     attach_from_clipboard, image_mime, AttachButton, AttachmentChips, AttachmentPreview,
 };
 use fixes::FixSelection;
+use nothing::NothingToDoPanel;
 use plan::PlanApproval;
 use pr_create::PrCreateForm;
 use pr_review::PrReviewPanel;
@@ -604,6 +606,17 @@ fn CardPanel(card: Card) -> Element {
                     card_id: id,
                     conclusion: conclusion.clone(),
                     rounds: card.investigation_rounds.clone(),
+                }
+            }
+        }
+
+        if let CardState::NothingToDo { phase, kind, explanation } = st {
+            div { class: "section-group", id: "nothing-to-do",
+                NothingToDoPanel {
+                    card_id: id,
+                    phase: *phase,
+                    kind: *kind,
+                    explanation: explanation.clone(),
                 }
             }
         }
@@ -1449,6 +1462,7 @@ fn state_discriminant(s: &CardState) -> &'static str {
         CardState::MergedWithoutReview { merged: true } => "ext-merged",
         CardState::MergedWithoutReview { merged: false } => "ext-closed",
         CardState::Done => "done",
+        CardState::NothingToDo { .. } => "nothing-to-do",
         // `effective()` never returns any of these.
         CardState::Failed { .. } | CardState::Answering { .. } | CardState::Updating { .. } => {
             "wrapped"

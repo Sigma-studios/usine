@@ -359,10 +359,13 @@ impl Executor {
             base = append_attachments(base, &attachments);
         }
         let prompt = match mode {
+            // A plan run may also conclude there's nothing to plan (see
+            // `no_work`).
             RunMode::Plan => format!(
-                "{}\n\n{}",
+                "{}\n\n{}\n\n{}",
                 base,
-                crate::agent::plan::plan_instruction(card.config.provider)
+                crate::agent::plan::plan_instruction(card.config.provider),
+                crate::agent::no_work::plan_instruction()
             ),
             RunMode::Investigate => format!(
                 "{}\n\n{}",
@@ -441,6 +444,12 @@ impl Executor {
                         run.is_some(),
                         scenario.is_available(),
                     ));
+                    // A first implementation may find there's nothing to do.
+                    // Change runs and fix runs are left out: their branch
+                    // already carries work, and a no-op there advances with a
+                    // warning instead (see `finalize_run`).
+                    tail.push_str("\n\n");
+                    tail.push_str(&crate::agent::no_work::implement_instruction());
                 } else {
                     // Every fix path (self-review, validation, PR comments,
                     // update / conflict resolution) runs as `ApplyFixes`. A
@@ -1404,13 +1413,131 @@ impl Executor {
     /// would have no stop path (and would keep holding ports + infra).
     pub(super) async fn mark_done(&self, card_id: Uuid) -> Result<()> {
         self.teardown_card_runtime(card_id).await;
+        let prior = self.store.get_card(card_id)?;
         self.apply(card_id, Transition::MarkDone)?;
+        // An implement run that concluded "nothing to do" — by verdict, or by
+        // failing "without changing any files" (whose message suggests Mark
+        // done) — left an empty worktree and `usine/` branch behind. Agreeing
+        // with it means they'll never be used, so remove them — but only when
+        // they really are empty: an edit the user made in the meantime, or an
+        // earlier attempt's commits, are never thrown away.
+        if matches!(
+            prior.state,
+            CardState::NothingToDo {
+                phase: NoWorkPhase::Implement,
+                ..
+            }
+        ) || matches!(&prior.state, CardState::Failed { previous, .. }
+            if matches!(previous.as_ref(), CardState::Implementing(_)))
+        {
+            self.drop_empty_worktree(&prior).await;
+        }
         let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
             card_id,
             Severity::Success,
             "Marked done",
         ));
         Ok(())
+    }
+
+    /// Remove `card`'s worktree and branch when they hold nothing: a clean
+    /// tree (a missing worktree dir counts as clean) and no commits beyond the
+    /// base. Anything uncertain (a git error) keeps them. Clears the card's pointers once they're gone.
+    async fn drop_empty_worktree(&self, card: &Card) {
+        let Ok(project) = self.store.get_project(card.project_id) else {
+            return;
+        };
+        let Some(dir) = card.worktree_path.clone().filter(|d| *d != project.path) else {
+            return;
+        };
+        let base = crate::infra::git::remote_tracking_base(
+            &project.path,
+            project.config.effective_base_branch(),
+        );
+        let (clean, empty) = if dir.exists() {
+            (
+                matches!(self.git.uncommitted_patch(&dir).await, Ok(p) if p.is_empty())
+                    && matches!(self.git.untracked_files(&dir).await, Ok(f) if f.is_empty()),
+                matches!(self.git.branch_has_commits(&dir, &base).await, Ok(false)),
+            )
+        } else {
+            // The worktree dir was removed by hand (or lost to a crash): there
+            // is no tree to hold edits, so only the branch itself can carry
+            // work — read it from the main repo.
+            let Some(branch) = card.branch.as_deref() else {
+                return;
+            };
+            (
+                true,
+                matches!(
+                    self.git.ref_has_commits(&project.path, branch, &base).await,
+                    Ok(false)
+                ),
+            )
+        };
+        if !(clean && empty) {
+            return;
+        }
+        if self
+            .teardown_card_worktrees(&project.path, card, true)
+            .await
+        {
+            if let Ok(updated) = self.store.mutate_card(card.id, |c| {
+                c.worktree_path = None;
+                c.branch = None;
+                c.updated_at = now_millis();
+                Ok(())
+            }) {
+                let _ = self.evt_tx.unbounded_send(ExecutorEvent::updated(updated));
+            }
+        }
+    }
+
+    /// Overrule a `NothingToDo` verdict: re-run the phase that reached it, with
+    /// the verdict and the user's note as context.
+    pub(super) async fn proceed_anyway(&self, card_id: Uuid, note: String) -> Result<()> {
+        let card = self.store.get_card(card_id)?;
+        let CardState::NothingToDo {
+            phase, explanation, ..
+        } = card.state.clone()
+        else {
+            return Err(CoreError::IllegalTransition(
+                "can only proceed anyway from a \"nothing to do\" verdict".into(),
+            ));
+        };
+        let extra = super::proceed_extra(&explanation, &note);
+        // Keep the user's note so a later "back to start" can fold it in.
+        if !note.trim().is_empty() {
+            self.record_qa(card_id, note.trim().to_string());
+        }
+        match phase {
+            NoWorkPhase::Plan => {
+                self.start_run(
+                    card_id,
+                    RunMode::Plan,
+                    Transition::ProceedAnyway,
+                    Some(extra),
+                )
+                .await
+            }
+            NoWorkPhase::Implement => {
+                // Reuse the empty worktree the verdict left behind; re-cut it
+                // when it's gone (an app restart, a manual removal).
+                let has_worktree = card.branch.is_some()
+                    && card.worktree_path.as_ref().is_some_and(|p| p.exists());
+                if !has_worktree {
+                    self.ensure_worktree(card_id).await?;
+                }
+                let card = self.apply(card_id, Transition::ProceedAnyway)?;
+                let plan = self.store.get_plan(card_id).unwrap_or(None);
+                let extra = match plan {
+                    Some(plan) => format!("Approved plan:\n{plan}\n\n{extra}"),
+                    None => extra,
+                };
+                self.launch(card, RunMode::Implement, Some(extra), None)
+                    .await
+            }
+        }
     }
 
     /// Append a clarifying exchange to the card's restart log (best-effort; the

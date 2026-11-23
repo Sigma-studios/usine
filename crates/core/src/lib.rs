@@ -40,11 +40,11 @@ pub use agent::handoff::{
     HandoffRevision, TestItem,
 };
 pub use agent::investigate::parse_findings;
-pub use agent::testing::SCENARIO_FILE;
 pub use agent::investigate::{
     conclusion_prose, findings_malformed, investigate_instruction, Evidence, Finding, Findings,
     INVESTIGATE_INSTRUCTION,
 };
+pub use agent::no_work::{parse_no_work, strip_no_work_block, NoWork, NO_WORK_TAG};
 pub use agent::plan::{
     parse_plan, parse_plan_outline, parse_questions, plan_block_malformed, plan_instruction,
     plan_outline_malformed, PlanOutline, PlanQuestion, PlanStep, PLAN_QUESTIONS_INSTRUCTION,
@@ -66,6 +66,7 @@ pub use agent::startup::{
     reconcile_interrupted_runs, reconcile_interrupted_sessions, reconcile_orphaned_worktree_stacks,
     seed_default_provider, sweep_orphan_attachments, sync_base_branches, SESSION_AUTO_ARCHIVE_DAYS,
 };
+pub use agent::testing::SCENARIO_FILE;
 pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
     anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, snapshot_blob,
@@ -76,12 +77,12 @@ pub use domain::config::{
     AppSettings, CardConfig, CardKind, ForgeKind, PreviewPort, ProjectConfig, SessionDefaults,
 };
 pub use domain::model::{
-    now_millis, supported_efforts, Card, CardAnswers, CardOrigin, CardState, CheckStatus, Column, Cost,
-    DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention, InvestigationRound,
-    Mergeable, ModelSpec, PrInfo, PrReviewSub, PrState, PreviewStatus, PreviewUrl, Project,
-    Provider, QaExchange, ReviewColumn, ReviewComment, ReviewEvent, ReviewStatus, ReviewSub,
-    ReviewSummary, ReviewTask, ReviewThread, RunSub, StoredDraft, StoredReviewEdits, UiDrafts, Usage,
-    CI_REGISTER_GRACE,
+    now_millis, supported_efforts, Card, CardAnswers, CardOrigin, CardState, CheckStatus, Column,
+    Cost, DesignSub, DraftComment, Effort, ExchangeKind, FixVerdict, Intervention,
+    InvestigationRound, Mergeable, ModelSpec, NoWorkKind, NoWorkPhase, PrInfo, PrReviewSub,
+    PrState, PreviewStatus, PreviewUrl, Project, Provider, QaExchange, ReviewColumn, ReviewComment,
+    ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
+    StoredDraft, StoredReviewEdits, UiDrafts, Usage, CI_REGISTER_GRACE,
     MERGEABILITY_RECOMPUTE_GRACE,
 };
 pub use domain::session::{

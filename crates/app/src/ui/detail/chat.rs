@@ -290,12 +290,15 @@ pub(in crate::ui) fn renders_chat(state: &CardState) -> bool {
         | CardState::Done => true,
 
         // The running phases and the two panels with a send box of their own
-        // (the intervention answer, the conclusion's "dig deeper"): these keep
+        // (the intervention answer, the conclusion's "dig deeper", the
+        // no-work verdict's "proceed anyway"): these keep
         // the panel-top attachments section.
         CardState::StartingBlock
         | CardState::Designing(DesignSub::Running | DesignSub::Intervention(_))
         | CardState::Investigating(_)
         | CardState::Concluded { .. }
+        // Its own note box (the "proceed anyway" textarea) sends the text.
+        | CardState::NothingToDo { .. }
         | CardState::Implementing(_)
         | CardState::AwaitingReview(
             ReviewSub::Reviewing

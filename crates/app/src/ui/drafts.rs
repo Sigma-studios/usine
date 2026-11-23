@@ -58,6 +58,7 @@ const FIELDS: &[&str] = &[
     "intervention.option",
     "review.guidance",
     "review.fixnote",
+    "nothing.note",
 ];
 
 /// One draft slot: the card or review it belongs to, plus a per-panel field

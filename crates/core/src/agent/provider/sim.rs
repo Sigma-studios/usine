@@ -113,6 +113,27 @@ async fn simulate(
                 text: "📖 Reading project files…".into()
             });
             pause!(500);
+            // `[no-work]` in the task: conclude there's nothing to plan (see
+            // `no_work`) — unless the user already overruled that verdict.
+            let prompt = cfg.full_prompt();
+            if prompt.contains("[no-work]") && !prompt.contains("wants you to proceed anyway") {
+                emit!(AgentEvent::Done {
+                    result: "This already exists: the card menu offers **Mark done** in \
+                             `crates/app/src/ui/cardmenu.rs:235`, wired to \
+                             `ExecutorCommand::MarkDone`.\n\n```usine-no-work\n{\
+                             \"v\":1,\"kind\":\"already_done\",\
+                             \"explanation\":\"The card menu already offers Mark done \
+                             (`crates/app/src/ui/cardmenu.rs:235`), so there is nothing to \
+                             add.\"}\n```"
+                        .into(),
+                    cost_usd: 0.01,
+                    usage: Usage {
+                        input_tokens: 800,
+                        output_tokens: 120,
+                    },
+                });
+                return;
+            }
             emit!(AgentEvent::Progress {
                 text: "🤔 Considering the approach…".into()
             });

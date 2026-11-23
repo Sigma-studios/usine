@@ -377,6 +377,8 @@ select option { background: var(--panel-2); color: var(--text); }
 .badge.blocked { background: var(--amber-wash); color: var(--amber); border: 1px solid var(--amber-border); font-weight: 600; }
 /* A finished investigation's conclusion — a deliverable to read, not a diff. */
 .badge.concluded { background: var(--accent-wash); color: var(--accent); font-weight: 600; }
+/* The agent found nothing to do: informational, never the failed red. */
+.badge.nothing { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
 .badge.pr-link { font-family: ui-monospace, monospace; color: var(--muted); text-decoration: none; }
 .badge.pr-link:hover { color: var(--text); text-decoration: underline; }
 .spinner { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--muted); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }

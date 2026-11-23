@@ -10,6 +10,7 @@ pub mod executor;
 pub mod fixes;
 pub mod handoff;
 pub mod investigate;
+pub mod no_work;
 pub mod plan;
 pub mod provider;
 pub mod review;

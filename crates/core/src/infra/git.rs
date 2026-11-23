@@ -507,6 +507,13 @@ pub trait GitOps: Send + Sync {
     async fn branch_has_commits(&self, _dir: &Path, _base: &str) -> Result<bool> {
         Ok(false)
     }
+    /// Whether `gitref` (a branch, read from `repo`) carries any commit beyond
+    /// its merge base with `base` — [`branch_has_commits`](Self::branch_has_commits)
+    /// for a branch whose worktree is gone. Backends that don't model refs
+    /// answer as `branch_has_commits` would for `repo`.
+    async fn ref_has_commits(&self, repo: &Path, _gitref: &str, base: &str) -> Result<bool> {
+        self.branch_has_commits(repo, base).await
+    }
     /// The paths in `dir` that still carry conflict markers. Empty means either
     /// "resolved" or "this backend doesn't model working trees"; callers use a
     /// non-empty answer as proof that the run left conflicts behind.
@@ -760,6 +767,10 @@ impl GitOps for RealGit {
 
     async fn branch_has_commits(&self, dir: &Path, base: &str) -> Result<bool> {
         Ok(!log_subjects(dir, base, "HEAD")?.is_empty())
+    }
+
+    async fn ref_has_commits(&self, repo: &Path, gitref: &str, base: &str) -> Result<bool> {
+        Ok(!log_subjects(repo, base, gitref)?.is_empty())
     }
 
     async fn unresolved_conflicts(&self, dir: &Path) -> Result<Vec<String>> {

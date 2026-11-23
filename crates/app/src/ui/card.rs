@@ -134,6 +134,9 @@ pub fn CardView(card: Card) -> Element {
     // An investigation finished: its conclusion is the deliverable — the primary
     // action is to read it (in the detail panel, where follow-up/convert live).
     let concluded = matches!(st, CardState::Concluded { .. });
+    // The agent concluded there's nothing to do: not an error, but the user
+    // has to read its verdict and decide (mark done / proceed anyway).
+    let nothing_to_do = matches!(st, CardState::NothingToDo { .. });
     // Nothing to triage until someone has actually left comments — the background
     // poll keeps the count fresh while the card sits in `Idle`. Keyed off the
     // *total*, matching the detail panel's `can_triage`: a comment from a
@@ -388,6 +391,8 @@ pub fn CardView(card: Card) -> Element {
                     span { class: "badge intervention", title: "{status_title}", "{status}" }
                 } else if concluded {
                     span { class: "badge concluded", title: "{status_title}", "{status}" }
+                } else if nothing_to_do {
+                    span { class: "badge nothing", title: "{status_title}", "{status}" }
                 } else {
                     span { class: "badge status", title: "{status_title}", "{status}" }
                 }
@@ -509,6 +514,13 @@ pub fn CardView(card: Card) -> Element {
                             class: "btn primary",
                             onclick: move |e| { e.stop_propagation(); super::open_card_at(state, id, "conclusion"); },
                             "Read conclusion"
+                        }
+                    }
+                    if nothing_to_do {
+                        button {
+                            class: "btn primary",
+                            onclick: move |e| { e.stop_propagation(); super::open_card_at(state, id, "nothing-to-do"); },
+                            "Review"
                         }
                     }
                     if can_read {

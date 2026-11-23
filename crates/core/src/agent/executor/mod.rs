@@ -34,8 +34,9 @@ use crate::agent::provider::{ProviderFactory, RunConfig, RunMode, UsageSource};
 use crate::domain::config::CardKind;
 use crate::domain::model::{
     now_millis, Card, CardAnswers, CardState, CheckStatus, DesignSub, DraftComment, FixVerdict,
-    Intervention, InvestigationRound, Mergeable, PrReviewSub, PrState, Project, ReviewComment,
-    ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread, RunSub,
+    Intervention, InvestigationRound, Mergeable, NoWorkPhase, PrReviewSub, PrState, Project,
+    ReviewComment, ReviewEvent, ReviewStatus, ReviewSub, ReviewSummary, ReviewTask, ReviewThread,
+    RunSub,
 };
 use crate::domain::state_machine::{note_entry, stop_transition, transition, Transition};
 use crate::error::{CoreError, Result};
@@ -556,6 +557,9 @@ impl Executor {
                 self.record_qa(card_id, feedback);
                 self.start_run(card_id, RunMode::Plan, Transition::RejectPlan, Some(extra))
                     .await
+            }
+            ExecutorCommand::ProceedAnyway { card_id, note } => {
+                self.proceed_anyway(card_id, note).await
             }
             ExecutorCommand::ApprovePlan { card_id } => self.approve_plan(card_id).await,
             ExecutorCommand::Answer { card_id, text } => self.answer(card_id, text).await,
@@ -1638,6 +1642,24 @@ fn revise_extra(plan: Option<&str>, feedback: &str) -> String {
     );
     s.push_str(feedback);
     s
+}
+
+/// Extra prompt for overruling a "no work needed" verdict: what the earlier
+/// run concluded, and the user's reason to proceed anyway.
+pub(super) fn proceed_extra(explanation: &str, note: &str) -> String {
+    let note = note.trim();
+    let note = if note.is_empty() {
+        "(no further detail given)"
+    } else {
+        note
+    };
+    format!(
+        "An earlier run on this task concluded that no code change was needed:\n\n{}\n\n\
+         The user reviewed that verdict and wants you to proceed anyway. Their note:\n\n{note}\n\n\
+         Do the work. Only answer with a `usine-no-work` block again if the user's note \
+         genuinely doesn't change that verdict — and then say specifically why.",
+        explanation.trim()
+    )
 }
 
 /// One bounded line for a qa_log entry: collapse whitespace/newlines and cap
