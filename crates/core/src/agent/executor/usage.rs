@@ -19,8 +19,8 @@ impl Executor {
         }
     }
 
-    /// Ask the Claude CLI for the account's usage (a free local command — no
-    /// turn runs, no tokens spent), read the Codex rollout files for the last
+    /// Ask the Claude CLI for the account's usage (a `get_usage` control
+    /// request — no turn runs, no tokens spent, ~1s), read the Codex rollout files for the last
     /// recorded rate-limit snapshot, and emit the result unconditionally: the
     /// snapshot carries `refreshed_at`, which the bar's tooltip shows even
     /// when the numbers themselves didn't move — and which is what clears the

@@ -281,8 +281,8 @@ fn WindowGauge(label: String, window: RateLimitWindow) -> Element {
     } else {
         "ok"
     };
-    // Claude reports a pre-formatted local time; Codex a unix timestamp that
-    // reads better as a countdown.
+    // Both real providers report a unix timestamp, shown as a countdown; the
+    // simulator's mock numbers carry a pre-formatted local time instead.
     let reset = window
         .resets_text
         .clone()
