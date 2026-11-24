@@ -129,6 +129,24 @@ pub fn parse<T: DeserializeOwned>(text: &str, tag: &str) -> (Block<T>, String) {
     (Block::Malformed, cut(text, first.start, first.end))
 }
 
+/// Whether `text` holds at least one complete fenced block whose tag starts
+/// with `usine-` — the machine-readable part of an agent's answer. An
+/// unclosed block doesn't count, as it doesn't for any parser.
+pub fn has_any_usine_block(text: &str) -> bool {
+    text.split_inclusive('\n').any(|line| {
+        let bare = bare(line);
+        ['`', '~']
+            .into_iter()
+            .any(|fence| match fence_run(bare, fence) {
+                Some(width) => {
+                    let tag = bare[width..].trim();
+                    tag.starts_with("usine-") && !candidates(text, tag).is_empty()
+                }
+                None => false,
+            })
+    })
+}
+
 /// An opening fence: where its line starts, where the payload starts (past the
 /// line's newline), and the fence character and width a close must match.
 struct Opener {
@@ -274,5 +292,19 @@ mod tests {
         let (parsed, rest) = parse::<Vec<u8>>("A.\n```usine-x\n[1]\n```", "usine-x");
         assert_eq!(parsed.ok(), Some(vec![1]));
         assert_eq!(rest, "A.");
+    }
+
+    #[test]
+    fn detects_any_complete_usine_block() {
+        assert!(has_any_usine_block("Done.\n```usine-commit\nfeat: x\n```"));
+        assert!(has_any_usine_block("Done.\n~~~usine-handoff\n{}\n~~~\n"));
+        assert!(!has_any_usine_block("My hand-off above still stands."));
+        assert!(!has_any_usine_block("Done.\n```usine-handoff\n{\"v\": 2"));
+        assert!(!has_any_usine_block("Look:\n```rust\nfn x() {}\n```"));
+        assert!(!has_any_usine_block("usine-status: testing"));
+        // A non-usine fence first doesn't hide a later usine block.
+        assert!(has_any_usine_block(
+            "```rust\nfn x() {}\n```\n```usine-no-work\n{}\n```"
+        ));
     }
 }

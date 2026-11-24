@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::time::{sleep_until, timeout, Instant};
 
+use crate::agent::block;
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{supported_efforts, Provider, Usage};
 use crate::domain::session::{strip_status_lines, BgTaskStatus, TaskEvent, TURN_REPLY_SEPARATOR};
@@ -220,7 +221,17 @@ impl AgentProvider for ClaudeProvider {
         } else {
             HELD_RESULT_GRACE
         };
-        tokio::spawn(pump(child, stdout, stderr, evt_tx, ctl_rx, grace, live));
+        let keep_answer = matches!(cfg.mode, RunMode::Implement | RunMode::ApplyFixes);
+        tokio::spawn(pump(
+            child,
+            stdout,
+            stderr,
+            evt_tx,
+            ctl_rx,
+            grace,
+            live,
+            keep_answer,
+        ));
 
         Ok(RunHandle {
             events: evt_rx.boxed(),
@@ -440,12 +451,23 @@ fn is_blank_reply(result: &str) -> bool {
 /// Session runs set `join_turns`: there a turn's answer is often the real reply
 /// (the agent answers, then a background subagent wakes it and it answers
 /// again), so every non-empty result is kept and joined with
-/// [`TURN_REPLY_SEPARATOR`]. Card runs keep "last wins": their parsers read the
-/// commit/handoff blocks from the final reply.
+/// [`TURN_REPLY_SEPARATOR`]. Card runs keep "last wins" — their parsers read the
+/// commit/handoff blocks from the final reply. Write runs (`keep_answer`) are
+/// the exception: their prompt requires a `usine-commit`/`usine-handoff` (or
+/// `usine-no-work`) block, so a last turn with no `usine-*` block after an
+/// earlier one that had some only acknowledged a wake-up (a `Monitor` or
+/// background command reporting after the hand-off), and the earlier one is
+/// released instead. It is released as is, not joined with the acknowledgement:
+/// `usine-no-work` must stay the reply's trailing block. Read-only runs (plan,
+/// investigate, review…) don't get this: their blocks are optional, so a
+/// block-less last turn there can be the real, revised answer.
 #[derive(Default)]
 struct TurnGate {
     /// Keep every turn's non-empty result rather than only the last (sessions).
     join_turns: bool,
+    /// Write runs: release the latest block-carrying turn over a block-less
+    /// final one (see above).
+    keep_answer: bool,
     /// The latest terminal event (`Done`/`Error`) seen, not yet forwarded.
     held: Option<AgentEvent>,
     /// Results of earlier turns that must reach the final answer.
@@ -453,6 +475,9 @@ struct TurnGate {
     /// Whether `held` is the last of `kept`, so the next event is the agent
     /// picking up the live message rather than resuming after background work.
     held_kept: bool,
+    /// Write runs: the latest turn result carrying a `usine-*` block — the
+    /// agent's real answer, kept in case a later wake-up turn only acknowledges it.
+    answer: Option<String>,
     /// Token usage summed over every turn's `result` (each reports its own turn).
     usage: Usage,
     /// Whether the current resumption has been announced in the activity log.
@@ -480,6 +505,9 @@ impl TurnGate {
                                 self.kept.push(prev.clone());
                             }
                         }
+                    }
+                    if self.keep_answer && block::has_any_usine_block(&result) {
+                        self.answer = Some(result.clone());
                     }
                     // `total_cost_usd` is cumulative for the process: the last wins.
                     self.held = Some(AgentEvent::Done {
@@ -554,6 +582,20 @@ impl TurnGate {
                 }
                 Some(AgentEvent::Done {
                     result: parts.join(TURN_REPLY_SEPARATOR),
+                    cost_usd,
+                    usage,
+                })
+            }
+            // Write run whose last turn only acknowledged a wake-up: release
+            // the earlier answer, with this turn's usage and cumulative cost.
+            AgentEvent::Done {
+                result,
+                cost_usd,
+                usage,
+            } if self.keep_answer && !block::has_any_usine_block(&result) => {
+                let result = self.answer.take().unwrap_or(result);
+                Some(AgentEvent::Done {
+                    result,
                     cost_usd,
                     usage,
                 })
@@ -703,7 +745,9 @@ const EXIT_DRAIN: Duration = Duration::from_secs(2);
 /// [`SESSION_HELD_RESULT_GRACE`] for sessions). Reacts to Cancel by killing the
 /// child. A session run (`live`) writes `Message` controls to the agent's
 /// stdin while it is open; other runs refuse them. (Questions can't be
-/// answered mid-flight, so `Answer` controls are ignored.)
+/// answered mid-flight, so `Answer` controls are ignored.) `keep_answer` marks a
+/// write run (see [`TurnGate`]).
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     mut child: Child,
     stdout: tokio::process::ChildStdout,
@@ -712,6 +756,7 @@ async fn pump(
     mut ctl_rx: mpsc::UnboundedReceiver<RunControl>,
     grace: Duration,
     mut live: Option<LiveInput>,
+    keep_answer: bool,
 ) {
     // Reaped on app quit while it runs (see `ExecutorHandle::shutdown`).
     let _tracked = track_agent(&child);
@@ -736,6 +781,7 @@ async fn pump(
     // with live input) join every turn's answer, other runs keep the last.
     let mut turns = TurnGate {
         join_turns: live.is_some(),
+        keep_answer: keep_answer && live.is_none(),
         ..Default::default()
     };
     // When the executor last received an event: its idle watchdog counts from
@@ -1090,8 +1136,11 @@ mod tests {
     /// Drive a `TurnGate` + `PlanGate` over the raw lines of a run, returning the
     /// forwarded events — mirrors exactly what `pump` does per line and at EOF.
     fn drive_gate(lines: &[&str]) -> Vec<AgentEvent> {
+        drive_gate_with(TurnGate::default(), lines)
+    }
+
+    fn drive_gate_with(mut turns: TurnGate, lines: &[&str]) -> Vec<AgentEvent> {
         let mut gate = PlanGate::default();
-        let mut turns = TurnGate::default();
         let mut out = Vec::new();
         for line in lines {
             gate.observe(line);
@@ -1249,6 +1298,45 @@ mod tests {
         assert_eq!(resumed_notes(&events), 2);
     }
 
+    // The stream shape of the Monitor wake-up: hand-off first, then a resumed
+    // turn whose result has no block. One Done, carrying the hand-off, with
+    // usage summed and the last cumulative cost.
+    #[test]
+    fn turn_gate_releases_the_handoff_over_a_wakeup_acknowledgement() {
+        let events = drive_gate_with(
+            write_gate(),
+            &[
+                INIT,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Done.\n```usine-handoff\n{}\n```","total_cost_usd":1.0,"usage":{"input_tokens":30,"output_tokens":3}}"#,
+                INIT,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"My hand-off above still stands.","total_cost_usd":1.1,"usage":{"input_tokens":5,"output_tokens":1}}"#,
+            ],
+        );
+        let dones: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Done {
+                    result,
+                    cost_usd,
+                    usage,
+                } => Some((result.clone(), *cost_usd, *usage)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 1);
+        let (result, cost, usage) = &dones[0];
+        assert!(result.contains("usine-handoff"));
+        assert_eq!(*cost, 1.1);
+        assert_eq!(
+            *usage,
+            Usage {
+                input_tokens: 35,
+                output_tokens: 4
+            }
+        );
+        assert_eq!(resumed_notes(&events), 1);
+    }
+
     // The plan is resolved against the *final* result, even when the
     // ExitPlanMode rejection happened in an earlier turn.
     #[test]
@@ -1349,6 +1437,13 @@ mod tests {
         .to_string()
     }
 
+    fn write_gate() -> TurnGate {
+        TurnGate {
+            keep_answer: true,
+            ..Default::default()
+        }
+    }
+
     fn session_gate() -> TurnGate {
         TurnGate {
             join_turns: true,
@@ -1397,6 +1492,86 @@ mod tests {
         turns.hold(parse_claude_line(&result_line("first answer", 0.1)).unwrap());
         turns.hold(parse_claude_line(&result_line("follow-up", 0.2)).unwrap());
         assert_eq!(finished_text(&mut turns), "follow-up");
+    }
+
+    // The agent handed off, then a Monitor it left running reported and woke
+    // it for a turn that only said "my hand-off above still stands": the run's
+    // answer is the hand-off, not the acknowledgement.
+    #[test]
+    fn turn_gate_card_run_keeps_the_answer_over_a_blockless_wakeup() {
+        let answer = "Done.\n```usine-commit\nfeat: x\n```\n```usine-handoff\n{\"v\":2,\"summary\":\"s\"}\n```";
+        let mut turns = write_gate();
+        turns.hold(parse_claude_line(&result_line(answer, 0.1)).unwrap());
+        turns.hold(vec![AgentEvent::Progress {
+            text: "back".into(),
+        }]);
+        turns
+            .hold(parse_claude_line(&result_line("My hand-off above still stands.", 0.2)).unwrap());
+        let result = finished_text(&mut turns);
+        assert_eq!(result, answer);
+        assert_eq!(
+            crate::agent::commit::parse_commit_message(&result).as_deref(),
+            Some("feat: x")
+        );
+        assert!(!crate::agent::handoff::handoff_from_reply(&result).is_empty());
+    }
+
+    // Read-only runs' blocks are optional: a plan whose first turn asked
+    // questions and whose woken turn wrote a revised plan without any keeps
+    // the revised plan, not the stale one.
+    #[test]
+    fn turn_gate_read_only_run_keeps_a_blockless_revised_answer() {
+        let mut turns = TurnGate::default();
+        turns.hold(
+            parse_claude_line(&result_line(
+                "Plan v1.\n```usine-questions\n[\"Which table?\"]\n```",
+                0.1,
+            ))
+            .unwrap(),
+        );
+        turns.hold(parse_claude_line(&result_line("Plan v2, questions settled.", 0.2)).unwrap());
+        assert_eq!(finished_text(&mut turns), "Plan v2, questions settled.");
+    }
+
+    // A later turn that carries blocks is a fresh answer: last wins.
+    #[test]
+    fn turn_gate_card_run_later_blocks_win() {
+        let mut turns = write_gate();
+        turns.hold(
+            parse_claude_line(&result_line("A.\n```usine-commit\nfeat: a\n```", 0.1)).unwrap(),
+        );
+        turns.hold(
+            parse_claude_line(&result_line("B.\n```usine-commit\nfeat: b\n```", 0.2)).unwrap(),
+        );
+        assert_eq!(
+            finished_text(&mut turns),
+            "B.\n```usine-commit\nfeat: b\n```"
+        );
+    }
+
+    // The no-work block must stay trailing, so the earlier answer is released
+    // as is rather than joined with the acknowledgement.
+    #[test]
+    fn turn_gate_card_run_no_work_stays_trailing() {
+        let answer = "Nothing to do.\n```usine-no-work\n{\"v\":1,\"kind\":\"already_done\",\"explanation\":\"x\"}\n```";
+        let mut turns = write_gate();
+        turns.hold(parse_claude_line(&result_line(answer, 0.1)).unwrap());
+        turns.hold(parse_claude_line(&result_line("Still stands.", 0.2)).unwrap());
+        let result = finished_text(&mut turns);
+        assert!(crate::agent::no_work::parse_no_work(&result).is_some());
+    }
+
+    // A failed final turn stays a failure even after an earlier answer.
+    #[test]
+    fn turn_gate_card_run_final_error_is_kept() {
+        let mut turns = write_gate();
+        turns.hold(
+            parse_claude_line(&result_line("A.\n```usine-commit\nfeat: a\n```", 0.1)).unwrap(),
+        );
+        turns.hold(vec![AgentEvent::Error {
+            message: "boom".into(),
+        }]);
+        assert!(matches!(turns.finish(), Some(AgentEvent::Error { .. })));
     }
 
     #[test]
@@ -1497,7 +1672,7 @@ mod tests {
         let (_ctl_tx, ctl_rx) = mpsc::unbounded();
         timeout(
             limit,
-            pump(child, stdout, stderr, evt_tx, ctl_rx, grace, None),
+            pump(child, stdout, stderr, evt_tx, ctl_rx, grace, None, false),
         )
         .await
         .expect("run should have ended");
@@ -1540,6 +1715,7 @@ mod tests {
             ctl_rx,
             Duration::from_secs(60),
             Some(live),
+            false,
         ));
         (task, ctl_tx, evt_rx)
     }
@@ -1621,6 +1797,7 @@ mod tests {
             ctl_rx,
             Duration::from_secs(60),
             None,
+            false,
         ));
         assert!(!message(&ctl_tx, "hi").await);
         ctl_tx.unbounded_send(RunControl::Cancel).unwrap();

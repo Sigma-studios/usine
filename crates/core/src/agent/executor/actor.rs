@@ -774,6 +774,16 @@ async fn finalize_run(
     // rather than leaving the previous attempt's recap describing this one.
     if matches!(transition, Transition::AgentImplementDone) && !is_change_run {
         let handoff = crate::agent::handoff::handoff_from_reply(&result_text);
+        // Say so now rather than let the user find an empty review panel.
+        // A garbled block isn't empty: the panel already flags it.
+        if handoff.is_empty() {
+            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Warning,
+                "The agent's reply had no hand-off block; the review panel will be empty."
+                    .to_string(),
+            ));
+        }
         let _ = store.set_handoff(card_id, &handoff);
         let _ = evt_tx.unbounded_send(ExecutorEvent::handoff_updated(card_id, handoff));
     }
