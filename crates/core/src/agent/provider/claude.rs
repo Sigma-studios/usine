@@ -10,6 +10,7 @@
 //! implement/fix phases run autonomously (`--dangerously-skip-permissions`) in
 //! the card's worktree. Relies on the user's existing `claude` auth.
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -28,9 +29,11 @@ use crate::error::{CoreError, Result};
 use crate::infra::process::{kill_tree, track_agent};
 
 use super::stream::{
-    errored_tool_result_ids, exit_plan_mode_tool_id, parse_claude_line, replayed_user_text,
+    errored_tool_result_ids, exit_plan_mode_tool_id, is_rate_limited_result,
+    is_usage_limit_message, parse_claude_line, parse_rate_limit_event, replayed_user_text,
+    RateLimitInfo,
 };
-use super::{AgentProvider, RunConfig, RunHandle, RunMode, SESSION_STATUS_PROMPT};
+use super::{AgentProvider, ClaudeAuth, RunConfig, RunHandle, RunMode, SESSION_STATUS_PROMPT};
 
 /// Build the argv for a `claude` headless run, **excluding** the binary name and
 /// the prompt (the prompt is appended as the final positional arg by `start`).
@@ -151,15 +154,42 @@ pub fn build_args(cfg: &RunConfig) -> Vec<String> {
 /// we would hard-kill the process — and the session then sees it cut off and
 /// resumes it (see [`TaskTracker`]). Card runs deny `Agent`/`Task`,
 /// and their background `Bash`/`Monitor` have their own 10-minute cap.
-fn cli_env(cfg: &RunConfig) -> Vec<(&'static str, String)> {
+///
+/// Auth (see [`ClaudeAuth`]): an API-key run sets `ANTHROPIC_API_KEY` and
+/// removes the variables that would outrank it (`ANTHROPIC_AUTH_TOKEN`,
+/// `CLAUDE_CODE_OAUTH_TOKEN`); a subscription run removes any inherited
+/// `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, so a key in the user's shell
+/// can never silently bill credits.
+fn cli_env(cfg: &RunConfig) -> CliEnv {
+    let mut env = CliEnv::default();
     if cfg.mode.is_session() {
-        vec![(
+        env.set.push((
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
             SESSION_BG_WAIT_CEILING.as_millis().to_string(),
-        )]
-    } else {
-        Vec::new()
+        ));
     }
+    match &cfg.claude_auth {
+        ClaudeAuth::ApiKey(key) => {
+            env.set
+                .push(("ANTHROPIC_API_KEY", key.expose().to_string()));
+            env.remove
+                .extend(["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]);
+        }
+        ClaudeAuth::Subscription => env.remove.extend(SUBSCRIPTION_STRIPPED_ENV),
+    }
+    env
+}
+
+/// The variables a plan-billed `claude` must not inherit: either would bill
+/// API usage instead of the subscription. Also stripped by the usage probe.
+pub(crate) const SUBSCRIPTION_STRIPPED_ENV: [&str; 2] =
+    ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+/// What [`cli_env`] does to the inherited environment.
+#[derive(Default)]
+struct CliEnv {
+    set: Vec<(&'static str, String)>,
+    remove: Vec<&'static str>,
 }
 
 pub struct ClaudeProvider;
@@ -177,10 +207,14 @@ impl AgentProvider for ClaudeProvider {
             args.push(cfg.full_prompt());
         }
 
+        let env = cli_env(&cfg);
         let mut command = Command::new("claude");
+        for name in &env.remove {
+            command.env_remove(name);
+        }
         command
             .args(&args)
-            .envs(cli_env(&cfg))
+            .envs(env.set)
             .current_dir(&cfg.project_dir)
             .stdin(if session {
                 Stdio::piped()
@@ -427,6 +461,85 @@ impl PlanGate {
         self.pending
             .take()
             .map(|(_, draft)| AgentEvent::PlanReady { plan: draft })
+    }
+}
+
+/// Tells a run cut off by the plan's usage limit apart from a real failure.
+///
+/// The CLI reports the plan's rate-limit state as `rate_limit_event` lines; a
+/// `rejected` one with no paid extra usage behind it means the next request
+/// fails. If the run then ends on an error, [`LimitWatch::classify`] turns it
+/// into [`AgentEvent::LimitReached`] so the executor can continue it on API
+/// credits. An error `result` the API rejected as rate-limited (429) whose
+/// text reads like a usage limit counts too, in case the event never came.
+///
+/// Each event is about one window (`rateLimitType`), so the state is kept per
+/// window: only a later event for the SAME window lifts its rejection, and
+/// events about other windows (a per-model `allowed`, say) leave it alone.
+#[derive(Default)]
+struct LimitWatch {
+    /// The latest rate-limit state the CLI reported, per `rateLimitType`
+    /// (`None` = the event named no window).
+    windows: BTreeMap<Option<String>, RateLimitInfo>,
+    /// Whether the latest error `result` was an API 429.
+    rate_limited_result: bool,
+}
+
+impl LimitWatch {
+    /// Note `line`; for a `rate_limit_event` carrying window readings, return
+    /// them as the [`AgentEvent::PlanUsage`] the executor's early switch to
+    /// API credits reads.
+    fn observe(&mut self, line: &str) -> Option<AgentEvent> {
+        if let Some(info) = parse_rate_limit_event(line) {
+            let usage = (!info.windows.is_empty()).then(|| AgentEvent::PlanUsage {
+                windows: info.windows.clone(),
+            });
+            self.windows.insert(info.limit_type.clone(), info);
+            return usage;
+        }
+        if line.contains("\"result\"") {
+            self.rate_limited_result = is_rate_limited_result(line);
+        }
+        None
+    }
+
+    /// The run's terminal event, an `Error` re-cast as `LimitReached` when the
+    /// plan's limit is what ended it.
+    ///
+    /// A refusal from the plan's session or weekly window carries that
+    /// window's reset, which blocks the plan until then. A refusal from a
+    /// per-model bucket only (e.g. `seven_day_opus`) carries none: the plan
+    /// still covers the other models, so the executor makes only a short,
+    /// guessed block of it, which its next usage poll lifts, instead of
+    /// billing every Claude run to credits until that bucket resets.
+    fn classify(&self, evt: AgentEvent) -> AgentEvent {
+        let AgentEvent::Error { message } = evt else {
+            return evt;
+        };
+        let blocking = || self.windows.values().filter(|i| i.is_blocking());
+        let plan_blocked = blocking().any(RateLimitInfo::is_plan_wide);
+        let model_blocked = blocking().any(|i| !i.is_plan_wide());
+        let usage_limit = self.rate_limited_result && is_usage_limit_message(&message);
+        if !(plan_blocked || model_blocked || usage_limit) {
+            return AgentEvent::Error { message };
+        }
+        // The plan window's reset: a refused one's, else (the 429 fallback)
+        // that of one the CLI warned about. None for a per-model refusal.
+        let resets_at = if plan_blocked {
+            blocking()
+                .filter(|i| i.is_plan_wide())
+                .filter_map(|i| i.resets_at)
+                .max()
+        } else if model_blocked {
+            None
+        } else {
+            self.windows
+                .values()
+                .filter(|i| i.is_plan_wide() && i.status != "allowed")
+                .filter_map(|i| i.resets_at)
+                .max()
+        };
+        AgentEvent::LimitReached { resets_at, message }
     }
 }
 
@@ -779,6 +892,7 @@ async fn pump(
     let mut gate = PlanGate::default();
     // Holds each turn's result until the run ends: sessions (the only runs
     // with live input) join every turn's answer, other runs keep the last.
+    let mut limit = LimitWatch::default();
     let mut turns = TurnGate {
         join_turns: live.is_some(),
         keep_answer: keep_answer && live.is_none(),
@@ -797,11 +911,18 @@ async fn pump(
 
     let forward = |line: &str,
                    gate: &mut PlanGate,
+                   limit: &mut LimitWatch,
                    turns: &mut TurnGate,
                    tasks: &mut TaskTracker,
                    live: &mut Option<LiveInput>,
                    last_sent: &mut Instant| {
         gate.observe(line);
+        // Window readings go straight out: they are billing telemetry, not
+        // agent output, so they neither wait behind a held result nor count
+        // as activity for the held-result grace (`last_sent`).
+        if let Some(usage) = limit.observe(line) {
+            let _ = evt_tx.unbounded_send(usage);
+        }
         let events = parse_claude_line(line).unwrap_or_default();
         tasks.observe(&events, turns.is_idle());
         if let Some(note) = live.as_mut().and_then(|l| l.observe(line, &events)) {
@@ -831,7 +952,7 @@ async fn pump(
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     last_line = Instant::now();
-                    forward(&line, &mut gate, &mut turns, &mut tasks, &mut live, &mut last_sent)
+                    forward(&line, &mut gate, &mut limit, &mut turns, &mut tasks, &mut live, &mut last_sent)
                 }
                 _ => break, // EOF or read error
             },
@@ -840,7 +961,7 @@ async fn pump(
                 // `claude` is gone; read what's left in the pipe, but don't wait
                 // on a grandchild (a background task) that still holds it open.
                 while let Ok(Ok(Some(line))) = timeout(EXIT_DRAIN, lines.next_line()).await {
-                    forward(&line, &mut gate, &mut turns, &mut tasks, &mut live, &mut last_sent);
+                    forward(&line, &mut gate, &mut limit, &mut turns, &mut tasks, &mut live, &mut last_sent);
                 }
                 break;
             },
@@ -898,7 +1019,7 @@ async fn pump(
         }
         let tail = match turns.finish() {
             // `line` is only read for PlanReady tool ids; none arrive here.
-            Some(evt) => gate.gate("", vec![evt]),
+            Some(evt) => gate.gate("", vec![limit.classify(evt)]),
             None => gate.finish().into_iter().collect(),
         };
         for evt in tail {
@@ -935,6 +1056,7 @@ async fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::{PlanWindow, PlanWindowUsage};
     use crate::domain::model::{Effort, ModelSpec, Provider};
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -950,6 +1072,7 @@ mod tests {
             extra_prompt: None,
             resume_session: None,
             attachments: Vec::new(),
+            claude_auth: Default::default(),
         }
     }
 
@@ -965,10 +1088,35 @@ mod tests {
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
             (24 * 60 * 60 * 1000 - 5 * 60 * 1000).to_string(),
         )];
-        assert_eq!(cli_env(&cfg(RunMode::SessionFull)), expected);
-        assert_eq!(cli_env(&cfg(RunMode::SessionReadOnly)), expected);
-        assert!(cli_env(&cfg(RunMode::Implement)).is_empty());
-        assert!(cli_env(&cfg(RunMode::Plan)).is_empty());
+        assert_eq!(cli_env(&cfg(RunMode::SessionFull)).set, expected);
+        assert_eq!(cli_env(&cfg(RunMode::SessionReadOnly)).set, expected);
+        assert!(cli_env(&cfg(RunMode::Implement)).set.is_empty());
+        assert!(cli_env(&cfg(RunMode::Plan)).set.is_empty());
+    }
+
+    #[test]
+    fn a_subscription_run_strips_inherited_api_credentials() {
+        let env = cli_env(&cfg(RunMode::Implement));
+        assert!(env.set.iter().all(|(k, _)| *k != "ANTHROPIC_API_KEY"));
+        assert_eq!(
+            env.remove,
+            vec!["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn an_api_key_run_sets_the_key_and_drops_what_would_outrank_it() {
+        let mut c = cfg(RunMode::Implement);
+        c.claude_auth = ClaudeAuth::ApiKey(crate::infra::secrets::SecretString::new("sk-test"));
+        let env = cli_env(&c);
+        assert_eq!(env.set, vec![("ANTHROPIC_API_KEY", "sk-test".to_string())]);
+        assert_eq!(
+            env.remove,
+            vec!["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
+        );
+        // Sessions keep their background-wait ceiling alongside the key.
+        c.mode = RunMode::SessionFull;
+        assert_eq!(cli_env(&c).set.len(), 2);
     }
 
     #[test]
@@ -1189,6 +1337,166 @@ mod tests {
 
     // A rejected ExitPlanMode: the buffered draft is dropped and the plan that
     // surfaces is the agent's real final result — the one carrying the questions.
+    /// A `rate_limit_event` line as CLI 2.1.330 writes it (captured live,
+    /// `status`/`overageStatus` varied per test).
+    fn rate_limit_line(status: &str, overage: &str) -> String {
+        format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{status}","resetsAt":1795730400,"rateLimitType":"five_hour","utilization":1.0,"overageStatus":"{overage}","overageDisabledReason":"org_level_disabled","isUsingOverage":false}},"uuid":"u","session_id":"s"}}"#
+        )
+    }
+
+    const LIMIT_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You've hit your session limit · resets 3pm","total_cost_usd":0.0}"#;
+
+    fn classify(lines: &[&str]) -> AgentEvent {
+        let mut watch = LimitWatch::default();
+        let mut last = None;
+        for line in lines {
+            watch.observe(line);
+            for evt in parse_claude_line(line).unwrap() {
+                if matches!(evt, AgentEvent::Done { .. } | AgentEvent::Error { .. }) {
+                    last = Some(evt);
+                }
+            }
+        }
+        watch.classify(last.expect("a terminal event"))
+    }
+
+    #[test]
+    fn rate_limit_events_report_the_plan_windows() {
+        // `unifiedWindows` (every window): the per-model bucket is left out.
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1795730400,"rateLimitType":"seven_day","utilization":0.9,"unifiedWindows":{"five_hour":{"utilization":0.96,"resetsAt":1795700000,"status":"allowed_warning"},"seven_day":{"utilization":0.9,"resetsAt":1795730400},"seven_day_overage_included":{"utilization":1.0,"resetsAt":1795730400}}}}"#;
+        let mut watch = LimitWatch::default();
+        match watch.observe(line) {
+            Some(AgentEvent::PlanUsage { windows }) => assert_eq!(
+                windows,
+                vec![
+                    PlanWindowUsage {
+                        window: PlanWindow::Session,
+                        utilization: 0.96,
+                        resets_at: Some(1_795_700_000),
+                    },
+                    PlanWindowUsage {
+                        window: PlanWindow::Weekly,
+                        utilization: 0.9,
+                        resets_at: Some(1_795_730_400),
+                    },
+                ]
+            ),
+            other => panic!("expected PlanUsage, got {other:?}"),
+        }
+        // No `unifiedWindows`: the top-level reading of the limiting window.
+        match watch.observe(&rate_limit_line("allowed_warning", "rejected")) {
+            Some(AgentEvent::PlanUsage { windows }) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].window, PlanWindow::Session);
+                assert_eq!(windows[0].utilization, 1.0);
+            }
+            other => panic!("expected PlanUsage, got {other:?}"),
+        }
+        // A per-model limit alone reports nothing; other lines neither.
+        let opus = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day_opus","utilization":0.99}}"#;
+        assert!(watch.observe(opus).is_none());
+        assert!(watch.observe(LIMIT_RESULT).is_none());
+    }
+
+    #[test]
+    fn a_rejected_plan_limit_turns_the_error_into_limit_reached() {
+        let rejected = rate_limit_line("rejected", "rejected");
+        match classify(&[&rejected, LIMIT_RESULT]) {
+            AgentEvent::LimitReached { resets_at, message } => {
+                assert_eq!(resets_at, Some(1_795_730_400));
+                assert!(message.contains("session limit"));
+            }
+            other => panic!("expected LimitReached, got {other:?}"),
+        }
+        // Any error after the rejection counts, whatever its text.
+        let generic = r#"{"type":"result","is_error":true,"result":"API Error"}"#;
+        assert!(matches!(
+            classify(&[&rejected, generic]),
+            AgentEvent::LimitReached { .. }
+        ));
+    }
+
+    #[test]
+    fn paid_extra_usage_or_a_lifted_limit_is_not_a_block() {
+        let generic = r#"{"type":"result","is_error":true,"result":"boom"}"#;
+        for overage in ["allowed", "allowed_warning"] {
+            let line = rate_limit_line("rejected", overage);
+            assert!(matches!(
+                classify(&[&line, generic]),
+                AgentEvent::Error { .. }
+            ));
+        }
+        // A warning alone, or a rejection a later `allowed` lifted, isn't one either.
+        let warn = rate_limit_line("allowed_warning", "rejected");
+        assert!(matches!(
+            classify(&[&warn, generic]),
+            AgentEvent::Error { .. }
+        ));
+        let rejected = rate_limit_line("rejected", "rejected");
+        let allowed = rate_limit_line("allowed", "rejected");
+        assert!(matches!(
+            classify(&[&rejected, &allowed, generic]),
+            AgentEvent::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn a_per_model_refusal_carries_no_plan_reset() {
+        // The CLI names the per-model bucket in `rateLimitType`: its reset
+        // must not become the whole plan's block.
+        let opus = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1796000000,"rateLimitType":"seven_day_opus","utilization":1.0,"overageStatus":"rejected"}}"#;
+        let generic = r#"{"type":"result","is_error":true,"result":"API Error"}"#;
+        match classify(&[opus, generic]) {
+            AgentEvent::LimitReached { resets_at, .. } => assert_eq!(resets_at, None),
+            other => panic!("expected LimitReached, got {other:?}"),
+        }
+        // A plan-wide refusal alongside it wins, with its own reset.
+        let session = rate_limit_line("rejected", "rejected");
+        match classify(&[opus, &session, generic]) {
+            AgentEvent::LimitReached { resets_at, .. } => {
+                assert_eq!(resets_at, Some(1_795_730_400))
+            }
+            other => panic!("expected LimitReached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_the_same_window_lifts_a_rejection() {
+        let rejected = rate_limit_line("rejected", "rejected");
+        let generic = r#"{"type":"result","is_error":true,"result":"API Error"}"#;
+        // A later event about another window leaves the session refusal be.
+        let opus_ok = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1796000000,"rateLimitType":"seven_day_opus","utilization":0.2}}"#;
+        let weekly_ok = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1796000000,"rateLimitType":"seven_day","utilization":0.4}}"#;
+        match classify(&[&rejected, opus_ok, weekly_ok, generic]) {
+            AgentEvent::LimitReached { resets_at, .. } => {
+                assert_eq!(resets_at, Some(1_795_730_400))
+            }
+            other => panic!("expected LimitReached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_usage_limit_429_counts_even_without_the_event() {
+        match classify(&[LIMIT_RESULT]) {
+            AgentEvent::LimitReached { resets_at, .. } => assert_eq!(resets_at, None),
+            other => panic!("expected LimitReached, got {other:?}"),
+        }
+        // A 429 that doesn't read like a usage limit stays an error.
+        let throttled = r#"{"type":"result","is_error":true,"api_error_status":429,"result":"Overloaded, try again"}"#;
+        assert!(matches!(classify(&[throttled]), AgentEvent::Error { .. }));
+    }
+
+    #[test]
+    fn a_successful_run_is_never_reclassified() {
+        let rejected = rate_limit_line("rejected", "rejected");
+        let ok = r#"{"type":"result","is_error":false,"result":"done","total_cost_usd":0.1}"#;
+        assert!(matches!(
+            classify(&[&rejected, ok]),
+            AgentEvent::Done { .. }
+        ));
+    }
+
     #[test]
     fn plan_gate_prefers_final_result_when_exit_plan_rejected() {
         let events = drive_gate(&[

@@ -46,6 +46,7 @@ use crate::infra::persistence::Store;
 
 mod actor;
 mod adopt;
+mod billing;
 mod diff;
 mod gate;
 mod lifecycle;
@@ -155,6 +156,13 @@ pub fn spawn_with_forges(
                 // `new_cyclic` so actor tasks can hold a Weak back-reference and
                 // call the executor directly where a re-dispatched command could
                 // be dropped by the in-flight claim (see `validation_actor`).
+                // The real CLIs keep the fallback's key in the OS keychain;
+                // the simulator and tests never touch it.
+                let key_store = match config.providers.usage_source() {
+                    UsageSource::Cli => billing::KeyStore::Keychain,
+                    UsageSource::Simulated | UsageSource::None => billing::KeyStore::Memory,
+                };
+                let billing = Arc::new(billing::Billing::new(key_store, evt_tx.clone()));
                 let executor = Arc::new_cyclic(|self_ref| Executor {
                     store: config.store,
                     providers: config.providers,
@@ -173,6 +181,7 @@ pub fn spawn_with_forges(
                     gate: Mutex::new(gate::RunGate::new()),
                     arrivals: std::sync::atomic::AtomicU64::new(0),
                     drafts_save_failing: std::sync::atomic::AtomicBool::new(false),
+                    billing,
                     self_ref: self_ref.clone(),
                 });
                 // Background poll: every few minutes, discover new PRs to review
@@ -189,6 +198,11 @@ pub fn spawn_with_forges(
                 // usage for the bottom bar. Real CLIs, or the simulator's mock
                 // numbers — but never tests, which must not shell out.
                 if executor.providers.usage_source() != UsageSource::None {
+                    // Tell the UI whether a fallback key is saved. The
+                    // keychain read runs off the dispatch loop: a pending OS
+                    // access prompt must not freeze the board.
+                    let billing = Arc::clone(&executor.billing);
+                    tokio::spawn(async move { billing.load_key().await });
                     let poller = Arc::clone(&executor);
                     tokio::spawn(async move { poller.usage_poll_loop().await });
                 }
@@ -412,6 +426,8 @@ struct Executor {
     /// disk) toasts once instead of on every autosave tick; cleared by the
     /// next successful save.
     drafts_save_failing: std::sync::atomic::AtomicBool,
+    /// The Claude API-credits fallback (see [`billing`]).
+    billing: Arc<billing::Billing>,
     /// Back-reference for actor tasks that must call the executor directly:
     /// a command re-dispatched from an actor can race the in-flight claim of
     /// the very handler that spawned it and be silently dropped, stranding the
@@ -638,6 +654,8 @@ impl Executor {
                 self.refresh_usage().await;
                 Ok(())
             }
+            ExecutorCommand::SetAnthropicKey { key } => self.set_anthropic_key(Some(key)).await,
+            ExecutorCommand::ClearAnthropicKey => self.set_anthropic_key(None).await,
             ExecutorCommand::ScanReviews { project_id } => self.scan_reviews(project_id).await,
             ExecutorCommand::StartReview {
                 review_id,

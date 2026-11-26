@@ -82,6 +82,9 @@ pub(super) enum QueuedRun {
     },
     Review {
         review_id: Uuid,
+        /// The cut-off run's session, when this continues one (see
+        /// `Executor::continue_review`).
+        resume_session: Option<String>,
     },
     Validation {
         card_id: Uuid,
@@ -92,7 +95,7 @@ impl QueuedRun {
     fn id(&self) -> Uuid {
         match self {
             QueuedRun::Card { card_id, .. } | QueuedRun::Validation { card_id } => *card_id,
-            QueuedRun::Review { review_id } => *review_id,
+            QueuedRun::Review { review_id, .. } => *review_id,
         }
     }
 
@@ -101,7 +104,7 @@ impl QueuedRun {
             QueuedRun::Card { card_id, .. } | QueuedRun::Validation { card_id } => {
                 QueuedTarget::Card(*card_id)
             }
-            QueuedRun::Review { review_id } => QueuedTarget::Review(*review_id),
+            QueuedRun::Review { review_id, .. } => QueuedTarget::Review(*review_id),
         }
     }
 }
@@ -380,7 +383,10 @@ impl Executor {
                         self.demote_stranded(card_id, &e);
                     }
                 }
-                QueuedRun::Review { review_id } => {
+                QueuedRun::Review {
+                    review_id,
+                    resume_session,
+                } => {
                     let reviewing = self
                         .store
                         .get_review_task(review_id)
@@ -390,7 +396,7 @@ impl Executor {
                         continue;
                     }
                     if let Err(e) = self
-                        .begin_review_run_admitted(review_id, Some((run_id, slot)))
+                        .begin_review_run_admitted(review_id, Some((run_id, slot)), resume_session)
                         .await
                     {
                         // Same failure handling as `start_review`.

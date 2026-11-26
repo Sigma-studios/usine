@@ -20,6 +20,9 @@ base64 = "0.22.1"
 directories.workspace = true
 futures.workspace = true
 git2 = "0.21.0"
+# The Anthropic API key for the API-credits fallback lives in the OS keychain
+# (macOS Keychain, Secret Service, Windows Credential Manager), never in the DB.
+keyring = "4.2"
 native_db = "0.8.2"
 native_model = "0.4.20"
 # Matches the redb `native_db` links against — only to tell the "database

@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::agent::events::{AgentEvent, RunControl};
 use crate::domain::model::{ModelSpec, Provider};
 use crate::error::Result;
+use crate::infra::secrets::SecretString;
 
 /// Which phase a run represents. Determines permission/sandbox level and which
 /// [`ModelSpec`] applies.
@@ -110,6 +111,30 @@ pub struct RunConfig {
     /// passes image attachments via `codex exec -i` (its shell tools can read
     /// text but not see images, unlike Claude's vision-capable Read tool).
     pub attachments: Vec<PathBuf>,
+    /// How a Claude run is billed (ignored by Codex and the simulator).
+    pub claude_auth: ClaudeAuth,
+}
+
+/// How a Claude run authenticates, which decides what it bills against.
+///
+/// Runs use the CLI's own plan login by default. Once the plan's usage limit
+/// is hit and the user saved an Anthropic API key, runs go to that key until
+/// the limit resets, billing the plan's monthly API credits instead (see
+/// `executor/billing.rs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClaudeAuth {
+    /// The `claude` login (subscription usage). Any `ANTHROPIC_API_KEY` the app
+    /// inherited is stripped, so credits are never billed behind the user's back.
+    #[default]
+    Subscription,
+    /// Bill to this API key (`ANTHROPIC_API_KEY`).
+    ApiKey(SecretString),
+}
+
+impl ClaudeAuth {
+    pub fn is_api_key(&self) -> bool {
+        matches!(self, ClaudeAuth::ApiKey(_))
+    }
 }
 
 impl RunConfig {

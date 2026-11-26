@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::agent::fixes::FixReport;
 use crate::agent::handoff::Handoff;
-use crate::agent::usage::UsageSnapshot;
+use crate::agent::usage::{ClaudeBilling, UsageSnapshot};
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
     Card, CardAnswers, DraftComment, FixVerdict, ModelSpec, PrInfo, PreviewStatus, PreviewUrl,
@@ -19,6 +19,7 @@ use crate::domain::model::{
 };
 use crate::domain::session::{Session, SessionAccess, TaskEvent};
 use crate::infra::forge::OpenPr;
+use crate::infra::secrets::SecretString;
 
 /// Severity for a user-facing toast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +56,46 @@ pub enum AgentEvent {
     },
     /// The run failed.
     Error { message: String },
+    /// The run was cut off by the usage source it billed — the Claude plan's
+    /// usage limit (session or weekly window), or the API credits running
+    /// out — not by a fault of its own. `resets_at` is when the plan's window
+    /// reopens (unix seconds), when the CLI said. The executor either resumes
+    /// the run on the other source or turns this into an `Error` (see
+    /// `executor/billing.rs`), so consumers only ever see it as "resume", with
+    /// `message` already saying where the run continues.
+    LimitReached {
+        resets_at: Option<i64>,
+        message: String,
+    },
+    /// A plan-billed Claude run's CLI reported how full the plan's windows
+    /// are (it does so whenever a window's rounded percentage moves). The
+    /// executor's billing reads it to move new runs onto API credits a little
+    /// before the plan runs out (see `executor/billing.rs`) and swallows it:
+    /// run consumers never see it.
+    PlanUsage { windows: Vec<PlanWindowUsage> },
     /// A background task (subagent or command) started, progressed or ended.
     /// Only sessions see these: card runs deny the `Agent`/`Task` tools.
     Task(TaskEvent),
+}
+
+/// Which of the Claude plan's shared usage windows a reading is for. The
+/// per-model weekly buckets (Fable, Opus…) are left out on purpose: when only
+/// one of them is full, the plan still covers the other models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanWindow {
+    /// The 5-hour session window.
+    Session,
+    /// The 7-day window.
+    Weekly,
+}
+
+/// How full one plan window is, as a fraction (`1.0` = at the limit), and
+/// when it resets (unix seconds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanWindowUsage {
+    pub window: PlanWindow,
+    pub utilization: f64,
+    pub resets_at: Option<i64>,
 }
 
 /// Control messages sent *into* an active run (UI → provider via executor).
@@ -656,6 +694,13 @@ pub enum ExecutorCommand {
     /// Refresh the usage bar's rate-limit data now (its manual refresh button)
     /// instead of waiting for the next background poll.
     RefreshUsage,
+    /// Save the Anthropic API key Claude runs fall back to once the plan's
+    /// usage limit is hit (stored in the OS keychain, never read back).
+    SetAnthropicKey {
+        key: SecretString,
+    },
+    /// Remove the saved Anthropic API key, turning the fallback off.
+    ClearAnthropicKey,
 
     // --- one-off sessions (ad-hoc agent chats in any folder) --------------
     /// Create a session and start its first turn. `id` is minted by the UI
@@ -837,7 +882,9 @@ impl ExecutorCommand {
             | ExecutorCommand::SaveSettings { .. }
             | ExecutorCommand::SaveUiDrafts { .. }
             | ExecutorCommand::ScanReviews { .. }
-            | ExecutorCommand::RefreshUsage => Uuid::nil(),
+            | ExecutorCommand::RefreshUsage
+            | ExecutorCommand::SetAnthropicKey { .. }
+            | ExecutorCommand::ClearAnthropicKey => Uuid::nil(),
         }
     }
 
@@ -1082,6 +1129,9 @@ pub enum ExecutorEventKind {
     /// windows for the usage bar); the UI replaces its snapshot wholesale.
     /// Not card-scoped.
     UsageUpdated(UsageSnapshot),
+    /// The Claude API-credits fallback changed (key saved/removed, plan
+    /// blocked or unblocked, credits spent or exhausted). Not card-scoped.
+    BillingUpdated(ClaudeBilling),
     /// The run queue changed (an entry queued, launched, or was purged). The
     /// full ordered queue — index = place in line; the UI replaces its copy
     /// wholesale. Not card-scoped. In-memory only: the queue doesn't survive a
@@ -1282,6 +1332,12 @@ impl ExecutorEvent {
         ExecutorEvent {
             card_id,
             kind: ExecutorEventKind::DiffUpdated { state },
+        }
+    }
+    pub fn billing_updated(billing: ClaudeBilling) -> Self {
+        ExecutorEvent {
+            card_id: Uuid::nil(),
+            kind: ExecutorEventKind::BillingUpdated(billing),
         }
     }
     pub fn usage_updated(snapshot: UsageSnapshot) -> Self {

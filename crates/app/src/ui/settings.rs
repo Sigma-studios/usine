@@ -245,6 +245,7 @@ pub fn SettingsModal() -> Element {
                     }
                     div { class: "hint", "Caps concurrently running agent runs and validation checks across all projects (default 5); further runs queue and start automatically. 0 = unlimited. Agent Chat questions, PR-comment triage, sessions and previews aren't counted." }
                 }
+                ApiCreditsSection {}
                 div { class: "section",
                     h3 { "Sessions" }
                     div { class: "field",
@@ -270,6 +271,97 @@ pub fn SettingsModal() -> Element {
                 div { class: "modal-actions",
                     button { class: "btn primary", onclick: move |_| close_settings(), "Done" }
                 }
+            }
+        }
+    }
+}
+
+/// Where the plan's monthly API credits are claimed (by linking a Console
+/// organization) and where that organization's API keys are created.
+const CLAIM_CREDITS_URL: &str = "https://claude.ai/settings/billing";
+const API_KEYS_URL: &str = "https://platform.claude.com/settings/keys";
+
+/// The Claude API-credits fallback: an Anthropic API key, saved to the OS
+/// keychain through the executor and never read back, that Claude runs bill
+/// only once the plan is nearly out (or cut a run off), until it resets.
+#[component]
+fn ApiCreditsSection() -> Element {
+    let state = use_context::<AppState>();
+    let billing = state.billing.read().clone();
+    let mut draft = use_signal(String::new);
+    let mut save = move || {
+        let key = draft.peek().trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        state.send(usine_core::ExecutorCommand::SetAnthropicKey {
+            key: usine_core::SecretString::new(key),
+        });
+        draft.set(String::new());
+    };
+    let status = if billing.fallback_configured {
+        "Key saved"
+    } else {
+        "No key — runs stop at your plan's limit"
+    };
+    let has_draft = !draft().trim().is_empty();
+
+    rsx! {
+        div { class: "section",
+            h3 { "Claude API credits (fallback)" }
+            div { class: "field",
+                label { r#for: "settings-anthropic-key", "Anthropic API key" }
+                div { class: "api-key-row",
+                    input {
+                        id: "settings-anthropic-key",
+                        r#type: "password",
+                        autocomplete: "off",
+                        placeholder: if billing.fallback_configured { "Paste a new key to replace the saved one" } else { "sk-ant-…" },
+                        value: "{draft}",
+                        oninput: move |e: Event<FormData>| draft.set(e.value()),
+                        onkeydown: move |e: KeyboardEvent| {
+                            if e.key() == Key::Enter {
+                                e.prevent_default();
+                                save();
+                            }
+                        },
+                    }
+                    button {
+                        class: "btn primary",
+                        disabled: !has_draft,
+                        onclick: move |_| save(),
+                        "Save"
+                    }
+                    if billing.fallback_configured {
+                        button {
+                            class: "btn",
+                            onclick: move |_| state.send(usine_core::ExecutorCommand::ClearAnthropicKey),
+                            "Remove"
+                        }
+                    }
+                }
+                div { class: if billing.fallback_configured { "api-key-status saved" } else { "api-key-status" }, "{status}" }
+            }
+            div { class: "hint",
+                "Used only once your plan is three-quarters used — 75% of the session or the weekly limit — until it resets: new Claude runs start on the key while runs already going finish on the plan, and any run a limit cuts off continues on the other source. Max and Ultra include monthly API credits — claim them by linking a Console organization in "
+                a {
+                    href: "#",
+                    onclick: move |e: MouseEvent| {
+                        e.prevent_default();
+                        crate::ui::sessions::open_url(CLAIM_CREDITS_URL);
+                    },
+                    "claude.ai billing settings"
+                }
+                ", then create a key in that organization ("
+                a {
+                    href: "#",
+                    onclick: move |e: MouseEvent| {
+                        e.prevent_default();
+                        crate::ui::sessions::open_url(API_KEYS_URL);
+                    },
+                    "Console API keys"
+                }
+                "). Stored in the system keychain."
             }
         }
     }

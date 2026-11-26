@@ -341,6 +341,7 @@ mod tests {
             extra_prompt: None,
             resume_session: None,
             attachments: Vec::new(),
+            claude_auth: Default::default(),
         }
     }
 
@@ -530,6 +531,7 @@ mod tests {
             extra_prompt: None,
             resume_session: None,
             attachments: Vec::new(),
+            claude_auth: Default::default(),
         };
         let effort_arg = |args: &[String]| {
             args.iter()

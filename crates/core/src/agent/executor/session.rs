@@ -71,6 +71,7 @@ const HISTORY_TURN_CHARS: usize = 500;
 
 /// What one turn sends: kept by the actor so a failed resume can be replayed
 /// as a fresh run carrying the same message.
+
 #[derive(Clone)]
 struct TurnInput {
     prompt: String,
@@ -496,6 +497,7 @@ impl Executor {
             SessionAccess::FullAccess => RunMode::SessionFull,
             SessionAccess::ReadOnly => RunMode::SessionReadOnly,
         };
+        let claude_auth = self.billing.auth_for(session.provider);
         let cfg = RunConfig {
             provider: session.provider,
             project_dir: session.folder.clone(),
@@ -508,6 +510,7 @@ impl Executor {
                 .then(|| SESSION_STATUS_PROMPT.to_string()),
             resume_session: resume.clone(),
             attachments: input.attachments.clone(),
+            claude_auth: claude_auth.clone(),
         };
         if resume.is_some() {
             transcript(
@@ -552,7 +555,7 @@ impl Executor {
         tokio::spawn(run_session_actor(SessionRun {
             session_id: id,
             run_id,
-            events: handle.events,
+            events: self.billing.meter(handle.events, &claude_auth, true),
             input,
             resumed: resume.is_some(),
             interactive,
@@ -585,7 +588,15 @@ impl Executor {
             };
             let resume = session.last_session.clone();
             if let Err(e) = self.launch_session_turn(&session, input, resume).await {
+                // The previous turn's slot is already released: fail the
+                // session rather than leave it Running with no process.
                 tracing::warn!("session {id}: queued turn failed to start: {e}");
+                fail_session(
+                    &self.store,
+                    &self.evt_tx,
+                    id,
+                    format!("Couldn't continue the conversation: {e}"),
+                );
             }
         })
     }
@@ -987,6 +998,8 @@ async fn run_session_actor(run: SessionRun) {
                 }
                 transcript(&store, &evt_tx, id, text);
             }
+            // Billing telemetry, swallowed by `Billing::meter`.
+            AgentEvent::PlanUsage { .. } => {}
             AgentEvent::Task(task) => {
                 saw_output = true;
                 if let TaskEvent::CutOff { ids } = &task {
@@ -1203,6 +1216,23 @@ async fn run_session_actor(run: SessionRun) {
                 transcript(&store, &evt_tx, id, "✔ finished".into());
                 settled = true;
                 break;
+            }
+            // The usage source the turn billed cut it off and the other one
+            // can take over (the metering in `launch_session_turn` turns
+            // every other limit into an `Error`, and its message says where
+            // the turn continues): resume the conversation there, through
+            // the direct call queued turns use.
+            AgentEvent::LimitReached { message, .. } => {
+                release_run(&session_runs, id, run_id);
+                transcript(&store, &evt_tx, id, format!("⚠ {}", message.trim()));
+                if let Some(exec) = executor.upgrade() {
+                    let input = TurnInput {
+                        prompt: super::billing::LIMIT_CONTINUE_PROMPT.to_string(),
+                        attachments: Vec::new(),
+                    };
+                    exec.continue_session_queue(id, input).await;
+                }
+                return;
             }
             AgentEvent::Error { message } => {
                 // A resume that dies before saying anything is a resume

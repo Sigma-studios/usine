@@ -55,6 +55,13 @@ impl Executor {
                 sim::simulated_usage(usage::now_secs())
             }
         };
+        // A window at 100% blocks the plan up front (API-credits fallback).
+        // Simulated numbers never do: a demo must not flip to credits.
+        if self.providers.usage_source() == UsageSource::Cli {
+            self.billing.observe_usage(snapshot.claude.as_ref());
+        } else {
+            self.billing.announce();
+        }
         snapshot.refreshed_at = Some(now_millis());
         let _ = self
             .evt_tx

@@ -22,7 +22,7 @@ pub mod mcp;
 
 pub use agent::events::{
     AdoptProbe, AgentEvent, DirtyAction, ExecutorCommand, ExecutorEvent, ExecutorEventKind,
-    OpenTarget, QueuedTarget, RunControl, Severity,
+    OpenTarget, PlanWindow, PlanWindowUsage, QueuedTarget, RunControl, Severity,
 };
 pub use agent::executor::{
     fix_prompt, spawn as spawn_executor, spawn_with_forges as spawn_executor_with_forges,
@@ -54,7 +54,8 @@ pub use agent::provider::codex::CodexProvider;
 pub use agent::provider::sim::SimFactory;
 pub use agent::provider::stream::THINKING_PROGRESS_PREFIX;
 pub use agent::provider::{
-    AgentProvider, ProviderFactory, RealFactory, RunConfig, RunHandle, RunMode, UsageSource,
+    AgentProvider, ClaudeAuth, ProviderFactory, RealFactory, RunConfig, RunHandle, RunMode,
+    UsageSource,
 };
 pub use agent::review::{
     find_review_prompt, normalize_severity, parse_pr_review, parse_self_review, parse_triage,
@@ -67,7 +68,7 @@ pub use agent::startup::{
     seed_default_provider, sweep_orphan_attachments, sync_base_branches, SESSION_AUTO_ARCHIVE_DAYS,
 };
 pub use agent::testing::SCENARIO_FILE;
-pub use agent::usage::{ProviderUsage, RateLimitWindow, UsageSnapshot};
+pub use agent::usage::{ClaudeBilling, ProviderUsage, RateLimitWindow, UsageSnapshot};
 pub use diff::{
     anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, snapshot_blob,
     DiffData, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus,
@@ -105,3 +106,4 @@ pub use infra::git::{
     UpstreamChanges,
 };
 pub use infra::persistence::{rebuild_database, Store};
+pub use infra::secrets::SecretString;

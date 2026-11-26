@@ -68,6 +68,29 @@ pub struct UsageSnapshot {
     pub refreshed_at: Option<i64>,
 }
 
+/// The Claude API-credits fallback, as the usage bar shows it (see
+/// `executor/billing.rs`): once the plan's usage limit is hit, Claude runs bill
+/// a saved Anthropic API key — the plan's monthly API credits — until the
+/// limit resets.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ClaudeBilling {
+    /// An API key is saved, so the fallback can kick in.
+    pub fallback_configured: bool,
+    /// Runs bill API credits until this time (unix seconds): the plan's
+    /// limit was hit and resets then. `None` = runs use the plan.
+    pub on_credits_until: Option<i64>,
+    /// The key's organization ran out of credits during this block. Runs
+    /// fail until the plan's limit resets if `plan_refused`; otherwise they
+    /// go back to the plan, which still has room.
+    pub credits_exhausted: bool,
+    /// The plan actually refused a run (or a window read 100%) during this
+    /// block. `false` = the block is only the early switch's padding (a
+    /// window past 75%): the plan is nearly used, not used up.
+    pub plan_refused: bool,
+    /// What usine's runs spent on credits during the current block (USD).
+    pub credit_spend_usd: f64,
+}
+
 /// The `get_usage` control request answers in ~1s (it reads the plan's rate
 /// limits from the API and skips the transcript scan); a hung CLI must not
 /// wedge the poll loop. Kept well under the bar's 60s spinner safety timer.
@@ -143,6 +166,10 @@ async fn request_claude_rate_limits() -> Result<serde_json::Value, String> {
             "--verbose",
             "--no-session-persistence",
         ])
+        // Always the plan's numbers: an inherited API key would make the CLI
+        // report (and bill) the key's organization instead.
+        .env_remove(crate::agent::provider::claude::SUBSCRIPTION_STRIPPED_ENV[0])
+        .env_remove(crate::agent::provider::claude::SUBSCRIPTION_STRIPPED_ENV[1])
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

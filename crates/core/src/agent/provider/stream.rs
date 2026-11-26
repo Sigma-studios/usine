@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 
-use crate::agent::events::AgentEvent;
+use crate::agent::events::{AgentEvent, PlanWindow, PlanWindowUsage};
 use crate::domain::model::Usage;
 use crate::domain::session::{BgTaskKind, BgTaskStatus, TaskEvent};
 use crate::error::Result;
@@ -149,6 +149,126 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
     }
 
     Ok(out)
+}
+
+/// A `rate_limit_event` line's `rate_limit_info` (plan billing only): emitted
+/// whenever the plan's rate-limit state changes. Shape verified on CLI 2.1.330:
+/// `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning",
+/// "resetsAt":1795730400,"rateLimitType":"seven_day","utilization":0.96,
+/// "overageStatus":"rejected","isUsingOverage":false,…}}`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RateLimitInfo {
+    /// `allowed`, `allowed_warning` or `rejected`.
+    pub status: String,
+    /// Unix seconds when the limiting window resets.
+    pub resets_at: Option<i64>,
+    /// `five_hour`, `seven_day`, … (which window is limiting).
+    pub limit_type: Option<String>,
+    /// Whether paid extra usage ("overage") covers the overflow: `allowed` /
+    /// `allowed_warning` mean nothing gets cut off.
+    pub overage_status: Option<String>,
+    /// How full the plan's session and weekly windows are. Read from
+    /// `unifiedWindows` (every window, re-sent whenever one's rounded
+    /// percentage moves), else from the top-level `utilization` of the
+    /// limiting window named by `rateLimitType`.
+    pub windows: Vec<PlanWindowUsage>,
+}
+
+impl RateLimitInfo {
+    /// The plan refused further requests and no paid extra usage picks them up.
+    pub fn is_blocking(&self) -> bool {
+        self.status == "rejected"
+            && !matches!(
+                self.overage_status.as_deref(),
+                Some("allowed") | Some("allowed_warning")
+            )
+    }
+
+    /// Whether this is about the plan's shared session or weekly window (or
+    /// names no window), rather than a per-model bucket such as
+    /// `seven_day_opus`. A per-model refusal leaves the plan open for the
+    /// other models, so it must not block the whole plan until its reset.
+    pub fn is_plan_wide(&self) -> bool {
+        matches!(
+            self.limit_type.as_deref(),
+            None | Some("five_hour") | Some("seven_day")
+        )
+    }
+}
+
+/// The `rate_limit_info` of a `rate_limit_event` line; `None` for any other line.
+pub fn parse_rate_limit_event(line: &str) -> Option<RateLimitInfo> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return None;
+    }
+    let info = v.get("rate_limit_info")?;
+    let str_of = |k: &str| info.get(k).and_then(Value::as_str).map(str::to_string);
+    let resets_at = info.get("resetsAt").and_then(Value::as_i64);
+    let limit_type = str_of("rateLimitType");
+    let window_of = |name: &str| match name {
+        "five_hour" => Some(PlanWindow::Session),
+        "seven_day" => Some(PlanWindow::Weekly),
+        // The per-model buckets and overage aren't the plan's shared windows.
+        _ => None,
+    };
+    let mut windows: Vec<PlanWindowUsage> = ["five_hour", "seven_day"]
+        .into_iter()
+        .filter_map(|name| {
+            let w = info.get("unifiedWindows")?.get(name)?;
+            Some(PlanWindowUsage {
+                window: window_of(name)?,
+                utilization: w.get("utilization")?.as_f64()?,
+                resets_at: w.get("resetsAt").and_then(Value::as_i64),
+            })
+        })
+        .collect();
+    if windows.is_empty() {
+        let top = limit_type
+            .as_deref()
+            .and_then(window_of)
+            .zip(info.get("utilization").and_then(Value::as_f64));
+        if let Some((window, utilization)) = top {
+            windows.push(PlanWindowUsage {
+                window,
+                utilization,
+                resets_at,
+            });
+        }
+    }
+    Some(RateLimitInfo {
+        status: str_of("status").unwrap_or_default(),
+        resets_at,
+        limit_type,
+        overage_status: str_of("overageStatus"),
+        windows,
+    })
+}
+
+/// Whether `line` is an error `result` the API rejected as rate-limited
+/// (`api_error_status` 429 or `api_error_type` `rate_limit_error`).
+pub fn is_rate_limited_result(line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    v.get("type").and_then(Value::as_str) == Some("result")
+        && v.get("is_error").and_then(Value::as_bool) == Some(true)
+        && (v.get("api_error_status").and_then(Value::as_u64) == Some(429)
+            || v.get("api_error_type").and_then(Value::as_str) == Some("rate_limit_error"))
+}
+
+/// Whether an error message reads like the plan's usage limit ("You've hit
+/// your session limit · resets 3pm", "You've reached your weekly limit…")
+/// rather than a transient per-minute throttle.
+pub fn is_usage_limit_message(message: &str) -> bool {
+    let m = message.to_lowercase();
+    (m.contains("hit your") || m.contains("reached your") || m.contains("usage limit"))
+        && m.contains("limit")
+}
+
+/// Whether an error says the API key's organization has no credits left.
+pub fn is_credit_exhausted_message(message: &str) -> bool {
+    message.to_lowercase().contains("credit balance is too low")
 }
 
 /// A `system/task_*` line: the CLI's account of a background task (subagent
@@ -585,10 +705,18 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, TaskEvent::Status { id, .. } if id == "b64qntfst"))
             .collect();
-        assert_eq!(stops.len(), 2, "task_updated(killed) and task_notification(stopped)");
-        assert!(stops
-            .iter()
-            .all(|e| matches!(e, TaskEvent::Status { status: BgTaskStatus::Stopped, .. })));
+        assert_eq!(
+            stops.len(),
+            2,
+            "task_updated(killed) and task_notification(stopped)"
+        );
+        assert!(stops.iter().all(|e| matches!(
+            e,
+            TaskEvent::Status {
+                status: BgTaskStatus::Stopped,
+                ..
+            }
+        )));
         // Other system lines stay silent.
         let other = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
         assert!(parse_claude_line(other).unwrap().is_empty());

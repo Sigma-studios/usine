@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dioxus::prelude::*;
 use usine_core::{
-    now_millis, CardState, Provider, ProviderUsage, QueuedTarget, RateLimitWindow, ReviewSub,
-    Session,
+    now_millis, CardState, ClaudeBilling, Provider, ProviderUsage, QueuedTarget, RateLimitWindow,
+    ReviewSub, Session,
 };
 use uuid::Uuid;
 
@@ -90,17 +90,28 @@ pub fn UsageBar() -> Element {
         )
     });
     let (claude_running, codex_running) = running();
-    let group = |usage: Option<ProviderUsage>, provider: Provider, running: usize| {
+    // The API-credits badge, only while the plan is blocked and runs bill the
+    // saved key (see `CreditsBadge`).
+    let credits = Some(state.billing.read().clone()).filter(|b| b.on_credits_until.is_some());
+    let group = |usage: Option<ProviderUsage>,
+                 provider: Provider,
+                 running: usize,
+                 credits: Option<ClaudeBilling>| {
         let usage = usage.filter(has_visible_window);
-        (usage.is_some() || running > 0).then(|| {
+        (usage.is_some() || running > 0 || credits.is_some()).then(|| {
             let usage = usage.unwrap_or_default();
             rsx! {
-                ProviderGauges { provider, usage, running }
+                ProviderGauges { provider, usage, running, credits }
             }
         })
     };
-    let claude = group(snapshot.claude.clone(), Provider::Claude, claude_running);
-    let codex = group(snapshot.codex.clone(), Provider::Codex, codex_running);
+    let claude = group(
+        snapshot.claude.clone(),
+        Provider::Claude,
+        claude_running,
+        credits,
+    );
+    let codex = group(snapshot.codex.clone(), Provider::Codex, codex_running, None);
     let empty = claude.is_none() && codex.is_none();
     // Read the ticker so the label re-renders with it.
     let _ = tick();
@@ -240,7 +251,12 @@ fn shown(window: Option<&RateLimitWindow>) -> bool {
 }
 
 #[component]
-fn ProviderGauges(provider: Provider, usage: ProviderUsage, running: usize) -> Element {
+fn ProviderGauges(
+    provider: Provider,
+    usage: ProviderUsage,
+    running: usize,
+    credits: Option<ClaudeBilling>,
+) -> Element {
     let name = provider.label();
     let class = provider_value(provider);
     let session = usage
@@ -267,7 +283,58 @@ fn ProviderGauges(provider: Provider, usage: ProviderUsage, running: usize) -> E
             {session}
             {weekly}
             {weekly_model}
+            if let Some(billing) = credits {
+                CreditsBadge { billing }
+            }
         }
+    }
+}
+
+/// "API credits": the plan's limit was hit (or a window passed the early
+/// switch point) and Claude runs bill the saved API key until it resets. Red
+/// once the key's credits ran out too and the plan has refused runs; when
+/// the block is only the early switch's padding, runs go back to the plan
+/// instead, so the badge says the plan is nearly used. The plan's gauges stay
+/// as they are — they still show the plan's own windows.
+#[component]
+fn CreditsBadge(billing: ClaudeBilling) -> Element {
+    let (label, class) = match (billing.credits_exhausted, billing.plan_refused) {
+        (true, true) => ("Credits exhausted", "usage-credits exhausted"),
+        (true, false) => ("Plan nearly used", "usage-credits"),
+        (false, _) => ("API credits", "usage-credits"),
+    };
+    let tip = credits_tip(&billing);
+    rsx! {
+        span { class: "{class} has-tip",
+            "{label}"
+            span { class: "info-tip up", "{tip}" }
+        }
+    }
+}
+
+/// The credits badge's tooltip.
+fn credits_tip(billing: &ClaudeBilling) -> String {
+    let until = billing
+        .on_credits_until
+        .map(countdown)
+        .unwrap_or_else(|| "soon".into());
+    let spent = format!("${:.2} spent by usine", billing.credit_spend_usd);
+    match (billing.credits_exhausted, billing.plan_refused) {
+        (true, true) => format!(
+            "Plan limit reached and API credits exhausted; Claude runs fail until the plan resets \
+             {until} · {spent}"
+        ),
+        (true, false) => format!(
+            "Plan nearly used and API credits exhausted; Claude runs continue on the plan until \
+             it resets {until} · {spent}"
+        ),
+        (false, true) => format!(
+            "Plan limit reached; Claude runs bill API credits until it resets {until} · {spent}"
+        ),
+        (false, false) => format!(
+            "Plan nearly used; new Claude runs bill API credits until it resets {until}, runs \
+             already going finish on the plan · {spent}"
+        ),
     }
 }
 
@@ -381,6 +448,40 @@ mod tests {
             .collect();
         let runs: Vec<_> = session_runs(&sessions).collect();
         assert_eq!(runs, vec![(running.id, Provider::Claude)]);
+    }
+
+    #[test]
+    fn the_credits_tip_says_until_when_and_what_was_spent() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut billing = ClaudeBilling {
+            fallback_configured: true,
+            on_credits_until: Some(now + 2 * 3_600 + 120),
+            credits_exhausted: false,
+            plan_refused: true,
+            credit_spend_usd: 1.234,
+        };
+        let tip = credits_tip(&billing);
+        assert!(tip.starts_with("Plan limit reached"), "{tip}");
+        assert!(
+            tip.contains("bill API credits until it resets in 2h"),
+            "{tip}"
+        );
+        assert!(tip.ends_with("$1.23 spent by usine"), "{tip}");
+        billing.credits_exhausted = true;
+        let tip = credits_tip(&billing);
+        assert!(tip.contains("runs fail until the plan resets"), "{tip}");
+        // Padding only (the early switch, no refusal): the plan has room.
+        billing.plan_refused = false;
+        let tip = credits_tip(&billing);
+        assert!(tip.starts_with("Plan nearly used"), "{tip}");
+        assert!(tip.contains("continue on the plan"), "{tip}");
+        billing.credits_exhausted = false;
+        let tip = credits_tip(&billing);
+        assert!(tip.starts_with("Plan nearly used"), "{tip}");
+        assert!(tip.contains("finish on the plan"), "{tip}");
     }
 
     #[test]

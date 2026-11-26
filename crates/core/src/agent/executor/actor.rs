@@ -17,11 +17,23 @@ pub(super) async fn run_actor(
     interactive: bool,
     cmd_tx: UnboundedSender<ExecutorCommand>,
     executor: Weak<Executor>,
-    // The run's concurrency slot (None for exempt modes). Held for the actor's
-    // whole life; dropping it — however the run ends, including the mid-loop
+    // The run's concurrency slot (None for exempt modes). Held until the actor
+    // ends (released just before a cut-off continuation); dropping it — however the run ends, including the mid-loop
     // NeedsInput teardown below — releases the slot and pumps the run queue.
-    _slot: Option<gate::SlotGuard>,
+    slot: Option<gate::SlotGuard>,
 ) {
+    // Set when the usage source the run billed cut it off and the other one
+    // can take over (see `Billing::meter`): the run is continued there once
+    // this actor has cleaned up (see below).
+    let mut continue_cut_off = false;
+    // This run's own provider session, for that continuation to resume.
+    // Read-only runs don't record theirs on the card (see `handle_event`).
+    let mut run_session: Option<String> = None;
+    // Whether the run has said anything yet: only an error before that is a
+    // failed --resume (as in sessions). One after it — a usage limit or
+    // credits running out mid-run — is the run's own failure, not a reason
+    // to drop the conversation and redo the phase.
+    let mut saw_output = false;
     loop {
         // One-shot runs get an idle watchdog: a hung child that never emits a
         // terminal event nor closes stdout would otherwise leak this actor + its
@@ -48,9 +60,33 @@ pub(super) async fn run_actor(
             }
         };
 
-        // A failed --resume run falls back to a fresh run: stay in the running
-        // state (no Failed flicker), warn, and re-dispatch as RetryFresh.
-        if is_resume && matches!(evt, AgentEvent::Error { .. }) {
+        if let AgentEvent::Started { session_id } = &evt {
+            run_session = Some(session_id.clone());
+        }
+        if matches!(
+            evt,
+            AgentEvent::Progress { .. } | AgentEvent::Task(_) | AgentEvent::PlanReady { .. }
+        ) {
+            saw_output = true;
+        }
+
+        // The usage source this run billed cut it off, and the metering
+        // wrapped around this stream (`Billing::meter`) only lets that
+        // through when the other source can take over — its message says
+        // which. Stay in the running state and continue the run there once
+        // this actor has released the card.
+        if let AgentEvent::LimitReached { message, .. } = &evt {
+            let note = message.trim().to_string();
+            transcript(&store, &evt_tx, card_id, format!("⚠ {note}"));
+            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(card_id, Severity::Warning, note));
+            continue_cut_off = true;
+            break;
+        }
+
+        // A failed --resume run (an error before any output) falls back to a
+        // fresh run: stay in the running state (no Failed flicker), warn, and
+        // re-dispatch as RetryFresh.
+        if is_resume && !saw_output && matches!(evt, AgentEvent::Error { .. }) {
             let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
                 card_id,
                 Severity::Warning,
@@ -234,6 +270,68 @@ pub(super) async fn run_actor(
             map.remove(&card_id);
         }
     }
+    // Only now, with the scratch tree gone and the runs-map slot released,
+    // so the continued run can't have its fresh tree torn down by this
+    // outgoing actor.
+    // Free the slot before the continuation asks for one (as the PR-review
+    // actor does), so it doesn't queue behind this outgoing run.
+    drop(slot);
+    if continue_cut_off && still_ours {
+        continue_cut_off_direct(&executor, &store, &evt_tx, card_id, run_session);
+    }
+}
+
+/// Continue a card run its usage source cut off, on the other source: the
+/// relaunch Retry uses, minus the Retry transition (the card never left its
+/// running state), `--resume`-ing the cut-off run's own conversation in every
+/// mode, read-only ones included (see `Executor::continue_cut_off`). A DIRECT
+/// executor call, never a re-dispatched command (see `Executor::self_ref`).
+/// If the card can't be relaunched right now it is failed instead, so it
+/// never sits in a running state with no run behind it.
+fn continue_cut_off_direct(
+    executor: &Weak<Executor>,
+    store: &Store,
+    evt_tx: &UnboundedSender<ExecutorEvent>,
+    card_id: Uuid,
+    run_session: Option<String>,
+) {
+    let Some(exec) = executor.upgrade() else {
+        return;
+    };
+    let store = store.clone();
+    let evt_tx = evt_tx.clone();
+    tokio::spawn(async move {
+        let fail = |message: String| {
+            if store
+                .get_card(card_id)
+                .map(|c| c.state.is_running())
+                .unwrap_or(false)
+            {
+                let _ =
+                    apply_transition(&store, &evt_tx, card_id, Transition::AgentError { message });
+            }
+        };
+        let Some(_guard) = claim(&exec.in_flight, &evt_tx, card_id) else {
+            // Another command owns the card (the user just acted on it).
+            fail("A usage limit cut this run off. Retry to continue it.".into());
+            return;
+        };
+        let card = match store.get_card(card_id) {
+            Ok(card) if card.state.is_running() => card,
+            _ => return,
+        };
+        let resume = run_session.or_else(|| card.last_session.clone());
+        if let Err(e) = exec.continue_cut_off(card, resume).await {
+            let _ = evt_tx.unbounded_send(ExecutorEvent::toast(
+                card_id,
+                Severity::Error,
+                e.to_string(),
+            ));
+            fail(format!(
+                "Couldn't continue the run after a usage limit: {e}"
+            ));
+        }
+    });
 }
 
 /// Finalize an implement/fix run: record cost, commit + push the worktree (so
@@ -1356,7 +1454,8 @@ pub(super) fn handle_event(
             transcript(store, evt_tx, card_id, text);
         }
         // Card runs deny the background-agent tools.
-        AgentEvent::Task(_) => {}
+        // Billing telemetry, swallowed by `Billing::meter`.
+        AgentEvent::Task(_) | AgentEvent::PlanUsage { .. } => {}
         AgentEvent::PlanReady { plan } => {
             // A plan run whose ExitPlanMode draft is a no-work verdict parks on
             // the verdict, not on an approvable "plan".
@@ -1432,7 +1531,9 @@ pub(super) fn handle_event(
         }
         // NeedsInput is intercepted in run_actor; nothing to do here.
         AgentEvent::NeedsInput { .. } => {}
-        AgentEvent::Error { message } => {
+        // `run_actor` resumes a `LimitReached` on credits before it gets here;
+        // a stray one fails like any error.
+        AgentEvent::Error { message } | AgentEvent::LimitReached { message, .. } => {
             apply_transition(
                 store,
                 evt_tx,

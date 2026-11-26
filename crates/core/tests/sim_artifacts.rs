@@ -31,6 +31,7 @@ async fn sim_result(mode: RunMode) -> String {
             extra_prompt: None,
             resume_session: None,
             attachments: Vec::new(),
+            claude_auth: Default::default(),
         })
         .await
         .expect("the sim provider always starts");

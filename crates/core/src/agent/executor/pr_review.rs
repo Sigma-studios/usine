@@ -4,6 +4,7 @@
 use super::*;
 use crate::diff::{compute_branch_diff, fold_unanchorable, DiffData};
 use crate::infra::git::remote_tracking_base;
+use futures::future::BoxFuture;
 
 impl Executor {
     /// Background loop: every [`REVIEW_POLL_INTERVAL`], for each project (a) scan
@@ -449,16 +450,51 @@ impl Executor {
 
     /// Fetch the PR head into a worktree and launch the review agent there.
     pub(super) async fn begin_review_run(&self, review_id: Uuid) -> Result<()> {
-        self.begin_review_run_admitted(review_id, None).await
+        self.begin_review_run_admitted(review_id, None, None).await
+    }
+
+    /// Continue a review or fix run its usage source cut off, on the other
+    /// source (see `Billing::meter`): `--resume` its conversation in the same
+    /// checkout, keeping a fix run's uncommitted edits. A DIRECT call from the
+    /// run's actor once it has released its slot, never a command. A
+    /// continuation that can't start fails the task (retryable).
+    ///
+    /// Boxed: it re-enters the launch path that spawned the calling actor, a
+    /// cycle an `async fn`'s opaque type can't express.
+    pub(super) fn continue_review(&self, review_id: Uuid) -> BoxFuture<'_, ()> {
+        Box::pin(self.continue_review_inner(review_id))
+    }
+
+    async fn continue_review_inner(&self, review_id: Uuid) {
+        let Ok(task) = self.store.get_review_task(review_id) else {
+            return;
+        };
+        if !task.status.is_running() {
+            return;
+        }
+        let resume = task.last_session.clone();
+        if let Err(e) = self
+            .begin_review_run_admitted(review_id, None, resume)
+            .await
+        {
+            let msg = format!("Couldn't continue the run after a usage limit: {e}");
+            self.review_progress(review_id, &format!("✗ {msg}"));
+            let _ = self.fail_review(review_id, msg.clone());
+            let _ =
+                self.evt_tx
+                    .unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Error, msg));
+        }
     }
 
     /// `begin_review_run` behind the concurrency gate. `admitted` is the queue
     /// pump's pre-claimed slot (see `launch_admitted`); every other caller
-    /// passes `None` and admits here.
+    /// passes `None` and admits here. `resume` continues a cut-off run's
+    /// session in its existing checkout (see [`Self::continue_review`]).
     pub(super) async fn begin_review_run_admitted(
         &self,
         review_id: Uuid,
         admitted: Option<(Uuid, super::gate::SlotGuard)>,
+        resume: Option<String>,
     ) -> Result<()> {
         // The concurrency gate, before the (expensive) worktree prep: either
         // take a slot now or park in the queue — the task stays `Reviewing` and
@@ -468,7 +504,10 @@ impl Executor {
             Some((run_id, guard)) => (run_id, guard),
             None => {
                 let run_id = Uuid::new_v4();
-                let entry = super::gate::QueuedRun::Review { review_id };
+                let entry = super::gate::QueuedRun::Review {
+                    review_id,
+                    resume_session: resume.clone(),
+                };
                 match self.admit_or_enqueue(run_id, entry) {
                     Some(guard) => (run_id, guard),
                     None => return Ok(()),
@@ -508,23 +547,31 @@ impl Executor {
                             "the PR's checkout is gone — discard the fix and re-review the PR",
                         )
                     })?;
-                let _ = self.git.discard_changes(&wt).await;
+                // A run continued after a usage limit keeps them: they are
+                // the work it resumes.
+                if resume.is_none() {
+                    let _ = self.git.discard_changes(&wt).await;
+                }
                 wt
             };
             let task = self.store.get_review_task(review_id)?;
             let project = self.store.get_project(task.project_id)?;
             return self
-                .launch_review_fix(&task, &project, wt, &note, run_id, slot)
+                .launch_review_fix(&task, &project, wt, &note, run_id, slot, resume)
                 .await;
         }
 
         // A review run always starts from a clean checkout: a retry must not
         // inherit whatever a previous attempt (or a preview's setup script) left
-        // behind in the worktree.
-        let wt = self.prepare_review_worktree(review_id, true).await?;
+        // behind in the worktree. A continued one reuses its checkout (the
+        // same path either way), as the conversation it resumes read it.
+        let wt = self
+            .prepare_review_worktree(review_id, resume.is_none())
+            .await?;
         let task = self.store.get_review_task(review_id)?;
         let project = self.store.get_project(task.project_id)?;
-        self.launch_review(&task, &project, wt, run_id, slot).await
+        self.launch_review(&task, &project, wt, run_id, slot, resume)
+            .await
     }
 
     /// Record the PR head a fix run is based on, once the worktree is built.
@@ -668,6 +715,7 @@ impl Executor {
         wt: PathBuf,
         run_id: Uuid,
         slot: super::gate::SlotGuard,
+        resume: Option<String>,
     ) -> Result<()> {
         let project_guide = crate::agent::review::find_review_prompt(&project.path);
         let base = if task.base_ref.is_empty() {
@@ -696,14 +744,18 @@ impl Executor {
                 task.guidance.trim()
             ));
         }
-        let extra = format!(
+        let mut extra = format!(
             "{project_guide}\n\n{}",
             crate::agent::review::PR_REVIEW_INSTRUCTION
         );
+        if resume.is_some() {
+            extra = format!("{extra}\n\n{}", super::billing::LIMIT_CONTINUE_PROMPT);
+        }
         // Provider/spec come from the *current* global settings, not a snapshot
         // taken at project creation — a settings change applies to the next
         // review run in any project.
         let settings = self.store.settings()?;
+        let claude_auth = self.billing.auth_for(settings.default_provider);
         let cfg = RunConfig {
             provider: settings.default_provider,
             project_dir: wt,
@@ -712,8 +764,9 @@ impl Executor {
             session_id: task.session_id,
             prompt,
             extra_prompt: Some(extra),
-            resume_session: None,
+            resume_session: resume,
             attachments: Vec::new(),
+            claude_auth: claude_auth.clone(),
         };
         self.review_progress(task.id, "Reviewing the changes…");
         let provider = self.providers.make(settings.default_provider);
@@ -723,7 +776,8 @@ impl Executor {
         tokio::spawn(run_review_actor(
             task.id,
             run_id,
-            handle.events,
+            // A usage limit continues the run in place (`continue_review`).
+            self.billing.meter(handle.events, &claude_auth, true),
             ReviewRunKind::Review,
             self.self_ref.clone(),
             self.store.clone(),
@@ -968,6 +1022,7 @@ impl Executor {
         note: &str,
         run_id: Uuid,
         slot: super::gate::SlotGuard,
+        resume: Option<String>,
     ) -> Result<()> {
         let Some((comments, _)) = task.status.fix_state() else {
             return Err(CoreError::IllegalTransition(
@@ -983,7 +1038,7 @@ impl Executor {
             task.pr_title,
             task.author
         );
-        let extra = format!(
+        let mut extra = format!(
             "{}\n\n{}",
             crate::agent::review::review_fix_prompt(
                 &pr_ref(project, task.pr_number),
@@ -993,7 +1048,11 @@ impl Executor {
             ),
             crate::agent::commit::COMMIT_MESSAGE_INSTRUCTION
         );
+        if resume.is_some() {
+            extra = format!("{extra}\n\n{}", super::billing::LIMIT_CONTINUE_PROMPT);
+        }
         let settings = self.store.settings()?;
+        let claude_auth = self.billing.auth_for(settings.default_provider);
         let cfg = RunConfig {
             provider: settings.default_provider,
             project_dir: wt,
@@ -1002,8 +1061,9 @@ impl Executor {
             session_id: task.session_id,
             prompt,
             extra_prompt: Some(extra),
-            resume_session: None,
+            resume_session: resume,
             attachments: Vec::new(),
+            claude_auth: claude_auth.clone(),
         };
         self.review_progress(task.id, "Fixing the comments you took on…");
         let provider = self.providers.make(settings.default_provider);
@@ -1013,7 +1073,8 @@ impl Executor {
         tokio::spawn(run_review_actor(
             task.id,
             run_id,
-            handle.events,
+            // A usage limit continues the run in place (`continue_review`).
+            self.billing.meter(handle.events, &claude_auth, true),
             ReviewRunKind::Fix,
             self.self_ref.clone(),
             self.store.clone(),
@@ -1479,8 +1540,11 @@ async fn run_review_actor(
     interactive: bool,
     // The run's concurrency slot; dropping it when the actor ends releases the
     // slot and pumps the run queue.
-    _slot: super::gate::SlotGuard,
+    slot: super::gate::SlotGuard,
 ) {
+    // Set when the run's usage source cut it off and the other one can take
+    // over: continued once this actor has let go of the run (see below).
+    let mut continue_cut_off = false;
     loop {
         let evt = if interactive {
             match events.next().await {
@@ -1502,6 +1566,16 @@ async fn run_review_actor(
                 }
             }
         };
+        // The metering (`Billing::meter`) only lets this through when the
+        // other usage source can take over; its message says which.
+        if let AgentEvent::LimitReached { message, .. } = &evt {
+            let note = message.trim().to_string();
+            transcript(&store, &evt_tx, review_id, format!("⚠ {note}"));
+            let _ =
+                evt_tx.unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Warning, note));
+            continue_cut_off = true;
+            break;
+        }
         let result = match (&evt, kind) {
             (AgentEvent::Done { .. }, ReviewRunKind::Review) => {
                 finalize_review(&store, &evt_tx, review_id, evt)
@@ -1533,13 +1607,23 @@ async fn run_review_actor(
             }
         }
     }
-    let mut map = lock(&review_runs);
-    if map
-        .get(&review_id)
-        .map(|(rid, _)| *rid == run_id)
-        .unwrap_or(false)
-    {
-        map.remove(&review_id);
+    let still_ours = {
+        let mut map = lock(&review_runs);
+        let ours = map
+            .get(&review_id)
+            .map(|(rid, _)| *rid == run_id)
+            .unwrap_or(false);
+        if ours {
+            map.remove(&review_id);
+        }
+        ours
+    };
+    // Free the slot before the continuation asks for one.
+    drop(slot);
+    if continue_cut_off && still_ours {
+        if let Some(exec) = executor.upgrade() {
+            tokio::spawn(async move { exec.continue_review(review_id).await });
+        }
     }
 }
 
@@ -1615,8 +1699,10 @@ fn handle_review_event(
         AgentEvent::PlanReady { .. } => {}
         // Done is handled by finalize_review; review runs deny the
         // background-agent tools, so no task events arrive.
-        AgentEvent::Done { .. } | AgentEvent::Task(_) => {}
-        AgentEvent::Error { message } => {
+        AgentEvent::Done { .. } | AgentEvent::Task(_) | AgentEvent::PlanUsage { .. } => {}
+        // `run_review_actor` continues a `LimitReached` before it gets here;
+        // handled as an error should one ever slip through.
+        AgentEvent::Error { message } | AgentEvent::LimitReached { message, .. } => {
             fail_review_task(store, evt_tx, review_id, message.clone())?;
             let _ =
                 evt_tx.unbounded_send(ExecutorEvent::toast(Uuid::nil(), Severity::Error, message));

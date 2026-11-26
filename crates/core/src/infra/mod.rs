@@ -6,3 +6,4 @@ pub mod git;
 pub mod paths;
 pub mod persistence;
 pub(crate) mod process;
+pub mod secrets;

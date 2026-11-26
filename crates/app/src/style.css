@@ -889,6 +889,10 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 .settings-modal { width: 420px; }
 .settings-modal .section { gap: 10px; }
 .settings-modal .section + .section { margin-top: 18px; }
+.api-key-row { display: flex; gap: 6px; align-items: center; }
+.api-key-row input { flex: 1; min-width: 0; }
+.api-key-status { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.api-key-status.saved { color: var(--green); }
 /* `pre-line` so a message can break into paragraphs; spaces still collapse. */
 .modal-body { color: var(--muted); font-size: 13px; line-height: 1.5; margin-bottom: 18px; white-space: pre-line; }
 /* The optional message field in the "Mark blocked" confirm dialog: same gap
@@ -1163,6 +1167,17 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
 .usage-refresh:disabled { cursor: default; background: transparent; }
 /* One tip for the whole bar, anchored under the gauges rather than the padding edge. */
 .usage-bar .info-tip { left: 14px; }
+/* The API-credits badge (plan limit hit, Claude runs bill the saved key). Its
+   own tooltip replaces the bar's while hovered, like the update control's. */
+.usage-credits {
+  flex: none; white-space: nowrap; font-weight: 600; font-size: 11px;
+  padding: 1px 7px; border-radius: 999px;
+  color: var(--amber); border: 1px solid var(--amber);
+}
+.usage-credits.exhausted { color: var(--red); border-color: var(--red); }
+.usage-bar .usage-credits .info-tip { left: 0; white-space: normal; width: 300px; font-weight: 400; }
+.usage-bar:has(.usage-credits:hover) > .info-tip { visibility: hidden; opacity: 0; }
+.usage-bar:hover .usage-credits:not(:hover) > .info-tip { visibility: hidden; opacity: 0; }
 /* The update control, last in the bar: "Check for updates", then the result
    and — once an update is found — the "Update when idle" toggle. Its own tip
    replaces the bar's usage tip while hovered. */

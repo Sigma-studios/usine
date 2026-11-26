@@ -107,6 +107,41 @@ async fn simulate(
         session_id: session
     });
 
+    // `[near-limit]` in the task: a plan-billed Claude run reports the plan's
+    // session window 96% used (resetting in 2h), the way the real CLI's
+    // `rate_limit_event` `unifiedWindows` do, then carries on normally: the
+    // padding moves the next runs onto API credits while this one finishes.
+    if cfg.full_prompt().contains("[near-limit]")
+        && cfg.provider == Provider::Claude
+        && !cfg.claude_auth.is_api_key()
+    {
+        emit!(AgentEvent::PlanUsage {
+            windows: vec![crate::agent::events::PlanWindowUsage {
+                window: crate::agent::events::PlanWindow::Session,
+                utilization: 0.96,
+                resets_at: Some(crate::agent::usage::now_secs() + 2 * 60 * 60),
+            }],
+        });
+    }
+
+    // `[limit]` in the task: a plan-billed Claude run is cut off by the plan's
+    // usage limit (resetting in 2h), the way the real CLI's `rate_limit_event`
+    // + error result surface. The run continued on API credits goes through.
+    if cfg.full_prompt().contains("[limit]")
+        && cfg.provider == Provider::Claude
+        && !cfg.claude_auth.is_api_key()
+    {
+        emit!(AgentEvent::Progress {
+            text: "📖 Reading project files…".into()
+        });
+        pause!(400);
+        emit!(AgentEvent::LimitReached {
+            resets_at: Some(crate::agent::usage::now_secs() + 2 * 60 * 60),
+            message: "You've hit your session limit · resets in 2h (simulated)".into(),
+        });
+        return;
+    }
+
     match cfg.mode {
         RunMode::Plan => {
             emit!(AgentEvent::Progress {

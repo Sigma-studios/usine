@@ -830,6 +830,7 @@ async fn real_plan(dir: PathBuf, task: String) -> anyhow::Result<()> {
         extra_prompt: None,
         resume_session: None,
         attachments: Vec::new(),
+        claude_auth: Default::default(),
     };
 
     let handle = ClaudeProvider.start(cfg).await?;
@@ -841,6 +842,8 @@ async fn real_plan(dir: PathBuf, task: String) -> anyhow::Result<()> {
             AgentEvent::NeedsInput { question, .. } => println!("   ? {question}"),
             // Card-mode runs deny the background-agent tools.
             AgentEvent::Task(_) => {}
+            // Plan billing telemetry: nothing to print.
+            AgentEvent::PlanUsage { .. } => {}
             AgentEvent::PlanReady { plan } => {
                 println!("\n=== PLAN ===\n{plan}\n============");
                 break;
@@ -851,7 +854,7 @@ async fn real_plan(dir: PathBuf, task: String) -> anyhow::Result<()> {
                 println!("\n✔ done (${cost_usd:.4})\n{result}");
                 break;
             }
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message } | AgentEvent::LimitReached { message, .. } => {
                 println!("\n✗ {message}");
                 std::process::exit(1);
             }

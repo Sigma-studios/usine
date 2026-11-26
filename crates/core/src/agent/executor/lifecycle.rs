@@ -477,6 +477,7 @@ impl Executor {
         // Kept for the preview dispatch below (a write run's `project_dir` is
         // its isolated worktree); `RunConfig` moves the original.
         let run_dir = project_dir.clone();
+        let claude_auth = self.billing.auth_for(card.config.provider);
         let cfg = RunConfig {
             provider: card.config.provider,
             project_dir,
@@ -487,6 +488,7 @@ impl Executor {
             extra_prompt: extra,
             resume_session,
             attachments,
+            claude_auth: claude_auth.clone(),
         };
 
         let provider = self.providers.make(card.config.provider);
@@ -517,11 +519,14 @@ impl Executor {
             }
         }
 
+        // Card runs continue on API credits when the plan's limit cuts them
+        // off (see `run_actor`).
+        let events = self.billing.meter(handle.events, &claude_auth, true);
         tokio::spawn(run_actor(
             card.id,
             run_id,
             mode,
-            handle.events,
+            events,
             self.store.clone(),
             self.evt_tx.clone(),
             self.runs.clone(),
@@ -1565,8 +1570,38 @@ impl Executor {
     /// continue-from-worktree note) so it's correct even when the killed session
     /// saved nothing. Read-only phases (plan / self-review / triage) are stateless
     /// single turns, so they re-run fresh.
-    pub(super) async fn relaunch(&self, mut card: Card, resume: Option<String>) -> Result<()> {
+    pub(super) async fn relaunch(&self, card: Card, resume: Option<String>) -> Result<()> {
+        self.relaunch_inner(card, resume, false).await
+    }
+
+    /// Continue the card's running phase after its usage source cut the run
+    /// off (see `run_actor`): `relaunch`, but `resume` (the cut-off run's own
+    /// session) is kept in every mode — a read-only run is mid-thought, not a
+    /// stateless turn to redo — and the run is told why it stopped. The scratch
+    /// trees sit at a fixed path per card, so the resumed conversation lands in
+    /// the cwd it began in; a resume that fails still falls back to a fresh run
+    /// (`run_actor`'s is_resume arm).
+    pub(super) async fn continue_cut_off(&self, card: Card, resume: Option<String>) -> Result<()> {
+        self.relaunch_inner(card, resume, true).await
+    }
+
+    async fn relaunch_inner(
+        &self,
+        mut card: Card,
+        resume: Option<String>,
+        cut_off: bool,
+    ) -> Result<()> {
         let card_id = card.id;
+        // A cut-off run is told why it stopped, on top of its usual extra.
+        let with_note = |extra: Option<String>| -> Option<String> {
+            if !cut_off {
+                return extra;
+            }
+            Some(match extra {
+                Some(e) => format!("{e}\n\n{}", super::billing::LIMIT_CONTINUE_PROMPT),
+                None => super::billing::LIMIT_CONTINUE_PROMPT.to_string(),
+            })
+        };
         // The validation check is a script, not an agent turn: re-run it
         // directly (the handler continues the gate at the restored attempt).
         if matches!(
@@ -1607,8 +1642,9 @@ impl Executor {
                 return Ok(());
             };
             let extra = question_extra(&stage, plan.as_deref(), &question);
+            let resume = if cut_off { resume } else { None };
             return self
-                .launch(card, RunMode::Question, Some(extra), None)
+                .launch(card, RunMode::Question, with_note(Some(extra)), resume)
                 .await;
         }
         let mode = match &card.state {
@@ -1641,14 +1677,15 @@ impl Executor {
             self.ensure_branch_worktree(card_id).await?;
             card = self.store.get_card(card_id)?;
         }
-        let resume = if matches!(
-            mode,
-            RunMode::Plan
-                | RunMode::Review
-                | RunMode::Triage
-                | RunMode::Investigate
-                | RunMode::Question
-        ) {
+        let resume = if !cut_off
+            && matches!(
+                mode,
+                RunMode::Plan
+                    | RunMode::Review
+                    | RunMode::Triage
+                    | RunMode::Investigate
+                    | RunMode::Question
+            ) {
             None
         } else {
             resume
@@ -1705,7 +1742,7 @@ impl Executor {
                 return Err(card_cannot_run_session_mode())
             }
         };
-        self.launch(card, mode, extra, resume).await
+        self.launch(card, mode, with_note(extra), resume).await
     }
 }
 

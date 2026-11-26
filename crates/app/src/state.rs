@@ -13,12 +13,12 @@ use dioxus::prelude::*;
 use futures::channel::mpsc::UnboundedReceiver;
 use usine_core::{
     spawn_executor_with_forges, AdoptProbe, AppSettings, Card, CardAnswers, CardState, Change,
-    DesignSub, DiffState, DirtyAction, ExecutorCommand, ExecutorConfig, ExecutorEvent,
-    ExecutorEventKind, ExecutorHandle, FixItem, FixOutcome, FixReport, ForgeKind, ForgeRegistry,
-    GitOps, Handoff, OpenPr, Outcome, PrInfo, PreviewStatus, PreviewUrl, Project, ProjectConfig,
-    Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewStatus, ReviewSub,
-    ReviewTask, RunSub, Session, SessionStatus, Severity, SimFactory, SimForge, SimGit, Store,
-    TestItem, UsageSnapshot,
+    ClaudeBilling, DesignSub, DiffState, DirtyAction, ExecutorCommand, ExecutorConfig,
+    ExecutorEvent, ExecutorEventKind, ExecutorHandle, FixItem, FixOutcome, FixReport, ForgeKind,
+    ForgeRegistry, GitOps, Handoff, OpenPr, Outcome, PrInfo, PreviewStatus, PreviewUrl, Project,
+    ProjectConfig, Provider, ProviderFactory, QueuedTarget, RealFactory, RealGit, ReviewStatus,
+    ReviewSub, ReviewTask, RunSub, Session, SessionStatus, Severity, SimFactory, SimForge, SimGit,
+    Store, TestItem, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -141,6 +141,9 @@ pub struct AppState {
     /// refreshed by the executor's background poll and rendered by the bottom
     /// usage bar. In-memory only — it's refetched shortly after launch.
     pub usage: Signal<UsageSnapshot>,
+    /// The Claude API-credits fallback (key saved, plan blocked, spend),
+    /// replaced wholesale by `BillingUpdated`. In-memory only.
+    pub billing: Signal<ClaudeBilling>,
     /// One-off sessions by id, seeded at startup and kept in sync via
     /// `SessionUpdated` / `SessionDeleted`.
     pub sessions: Signal<HashMap<Uuid, Session>>,
@@ -324,6 +327,7 @@ impl AppState {
             busy: Signal::new(HashSet::new()),
             run_queue: Signal::new(Vec::new()),
             usage: Signal::new(UsageSnapshot::default()),
+            billing: Signal::new(ClaudeBilling::default()),
             sessions: Signal::new(sessions),
             selected_session: Signal::new(None),
             window_focused: Signal::new(true),
@@ -743,6 +747,12 @@ impl AppState {
             ExecutorEventKind::UsageUpdated(snapshot) => {
                 let mut usage = self.usage;
                 usage.set(snapshot);
+            }
+            ExecutorEventKind::BillingUpdated(billing) => {
+                let mut signal = self.billing;
+                if *signal.peek() != billing {
+                    signal.set(billing);
+                }
             }
             ExecutorEventKind::Toast { severity, message } => {
                 if severity == Severity::Error {
