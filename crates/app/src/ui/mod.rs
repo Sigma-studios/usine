@@ -164,6 +164,9 @@ fn confirm_publish_review(
     event: ReviewEvent,
     body: String,
 ) {
+    // Approve with nothing else attached: say so plainly rather than describing
+    // a "summary-only review" whose summary doesn't exist.
+    let bare = reviewdraft::is_bare_approval(&drafts, &body, event);
     let selected = drafts.iter().filter(|d| d.selected).count();
     let what = match selected {
         0 => "a summary-only review".to_string(),
@@ -186,14 +189,30 @@ fn confirm_publish_review(
         .map(|t| state.forge_of(t.project_id))
         .unwrap_or_default()
         .display_name();
+    let (title, message, confirm_label) = if bare {
+        (
+            "Approve PR",
+            format!(
+                "Approve this pull request on {host}? This posts an approval under \
+                 your account and can't be undone from here."
+            ),
+            "Approve",
+        )
+    } else {
+        (
+            "Publish review",
+            format!(
+                "Submit {what} to {host} as “{}”? This posts on the contributor's pull \
+                 request under your account and can't be undone from here.",
+                event.label()
+            ),
+            "Publish",
+        )
+    };
     request_confirm(ConfirmRequest {
-        title: "Publish review".into(),
-        message: format!(
-            "Submit {what} to {host} as “{}”? This posts on the contributor's pull \
-             request under your account and can't be undone from here.",
-            event.label()
-        ),
-        confirm_label: "Publish".into(),
+        title: title.into(),
+        message,
+        confirm_label: confirm_label.into(),
         danger: false,
         action: ConfirmAction::PublishReview(cmd),
     });

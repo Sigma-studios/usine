@@ -353,11 +353,7 @@ fn DraftSelection(
     // A summary-only review is a legitimate outcome, so the button stays live
     // with nothing checked — it just says what it will actually post.
     let checked_count = edits.comments.iter().filter(|c| c.selected).count();
-    let publish_label = match checked_count {
-        0 => "Publish summary only".to_string(),
-        1 => "Publish 1 comment".to_string(),
-        n => format!("Publish {n} comments"),
-    };
+    let publish_label = reviewdraft::publish_label(&edits.comments, &edits.summary, edits.verdict);
     let verdict = edits.verdict;
     let comments_for_publish = edits.comments.clone();
     let summary_for_publish = edits.summary.clone();

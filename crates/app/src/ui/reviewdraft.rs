@@ -158,3 +158,91 @@ pub(crate) fn set_verdict(verdict: ReviewEvent) {
 pub(crate) fn anchor_id(index: usize) -> String {
     format!("draftcomment-{index}")
 }
+
+/// True when publishing would post only the verdict: Approve, no checked
+/// comment, and an empty summary (whitespace counts as empty).
+pub(crate) fn is_bare_approval(
+    comments: &[DraftComment],
+    summary: &str,
+    verdict: ReviewEvent,
+) -> bool {
+    verdict == ReviewEvent::Approve
+        && summary.trim().is_empty()
+        && !comments.iter().any(|c| c.selected)
+}
+
+/// The publish button's label: what will actually be posted. Shared by the
+/// detail panel and the diff viewer's bar so the two can't disagree.
+pub(crate) fn publish_label(
+    comments: &[DraftComment],
+    summary: &str,
+    verdict: ReviewEvent,
+) -> String {
+    if is_bare_approval(comments, summary, verdict) {
+        return "Approve the PR".into();
+    }
+    match comments.iter().filter(|c| c.selected).count() {
+        0 => "Publish summary only".into(),
+        1 => "Publish 1 comment".into(),
+        n => format!("Publish {n} comments"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comment(selected: bool) -> DraftComment {
+        DraftComment {
+            path: "src/lib.rs".into(),
+            line: Some(1),
+            body: "nit".into(),
+            severity: String::new(),
+            selected,
+        }
+    }
+
+    #[test]
+    fn bare_approval_says_approve() {
+        assert_eq!(
+            publish_label(&[], "", ReviewEvent::Approve),
+            "Approve the PR"
+        );
+        assert_eq!(
+            publish_label(&[comment(false)], "  \n ", ReviewEvent::Approve),
+            "Approve the PR"
+        );
+    }
+
+    #[test]
+    fn approval_with_summary_is_summary_only() {
+        assert_eq!(
+            publish_label(&[comment(false)], "LGTM", ReviewEvent::Approve),
+            "Publish summary only"
+        );
+    }
+
+    #[test]
+    fn other_verdicts_without_summary_stay_summary_only() {
+        assert_eq!(
+            publish_label(&[], "", ReviewEvent::Comment),
+            "Publish summary only"
+        );
+        assert_eq!(
+            publish_label(&[], "", ReviewEvent::RequestChanges),
+            "Publish summary only"
+        );
+    }
+
+    #[test]
+    fn checked_comments_are_counted() {
+        assert_eq!(
+            publish_label(&[comment(true), comment(false)], "", ReviewEvent::Approve),
+            "Publish 1 comment"
+        );
+        assert_eq!(
+            publish_label(&[comment(true), comment(true)], "", ReviewEvent::Approve),
+            "Publish 2 comments"
+        );
+    }
+}
