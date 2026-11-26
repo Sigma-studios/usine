@@ -47,6 +47,7 @@ pub(crate) fn SessionDetail() -> Element {
     let access = session.access;
     let status = session.status.label();
     let status_class = match &session.status {
+        SessionStatus::NotStarted => "badge status",
         SessionStatus::Running => "badge status",
         SessionStatus::NeedsAnswer(_) => "badge status warn",
         SessionStatus::Finished => "badge status",
@@ -70,7 +71,8 @@ pub(crate) fn SessionDetail() -> Element {
         "Add blocked message"
     };
     let block_title = session.title.clone();
-    let can_clear = !running && !session.turns.is_empty();
+    // A saved session has nothing to clear: nothing was sent yet.
+    let can_clear = !running && !session.is_not_started() && !session.turns.is_empty();
     let crowded = folder_in_use(&state, &session);
 
     rsx! {
@@ -273,6 +275,7 @@ pub(crate) fn SessionDetail() -> Element {
                         Composer {
                             session_id: id,
                             running,
+                            not_started: session.is_not_started(),
                             steerable: running && session.provider == Provider::Claude,
                             has_queue: !session.queued.is_empty(),
                         }
@@ -399,7 +402,11 @@ fn Conversation(session: Session) -> Element {
                     }
                 }
             }
-            if session.turns.is_empty() && !running {
+            if session.is_not_started() {
+                div { class: "session-empty",
+                    "Not started — nothing has been sent to {session.provider.label()} yet."
+                }
+            } else if session.turns.is_empty() && !running {
                 div { class: "session-empty", "Send a message to start a fresh conversation." }
             }
             if running {
@@ -685,7 +692,16 @@ pub(crate) fn drop_files(state: AppState, id: Uuid, e: &DragEvent) {
 /// to a Claude run goes to the agent live ("Send now"); anything else is
 /// queued for when the turn ends.
 #[component]
-fn Composer(session_id: Uuid, running: bool, steerable: bool, has_queue: bool) -> Element {
+fn Composer(
+    session_id: Uuid,
+    running: bool,
+    /// The session was saved without starting: the button starts it with the
+    /// saved message (plus whatever is typed here), so it is always enabled.
+    #[props(default)]
+    not_started: bool,
+    steerable: bool,
+    has_queue: bool,
+) -> Element {
     let state = use_context::<AppState>();
     let mut text = drafts::use_draft(session_id, "session-message", String::new);
     // Uncontrolled field (see `chat.rs`); a send clears it via a remount.
@@ -693,9 +709,15 @@ fn Composer(session_id: Uuid, running: bool, steerable: bool, has_queue: bool) -
     let mut dragging = use_signal(|| false);
     let has_files = !state.card_attachments(session_id).is_empty();
     let blank = text.read().trim().is_empty();
-    let can_send = !blank || has_files || (!running && has_queue);
+    let can_send = not_started || !blank || has_files || (!running && has_queue);
     let live = steerable && !has_files;
-    let (label, tip, placeholder) = if live {
+    let (label, tip, placeholder) = if not_started {
+        (
+            "Start session",
+            "Send the message above to the agent",
+            "Add to the message before starting (optional)…",
+        )
+    } else if live {
         (
             "Send now",
             "The agent reads it at its next step",

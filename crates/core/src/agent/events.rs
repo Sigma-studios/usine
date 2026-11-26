@@ -715,9 +715,11 @@ pub enum ExecutorCommand {
     },
 
     // --- one-off sessions (ad-hoc agent chats in any folder) --------------
-    /// Create a session and start its first turn. `id` is minted by the UI
-    /// when the dialog opens, so files can be staged under it beforehand; the
-    /// staged attachments ride the first turn.
+    /// Create a session and, when `start`, run its first turn. `id` is minted
+    /// by the UI when the dialog opens, so files can be staged under it
+    /// beforehand; the staged attachments ride the first turn. With `start`
+    /// false the session is saved [`NotStarted`](crate::domain::session::SessionStatus::NotStarted):
+    /// the first message waits until a `SendSessionMessage` starts it.
     CreateSession {
         id: Uuid,
         folder: PathBuf,
@@ -725,6 +727,7 @@ pub enum ExecutorCommand {
         spec: ModelSpec,
         access: SessionAccess,
         prompt: String,
+        start: bool,
     },
     /// Send a follow-up message (with the staged attachments) as a resumed turn.
     SendSessionMessage {

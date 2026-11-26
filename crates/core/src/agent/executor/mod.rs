@@ -1045,8 +1045,9 @@ impl Executor {
                 spec,
                 access,
                 prompt,
+                start,
             } => {
-                self.create_session(id, folder, provider, spec, access, prompt)
+                self.create_session(id, folder, provider, spec, access, prompt, start)
                     .await
             }
             ExecutorCommand::SendSessionMessage { session_id, text } => {

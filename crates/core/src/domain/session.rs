@@ -38,6 +38,9 @@ impl SessionAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStatus {
+    /// Saved for later: the first message is stored but nothing was sent to
+    /// the agent yet. Sending a message (even an empty one) starts it.
+    NotStarted,
     /// A turn is in flight.
     Running,
     /// The agent asked a question; the one-shot run was torn down to wait for
@@ -52,6 +55,7 @@ pub enum SessionStatus {
 impl SessionStatus {
     pub fn label(&self) -> &'static str {
         match self {
+            SessionStatus::NotStarted => "Not started",
             SessionStatus::Running => "Running",
             SessionStatus::NeedsAnswer(_) => "Needs answer",
             SessionStatus::Finished => "Finished",
@@ -328,6 +332,27 @@ impl Session {
         }
     }
 
+    /// Like [`Session::new`], but saved without starting: the first message
+    /// waits in the session until the user starts it.
+    pub fn not_started(
+        id: Uuid,
+        folder: PathBuf,
+        provider: Provider,
+        spec: ModelSpec,
+        access: SessionAccess,
+        prompt: &str,
+        attachments: Vec<PathBuf>,
+    ) -> Self {
+        Session {
+            status: SessionStatus::NotStarted,
+            ..Session::new(id, folder, provider, spec, access, prompt, attachments)
+        }
+    }
+
+    pub fn is_not_started(&self) -> bool {
+        matches!(self.status, SessionStatus::NotStarted)
+    }
+
     /// Set (or clear) the user's blocked marker and its message, like
     /// [`Card::set_blocked`](super::model::Card::set_blocked).
     pub fn set_blocked(&mut self, blocked: bool, note: Option<String>) {
@@ -340,7 +365,7 @@ impl Session {
     }
 
     /// Whether the session counts toward the attention badges: it sits idle
-    /// (ended, failed, or asking a question) until the user archives, deletes
+    /// (not started yet, ended, failed, or asking a question) until the user archives, deletes
     /// or blocks it. Reading it doesn't clear it; a running turn doesn't count.
     pub fn needs_attention(&self) -> bool {
         !self.archived && !self.blocked && !self.is_running()
@@ -413,12 +438,13 @@ impl Session {
             }
             (S::NeedsAnswer(_), T::Answer) => S::Running,
             (_, T::Answer) => return Err(illegal("there is no question to answer")),
-            (S::Finished | S::Failed { .. }, T::StartTurn) => S::Running,
+            (S::NotStarted | S::Finished | S::Failed { .. }, T::StartTurn) => S::Running,
             (S::Running, T::NeedsInput(i)) => S::NeedsAnswer(i),
             (S::Running, T::TurnDone) => S::Finished,
             (S::Running, T::TurnFailed { message }) => S::Failed { message },
             (S::Running | S::NeedsAnswer(_), T::Cancelled) => S::Finished,
             (S::Running, T::Cleared) => return Err(illegal("stop the turn first")),
+            (S::NotStarted, T::Cleared) => return Err(illegal("nothing was sent yet")),
             (_, T::Cleared) => S::Finished,
             (s, t) => {
                 return Err(illegal(&format!(
@@ -1031,6 +1057,48 @@ mod tests {
         s.set_blocked(false, Some("ignored".into()));
         assert!(!s.blocked);
         assert_eq!(s.blocked_note, None);
+    }
+
+    fn saved_session() -> Session {
+        Session::not_started(
+            Uuid::new_v4(),
+            PathBuf::from("/tmp"),
+            Provider::Claude,
+            ModelSpec::new("opus", Effort::High),
+            SessionAccess::FullAccess,
+            "Later: do the thing",
+            vec![],
+        )
+    }
+
+    #[test]
+    fn not_started_session_counts_until_blocked_or_archived() {
+        let mut s = saved_session();
+        assert!(s.is_not_started());
+        assert!(!s.is_running());
+        assert_eq!(s.turns.len(), 1);
+        assert_eq!(s.title, "Later: do the thing");
+        assert!(s.needs_attention());
+        assert!(!s.needs_answer());
+        s.set_blocked(true, None);
+        assert!(!s.needs_attention());
+        s.set_blocked(false, None);
+        s.archived = true;
+        assert!(!s.needs_attention());
+    }
+
+    #[test]
+    fn not_started_session_only_starts() {
+        let mut s = saved_session();
+        assert!(s.apply(SessionTransition::Answer).is_err());
+        assert!(s.apply(SessionTransition::Cancelled).is_err());
+        assert!(s.apply(SessionTransition::Cleared).is_err());
+        assert!(s.apply(SessionTransition::TurnDone).is_err());
+        assert!(s.clear_context().is_err());
+        assert_eq!(s.turns.len(), 1);
+        assert!(s.is_not_started());
+        s.apply(SessionTransition::StartTurn).unwrap();
+        assert!(s.is_running());
     }
 
     #[test]

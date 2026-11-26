@@ -58,7 +58,8 @@ pub fn session_notification(
     }
     let title = &session.title;
     let (subtitle, body) = match &session.status {
-        SessionStatus::Running => return None,
+        // Never reached from Running; a saved session pings nobody.
+        SessionStatus::NotStarted | SessionStatus::Running => return None,
         SessionStatus::NeedsAnswer(iv) => {
             (format!("Needs an answer · {title}"), iv.question.clone())
         }

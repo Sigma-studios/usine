@@ -79,6 +79,7 @@ struct TurnInput {
 }
 
 impl Executor {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn create_session(
         &self,
         id: Uuid,
@@ -87,6 +88,7 @@ impl Executor {
         spec: ModelSpec,
         access: SessionAccess,
         prompt: String,
+        start: bool,
     ) -> Result<()> {
         match self.store.get_session(id) {
             Ok(_) => return Err(CoreError::other("that session already exists")),
@@ -112,7 +114,12 @@ impl Executor {
             ));
         }
         let attachments = existing(&staged);
-        let session = Session::new(
+        let build = if start {
+            Session::new
+        } else {
+            Session::not_started
+        };
+        let session = build(
             id,
             folder,
             provider,
@@ -139,6 +146,10 @@ impl Executor {
                 .evt_tx
                 .unbounded_send(ExecutorEvent::settings_updated(settings));
         }
+        if !start {
+            // Saved for later: the first send starts it.
+            return Ok(());
+        }
 
         let input = TurnInput {
             prompt: message_prompt(&prompt, &attachments),
@@ -153,6 +164,9 @@ impl Executor {
     /// messages first.
     pub(super) async fn send_session_message(&self, id: Uuid, text: String) -> Result<()> {
         let probe = self.store.get_session(id)?;
+        if probe.is_not_started() {
+            return self.start_pending_session(id, text).await;
+        }
         let staged = self.store.get_attachments(id).unwrap_or_default();
         let attachments = existing(&staged);
         let blank = text.trim().is_empty();
@@ -219,6 +233,53 @@ impl Executor {
         let resume = session.last_session.clone();
         let input = with_interrupted(with_unresolved(queued_input(&batch), &cut), interrupted);
         self.launch_session_turn(&session, input, resume).await
+    }
+
+    /// Start a session saved without starting. `text` and the staged files
+    /// (both optional) join the saved first message, so it stays one turn —
+    /// what Retry re-sends — and the agent starts a fresh conversation.
+    async fn start_pending_session(&self, id: Uuid, text: String) -> Result<()> {
+        let staged = self.store.get_attachments(id).unwrap_or_default();
+        let attachments = existing(&staged);
+        let extra = text.trim();
+        // The saved message may have waited for days: refuse to send an
+        // empty one when its files are gone and nothing new was added.
+        let mut check = self.store.get_session(id)?;
+        check.apply(SessionTransition::StartTurn)?;
+        let saved_empty = check
+            .turns
+            .first()
+            .is_none_or(|t| t.text.trim().is_empty() && existing(&t.attachments).is_empty());
+        if saved_empty && extra.is_empty() && attachments.is_empty() {
+            return Err(CoreError::other("write a message or attach a file"));
+        }
+        let mut first = SessionTurn::new(SessionTurnKind::User, "");
+        let session = self.store.mutate_session(id, |s| {
+            s.apply(SessionTransition::StartTurn)?;
+            let now = now_millis();
+            if s.turns.is_empty() {
+                s.turns.push(SessionTurn::new(SessionTurnKind::User, ""));
+            }
+            let turn = &mut s.turns[0];
+            if !extra.is_empty() {
+                turn.text = if turn.text.is_empty() {
+                    extra.to_string()
+                } else {
+                    format!("{}\n\n{extra}", turn.text)
+                };
+            }
+            turn.attachments.extend(attachments.iter().cloned());
+            // The work starts now: date the message (and the list) from it.
+            turn.ts = now;
+            s.last_activity_at = now;
+            first = turn.clone();
+            Ok(())
+        })?;
+        self.unstage(id, &staged)?;
+        self.emit_session(session.clone());
+        // Only the files still on disk, like every other re-send path.
+        let input = queued_input(std::slice::from_ref(&first));
+        self.launch_session_turn(&session, input, None).await
     }
 
     /// Hand `text` to the running turn's agent. Whether it took it — it then

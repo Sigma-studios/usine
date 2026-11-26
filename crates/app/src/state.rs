@@ -866,8 +866,8 @@ impl AppState {
         self.sessions.read().get(&id).cloned()
     }
 
-    /// Idle sessions (ended, failed, or asking) the user hasn't archived or
-    /// blocked — read or not. A running turn doesn't count.
+    /// Idle sessions (not started yet, ended, failed, or asking) the user
+    /// hasn't archived or blocked — read or not. A running turn doesn't count.
     pub fn session_attention_count(&self) -> usize {
         self.sessions
             .read()

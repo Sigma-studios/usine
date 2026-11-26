@@ -106,6 +106,8 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
         }
     });
     let mut prompt = use_signal(String::new);
+    // Which button sent the pending create: it alone shows the busy label.
+    let mut saving = use_signal(|| false);
     let mut dragging = use_signal(|| false);
 
     let resolved = expand_tilde(&folder.read(), home.as_deref());
@@ -127,7 +129,7 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
         *OPEN.write() = None;
     };
 
-    let start = move || {
+    let mut start = move |run: bool| {
         let folder = expand_tilde(&folder.peek(), home_dir().as_deref());
         state.send(ExecutorCommand::CreateSession {
             id: draft_id,
@@ -136,7 +138,9 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
             spec: spec.peek().clone(),
             access: *access.peek(),
             prompt: prompt.peek().clone(),
+            start: run,
         });
+        saving.set(!run);
         *STARTING.write() = true;
     };
 
@@ -291,16 +295,27 @@ fn NewSessionDialog(draft_id: Uuid) -> Element {
                 div { class: "modal-actions",
                     button { class: "btn", disabled: starting, onclick: move |_| cancel(), "Cancel" }
                     button {
+                        class: "btn",
+                        title: "Save it for later — it waits in the list and counts toward the attention badge until you start, block or archive it.",
+                        disabled: !can_start,
+                        onclick: move |_| {
+                            if can_start {
+                                start(false);
+                            }
+                        },
+                        if starting && saving() { "Creating…" } else { "Create without starting" }
+                    }
+                    button {
                         class: "btn primary",
                         "data-submit": "1",
                         title: "Start ({hint})",
                         disabled: !can_start,
                         onclick: move |_| {
                             if can_start {
-                                start();
+                                start(true);
                             }
                         },
-                        if starting { "Starting…" } else { "Start session" }
+                        if starting && !saving() { "Starting…" } else { "Start session" }
                     }
                 }
             }

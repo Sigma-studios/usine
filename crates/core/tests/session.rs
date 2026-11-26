@@ -153,6 +153,7 @@ fn create(handle: &ExecutorHandle, id: Uuid, folder: &Path, prompt: &str) {
         spec: ModelSpec::new("opus", Effort::High),
         access: SessionAccess::FullAccess,
         prompt: prompt.into(),
+        start: true,
     });
 }
 
@@ -838,6 +839,7 @@ fn create_with(handle: &ExecutorHandle, id: Uuid, folder: &Path, provider: Provi
         spec,
         access: SessionAccess::FullAccess,
         prompt: prompt.into(),
+        start: true,
     });
 }
 
@@ -1194,4 +1196,130 @@ async fn a_restart_cuts_off_live_agents_and_retry_names_them() {
     let done = wait_status(&mut rx, s.id, finished).await;
     assert!(spy.last().full_prompt().contains("never relaunched: \"Long job\""));
     assert!(done.bg_tasks.is_empty(), "settled tasks are dropped on a new turn");
+}
+
+fn save_for_later(handle: &ExecutorHandle, id: Uuid, folder: &Path, prompt: &str) {
+    handle.send(ExecutorCommand::CreateSession {
+        id,
+        folder: folder.to_path_buf(),
+        provider: Provider::Claude,
+        spec: ModelSpec::new("opus", Effort::High),
+        access: SessionAccess::FullAccess,
+        prompt: prompt.into(),
+        start: false,
+    });
+}
+
+fn not_started(s: &SessionStatus) -> bool {
+    matches!(s, SessionStatus::NotStarted)
+}
+
+#[tokio::test]
+async fn a_session_saved_for_later_waits_without_running() {
+    let folder = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    let staged = stage(&store, id, files.path(), &["notes.txt"]);
+
+    save_for_later(&handle, id, folder.path(), "Build OTS file downloads");
+    let s = wait_status(&mut rx, id, not_started).await;
+    assert!(s.needs_attention(), "a saved session counts until started");
+    assert_eq!(s.title, "Build OTS file downloads");
+    assert_eq!(s.turns.len(), 1);
+    assert_eq!(s.turns[0].kind, SessionTurnKind::User);
+    assert_eq!(s.turns[0].text, "Build OTS file downloads");
+    assert_eq!(s.turns[0].attachments, staged);
+    assert!(store.get_attachments(id).unwrap().is_empty(), "the files were taken");
+    assert_eq!(s.last_session, None);
+
+    // Nothing ever starts on its own.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(spy.count(), 0);
+    assert!(store.get_session(id).unwrap().is_not_started());
+
+    // A blank send starts it with the saved message, as a fresh conversation.
+    send(&handle, id, "  ");
+    let s = wait_status(&mut rx, id, finished).await;
+    assert_eq!(spy.count(), 1);
+    let cfg = spy.last();
+    assert_eq!(cfg.resume_session, None);
+    assert!(cfg.prompt.contains("Build OTS file downloads"));
+    assert_eq!(cfg.attachments, staged);
+    let users = s
+        .turns
+        .iter()
+        .filter(|t| t.kind == SessionTurnKind::User)
+        .count();
+    assert_eq!(users, 1);
+}
+
+#[tokio::test]
+async fn starting_a_saved_session_merges_the_extra_text_into_its_message() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+
+    save_for_later(&handle, id, folder.path(), "Build OTS file downloads");
+    wait_status(&mut rx, id, not_started).await;
+    send(&handle, id, "into Partage");
+    let s = wait_status(&mut rx, id, finished).await;
+
+    let users: Vec<_> = s
+        .turns
+        .iter()
+        .filter(|t| t.kind == SessionTurnKind::User)
+        .collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].text, "Build OTS file downloads\n\ninto Partage");
+    let cfg = spy.last();
+    assert_eq!(cfg.resume_session, None);
+    assert!(cfg.prompt.contains("Build OTS file downloads"));
+    assert!(cfg.prompt.contains("into Partage"));
+    assert!(!cfg.prompt.contains("while you were working"));
+}
+
+#[tokio::test]
+async fn starting_a_saved_session_skips_files_deleted_meanwhile() {
+    let folder = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    let staged = stage(&store, id, files.path(), &["kept.txt", "gone.txt"]);
+
+    save_for_later(&handle, id, folder.path(), "Build OTS file downloads");
+    wait_status(&mut rx, id, not_started).await;
+    std::fs::remove_file(&staged[1]).unwrap();
+    send(&handle, id, "");
+    wait_status(&mut rx, id, finished).await;
+
+    let cfg = spy.last();
+    assert_eq!(cfg.attachments, vec![staged[0].clone()]);
+    assert!(!cfg.prompt.contains("gone.txt"), "a missing file is not listed");
+}
+
+#[tokio::test]
+async fn a_files_only_saved_session_whose_files_are_gone_does_not_start_empty() {
+    let folder = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    let spy = SpyFactory::default();
+    let (handle, mut rx) = spawn(&store, &spy);
+    let id = Uuid::new_v4();
+    let staged = stage(&store, id, files.path(), &["gone.txt"]);
+
+    save_for_later(&handle, id, folder.path(), "");
+    wait_status(&mut rx, id, not_started).await;
+    std::fs::remove_file(&staged[0]).unwrap();
+    send(&handle, id, " ");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(spy.count(), 0, "nothing to send, so nothing starts");
+    assert!(store.get_session(id).unwrap().is_not_started());
 }

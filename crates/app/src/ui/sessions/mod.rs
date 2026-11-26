@@ -65,6 +65,8 @@ pub(crate) fn session_dot(s: &Session) -> &'static str {
         SessionStatus::Running => "proj-dot working",
         _ if s.archived || s.blocked => "proj-dot idle",
         SessionStatus::NeedsAnswer(_) => "proj-dot urgent",
+        // Saved for later: waiting on the user to start it.
+        SessionStatus::NotStarted => "proj-dot",
         SessionStatus::Failed { .. } if s.unread => "proj-dot urgent",
         _ if s.unread => "proj-dot",
         _ => "proj-dot idle",

@@ -13,6 +13,7 @@ use crate::ui::confirm::{request_confirm, ConfirmAction, ConfirmRequest};
 pub(crate) enum Section {
     NeedsYou,
     Unread,
+    NotStarted,
     Running,
     Earlier,
     Blocked,
@@ -24,6 +25,7 @@ impl Section {
         match self {
             Section::NeedsYou => "Needs you",
             Section::Unread => "Unread",
+            Section::NotStarted => "Not started",
             Section::Running => "Running",
             Section::Earlier => "Earlier",
             Section::Blocked => "Blocked",
@@ -39,6 +41,8 @@ pub(crate) fn section_of(s: &Session) -> Section {
         Section::Blocked
     } else if matches!(s.status, SessionStatus::NeedsAnswer(_)) {
         Section::NeedsYou
+    } else if s.is_not_started() {
+        Section::NotStarted
     } else if s.is_running() {
         Section::Running
     } else if s.unread {
@@ -54,6 +58,7 @@ pub(crate) fn grouped(sessions: Vec<Session>) -> Vec<(Section, Vec<Session>)> {
     let order = [
         Section::NeedsYou,
         Section::Unread,
+        Section::NotStarted,
         Section::Running,
         Section::Earlier,
         Section::Blocked,
@@ -376,6 +381,29 @@ mod tests {
         assert_eq!(
             section_of(&session(SessionStatus::Finished, false, false, 0)),
             Section::Earlier
+        );
+    }
+
+    #[test]
+    fn not_started_sessions_sit_between_unread_and_running() {
+        let saved = |archived: bool| session(SessionStatus::NotStarted, false, archived, 0);
+        assert_eq!(section_of(&saved(false)), Section::NotStarted);
+        assert_eq!(section_of(&saved(true)), Section::Archived);
+        let mut b = saved(false);
+        b.blocked = true;
+        assert_eq!(section_of(&b), Section::Blocked);
+
+        let order: Vec<Section> = grouped(vec![
+            session(SessionStatus::Running, false, false, 0),
+            saved(false),
+            session(SessionStatus::Finished, true, false, 0),
+        ])
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+        assert_eq!(
+            order,
+            vec![Section::Unread, Section::NotStarted, Section::Running]
         );
     }
 
