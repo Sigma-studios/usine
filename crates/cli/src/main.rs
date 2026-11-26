@@ -843,7 +843,7 @@ async fn real_plan(dir: PathBuf, task: String) -> anyhow::Result<()> {
             // Card-mode runs deny the background-agent tools.
             AgentEvent::Task(_) => {}
             // Plan billing telemetry: nothing to print.
-            AgentEvent::PlanUsage { .. } => {}
+            AgentEvent::PlanUsage { .. } | AgentEvent::RunCost { .. } => {}
             AgentEvent::PlanReady { plan } => {
                 println!("\n=== PLAN ===\n{plan}\n============");
                 break;

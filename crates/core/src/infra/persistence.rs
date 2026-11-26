@@ -10,7 +10,7 @@
 //! at this app's scale a full scan + in-Rust filter for the per-project view is
 //! both simplest and plenty fast.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::agent::fixes::{FixItem, FixReport};
 use crate::agent::handoff::Handoff;
+use crate::agent::usage::CreditBalance;
 use crate::domain::config::AppSettings;
 use crate::domain::model::{
     Card, CardAnswers, ExchangeKind, Project, QaExchange, ReviewComment, ReviewTask, UiDrafts,
@@ -342,8 +343,41 @@ struct UiDraftsRecord {
     drafts: UiDrafts,
 }
 
+/// The API-credit counter's state (see [`CreditLedger`]). A single row.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[native_model(id = 17, version = 1, with = Json)]
+#[native_db]
+struct CreditLedgerRecord {
+    #[primary_key]
+    id: u8,
+    ledger: CreditLedger,
+}
+
+/// What the API-credit counter keeps across restarts: the balance the user
+/// entered (with what usine's credit runs spent since) and, per Claude
+/// session, the cumulative `total_cost_usd` its last run reported. The CLI
+/// restores a session's cost on `--resume`, so a resumed run's figure covers
+/// the whole session — plan-billed turns included — and only the increase is
+/// new spend.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct CreditLedger {
+    #[serde(default)]
+    pub balance: Option<CreditBalance>,
+    #[serde(default)]
+    pub session_costs: BTreeMap<String, SessionCost>,
+}
+
+/// A Claude session's latest cumulative cost, and when it was read (unix
+/// seconds) — the oldest are dropped past a cap.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq)]
+pub struct SessionCost {
+    pub cost_usd: f64,
+    pub at: i64,
+}
+
 const SETTINGS_ID: u8 = 1;
 const UI_DRAFTS_ID: u8 = 1;
+const CREDIT_LEDGER_ID: u8 = 1;
 
 /// Model registry. Must be `'static` so the [`Database`] can be `'static` and
 /// thus stored in a `Clone + Send + Sync` handle.
@@ -400,6 +434,9 @@ static MODELS: LazyLock<Models> = LazyLock::new(|| {
     models
         .define::<UiDraftsRecord>()
         .expect("define UiDraftsRecord");
+    models
+        .define::<CreditLedgerRecord>()
+        .expect("define CreditLedgerRecord");
     models
 });
 
@@ -464,6 +501,7 @@ impl Store {
         self.refresh_type::<DismissedReviewsRecord>();
         self.refresh_type::<CardAnswerRecord>();
         self.refresh_type::<UiDraftsRecord>();
+        self.refresh_type::<CreditLedgerRecord>();
     }
 
     /// Refresh one record type in its own transaction, best-effort: an undecodable
@@ -525,6 +563,29 @@ impl Store {
         };
         let rw = self.db.rw_transaction()?;
         let old: Option<UiDraftsRecord> = rw.get().primary(UI_DRAFTS_ID)?;
+        match old {
+            Some(old) => rw.update(old, rec)?,
+            None => rw.insert(rec)?,
+        }
+        rw.commit()?;
+        Ok(())
+    }
+
+    // --- API credit counter ---------------------------------------------
+
+    pub fn credit_ledger(&self) -> Result<CreditLedger> {
+        let r = self.db.r_transaction()?;
+        let rec: Option<CreditLedgerRecord> = r.get().primary(CREDIT_LEDGER_ID)?;
+        Ok(rec.map(|r| r.ledger).unwrap_or_default())
+    }
+
+    pub fn save_credit_ledger(&self, ledger: &CreditLedger) -> Result<()> {
+        let rec = CreditLedgerRecord {
+            id: CREDIT_LEDGER_ID,
+            ledger: ledger.clone(),
+        };
+        let rw = self.db.rw_transaction()?;
+        let old: Option<CreditLedgerRecord> = rw.get().primary(CREDIT_LEDGER_ID)?;
         match old {
             Some(old) => rw.update(old, rec)?,
             None => rw.insert(rec)?,
@@ -1810,6 +1871,7 @@ pub fn rebuild_database(old: &Path, new: &Path) -> Result<Vec<(&'static str, usi
     copy_table!(DismissedReviewsRecord, "dismissed_reviews");
     copy_table!(CardAnswerRecord, "answers");
     copy_table!(UiDraftsRecord, "ui_drafts");
+    copy_table!(CreditLedgerRecord, "credit_ledger");
 
     rw.commit()?;
     Ok(report)
@@ -1929,6 +1991,33 @@ mod tests {
         // A second save replaces the single row rather than adding one.
         store.save_ui_drafts(&UiDrafts::default()).unwrap();
         assert_eq!(store.ui_drafts().unwrap(), UiDrafts::default());
+    }
+
+    #[test]
+    fn credit_ledger_round_trip_and_overwrite() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.credit_ledger().unwrap(), CreditLedger::default());
+        let mut ledger = CreditLedger {
+            balance: Some(CreditBalance {
+                set_usd: 25.0,
+                set_at: 1_790_000_000,
+                spent_usd: 1.234_567,
+            }),
+            ..Default::default()
+        };
+        ledger.session_costs.insert(
+            "abc".into(),
+            SessionCost {
+                cost_usd: 0.005_674_170_000_000_001,
+                at: 1_790_000_100,
+            },
+        );
+        store.save_credit_ledger(&ledger).unwrap();
+        assert_eq!(store.credit_ledger().unwrap(), ledger);
+        // Overwriting (an update, not an insert) lands too.
+        ledger.balance = None;
+        store.save_credit_ledger(&ledger).unwrap();
+        assert_eq!(store.credit_ledger().unwrap(), ledger);
     }
 
     #[test]

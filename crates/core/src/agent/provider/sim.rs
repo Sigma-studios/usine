@@ -3,7 +3,8 @@
 //! real agent. It exercises the exact same executor code path the real
 //! providers will use.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use futures::channel::mpsc;
@@ -78,11 +79,40 @@ impl AgentProvider for SimProvider {
         } else {
             cfg.session_id.to_string()
         };
+        let costs_for = session.clone();
         tokio::spawn(simulate(cfg, session, evt_tx, ctl_rx));
         Ok(RunHandle {
-            events: evt_rx.boxed(),
+            events: evt_rx
+                .map(move |evt| session_total_cost(&costs_for, evt))
+                .boxed(),
             control: ctl_tx,
         })
+    }
+}
+
+/// Each simulated session's spend so far, across its runs.
+static SESSION_COSTS: LazyLock<Mutex<HashMap<String, f64>>> = LazyLock::new(Default::default);
+
+/// Report a `Done`'s cost the way the real CLI's `total_cost_usd` does: as the
+/// session's running total (the CLI restores it on `--resume`), so the
+/// executor's API-credit counter sees the same figures in a demo.
+fn session_total_cost(session: &str, evt: AgentEvent) -> AgentEvent {
+    match evt {
+        AgentEvent::Done {
+            result,
+            cost_usd,
+            usage,
+        } => {
+            let mut costs = SESSION_COSTS.lock().unwrap_or_else(|e| e.into_inner());
+            let total = costs.entry(session.to_string()).or_insert(0.0);
+            *total += cost_usd;
+            AgentEvent::Done {
+                result,
+                cost_usd: *total,
+                usage,
+            }
+        }
+        other => other,
     }
 }
 

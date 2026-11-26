@@ -89,6 +89,40 @@ pub struct ClaudeBilling {
     pub plan_refused: bool,
     /// What usine's runs spent on credits during the current block (USD).
     pub credit_spend_usd: f64,
+    /// The API balance the user entered and what usine's credit runs spent
+    /// since: the bar's "API $x left" counter. `None` = none entered.
+    pub credit_balance: Option<CreditBalance>,
+}
+
+/// The API credit balance the user copied from the Anthropic Console, and
+/// what usine's own runs on the key spent since (the CLI's `total_cost_usd`,
+/// an estimate at list prices). A plain key can't read the real balance, so
+/// this is a countdown from what was entered: spend from anything else using
+/// the key isn't seen. Entering a new balance starts the count over.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CreditBalance {
+    /// The balance entered (USD).
+    pub set_usd: f64,
+    /// When it was entered (unix seconds).
+    pub set_at: i64,
+    /// What usine's credit runs spent since (USD).
+    pub spent_usd: f64,
+}
+
+impl CreditBalance {
+    /// A balance of `usd` entered now, nothing spent yet.
+    pub fn new(usd: f64) -> Self {
+        CreditBalance {
+            set_usd: usd.max(0.0),
+            set_at: now_secs(),
+            spent_usd: 0.0,
+        }
+    }
+
+    /// What's left (USD), never below zero.
+    pub fn remaining(&self) -> f64 {
+        (self.set_usd - self.spent_usd).max(0.0)
+    }
 }
 
 /// The `get_usage` control request answers in ~1s (it reads the plan's rate

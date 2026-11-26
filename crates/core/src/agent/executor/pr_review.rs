@@ -1699,7 +1699,10 @@ fn handle_review_event(
         AgentEvent::PlanReady { .. } => {}
         // Done is handled by finalize_review; review runs deny the
         // background-agent tools, so no task events arrive.
-        AgentEvent::Done { .. } | AgentEvent::Task(_) | AgentEvent::PlanUsage { .. } => {}
+        AgentEvent::Done { .. }
+        | AgentEvent::Task(_)
+        | AgentEvent::PlanUsage { .. }
+        | AgentEvent::RunCost { .. } => {}
         // `run_review_actor` continues a `LimitReached` before it gets here;
         // handled as an error should one ever slip through.
         AgentEvent::Error { message } | AgentEvent::LimitReached { message, .. } => {

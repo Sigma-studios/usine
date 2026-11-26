@@ -73,6 +73,12 @@ pub enum AgentEvent {
     /// before the plan runs out (see `executor/billing.rs`) and swallows it:
     /// run consumers never see it.
     PlanUsage { windows: Vec<PlanWindowUsage> },
+    /// What a run that ended on an error had spent (the CLI's cumulative
+    /// `total_cost_usd`, USD), sent just before its `Error`/`LimitReached`. A
+    /// successful run's cost rides on `Done` instead. The executor's billing
+    /// counts it against the API credit balance and swallows it: run
+    /// consumers never see it.
+    RunCost { cost_usd: f64 },
     /// A background task (subagent or command) started, progressed or ended.
     /// Only sessions see these: card runs deny the `Agent`/`Task` tools.
     Task(TaskEvent),
@@ -701,6 +707,12 @@ pub enum ExecutorCommand {
     },
     /// Remove the saved Anthropic API key, turning the fallback off.
     ClearAnthropicKey,
+    /// Enter the API credit balance (USD, copied from the Anthropic Console)
+    /// the bar counts down from as usine's runs spend credits; `None` clears
+    /// it. Entering one starts the count over.
+    SetCreditBalance {
+        usd: Option<f64>,
+    },
 
     // --- one-off sessions (ad-hoc agent chats in any folder) --------------
     /// Create a session and start its first turn. `id` is minted by the UI
@@ -884,7 +896,8 @@ impl ExecutorCommand {
             | ExecutorCommand::ScanReviews { .. }
             | ExecutorCommand::RefreshUsage
             | ExecutorCommand::SetAnthropicKey { .. }
-            | ExecutorCommand::ClearAnthropicKey => Uuid::nil(),
+            | ExecutorCommand::ClearAnthropicKey
+            | ExecutorCommand::SetCreditBalance { .. } => Uuid::nil(),
         }
     }
 

@@ -162,7 +162,11 @@ pub fn spawn_with_forges(
                     UsageSource::Cli => billing::KeyStore::Keychain,
                     UsageSource::Simulated | UsageSource::None => billing::KeyStore::Memory,
                 };
-                let billing = Arc::new(billing::Billing::new(key_store, evt_tx.clone()));
+                let billing = Arc::new(billing::Billing::new(
+                    key_store,
+                    Some(config.store.clone()),
+                    evt_tx.clone(),
+                ));
                 let executor = Arc::new_cyclic(|self_ref| Executor {
                     store: config.store,
                     providers: config.providers,
@@ -656,6 +660,10 @@ impl Executor {
             }
             ExecutorCommand::SetAnthropicKey { key } => self.set_anthropic_key(Some(key)).await,
             ExecutorCommand::ClearAnthropicKey => self.set_anthropic_key(None).await,
+            ExecutorCommand::SetCreditBalance { usd } => {
+                self.set_credit_balance(usd);
+                Ok(())
+            }
             ExecutorCommand::ScanReviews { project_id } => self.scan_reviews(project_id).await,
             ExecutorCommand::StartReview {
                 review_id,

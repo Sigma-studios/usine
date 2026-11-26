@@ -112,6 +112,14 @@ pub fn parse_claude_line(line: &str) -> Result<Vec<AgentEvent>> {
                 .unwrap_or("")
                 .to_string();
             if is_error {
+                // A failed run still spent money: say how much first.
+                let cost_usd = v
+                    .get("total_cost_usd")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                if cost_usd > 0.0 {
+                    out.push(AgentEvent::RunCost { cost_usd });
+                }
                 out.push(AgentEvent::Error {
                     message: if result.is_empty() {
                         "run failed".into()
@@ -806,6 +814,41 @@ mod tests {
             None
         );
         assert_eq!(codex_agent_message("not json"), None);
+    }
+
+    #[test]
+    fn a_failed_result_reports_its_cost_before_the_error() {
+        let evts = parse_claude_line(
+            r#"{"type":"result","is_error":true,"result":"boom","total_cost_usd":0.37}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(evts.as_slice(), [
+                AgentEvent::RunCost { cost_usd },
+                AgentEvent::Error { message },
+            ] if (*cost_usd - 0.37).abs() < 1e-9 && message == "boom"),
+            "{evts:?}"
+        );
+        // No cost (or none spent): only the error.
+        for line in [
+            r#"{"type":"result","is_error":true,"result":"boom"}"#,
+            r#"{"type":"result","is_error":true,"result":"boom","total_cost_usd":0}"#,
+        ] {
+            let evts = parse_claude_line(line).unwrap();
+            assert!(
+                matches!(evts.as_slice(), [AgentEvent::Error { .. }]),
+                "{evts:?}"
+            );
+        }
+        // A success is unchanged: the cost rides on `Done`.
+        let evts = parse_claude_line(
+            r#"{"type":"result","is_error":false,"result":"ok","total_cost_usd":0.5}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(evts.as_slice(), [AgentEvent::Done { cost_usd, .. }] if *cost_usd == 0.5),
+            "{evts:?}"
+        );
     }
 
     #[test]

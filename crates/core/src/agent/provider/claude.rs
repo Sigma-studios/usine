@@ -595,6 +595,9 @@ struct TurnGate {
     usage: Usage,
     /// Whether the current resumption has been announced in the activity log.
     resumed_announced: bool,
+    /// The latest `total_cost_usd` any turn reported (cumulative for the
+    /// session), from a `Done` or a failed result's `RunCost`.
+    cost_usd: f64,
 }
 
 impl TurnGate {
@@ -610,6 +613,7 @@ impl TurnGate {
                     usage,
                 } => {
                     self.usage += usage;
+                    self.cost_usd = self.cost_usd.max(cost_usd);
                     // Sessions keep the replaced turn's answer. A kept held
                     // result is already the last of `kept`.
                     if self.join_turns && !self.held_kept {
@@ -636,6 +640,11 @@ impl TurnGate {
                     self.resumed_announced = false;
                     self.held_kept = false;
                 }
+                // Part of the failed result that follows: held with it (see
+                // `error_cost`), and not the agent resuming.
+                AgentEvent::RunCost { cost_usd } => {
+                    self.cost_usd = self.cost_usd.max(cost_usd);
+                }
                 // A subagent's progress isn't the agent resuming: it works
                 // while the parent waits.
                 AgentEvent::Task(_) => out.push(evt),
@@ -651,6 +660,16 @@ impl TurnGate {
             }
         }
         out
+    }
+
+    /// What the run spent, when it is ending on an error: the billing reads
+    /// it ([`AgentEvent::RunCost`]) since a failed run's `Error` carries no
+    /// cost of its own. `None` when it ends on a `Done` (whose cost rides on
+    /// it), on nothing, or spent nothing.
+    fn error_cost(&self) -> Option<f64> {
+        matches!(self.held, Some(AgentEvent::Error { .. }))
+            .then_some(self.cost_usd)
+            .filter(|c| *c > 0.0)
     }
 
     /// Whether a turn's result is waiting for the run to end.
@@ -1017,6 +1036,9 @@ async fn pump(
         if !cut.is_empty() {
             let _ = evt_tx.unbounded_send(AgentEvent::Task(TaskEvent::CutOff { ids: cut }));
         }
+        if let Some(cost_usd) = turns.error_cost() {
+            let _ = evt_tx.unbounded_send(AgentEvent::RunCost { cost_usd });
+        }
         let tail = match turns.finish() {
             // `line` is only read for PlanReady tool ids; none arrive here.
             Some(evt) => gate.gate("", vec![limit.classify(evt)]),
@@ -1293,6 +1315,9 @@ mod tests {
         for line in lines {
             gate.observe(line);
             out.extend(gate.gate(line, turns.hold(parse_claude_line(line).unwrap())));
+        }
+        if let Some(cost_usd) = turns.error_cost() {
+            out.push(AgentEvent::RunCost { cost_usd });
         }
         match turns.finish() {
             Some(evt) => out.extend(gate.gate("", vec![evt])),
@@ -1677,6 +1702,43 @@ mod tests {
         let k = kinds(&events);
         assert!(!k.contains(&"error"));
         assert_eq!(k.iter().filter(|k| **k == "done").count(), 1);
+    }
+
+    // A failed run's cost is held with its error and released just before
+    // it — never mid-stream, never as a resumption — and covers the earlier
+    // turns (the CLI's figure is cumulative).
+    #[test]
+    fn turn_gate_releases_a_failed_runs_cost_before_its_error() {
+        let events = drive_gate(&[
+            INIT,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"first","total_cost_usd":0.1}"#,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","total_cost_usd":0.25}"#,
+        ]);
+        assert_eq!(resumed_notes(&events), 0);
+        let tail: Vec<_> = events.iter().rev().take(2).collect();
+        assert!(matches!(tail[0], AgentEvent::Error { .. }), "{events:?}");
+        assert!(
+            matches!(tail[1], AgentEvent::RunCost { cost_usd } if (*cost_usd - 0.25).abs() < 1e-9),
+            "{events:?}"
+        );
+        // An error with no cost of its own still carries the earlier turn's.
+        let events = drive_gate(&[
+            INIT,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"first","total_cost_usd":0.1}"#,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}"#,
+        ]);
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::RunCost { cost_usd } if (*cost_usd - 0.1).abs() < 1e-9)
+        ));
+        // A run ending on a success sends none: `Done` carries the cost.
+        let events = drive_gate(&[
+            INIT,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"x","total_cost_usd":0.2}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.3}"#,
+        ]);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RunCost { .. })));
     }
 
     // A single-turn run gets no resumption note.

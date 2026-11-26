@@ -999,7 +999,7 @@ async fn run_session_actor(run: SessionRun) {
                 transcript(&store, &evt_tx, id, text);
             }
             // Billing telemetry, swallowed by `Billing::meter`.
-            AgentEvent::PlanUsage { .. } => {}
+            AgentEvent::PlanUsage { .. } | AgentEvent::RunCost { .. } => {}
             AgentEvent::Task(task) => {
                 saw_output = true;
                 if let TaskEvent::CutOff { ids } = &task {

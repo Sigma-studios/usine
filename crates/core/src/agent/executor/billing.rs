@@ -25,8 +25,9 @@ use super::*;
 use crate::agent::events::{PlanWindow, PlanWindowUsage};
 use crate::agent::provider::stream::is_credit_exhausted_message;
 use crate::agent::provider::ClaudeAuth;
-use crate::agent::usage::{ClaudeBilling, ProviderUsage};
+use crate::agent::usage::{ClaudeBilling, CreditBalance, ProviderUsage};
 use crate::domain::model::Provider;
+use crate::infra::persistence::{CreditLedger, SessionCost};
 use crate::infra::secrets::{self, SecretString};
 
 /// How long the plan counts as blocked when neither the CLI nor the usage
@@ -61,6 +62,14 @@ fn switch_at(window: PlanWindow) -> f64 {
 /// may still show the window just under 100%.
 const GUESS_END_MIN_AGE_SECS: i64 = 30;
 
+/// How many Claude sessions' cumulative costs the ledger remembers for resume
+/// accounting; the least recently seen are dropped past it. Every Claude run
+/// records one (plan-billed card runs, reviews, sessions alike), and a
+/// forgotten session resumed on credits is charged its whole running total,
+/// so this must outlast a card parked in review for weeks. Entries are a few
+/// dozen bytes each.
+const SESSION_COSTS_CAP: usize = 2000;
+
 /// Where the saved API key lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeyStore {
@@ -93,12 +102,21 @@ struct BillingState {
     /// The latest Claude usage the poll read, for a reset time when the CLI
     /// gave none.
     last_usage: Option<ProviderUsage>,
+    /// The entered credit balance and per-session costs (persisted).
+    ledger: CreditLedger,
+    /// Bumped on every ledger change, so a slow save never overwrites a
+    /// newer one (see [`Billing::persist`]).
+    ledger_gen: u64,
 }
 
 /// The fallback's shared state (see the module docs).
 pub(super) struct Billing {
     state: Mutex<BillingState>,
     store: KeyStore,
+    /// Where the ledger is saved; `None` in unit tests.
+    db: Option<Store>,
+    /// The generation of the last ledger save that landed.
+    saved_gen: Arc<Mutex<u64>>,
     evt_tx: UnboundedSender<ExecutorEvent>,
 }
 
@@ -114,14 +132,31 @@ pub(super) enum LimitOutcome {
 impl Billing {
     /// The keychain is NOT read here: on macOS a re-signed binary (every dev
     /// rebuild) gets an access prompt, and the executor must not wait on it.
-    /// Call [`Billing::load_key`] once the executor is up.
-    pub(super) fn new(store: KeyStore, evt_tx: UnboundedSender<ExecutorEvent>) -> Self {
+    /// Call [`Billing::load_key`] once the executor is up. The credit ledger
+    /// (a small database row) is read here.
+    pub(super) fn new(
+        store: KeyStore,
+        db: Option<Store>,
+        evt_tx: UnboundedSender<ExecutorEvent>,
+    ) -> Self {
+        let ledger = db
+            .as_ref()
+            .map(|db| {
+                db.credit_ledger().unwrap_or_else(|e| {
+                    tracing::warn!("reading the API credit ledger failed: {e}");
+                    CreditLedger::default()
+                })
+            })
+            .unwrap_or_default();
         Billing {
             state: Mutex::new(BillingState {
                 key_loaded: store == KeyStore::Memory,
+                ledger,
                 ..Default::default()
             }),
             store,
+            db,
+            saved_gen: Arc::new(Mutex::new(0)),
             evt_tx,
         }
     }
@@ -339,6 +374,8 @@ impl Billing {
     ) -> BoxStream<'static, AgentEvent> {
         let billing = Arc::clone(self);
         let on_credits = auth.is_api_key();
+        // The run's provider session, for resume accounting (see `note_cost`).
+        let mut session: Option<String> = None;
         events
             .filter_map(move |evt| {
                 let out = match evt {
@@ -346,7 +383,22 @@ impl Billing {
                         billing.observe_plan_windows(&windows);
                         None
                     }
-                    evt => Some(billing.meter_event(evt, on_credits, can_resume)),
+                    AgentEvent::RunCost { cost_usd } => {
+                        billing.note_cost(session.as_deref(), cost_usd, on_credits);
+                        None
+                    }
+                    evt => {
+                        match &evt {
+                            AgentEvent::Started { session_id } => {
+                                session = Some(session_id.clone());
+                            }
+                            AgentEvent::Done { cost_usd, .. } => {
+                                billing.note_cost(session.as_deref(), *cost_usd, on_credits)
+                            }
+                            _ => {}
+                        }
+                        Some(billing.meter_event(evt, on_credits, can_resume))
+                    }
                 };
                 futures::future::ready(out)
             })
@@ -355,16 +407,18 @@ impl Billing {
 
     fn meter_event(&self, evt: AgentEvent, on_credits: bool, can_resume: bool) -> AgentEvent {
         match evt {
-            AgentEvent::Done { cost_usd, .. } if on_credits => {
-                let mut st = lock(&self.state);
-                st.credit_spend_usd += cost_usd.max(0.0);
-                self.emit(&st);
-                evt
-            }
             AgentEvent::Error { message }
                 if on_credits && is_credit_exhausted_message(&message) =>
             {
                 let mut st = lock(&self.state);
+                // Anthropic's word beats our estimate: nothing is left.
+                if let Some(b) = st.ledger.balance.as_mut() {
+                    if b.spent_usd < b.set_usd {
+                        b.spent_usd = b.set_usd;
+                        st.ledger_gen += 1;
+                        self.persist(&st);
+                    }
+                }
                 // The plan reset while this run billed credits, or the block
                 // was only the early switch's padding: the plan has room, so
                 // the run continues there. A padding-only block stays (new
@@ -401,7 +455,8 @@ impl Billing {
                 self.emit(&st);
                 AgentEvent::Error {
                     message: format!(
-                        "API credits exhausted. Top up at platform.claude.com/settings/billing; \
+                        "API credits exhausted. Top up at platform.claude.com/settings/billing \
+                         and save the key again in Settings to retry on credits; otherwise \
                          runs go back to your plan when its limit resets{}.",
                         if until.is_empty() {
                             String::new()
@@ -435,6 +490,99 @@ impl Billing {
                 }
             }
             other => other,
+        }
+    }
+
+    /// A run reported its cost: `cost` is the CLI's `total_cost_usd`, which
+    /// covers the whole `session` — the CLI restores a session's cost on
+    /// `--resume` (verified on CLI 2.1.330), plan-billed turns included — so
+    /// only the increase over the session's last figure is new. Every run's
+    /// figure is remembered for that; only a run on credits (`on_credits`)
+    /// adds its share to the block's spend and the entered balance's.
+    pub(super) fn note_cost(&self, session: Option<&str>, cost: f64, on_credits: bool) {
+        let cost = if cost.is_finite() { cost.max(0.0) } else { 0.0 };
+        if cost <= 0.0 {
+            return;
+        }
+        let mut st = lock(&self.state);
+        let delta = match session {
+            Some(sid) => {
+                let costs = &mut st.ledger.session_costs;
+                let prev = costs.get(sid).map_or(0.0, |c| c.cost_usd);
+                costs.insert(
+                    sid.to_string(),
+                    SessionCost {
+                        cost_usd: cost,
+                        at: crate::agent::usage::now_secs(),
+                    },
+                );
+                while costs.len() > SESSION_COSTS_CAP {
+                    let Some(oldest) = costs
+                        .iter()
+                        .min_by_key(|(_, c)| c.at)
+                        .map(|(k, _)| k.clone())
+                    else {
+                        break;
+                    };
+                    costs.remove(&oldest);
+                }
+                // A total below the last one: the CLI started the count over
+                // (a session it couldn't restore), so all of it is new.
+                if cost >= prev {
+                    cost - prev
+                } else {
+                    cost
+                }
+            }
+            None => cost,
+        };
+        if on_credits {
+            st.credit_spend_usd += delta;
+            if let Some(b) = st.ledger.balance.as_mut() {
+                b.spent_usd += delta;
+            }
+            self.emit(&st);
+        }
+        st.ledger_gen += 1;
+        self.persist(&st);
+    }
+
+    /// Enter (`Some`, USD) or clear (`None`) the credit balance the bar
+    /// counts down from. A new balance starts the count over. It is only a
+    /// counter: it never overrides Anthropic refusing the key this block
+    /// (`credits_exhausted`) — saving the key again does, after a top-up.
+    pub(super) fn set_balance(&self, usd: Option<f64>) {
+        let mut st = lock(&self.state);
+        st.ledger.balance = usd.filter(|u| u.is_finite()).map(CreditBalance::new);
+        st.ledger_gen += 1;
+        self.persist(&st);
+        self.emit(&st);
+    }
+
+    /// Save the ledger off the async thread (inline when there's no runtime,
+    /// as in unit tests). Saves are serialised and a stale one is skipped, so
+    /// the newest state always wins.
+    fn persist(&self, st: &BillingState) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        let (ledger, gen) = (st.ledger.clone(), st.ledger_gen);
+        let saved = Arc::clone(&self.saved_gen);
+        let save = move || {
+            let mut last = lock(&saved);
+            if gen <= *last {
+                return;
+            }
+            match db.save_credit_ledger(&ledger) {
+                Ok(()) => *last = gen,
+                Err(e) => tracing::warn!("saving the API credit ledger failed: {e}"),
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(save);
+            }
+            Err(_) => save(),
         }
     }
 
@@ -489,6 +637,7 @@ fn to_snapshot(st: &BillingState) -> ClaudeBilling {
         credits_exhausted: st.credits_exhausted,
         plan_refused: st.rejected,
         credit_spend_usd: st.credit_spend_usd,
+        credit_balance: st.ledger.balance.clone(),
     }
 }
 
@@ -559,6 +708,24 @@ impl Executor {
         ));
         Ok(())
     }
+
+    /// `SetCreditBalance`: enter or clear the balance the bar counts down
+    /// from, and confirm with a toast.
+    pub(super) fn set_credit_balance(&self, usd: Option<f64>) {
+        let usd = usd.filter(|u| u.is_finite() && *u >= 0.0);
+        self.billing.set_balance(usd);
+        let message = match usd {
+            Some(u) => format!(
+                "API credit balance set to ${u:.2}. The bar counts down as usine's runs spend it."
+            ),
+            None => "API credit balance cleared.".to_string(),
+        };
+        let _ = self.evt_tx.unbounded_send(ExecutorEvent::toast(
+            Uuid::nil(),
+            Severity::Success,
+            message,
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -570,7 +737,7 @@ mod tests {
 
     fn billing() -> (Arc<Billing>, UnboundedReceiver<ExecutorEvent>) {
         let (tx, rx) = mpsc::unbounded();
-        (Arc::new(Billing::new(KeyStore::Memory, tx)), rx)
+        (Arc::new(Billing::new(KeyStore::Memory, None, tx)), rx)
     }
 
     fn with_key() -> (Arc<Billing>, UnboundedReceiver<ExecutorEvent>) {
@@ -663,10 +830,10 @@ mod tests {
     fn credit_runs_are_metered_and_exhaustion_is_noted() {
         let (b, _rx) = with_key();
         b.note_subscription_limit(Some(now_secs() + 600), true);
-        b.meter_event(done(1.25), true, true);
-        b.meter_event(done(0.5), true, true);
+        run_on(&b, true, vec![done(1.25)]);
+        run_on(&b, true, vec![done(0.5)]);
         // Plan-billed runs cost the credits nothing.
-        b.meter_event(done(9.0), false, true);
+        run_on(&b, false, vec![done(9.0)]);
         assert!((b.snapshot().credit_spend_usd - 1.75).abs() < 1e-9);
 
         let evt = b.meter_event(
@@ -983,6 +1150,155 @@ mod tests {
             b.meter_event(exhausted(), true, false),
             AgentEvent::Error { message } if message.contains("retry")
         ));
+    }
+
+    /// Run `events` through the meter as one run's stream, on credits or
+    /// the plan.
+    fn run_on(b: &Arc<Billing>, on_credits: bool, events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let auth = if on_credits {
+            ClaudeAuth::ApiKey(SecretString::new("sk-test"))
+        } else {
+            ClaudeAuth::Subscription
+        };
+        let stream = futures::stream::iter(events).boxed();
+        block_on(b.meter(stream, &auth, true).collect::<Vec<_>>())
+    }
+
+    fn started(sid: &str) -> AgentEvent {
+        AgentEvent::Started {
+            session_id: sid.into(),
+        }
+    }
+
+    fn remaining(b: &Billing) -> Option<f64> {
+        b.snapshot().credit_balance.map(|c| c.remaining())
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-9)
+    }
+
+    #[test]
+    fn credit_runs_count_down_the_entered_balance() {
+        let (b, _rx) = with_key();
+        // No balance: only the block's spend moves.
+        run_on(&b, true, vec![started("s0"), done(0.5)]);
+        assert_eq!(remaining(&b), None);
+        assert!((b.snapshot().credit_spend_usd - 0.5).abs() < 1e-9);
+
+        b.set_balance(Some(10.0));
+        let out = run_on(&b, true, vec![started("s1"), done(1.5)]);
+        assert!(matches!(out.last(), Some(AgentEvent::Done { .. })));
+        assert!(close(remaining(&b), 8.5));
+        // A failed run's cost counts too, and never reaches the consumer.
+        let out = run_on(
+            &b,
+            true,
+            vec![
+                started("s2"),
+                AgentEvent::RunCost { cost_usd: 0.25 },
+                AgentEvent::Error {
+                    message: "tool blew up".into(),
+                },
+            ],
+        );
+        assert!(!out.iter().any(|e| matches!(e, AgentEvent::RunCost { .. })));
+        assert!(close(remaining(&b), 8.25));
+        // Plan-billed runs don't touch it.
+        run_on(&b, false, vec![started("s3"), done(4.0)]);
+        assert!(close(remaining(&b), 8.25));
+        // A block reset leaves it alone.
+        lock(&b.state).blocked_until = Some(now_secs() - 1);
+        b.auth_for(Provider::Claude);
+        assert_eq!(b.snapshot().credit_spend_usd, 0.0);
+        assert!(close(remaining(&b), 8.25));
+        // Never below zero.
+        run_on(&b, true, vec![started("s4"), done(100.0)]);
+        assert!(close(remaining(&b), 0.0));
+    }
+
+    #[test]
+    fn a_resumed_session_counts_only_its_increase() {
+        let (b, _rx) = with_key();
+        b.set_balance(Some(10.0));
+        // Plan-billed turns of the session: remembered, not counted.
+        run_on(&b, false, vec![started("s"), done(2.0)]);
+        assert!(close(remaining(&b), 10.0));
+        // Resumed on credits: the CLI reports the session's running total.
+        run_on(&b, true, vec![started("s"), done(2.5)]);
+        assert!(close(remaining(&b), 9.5));
+        run_on(
+            &b,
+            true,
+            vec![
+                started("s"),
+                AgentEvent::RunCost { cost_usd: 3.0 },
+                AgentEvent::Error {
+                    message: "boom".into(),
+                },
+            ],
+        );
+        assert!(close(remaining(&b), 9.0));
+        // A total below the last: the CLI started over, all of it is new.
+        run_on(&b, true, vec![started("s"), done(0.25)]);
+        assert!(close(remaining(&b), 8.75));
+        // The map is capped, dropping the least recently seen.
+        for i in 0..SESSION_COSTS_CAP + 5 {
+            b.note_cost(Some(&format!("x{i}")), 0.01, false);
+        }
+        assert_eq!(lock(&b.state).ledger.session_costs.len(), SESSION_COSTS_CAP);
+    }
+
+    #[test]
+    fn credits_running_out_empty_the_balance() {
+        let (b, _rx) = with_key();
+        b.note_subscription_limit(Some(now_secs() + 600), true);
+        b.set_balance(Some(10.0));
+        run_on(&b, true, vec![started("s"), done(1.0)]);
+        let _ = b.meter_event(
+            AgentEvent::Error {
+                message: "Your credit balance is too low to access the Anthropic API.".into(),
+            },
+            true,
+            true,
+        );
+        assert!(close(remaining(&b), 0.0));
+        assert!(b.snapshot().credits_exhausted);
+        // Entering a new balance starts the count over but doesn't override
+        // the refusal: runs stay off credits this block…
+        b.set_balance(Some(20.0));
+        let snap = b.snapshot();
+        assert!(close(remaining(&b), 20.0));
+        assert_eq!(snap.credit_balance.unwrap().spent_usd, 0.0);
+        assert!(snap.credits_exhausted);
+        assert!(!b.auth_for(Provider::Claude).is_api_key());
+        // …until the key is saved again (what a top-up calls for).
+        block_on(b.set_key(Some("sk-test".into()))).unwrap();
+        assert!(!b.snapshot().credits_exhausted);
+        assert!(b.auth_for(Provider::Claude).is_api_key());
+        // Clearing it hides the counter; the key stays.
+        b.set_balance(None);
+        assert_eq!(remaining(&b), None);
+        assert!(b.snapshot().fallback_configured);
+    }
+
+    #[test]
+    fn the_ledger_survives_a_restart() {
+        let db = Store::open_in_memory().unwrap();
+        let (tx, _rx) = mpsc::unbounded();
+        let b = Arc::new(Billing::new(KeyStore::Memory, Some(db.clone()), tx));
+        block_on(b.set_key(Some("sk-test".into()))).unwrap();
+        b.set_balance(Some(10.0));
+        run_on(&b, false, vec![started("s"), done(2.0)]);
+        run_on(&b, true, vec![started("s"), done(3.0)]);
+        // A fresh executor on the same store picks it all back up.
+        let (tx, _rx) = mpsc::unbounded();
+        let b = Arc::new(Billing::new(KeyStore::Memory, Some(db), tx));
+        block_on(b.set_key(Some("sk-test".into()))).unwrap();
+        assert!(close(remaining(&b), 9.0));
+        // Including the session's last total, for the next resume.
+        run_on(&b, true, vec![started("s"), done(3.5)]);
+        assert!(close(remaining(&b), 8.5));
     }
 
     #[test]

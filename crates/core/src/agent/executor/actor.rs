@@ -1455,7 +1455,7 @@ pub(super) fn handle_event(
         }
         // Card runs deny the background-agent tools.
         // Billing telemetry, swallowed by `Billing::meter`.
-        AgentEvent::Task(_) | AgentEvent::PlanUsage { .. } => {}
+        AgentEvent::Task(_) | AgentEvent::PlanUsage { .. } | AgentEvent::RunCost { .. } => {}
         AgentEvent::PlanReady { plan } => {
             // A plan run whose ExitPlanMode draft is a no-work verdict parks on
             // the verdict, not on an approvable "plan".

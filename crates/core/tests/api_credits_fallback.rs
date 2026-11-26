@@ -280,3 +280,87 @@ async fn without_a_key_the_limit_fails_the_run_with_a_hint() {
     }
     assert_eq!(runs.len(), 1);
 }
+
+/// The bar's "API $x left" counter: a run continued on credits counts down
+/// the entered balance, and the count survives an executor restart.
+#[tokio::test]
+async fn credit_runs_count_down_the_entered_balance_across_restarts() {
+    let store = Store::open_in_memory().unwrap();
+    let project = Project::new(
+        "p",
+        PathBuf::from("/tmp/usine-api-credits-balance"),
+        ProjectConfig::default(),
+    );
+    store.upsert_project(&project).unwrap();
+    let card = Card::new(project.id, "c", "Do the thing.", CardConfig::default());
+    store.upsert_card(&card).unwrap();
+    let provider = LimitedProvider::default();
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(provider.clone()),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::SetAnthropicKey {
+        key: SecretString::new("sk-test"),
+    });
+    handle.send(ExecutorCommand::SetCreditBalance { usd: Some(10.0) });
+    wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::BillingUpdated(b)
+            if b.fallback_configured && b.credit_balance.is_some() =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    // Cut off on the plan, continued on credits for $0.42.
+    handle.send(ExecutorCommand::Start { card_id: card.id });
+    let left = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::BillingUpdated(b) => b
+            .credit_balance
+            .as_ref()
+            .map(|c| c.remaining())
+            .filter(|r| *r < 10.0),
+        _ => None,
+    })
+    .await;
+    assert!((left - 9.58).abs() < 1e-9, "{left}");
+    drop(handle);
+
+    // The save runs off the async thread: give it a moment to land.
+    for _ in 0..50 {
+        if store
+            .credit_ledger()
+            .unwrap()
+            .balance
+            .is_some_and(|b| b.spent_usd > 0.0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (handle, mut rx) = spawn_executor(ExecutorConfig {
+        store: store.clone(),
+        providers: Arc::new(provider.clone()),
+        forge: Arc::new(SimForge),
+        git: Arc::new(SimGit),
+    });
+    handle.send(ExecutorCommand::SetAnthropicKey {
+        key: SecretString::new("sk-test"),
+    });
+    let left = wait_for(&mut rx, |e| match &e.kind {
+        ExecutorEventKind::BillingUpdated(b) if b.fallback_configured => {
+            Some(b.credit_balance.as_ref().map(|c| c.remaining()))
+        }
+        _ => None,
+    })
+    .await;
+    assert!(
+        left.is_some_and(|l| (l - 9.58).abs() < 1e-9),
+        "the balance survives a restart: {left:?}"
+    );
+    // The session's last total is kept too, for the next resume.
+    let ledger = store.credit_ledger().unwrap();
+    assert!(ledger.session_costs.contains_key("sess-1"), "{ledger:?}");
+}

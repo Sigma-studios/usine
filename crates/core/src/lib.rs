@@ -68,7 +68,9 @@ pub use agent::startup::{
     seed_default_provider, sweep_orphan_attachments, sync_base_branches, SESSION_AUTO_ARCHIVE_DAYS,
 };
 pub use agent::testing::SCENARIO_FILE;
-pub use agent::usage::{ClaudeBilling, ProviderUsage, RateLimitWindow, UsageSnapshot};
+pub use agent::usage::{
+    ClaudeBilling, CreditBalance, ProviderUsage, RateLimitWindow, UsageSnapshot,
+};
 pub use diff::{
     anchor_drafts, compute_branch_diff, compute_card_diff, fold_unanchorable, snapshot_blob,
     DiffData, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffState, DraftAnchors, FileStatus,
@@ -105,5 +107,5 @@ pub use infra::git::{
     origin_url, remote_tracking_base, sanitize_branch_name, GitOps, MergeOutcome, RealGit, SimGit,
     UpstreamChanges,
 };
-pub use infra::persistence::{rebuild_database, Store};
+pub use infra::persistence::{rebuild_database, CreditLedger, SessionCost, Store};
 pub use infra::secrets::SecretString;

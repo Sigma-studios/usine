@@ -280,6 +280,23 @@ pub fn SettingsModal() -> Element {
 /// organization) and where that organization's API keys are created.
 const CLAIM_CREDITS_URL: &str = "https://claude.ai/settings/billing";
 const API_KEYS_URL: &str = "https://platform.claude.com/settings/keys";
+/// Where the Console shows the organization's remaining credit balance.
+const CONSOLE_BILLING_URL: &str = "https://platform.claude.com/settings/billing";
+
+/// A dollar amount typed into the balance field: "$1,234.50", "42", "0.5".
+/// `None` for anything else, or a negative amount.
+fn parse_usd(text: &str) -> Option<f64> {
+    let cleaned: String = text
+        .trim()
+        .trim_start_matches('$')
+        .chars()
+        .filter(|c| *c != ',' && !c.is_whitespace())
+        .collect();
+    cleaned
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
 
 /// The Claude API-credits fallback: an Anthropic API key, saved to the OS
 /// keychain through the executor and never read back, that Claude runs bill
@@ -305,6 +322,23 @@ fn ApiCreditsSection() -> Element {
         "No key — runs stop at your plan's limit"
     };
     let has_draft = !draft().trim().is_empty();
+    let mut balance_draft = use_signal(String::new);
+    let mut set_balance = move || {
+        let Some(usd) = parse_usd(&balance_draft.peek()) else {
+            return;
+        };
+        state.send(usine_core::ExecutorCommand::SetCreditBalance { usd: Some(usd) });
+        balance_draft.set(String::new());
+    };
+    let balance_valid = parse_usd(&balance_draft()).is_some();
+    let balance_status = billing.credit_balance.as_ref().map(|b| {
+        format!(
+            "${:.2} left of ${:.2} set on {}",
+            b.remaining(),
+            b.set_usd,
+            crate::ui::usagebar::set_on(b.set_at)
+        )
+    });
 
     rsx! {
         div { class: "section",
@@ -341,6 +375,57 @@ fn ApiCreditsSection() -> Element {
                     }
                 }
                 div { class: if billing.fallback_configured { "api-key-status saved" } else { "api-key-status" }, "{status}" }
+            }
+            if billing.fallback_configured {
+                div { class: "field",
+                    label { r#for: "settings-credit-balance", "Credit balance ($)" }
+                    div { class: "api-key-row",
+                        input {
+                            id: "settings-credit-balance",
+                            r#type: "text",
+                            inputmode: "decimal",
+                            autocomplete: "off",
+                            placeholder: "e.g. 42.50 — copy it from Console → Billing",
+                            value: "{balance_draft}",
+                            oninput: move |e: Event<FormData>| balance_draft.set(e.value()),
+                            onkeydown: move |e: KeyboardEvent| {
+                                if e.key() == Key::Enter {
+                                    e.prevent_default();
+                                    set_balance();
+                                }
+                            },
+                        }
+                        button {
+                            class: "btn primary",
+                            disabled: !balance_valid,
+                            onclick: move |_| set_balance(),
+                            "Set"
+                        }
+                        if billing.credit_balance.is_some() {
+                            button {
+                                class: "btn",
+                                onclick: move |_| state.send(usine_core::ExecutorCommand::SetCreditBalance { usd: None }),
+                                "Clear"
+                            }
+                        }
+                    }
+                    match balance_status {
+                        Some(status) => rsx! { div { class: "api-key-status saved", "{status}" } },
+                        None => rsx! { div { class: "api-key-status", "No balance — the bar shows no API counter" } },
+                    }
+                    div { class: "hint",
+                        "A key can't read its balance, so copy it from "
+                        a {
+                            href: "#",
+                            onclick: move |e: MouseEvent| {
+                                e.prevent_default();
+                                crate::ui::sessions::open_url(CONSOLE_BILLING_URL);
+                            },
+                            "Console → Billing"
+                        }
+                        ". The bar then counts it down by what usine's runs on the key spend (the CLI's estimate). Spend from other apps using this key isn't seen: set the balance again to line it back up."
+                    }
+                }
             }
             div { class: "hint",
                 "Used only once your plan is three-quarters used — 75% of the session or the weekly limit — until it resets: new Claude runs start on the key while runs already going finish on the plan, and any run a limit cuts off continues on the other source. Max and Ultra include monthly API credits — claim them by linking a Console organization in "
@@ -1195,5 +1280,22 @@ fn NotificationsTab(pid: Uuid) -> Element {
                 div { class: "hint", "Cards and PR reviews here stop counting toward the dock badge and sidebar badges. Unmute here to restore them." }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_usd;
+
+    #[test]
+    fn a_typed_balance_accepts_dollar_signs_and_thousands_separators() {
+        assert_eq!(parse_usd("42"), Some(42.0));
+        assert_eq!(parse_usd(" $1,234.50 "), Some(1234.5));
+        assert_eq!(parse_usd("0.5"), Some(0.5));
+        assert_eq!(parse_usd("0"), Some(0.0));
+        assert_eq!(parse_usd(""), None);
+        assert_eq!(parse_usd("-3"), None);
+        assert_eq!(parse_usd("abc"), None);
+        assert_eq!(parse_usd("inf"), None);
     }
 }
