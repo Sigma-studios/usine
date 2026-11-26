@@ -411,7 +411,7 @@ fn ApiCreditsSection() -> Element {
                     }
                     match balance_status {
                         Some(status) => rsx! { div { class: "api-key-status saved", "{status}" } },
-                        None => rsx! { div { class: "api-key-status", "No balance — the bar shows no API counter" } },
+                        None => rsx! { div { class: "api-key-status", "No balance — the API credits badge won't show what's left" } },
                     }
                     div { class: "hint",
                         "A key can't read its balance, so copy it from "
@@ -423,7 +423,7 @@ fn ApiCreditsSection() -> Element {
                             },
                             "Console → Billing"
                         }
-                        ". The bar then counts it down by what usine's runs on the key spend (the CLI's estimate). Spend from other apps using this key isn't seen: set the balance again to line it back up."
+                        ". While runs bill the key, the bar's API credits badge counts it down by what usine's runs on the key spend (the CLI's estimate). Spend from other apps using this key isn't seen: set the balance again to line it back up."
                     }
                 }
             }

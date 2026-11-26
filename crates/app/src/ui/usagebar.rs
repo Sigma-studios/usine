@@ -13,6 +13,11 @@
 //! one-off sessions), hidden at zero. A provider with running agents but no
 //! visible window still gets its segment, holding just the badge and the count.
 //!
+//! While Claude runs bill the saved API key (the plan's limit was hit), the
+//! Claude segment also carries a single API-credits badge showing that the
+//! fallback is on and, when a balance was entered in Settings, the estimated
+//! credits left.
+//!
 //! The far right holds the update control (`ui/update.rs`).
 
 use std::collections::HashMap;
@@ -93,19 +98,16 @@ pub fn UsageBar() -> Element {
     // The API-credits badge, only while the plan is blocked and runs bill the
     // saved key (see `CreditsBadge`).
     let billing = state.billing.read().clone();
-    let credits = Some(billing.clone()).filter(|b| b.on_credits_until.is_some());
-    // The "API $x left" counter, whenever a key and a balance are saved.
-    let counter = Some(billing).filter(shows_counter);
+    let credits = Some(billing).filter(|b| b.on_credits_until.is_some());
     let group = |usage: Option<ProviderUsage>,
                  provider: Provider,
                  running: usize,
-                 credits: Option<ClaudeBilling>,
-                 counter: Option<ClaudeBilling>| {
+                 credits: Option<ClaudeBilling>| {
         let usage = usage.filter(has_visible_window);
-        (usage.is_some() || running > 0 || credits.is_some() || counter.is_some()).then(|| {
+        (usage.is_some() || running > 0 || credits.is_some()).then(|| {
             let usage = usage.unwrap_or_default();
             rsx! {
-                ProviderGauges { provider, usage, running, credits, counter }
+                ProviderGauges { provider, usage, running, credits }
             }
         })
     };
@@ -114,15 +116,8 @@ pub fn UsageBar() -> Element {
         Provider::Claude,
         claude_running,
         credits,
-        counter,
     );
-    let codex = group(
-        snapshot.codex.clone(),
-        Provider::Codex,
-        codex_running,
-        None,
-        None,
-    );
+    let codex = group(snapshot.codex.clone(), Provider::Codex, codex_running, None);
     let empty = claude.is_none() && codex.is_none();
     // Read the ticker so the label re-renders with it.
     let _ = tick();
@@ -267,7 +262,6 @@ fn ProviderGauges(
     usage: ProviderUsage,
     running: usize,
     credits: Option<ClaudeBilling>,
-    counter: Option<ClaudeBilling>,
 ) -> Element {
     let name = provider.label();
     let class = provider_value(provider);
@@ -298,58 +292,13 @@ fn ProviderGauges(
             if let Some(billing) = credits {
                 CreditsBadge { billing }
             }
-            if let Some(billing) = counter {
-                CreditCounter { billing }
-            }
         }
     }
 }
 
-/// Whether the bar shows the "API $x left" counter: a key and an entered
-/// balance are both saved.
-fn shows_counter(billing: &ClaudeBilling) -> bool {
-    billing.fallback_configured && billing.credit_balance.is_some()
-}
-
-/// "API $12.34 left": the balance the user entered (Settings) minus what
-/// usine's runs on the key spent since. Red once nothing is left — counted
-/// down to zero, or the API itself said the credits ran out.
-#[component]
-fn CreditCounter(billing: ClaudeBilling) -> Element {
-    let Some(balance) = billing.credit_balance.clone() else {
-        return rsx! {};
-    };
-    let class = if counter_empty(&billing) {
-        "usage-credits exhausted"
-    } else {
-        "usage-credits"
-    };
-    let label = counter_label(&balance);
-    let tip = counter_tip(&balance);
-    rsx! {
-        span { class: "{class} has-tip",
-            "{label}"
-            span { class: "info-tip up", "{tip}" }
-        }
-    }
-}
-
-/// Whether the counter reads as empty (red).
-fn counter_empty(billing: &ClaudeBilling) -> bool {
-    billing.credits_exhausted
-        || billing
-            .credit_balance
-            .as_ref()
-            .is_some_and(|b| b.remaining() < 0.005)
-}
-
-/// The counter's label.
-fn counter_label(balance: &CreditBalance) -> String {
-    format!("API ${:.2} left", balance.remaining())
-}
-
-/// The counter's tooltip: what it counts from, and what it can't see.
-fn counter_tip(balance: &CreditBalance) -> String {
+/// The entered balance's details for the badge's tooltip: what it counts
+/// from, and what it can't see.
+fn balance_tip(balance: &CreditBalance) -> String {
     format!(
         "${:.2} left of ${:.2} set on {} · counts only usine's runs (the CLI's estimate at list \
          prices); spend from other apps using this key isn't seen — re-enter the balance in \
@@ -367,19 +316,18 @@ pub(crate) fn set_on(set_at: i64) -> String {
         .unwrap_or_else(|| "an unknown date".into())
 }
 
-/// "API credits": the plan's limit was hit (or a window passed the early
-/// switch point) and Claude runs bill the saved API key until it resets. Red
-/// once the key's credits ran out too and the plan has refused runs; when
-/// the block is only the early switch's padding, runs go back to the plan
-/// instead, so the badge says the plan is nearly used. The plan's gauges stay
-/// as they are — they still show the plan's own windows.
+/// "API credits · $12.34 left": the plan's limit was hit (or a window passed
+/// the early switch point) and Claude runs bill the saved API key until it
+/// resets — shown only then. With a balance entered in Settings it also says
+/// what's left: that balance minus what usine's runs on the key spent since,
+/// red once counted down to zero. Red too once the key's credits ran out and
+/// the plan has refused runs; when the block is only the early switch's
+/// padding, runs go back to the plan instead, so the badge says the plan is
+/// nearly used. The plan's gauges stay as they are — they still show the
+/// plan's own windows.
 #[component]
 fn CreditsBadge(billing: ClaudeBilling) -> Element {
-    let (label, class) = match (billing.credits_exhausted, billing.plan_refused) {
-        (true, true) => ("Credits exhausted", "usage-credits exhausted"),
-        (true, false) => ("Plan nearly used", "usage-credits"),
-        (false, _) => ("API credits", "usage-credits"),
-    };
+    let (label, class) = credits_badge(&billing);
     let tip = credits_tip(&billing);
     rsx! {
         span { class: "{class} has-tip",
@@ -389,8 +337,43 @@ fn CreditsBadge(billing: ClaudeBilling) -> Element {
     }
 }
 
-/// The credits badge's tooltip.
+/// The credits badge's label and class.
+fn credits_badge(billing: &ClaudeBilling) -> (String, &'static str) {
+    match (billing.credits_exhausted, billing.plan_refused) {
+        (true, true) => ("Credits exhausted".into(), "usage-credits exhausted"),
+        // Runs are back on the plan: what's left on the key doesn't matter.
+        (true, false) => ("Plan nearly used".into(), "usage-credits"),
+        (false, _) => match &billing.credit_balance {
+            Some(balance) => {
+                let left = balance.remaining();
+                let class = if left < 0.005 {
+                    "usage-credits exhausted"
+                } else {
+                    "usage-credits"
+                };
+                (format!("API credits · ${left:.2} left"), class)
+            }
+            None => ("API credits".into(), "usage-credits"),
+        },
+    }
+}
+
+/// The credits badge's tooltip: the mode, then the entered balance's details
+/// — left off once the key's credits are exhausted, where a balance still
+/// counting down would contradict the mode (and, with runs back on the plan,
+/// what's left on the key doesn't matter).
 fn credits_tip(billing: &ClaudeBilling) -> String {
+    let mode = credits_mode_tip(billing);
+    match &billing.credit_balance {
+        Some(balance) if !billing.credits_exhausted => {
+            format!("{mode} · {}", balance_tip(balance))
+        }
+        _ => mode,
+    }
+}
+
+/// What the fallback is doing and until when.
+fn credits_mode_tip(billing: &ClaudeBilling) -> String {
     let until = billing
         .on_credits_until
         .map(countdown)
@@ -560,44 +543,72 @@ mod tests {
         let tip = credits_tip(&billing);
         assert!(tip.starts_with("Plan nearly used"), "{tip}");
         assert!(tip.contains("finish on the plan"), "{tip}");
+        // A balance entered: its details follow the mode.
+        billing.credit_balance = Some(CreditBalance {
+            set_usd: 20.0,
+            set_at: 1_790_000_000,
+            spent_usd: 7.656,
+        });
+        let tip = credits_tip(&billing);
+        assert!(tip.starts_with("Plan nearly used"), "{tip}");
+        assert!(
+            tip.contains("$1.23 spent by usine · $12.34 left of $20.00 set on "),
+            "{tip}"
+        );
+        assert!(tip.contains("isn't seen"), "{tip}");
+        // Credits exhausted: no balance still counting down after the mode.
+        billing.credits_exhausted = true;
+        for refused in [true, false] {
+            billing.plan_refused = refused;
+            let tip = credits_tip(&billing);
+            assert!(tip.ends_with("$1.23 spent by usine"), "{tip}");
+            assert!(!tip.contains("left of"), "{tip}");
+        }
     }
 
     #[test]
-    fn the_credit_counter_shows_whats_left_and_goes_red_at_zero() {
+    fn the_credits_badge_shows_mode_and_whats_left() {
         let balance = CreditBalance {
             set_usd: 20.0,
             set_at: 1_790_000_000,
             spent_usd: 7.656,
         };
-        assert_eq!(counter_label(&balance), "API $12.34 left");
-        let tip = counter_tip(&balance);
-        assert!(tip.starts_with("$12.34 left of $20.00 set on "), "{tip}");
-        assert!(tip.contains("isn't seen"), "{tip}");
-
         let mut billing = ClaudeBilling {
             fallback_configured: true,
+            on_credits_until: Some(1_790_100_000),
+            plan_refused: true,
             credit_balance: Some(balance.clone()),
             ..Default::default()
         };
-        assert!(shows_counter(&billing));
-        assert!(!counter_empty(&billing));
+        assert_eq!(
+            credits_badge(&billing),
+            ("API credits · $12.34 left".into(), "usage-credits")
+        );
         // Spent down to zero: red, never negative.
         billing.credit_balance.as_mut().unwrap().spent_usd = 25.0;
-        assert!(counter_empty(&billing));
         assert_eq!(
-            counter_label(billing.credit_balance.as_ref().unwrap()),
-            "API $0.00 left"
+            credits_badge(&billing),
+            ("API credits · $0.00 left".into(), "usage-credits exhausted")
+        );
+        // No balance entered: just the mode.
+        billing.credit_balance = None;
+        assert_eq!(
+            credits_badge(&billing),
+            ("API credits".into(), "usage-credits")
         );
         // The API said the credits ran out: red whatever the estimate.
         billing.credit_balance = Some(balance);
         billing.credits_exhausted = true;
-        assert!(counter_empty(&billing));
-        // Hidden without a key or without a balance.
-        billing.fallback_configured = false;
-        assert!(!shows_counter(&billing));
-        billing.fallback_configured = true;
-        billing.credit_balance = None;
-        assert!(!shows_counter(&billing));
+        assert_eq!(
+            credits_badge(&billing),
+            ("Credits exhausted".into(), "usage-credits exhausted")
+        );
+        // Padding only: runs are back on the plan, no amount.
+        billing.plan_refused = false;
+        assert_eq!(
+            credits_badge(&billing),
+            ("Plan nearly used".into(), "usage-credits")
+        );
     }
 
     #[test]

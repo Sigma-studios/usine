@@ -1132,9 +1132,13 @@ select.sev option { text-transform: none; color: var(--text); background: var(--
    draw the bar shows a muted placeholder so its refresh button stays reachable.
    Up to five gauges is more than a narrow window fits, so the row clips rather
    than pushing the refresh button out: the `resets …` texts, the only elastic
-   part, give way first (ellipsis), and the meters keep their size. */
+   part, give way first (ellipsis), and the meters keep their size. Clipped
+   horizontally only (`clip`, unlike `hidden`, leaves the other axis visible):
+   the bar's tips open upward out of it, and clipping that axis too cut them
+   off, leaving only their shadow smudged over the bar on hover. */
 .usage-bar {
-  display: flex; align-items: center; gap: 14px; flex: none; overflow: hidden;
+  display: flex; align-items: center; gap: 14px; flex: none;
+  overflow-x: clip; overflow-y: visible;
   padding: 5px 14px; background: var(--panel); border-top: 1px solid var(--border);
   font-size: 11px; color: var(--muted);
 }
